@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from rpent.envs.prompt_bundle import PromptBundle
-from rpent.envs.env_spec import EnvSpec
 from robots.libero.prompt_bundle import (
     system_prompt,
     user_prompt,
 )
+from rpent.envs.env_spec import EnvSpec
+from rpent.envs.prompt_bundle import PromptBundle
 
 
 def get_env_spec() -> EnvSpec:
@@ -40,3 +40,10 @@ def get_toolkit(
         video_path=video_path,
         dashboard=dashboard,
     )
+
+
+def get_runtime_provider():
+    """Return the LIBERO CLI/runtime provider."""
+    from robots.libero.runtime_provider import LiberoRuntimeProvider
+
+    return LiberoRuntimeProvider()

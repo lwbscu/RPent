@@ -225,6 +225,7 @@ class CodexCerebrum:
                 _codex_mcp_config_overrides(
                     mcp_url=mcp_url,
                     base_url=self._base_url,
+                    tool_timeout_sec=self._timeout_s,
                 )
             ),
             "cwd": self._repo_root,
@@ -388,9 +389,11 @@ def _codex_mcp_config_overrides(
     *,
     mcp_url: str,
     base_url: str | None,
+    tool_timeout_sec: int,
 ) -> list[str]:
     config: list[tuple[str, Any]] = [
         ("mcp_servers.rpent.url", mcp_url),
+        ("mcp_servers.rpent.tool_timeout_sec", tool_timeout_sec),
     ]
     if base_url:
         normalized = base_url.rstrip("/")
