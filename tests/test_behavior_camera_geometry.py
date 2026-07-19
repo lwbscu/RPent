@@ -103,6 +103,19 @@ def test_observe_payload_returns_png_bytes_for_tool_result_without_pixel_dump():
     assert "[[[" not in text
 
 
+def test_observe_reissues_expired_unchanged_frame_and_invalidates_old_id():
+    cache, frame = _cache()
+    old_frame_id = frame.frame_id
+    frame.timestamp_s -= cache.ttl_s + 1.0
+
+    payload = cache.observe_payload("head")
+
+    assert payload["frame_id"] != old_frame_id
+    assert cache.get_current("head", payload["frame_id"]) is frame
+    with pytest.raises(CameraGeometryError, match="stale frame_id"):
+        cache.get_current("head", old_frame_id)
+
+
 def _calibration_samples(offset):
     points = [
         np.array([0.0, 0.0, -1.0]),

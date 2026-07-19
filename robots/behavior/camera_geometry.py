@@ -698,6 +698,14 @@ class FrameCache:
 
     def observe_payload(self, camera: str) -> dict[str, Any]:
         frame = self.latest(camera)
+        # Simulator state only changes through facade calls that add a new frame.
+        # Reissue the unchanged latest capture so a just-returned frame_id can
+        # always be consumed, while any ID returned by an earlier observe call
+        # remains stale.
+        frame.frame_id = (
+            f"{frame.camera}:{int(frame.step_index)}:{uuid.uuid4().hex[:8]}"
+        )
+        frame.timestamp_s = time.monotonic()
         return {
             "camera": frame.camera,
             "frame_id": frame.frame_id,
