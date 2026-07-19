@@ -358,14 +358,26 @@ class RealCuroboBackend:
         for joint in lock_joints:
             self._validate_joint_name(robot, str(joint))
 
-    def _probe_generator_lock_resolution(self, generator: Any, *, kind: str, hand: str) -> None:
+    def _probe_generator_lock_resolution(
+        self,
+        generator: Any,
+        *,
+        kind: str,
+        hand: str,
+        emb_sel: Any | None = None,
+    ) -> None:
         """Fail early if official null lock_joints were not resolved by OG/cuRobo."""
         update = getattr(generator, "update_locked_joints", None)
         if update is not None:
             try:
                 from omnigibson import lazy
 
-                emb_sel = self._embodiment_cls.DEFAULT if self._embodiment_cls is not None else None
+                if emb_sel is None:
+                    emb_sel = (
+                        self._embodiment_cls.DEFAULT
+                        if self._embodiment_cls is not None
+                        else None
+                    )
                 robot = self._find_robot()
                 torch = self._torch
                 if torch is None:
@@ -411,15 +423,22 @@ class RealCuroboBackend:
         if key in self._generators:
             return self._generators[key]
         if kind == "arm":
-            cfg_path = str(self._hand_config_path(hand))
+            robot_cfg_path: Any = str(self._hand_config_path(hand))
+            use_default_embodiment_only = True
+            emb_sel = self._embodiment_cls.DEFAULT
         elif kind == "base":
-            cfg_path = str(self._base_config_path())
+            robot_cfg_path = dict(getattr(robot, "curobo_path", {}) or {})
+            if not robot_cfg_path:
+                raise RuntimeError("R1Pro does not expose official cuRobo embodiment configs")
+            emb_sel = self._embodiment_cls.BASE
+            robot_cfg_path[emb_sel] = str(self._base_config_path())
+            use_default_embodiment_only = False
         else:
             raise ValueError(f"unknown cuRobo generator kind {kind!r}")
         assert self._curobo_cls is not None
         generator = self._curobo_cls(
             robot,
-            robot_cfg_path=cfg_path,
+            robot_cfg_path=robot_cfg_path,
             motion_cfg_kwargs={
                 "trajopt_tsteps": 32,
                 "num_trajopt_seeds": 4,
@@ -428,9 +447,14 @@ class RealCuroboBackend:
             },
             batch_size=2,
             use_cuda_graph=False,
-            use_default_embodiment_only=True,
+            use_default_embodiment_only=use_default_embodiment_only,
         )
-        self._probe_generator_lock_resolution(generator, kind=kind, hand=hand)
+        self._probe_generator_lock_resolution(
+            generator,
+            kind=kind,
+            hand=hand,
+            emb_sel=emb_sel,
+        )
         self._generators[key] = generator
         return generator
 
@@ -829,6 +853,7 @@ class RealCuroboBackend:
     def _compute_base_plan(self, *, target_xyyaw: np.ndarray, timeout_s: float) -> dict[str, Any]:
         generator = self._generator(kind="base")
         self._active_generator = generator
+        emb_sel = self._embodiment_cls.BASE
         torch = self._torch
         if torch is None:
             import torch as torch  # type: ignore[no-redef]
@@ -847,6 +872,7 @@ class RealCuroboBackend:
             success_ratio=1.0 / max(int(generator.batch_size), 1),
             ik_only=False,
             skip_obstacle_update=False,
+            emb_sel=emb_sel,
         )
         success_array = np.asarray(_jsonable(successes), dtype=bool).reshape(-1)
         success_indices = np.flatnonzero(success_array)
@@ -860,7 +886,11 @@ class RealCuroboBackend:
         if success_indices.size == 0:
             return {"ok": False, "stop_reason": "base_plan_failed", "metrics": metrics}
         path = paths[int(success_indices[0])]
-        q_traj = generator.path_to_joint_trajectory(path, get_full_js=True)
+        q_traj = generator.path_to_joint_trajectory(
+            path,
+            get_full_js=True,
+            emb_sel=emb_sel,
+        )
         q_traj = _interpolate_joint_trajectory(q_traj, max_inter_dist=0.01)
         collision_report = self._check_q_trajectory_collisions(generator, q_traj)
         metrics.update(
