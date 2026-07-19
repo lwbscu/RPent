@@ -8,6 +8,7 @@ arrays, and other LIBERO/OpenPI payloads ride the wire as pickle frames
 Both processes are spawned by the same user on the same host, so we use
 pickle rather than a more defensive codec.
 """
+
 from __future__ import annotations
 
 import logging
@@ -46,6 +47,10 @@ def _read_frame(reader) -> Any:
 
 def _write_frame(writer, obj: Any) -> None:
     body = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    _write_serialized_frame(writer, body)
+
+
+def _write_serialized_frame(writer, body: bytes) -> None:
     writer.write(_LEN_PREFIX.pack(len(body)) + body)
     writer.flush()
 
@@ -130,6 +135,7 @@ class _RequestHandler(socketserver.StreamRequestHandler):
             response: dict = {"id": req_id, "ok": True, "result": result}
         except Exception as exc:
             import traceback as _tb
+
             response = {
                 "id": req_id,
                 "ok": False,
@@ -137,18 +143,19 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 "traceback": _tb.format_exc(),
             }
         try:
-            _write_frame(self.wfile, response)
+            body = pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception as exc:
-            logger.exception("failed to write RPC response for %s", req_id)
+            logger.exception("failed to serialize RPC response for %s", req_id)
             fallback = {
                 "id": req_id,
                 "ok": False,
                 "error": f"response serialization failed: {type(exc).__name__}: {exc}",
             }
-            try:
-                _write_frame(self.wfile, fallback)
-            except Exception:
-                logger.exception("failed to write RPC serialization error for %s", req_id)
+            body = pickle.dumps(fallback, protocol=pickle.HIGHEST_PROTOCOL)
+        try:
+            _write_serialized_frame(self.wfile, body)
+        except Exception:
+            logger.exception("failed to write RPC response for %s", req_id)
 
 
 class SocketRpcServer(socketserver.ThreadingTCPServer):

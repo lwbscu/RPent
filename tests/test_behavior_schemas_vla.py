@@ -1,11 +1,14 @@
 import base64
 import pickle
+import sys
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from robots.behavior.env_server import (
+    BehaviorEnvFacade,
     _bootstrap_template_path,
     _MainThreadDispatcher,
     _payload_intrinsics,
@@ -34,9 +37,7 @@ def test_behavior_rpc_executes_env_method_on_dispatcher_thread():
     dispatcher = _MainThreadDispatcher(env, shutdown_event)
     result = {}
     submitter = threading.Thread(
-        target=lambda: result.setdefault(
-            "value", dispatcher.submit("env.ping", (), {})
-        )
+        target=lambda: result.setdefault("value", dispatcher.submit("env.ping", (), {}))
     )
     submitter.start()
 
@@ -64,6 +65,54 @@ def test_behavior_wire_info_replaces_only_unpickleable_leaves():
     assert safe["object_array"][0] == 3
     assert safe["object_array"][1].startswith("<unserializable:")
     pickle.dumps(safe, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def test_behavior_chunk_step_round_trips_official_success_with_simulator_object(
+    monkeypatch,
+):
+    info = {
+        "done": {"success": np.bool_(True)},
+        "simulator_object": SimpleNamespace(callback=lambda: None),
+    }
+
+    class _DirectProcess:
+        @staticmethod
+        def step_env(_action, *, need_obs):
+            assert need_obs is True
+            return {}, np.array([1.0]), np.array([False]), np.array([False]), [info]
+
+    wrapped_observation = {
+        "main_images": np.zeros((1, 3, 4, 3), dtype=np.uint8),
+        "wrist_images": np.zeros((1, 2, 3, 4, 3), dtype=np.uint8),
+        "states": np.zeros((1, 256), dtype=np.float32),
+        "task_descriptions": ["turn on the radio"],
+    }
+    facade = BehaviorEnvFacade.__new__(BehaviorEnvFacade)
+    facade._done = False
+    facade._env_steps = 0
+    facade._env = SimpleNamespace(
+        _direct_process=_DirectProcess(),
+        _wrap_obs=lambda _raw: wrapped_observation,
+    )
+    facade._record_rgbd_frames = lambda _raw, _wrapped: None
+    facade._append_video = lambda _observation: None
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            float32=np.float32,
+            as_tensor=lambda value, dtype: np.asarray(value, dtype=dtype),
+            is_tensor=lambda _value: False,
+        ),
+    )
+
+    result = facade.chunk_step(np.zeros((1, 23), dtype=np.float32))
+    round_tripped = pickle.loads(pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+
+    assert round_tripped[4]["done"]["success"] is True
+    assert round_tripped[4]["simulator_object"].startswith("<unserializable:")
+    assert round_tripped[4]["_rpent"] == {"executed_steps": 1}
+    assert facade._done is True
 
 
 def test_invalid_payload_intrinsics_fall_through_to_valid_sensor_intrinsics():

@@ -1,4 +1,5 @@
 """OmniGibson/R1Pro process for the BEHAVIOR RPent runtime."""
+
 from __future__ import annotations
 
 import argparse
@@ -57,22 +58,23 @@ def _numpy_tree(value: Any) -> Any:
 
 
 def _wire_safe(value: Any) -> Any:
-    """Preserve ordinary simulator data while replacing non-pickleable leaves."""
+    """Keep only wire-stable builtins and arrays at the simulator boundary."""
     value = _numpy_tree(value)
     if isinstance(value, np.generic):
-        return value.item()
+        return _wire_safe(value.item())
     if isinstance(value, np.ndarray):
         if value.dtype.hasobject:
             return _wire_safe(value.tolist())
         return value
     if isinstance(value, dict):
         result = {}
-        for key, item in value.items():
-            try:
-                pickle.dumps(key, protocol=pickle.HIGHEST_PROTOCOL)
+        for index, (key, item) in enumerate(value.items()):
+            if key is None or isinstance(key, (str, bytes, bool, int, float)):
                 safe_key = key
-            except Exception:
-                safe_key = f"<{type(key).__module__}.{type(key).__qualname__}>"
+            else:
+                safe_key = (
+                    f"<key:{index}:{type(key).__module__}.{type(key).__qualname__}>"
+                )
             result[safe_key] = _wire_safe(item)
         return result
     if isinstance(value, list):
@@ -81,11 +83,9 @@ def _wire_safe(value: Any) -> Any:
         return tuple(_wire_safe(item) for item in value)
     if isinstance(value, (set, frozenset)):
         return [_wire_safe(item) for item in value]
-    try:
-        pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
         return value
-    except Exception:
-        return f"<unserializable:{type(value).__module__}.{type(value).__qualname__}>"
+    return f"<unserializable:{type(value).__module__}.{type(value).__qualname__}>"
 
 
 def _single_observation(obs: dict[str, Any]) -> dict[str, Any]:
@@ -175,7 +175,9 @@ def _matrix_from_pose(position: Any, orientation_xyzw: Any) -> np.ndarray:
     return out
 
 
-def _payload_matrix(payload: dict[str, Any], names: tuple[str, ...]) -> np.ndarray | None:
+def _payload_matrix(
+    payload: dict[str, Any], names: tuple[str, ...]
+) -> np.ndarray | None:
     for name in names:
         if name not in payload:
             continue
@@ -213,7 +215,9 @@ def _payload_intrinsics(
     return None
 
 
-def _sensor_intrinsics(sensor: Any, *, rgb_shape: tuple[int, ...]) -> CameraIntrinsics | None:
+def _sensor_intrinsics(
+    sensor: Any, *, rgb_shape: tuple[int, ...]
+) -> CameraIntrinsics | None:
     for name in ("intrinsic_matrix", "camera_intrinsics", "K"):
         try:
             value = getattr(sensor, name)
@@ -317,7 +321,7 @@ def _bootstrap_template_path(
     )
     if not template_path.is_file():
         raise FileNotFoundError(
-            "BEHAVIOR bootstrap scene template not found: " f"{template_path}"
+            f"BEHAVIOR bootstrap scene template not found: {template_path}"
         )
     return template_path
 
@@ -339,7 +343,9 @@ def _load_env_config(args: argparse.Namespace) -> Any:
         raise FileNotFoundError(f"BEHAVIOR env config not found: {config_path}")
     instance_dir = Path(args.activity_instance_dir).expanduser().resolve()
     if not instance_dir.is_dir():
-        raise FileNotFoundError(f"BEHAVIOR instance directory not found: {instance_dir}")
+        raise FileNotFoundError(
+            f"BEHAVIOR instance directory not found: {instance_dir}"
+        )
 
     cfg = OmegaConf.load(config_path)
     action_frequency = int(cfg.omni_config.env.action_frequency)
@@ -495,7 +501,9 @@ class BehaviorEnvFacade:
         pose = payload.get("pose") or payload.get("camera_pose")
         if isinstance(pose, dict) and "position" in pose and "orientation" in pose:
             return _matrix_from_pose(pose["position"], pose["orientation"])
-        view = _payload_matrix(payload, ("view_matrix", "view_transform", "world_to_camera"))
+        view = _payload_matrix(
+            payload, ("view_matrix", "view_transform", "world_to_camera")
+        )
         if view is not None:
             return np.linalg.inv(view.T)
         if sensor is not None:
@@ -504,7 +512,9 @@ class BehaviorEnvFacade:
                 return sensor_matrix
         raise CameraGeometryError(f"camera pose unavailable for {camera}")
 
-    def _record_rgbd_frames(self, raw_observations: Any, observation: dict[str, Any]) -> None:
+    def _record_rgbd_frames(
+        self, raw_observations: Any, observation: dict[str, Any]
+    ) -> None:
         del observation
         raw = _first_env_value(raw_observations)
         if raw is None:
@@ -522,13 +532,12 @@ class BehaviorEnvFacade:
             sensor = self._sensor_for_camera(camera)
             try:
                 rgb_array = np.asarray(_numpy_tree(rgb))
-                intrinsics = (
-                    _payload_intrinsics(payload, rgb_shape=rgb_array.shape)
-                    or (
-                        _sensor_intrinsics(sensor, rgb_shape=rgb_array.shape)
-                        if sensor is not None
-                        else None
-                    )
+                intrinsics = _payload_intrinsics(
+                    payload, rgb_shape=rgb_array.shape
+                ) or (
+                    _sensor_intrinsics(sensor, rgb_shape=rgb_array.shape)
+                    if sensor is not None
+                    else None
                 )
                 if intrinsics is None:
                     raise CameraGeometryError(
@@ -630,12 +639,14 @@ class BehaviorEnvFacade:
         if not isinstance(returned_info, dict):
             returned_info = {"raw": returned_info}
         returned_info["_rpent"] = {"executed_steps": executed_steps}
-        result = (
-            final_observation,
-            _numpy_tree(final_reward),
-            terminated,
-            truncated,
-            returned_info,
+        result = _wire_safe(
+            (
+                final_observation,
+                _numpy_tree(final_reward),
+                terminated,
+                truncated,
+                returned_info,
+            )
         )
         # Catch simulator-owned objects here so the transport can return a
         # useful RPC error instead of closing the socket without a frame.
