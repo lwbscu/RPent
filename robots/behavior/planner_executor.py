@@ -549,7 +549,7 @@ class RealCuroboBackend:
             enable_finetune_trajopt=not bool(ik_only),
             finetune_attempts=0 if ik_only else 2,
             return_full_result=False,
-            success_ratio=1.0,
+            success_ratio=1.0 / max(int(generator.batch_size), 1),
             attached_obj=attached_obj,
             ik_only=bool(ik_only),
             is_local=False,
@@ -572,6 +572,7 @@ class RealCuroboBackend:
             "curobo_config": str(self._hand_config_path(hand)),
             "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
             "attached_collision_body": {"available": attached_obj is not None},
+            "success_ratio": 1.0 / max(int(generator.batch_size), 1),
         }
         if success_indices.size == 0:
             return {
@@ -843,7 +844,7 @@ class RealCuroboBackend:
             enable_finetune_trajopt=True,
             finetune_attempts=2,
             return_full_result=False,
-            success_ratio=1.0,
+            success_ratio=1.0 / max(int(generator.batch_size), 1),
             ik_only=False,
             skip_obstacle_update=False,
         )
@@ -854,6 +855,7 @@ class RealCuroboBackend:
             "ik_only": False,
             "curobo_config": str(self._base_config_path()),
             "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
+            "success_ratio": 1.0 / max(int(generator.batch_size), 1),
         }
         if success_indices.size == 0:
             return {"ok": False, "stop_reason": "base_plan_failed", "metrics": metrics}
