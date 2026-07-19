@@ -169,6 +169,9 @@ class RealCuroboBackend:
         self._generators: dict[str, Any] = {}
         self._config_paths: dict[str, Path] = {}
         self._attached_objects_by_hand: dict[str, Any] = {}
+        self._active_generator: Any | None = None
+        self._last_collision_step = -1
+        self._collision_check_interval_steps = 4
         self._last_collision_report: dict[str, Any] = {
             "available": False,
             "reason": "not_checked",
@@ -513,6 +516,7 @@ class RealCuroboBackend:
     ) -> dict[str, Any]:
         hand = _normalize_hand(hand)
         generator = self._generator(kind="arm", hand=hand)
+        self._active_generator = generator
         torch = self._torch
         if torch is None:
             import torch as torch  # type: ignore[no-redef]
@@ -779,6 +783,7 @@ class RealCuroboBackend:
 
     def _compute_base_plan(self, *, target_xyyaw: np.ndarray, timeout_s: float) -> dict[str, Any]:
         generator = self._generator(kind="base")
+        self._active_generator = generator
         torch = self._torch
         if torch is None:
             import torch as torch  # type: ignore[no-redef]
@@ -1056,8 +1061,6 @@ class RealCuroboBackend:
                 skip_obstacle_update=False,
                 attached_obj=attached_obj,
             )
-        except TypeError:
-            colliding = generator.check_collisions(q_traj, skip_obstacle_update=False)
         except Exception as exc:
             report = {
                 "available": False,
@@ -1077,9 +1080,39 @@ class RealCuroboBackend:
             "attached_collision_body": {"available": attached_obj is not None},
         }
         self._last_collision_report = report
+        self._last_collision_step = int(getattr(self.env_facade, "_env_steps", -1))
         return report
 
     def collision_report(self) -> dict[str, Any]:
+        step = int(getattr(self.env_facade, "_env_steps", -1))
+        if (
+            self._last_collision_report.get("available")
+            and step >= 0
+            and self._last_collision_step >= 0
+            and step - self._last_collision_step < self._collision_check_interval_steps
+        ):
+            return dict(self._last_collision_report)
+        try:
+            generator = self._active_generator or self._generator(kind="arm", hand="left")
+            robot = self._find_robot()
+            q = robot.get_joint_positions().reshape(1, -1)
+            attached: dict[str, Any] = {}
+            for side in ("left", "right"):
+                item = self.get_attached_object(side)
+                if item:
+                    attached.update(item)
+            self._check_q_trajectory_collisions(
+                generator,
+                q,
+                attached_obj=attached or None,
+            )
+        except Exception as exc:
+            self._last_collision_report = {
+                "available": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "min_margin_m": None,
+            }
+            self._last_collision_step = step
         return dict(self._last_collision_report)
 
     def collision_margin(self) -> float | None:
