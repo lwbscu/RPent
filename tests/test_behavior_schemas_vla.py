@@ -202,6 +202,29 @@ def test_invalid_payload_intrinsics_fall_through_to_valid_sensor_intrinsics():
     assert sensor_intrinsics.fy == 301.0
 
 
+def test_sensor_intrinsics_fall_back_to_verified_usd_camera_physical_attributes():
+    class _Sensor:
+        intrinsic_matrix = np.diag([0.0, 0.0, 1.0])
+        focal_length = 20.0
+        horizontal_aperture = 40.0
+
+        @staticmethod
+        def get_attribute(name):
+            return {
+                "verticalAperture": 30.0,
+                "horizontalApertureOffset": 0.0,
+                "verticalApertureOffset": 0.0,
+            }[name]
+
+    intrinsics = _sensor_intrinsics(_Sensor(), rgb_shape=(300, 400, 3))
+
+    assert intrinsics is not None
+    assert intrinsics.fx == 200.0
+    assert intrinsics.fy == 200.0
+    assert intrinsics.cx == 200.0
+    assert intrinsics.cy == 150.0
+
+
 def test_bootstrap_template_uses_instance_zero_without_changing_target(tmp_path):
     instance_dir = tmp_path / "radio_instances"
     instance_dir.mkdir()

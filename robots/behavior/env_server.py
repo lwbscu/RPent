@@ -247,6 +247,55 @@ def _sensor_intrinsics(
             return intrinsics
         except Exception:
             pass
+    width = int(rgb_shape[1])
+    height = int(rgb_shape[0])
+
+    def scalar(property_name: str, usd_attribute: str) -> float | None:
+        try:
+            value = getattr(sensor, property_name)
+            number = float(np.asarray(_numpy_tree(value)).reshape(()))
+            if np.isfinite(number):
+                return number
+        except Exception:
+            pass
+        getter = getattr(sensor, "get_attribute", None)
+        if getter is None:
+            return None
+        try:
+            number = float(
+                np.asarray(_numpy_tree(getter(usd_attribute))).reshape(())
+            )
+            return number if np.isfinite(number) else None
+        except Exception:
+            return None
+
+    focal_length = scalar("focal_length", "focalLength")
+    horizontal_aperture = scalar("horizontal_aperture", "horizontalAperture")
+    vertical_aperture = scalar("vertical_aperture", "verticalAperture")
+    horizontal_offset = scalar(
+        "horizontal_aperture_offset", "horizontalApertureOffset"
+    )
+    vertical_offset = scalar("vertical_aperture_offset", "verticalApertureOffset")
+    if horizontal_offset not in (None, 0.0) or vertical_offset not in (None, 0.0):
+        return None
+    if (
+        focal_length is not None
+        and horizontal_aperture is not None
+        and vertical_aperture is not None
+        and focal_length > 0
+        and horizontal_aperture > 0
+        and vertical_aperture > 0
+    ):
+        intrinsics = CameraIntrinsics(
+            fx=focal_length * width / horizontal_aperture,
+            fy=focal_length * height / vertical_aperture,
+            cx=width / 2.0,
+            cy=height / 2.0,
+            width=width,
+            height=height,
+        )
+        intrinsics.validate()
+        return intrinsics
     return None
 
 
