@@ -602,17 +602,19 @@ class BehaviorEnvFacade:
         action_tensor = torch.as_tensor(action_array, dtype=torch.float32).reshape(
             1, action_array.shape[0], action_array.shape[1]
         )
-        final_observation = None
+        final_observation = self._last_observation
         final_reward = None
         official_info: Any = {}
         terminated = False
         truncated = False
         executed_steps = 0
         for step_index in range(action_tensor.shape[1]):
+            is_last_action = step_index == action_tensor.shape[1] - 1
+            need_observation = is_last_action or (self._env_steps + 1) % 4 == 0
             step_obs, step_reward, step_term, step_trunc, step_infos = (
                 self._env._direct_process.step_env(
                     action_tensor[:, step_index],
-                    need_obs=True,
+                    need_obs=need_observation,
                 )
             )
             self._env_steps += 1
@@ -622,12 +624,15 @@ class BehaviorEnvFacade:
             final_reward = step_reward[0]
             terminated = terminated or _scalar_bool(step_term) or _raw_done(step_info)
             truncated = truncated or _scalar_bool(step_trunc)
-            final_observation = _single_observation(self._env._wrap_obs(step_obs))
-            self._last_observation = final_observation
             self._last_info = _numpy_tree(step_info)
-            self._record_rgbd_frames(step_obs, final_observation)
-            if self._env_steps % 4 == 0:
-                self._append_video(final_observation)
+            if need_observation:
+                if step_obs is None:
+                    raise RuntimeError("BEHAVIOR requested observation but received None")
+                final_observation = _single_observation(self._env._wrap_obs(step_obs))
+                self._last_observation = final_observation
+                self._record_rgbd_frames(step_obs, final_observation)
+                if self._env_steps % 4 == 0:
+                    self._append_video(final_observation)
             if _raw_success(step_info) or terminated or truncated:
                 break
 

@@ -116,6 +116,7 @@ def test_behavior_chunk_step_round_trips_official_success_with_simulator_object(
     facade = BehaviorEnvFacade.__new__(BehaviorEnvFacade)
     facade._done = False
     facade._env_steps = 0
+    facade._last_observation = wrapped_observation
     facade._env = SimpleNamespace(
         _direct_process=_DirectProcess(),
         _wrap_obs=lambda _raw: wrapped_observation,
@@ -139,6 +140,49 @@ def test_behavior_chunk_step_round_trips_official_success_with_simulator_object(
     assert round_tripped[4]["simulator_object"].startswith("<unserializable:")
     assert round_tripped[4]["_rpent"] == {"executed_steps": 1}
     assert facade._done is True
+
+
+def test_behavior_chunk_renders_every_four_steps_and_on_last_step(monkeypatch):
+    need_obs_calls = []
+
+    class _DirectProcess:
+        @staticmethod
+        def step_env(_action, *, need_obs):
+            need_obs_calls.append(need_obs)
+            raw = {} if need_obs else None
+            info = {"done": {"success": False}}
+            return raw, np.array([0.0]), np.array([False]), np.array([False]), [info]
+
+    wrapped_observation = {
+        "main_images": np.zeros((1, 3, 4, 3), dtype=np.uint8),
+        "wrist_images": np.zeros((1, 2, 3, 4, 3), dtype=np.uint8),
+        "states": np.zeros((1, 256), dtype=np.float32),
+        "task_descriptions": ["turn on the radio"],
+    }
+    facade = BehaviorEnvFacade.__new__(BehaviorEnvFacade)
+    facade._done = False
+    facade._env_steps = 0
+    facade._last_observation = wrapped_observation
+    facade._env = SimpleNamespace(
+        _direct_process=_DirectProcess(),
+        _wrap_obs=lambda _raw: wrapped_observation,
+    )
+    facade._record_rgbd_frames = lambda _raw, _wrapped: None
+    facade._append_video = lambda _observation: None
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            float32=np.float32,
+            as_tensor=lambda value, dtype: np.asarray(value, dtype=dtype),
+            is_tensor=lambda _value: False,
+        ),
+    )
+
+    result = facade.chunk_step(np.zeros((5, 23), dtype=np.float32))
+
+    assert need_obs_calls == [False, False, False, True, True]
+    assert result[4]["_rpent"] == {"executed_steps": 5}
 
 
 def test_invalid_payload_intrinsics_fall_through_to_valid_sensor_intrinsics():
