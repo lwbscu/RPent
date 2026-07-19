@@ -881,9 +881,9 @@ class RealCuroboBackend:
         full_results = generator.compute_trajectories(
             planner_targets,
             planner_quats,
-            max_attempts=5,
-            timeout=min(float(timeout_s), 8.0),
-            ik_fail_return=5,
+            max_attempts=max(1, math.ceil(100 / batch_size)),
+            timeout=min(float(timeout_s), 60.0),
+            ik_fail_return=50,
             enable_finetune_trajopt=True,
             finetune_attempts=2,
             return_full_result=True,
@@ -927,6 +927,8 @@ class RealCuroboBackend:
             "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
             "success_ratio": 1.0 / batch_size,
             "planner_seed_count": batch_size,
+            "max_attempts": max(1, math.ceil(100 / batch_size)),
+            "ik_fail_return": 50,
             "motion_gen_results": result_statuses,
         }
         if success_indices.size == 0:
