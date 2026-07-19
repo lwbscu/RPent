@@ -251,7 +251,12 @@ def main() -> int:
         logger.error("error: %s", agent_error)
 
     if args.dashboard and dashboard_state is not None:
-        dashboard_state.mark_done()
+        task_success = (
+            bool(finish_result.get("task_success"))
+            if isinstance(finish_result, dict)
+            else None
+        )
+        dashboard_state.mark_done(task_success)
         logger.info(
             "Run finished. Dashboard still serving at %s. Press Ctrl+C to stop.",
             dashboard_url,

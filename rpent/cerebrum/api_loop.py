@@ -83,10 +83,17 @@ class ApiAgentLoop:
         toolkit: Toolkit,
         max_turns: int,
     ) -> CerebrumResult:
+        finish_result: dict[str, Any] | None = None
+
+        def capture_finish(tool_result: Any) -> None:
+            nonlocal finish_result
+            if finish_result is None and getattr(tool_result, "is_finish", False):
+                finish_result = dict(tool_result.result)
+
         agent = Agent(
             self._model,
             instructions=system_prompt or None,
-            tools=_build_tools(toolkit),
+            tools=_build_tools(toolkit, on_tool_result=capture_finish),
             model_settings=_build_model_settings(self._model, self._max_tokens),
             capabilities=[
                 Thinking(effort="high"),
@@ -95,7 +102,6 @@ class ApiAgentLoop:
         )
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
-        finish_result: dict[str, Any] | None = None
         n_tool_calls = 0
         turns = 0
         last_error: str | None = None
@@ -119,11 +125,6 @@ class ApiAgentLoop:
                             async for event in stream:
                                 if isinstance(event, FunctionToolCallEvent):
                                     n_tool_calls += 1
-                                    if event.part.tool_name == "finish":
-                                        finish_result = {
-                                            "_finish": True,
-                                            **event.part.args_as_dict(),
-                                        }
                                 elif isinstance(event, FunctionToolResultEvent):
                                     message = _serialize_tool_result(event)
                                     messages.append(message)
@@ -218,14 +219,20 @@ def _prune_history_images(messages: list[ModelMessage]) -> list[ModelMessage]:
     return new_messages
 
 
-def _build_tools(toolkit: Toolkit) -> list[Tool]:
+def _build_tools(
+    toolkit: Toolkit,
+    *,
+    on_tool_result: Any = None,
+) -> list[Tool]:
     """Wrap each toolkit tool as a pydantic-ai function tool from its schema."""
     tools: list[Tool] = []
     for spec in toolkit.get_tools_spec():
         name = spec["name"]
         tools.append(
             Tool.from_schema(
-                function=_make_tool_function(toolkit, name),
+                function=_make_tool_function(
+                    toolkit, name, on_tool_result=on_tool_result
+                ),
                 name=name,
                 description=spec.get("description", ""),
                 json_schema=spec.get("input_schema")
@@ -236,11 +243,18 @@ def _build_tools(toolkit: Toolkit) -> list[Tool]:
     return tools
 
 
-def _make_tool_function(toolkit: Toolkit, name: str):
+def _make_tool_function(
+    toolkit: Toolkit,
+    name: str,
+    *,
+    on_tool_result: Any = None,
+):
     """Return a callable that dispatches one tool call to the toolkit."""
 
     def _call(**kwargs: Any) -> Any:
         result = toolkit.execute_tool(name, kwargs)
+        if on_tool_result is not None:
+            on_tool_result(result)
         text, images = _content_blocks_to_pydantic(result.content_blocks)
         if images:
             return ToolReturn(return_value=text, content=images)

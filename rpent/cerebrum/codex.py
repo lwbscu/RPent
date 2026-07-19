@@ -83,7 +83,9 @@ class CodexCerebrum:
 
         # Start the in-thread MCP HTTP server so Codex can reach the
         # shared toolkit without spawning a subprocess.
-        mcp_server = HttpMcpServer(toolkit)
+        mcp_server = HttpMcpServer(
+            toolkit, on_tool_result=recorder.capture_tool_result
+        )
         mcp_url = mcp_server.start()
         logger.info("mcp http endpoint: %s", mcp_url)
 
@@ -207,6 +209,12 @@ class CodexCerebrum:
                             out_f.write(rendered)
                             out_f.flush()
                             logger.info(rendered.rstrip())
+                        if recorder.finish_result is not None:
+                            logger.info(
+                                "FINISH returned by tool: %s",
+                                recorder.finish_result,
+                            )
+                            break
 
             state["text"] = "".join(chunks)
             if recorder.final_response is not None:
@@ -268,6 +276,11 @@ class _Recorder:
 
     def stats(self) -> dict[str, int]:
         return {"turns_used": self.turns, "tool_calls": self.tool_calls, **self.usage}
+
+    def capture_tool_result(self, tool_result: Any) -> None:
+        """Capture completion from the executed tool, independent of its name."""
+        if self.finish_result is None and getattr(tool_result, "is_finish", False):
+            self.finish_result = dict(tool_result.result)
 
     def observe(self, event: Any) -> str:
         method = str(_get(event, "method", ""))

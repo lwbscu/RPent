@@ -9,6 +9,19 @@ import numpy as np
 ACTION_DIM = 23
 DEFAULT_ACTION_CHUNK = 32
 CAMERA_KEYS = ("main", "left_wrist", "right_wrist")
+CONTROL_MODES = ("full_task_vla", "planner_tools")
+FULL_TASK_VLA_MODE = "full_task_vla"
+PLANNER_TOOLS_MODE = "planner_tools"
+PLANNER_TOOL_NAMES = (
+    "observe",
+    "pixel_to_world",
+    "navigate_to",
+    "move_to",
+    "pick",
+    "rotate_wrist",
+    "press",
+    "release",
+)
 
 # Pi0.5 compacts raw R1Pro proprio in this order. In particular, both arms
 # precede both grippers.
@@ -156,12 +169,256 @@ RUN_FULL_TASK_SPEC: dict[str, Any] = {
 }
 
 
+_HAND_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "enum": ["left", "right"],
+    "description": "Which R1Pro hand/arm should execute the primitive.",
+}
+
+_XYZ_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "number"},
+    "minItems": 3,
+    "maxItems": 3,
+    "description": "Target position as [x, y, z] in the selected frame.",
+}
+
+_QUAT_SCHEMA: dict[str, Any] = {
+    "type": ["array", "null"],
+    "items": {"type": "number"},
+    "minItems": 4,
+    "maxItems": 4,
+    "description": "Quaternion [x, y, z, w].",
+}
+
+_VECTOR_SCHEMA: dict[str, Any] = {
+    "type": ["array", "null"],
+    "items": {"type": "number"},
+    "minItems": 3,
+    "maxItems": 3,
+}
+
+_FRAME_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "default": "world",
+    "description": "Coordinate frame understood by the BEHAVIOR env server.",
+}
+
+
+def _planner_spec(
+    name: str,
+    description: str,
+    properties: dict[str, Any],
+    *,
+    required: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": description,
+        "input_schema": {
+            "type": "object",
+            "properties": properties,
+            "required": required or [],
+            "additionalProperties": False,
+        },
+    }
+
+
+PLANNER_TOOL_SPECS: dict[str, dict[str, Any]] = {
+    "observe": _planner_spec(
+        "observe",
+        (
+            "Capture one synchronized BEHAVIOR RGB-D frame from the selected "
+            "camera. Returns RGB, frame_id, image size, and camera metadata."
+        ),
+        {
+            "camera": {
+                "type": "string",
+                "enum": ["head", "left_wrist", "right_wrist"],
+                "description": "Camera to observe.",
+            },
+        },
+        required=["camera"],
+    ),
+    "pixel_to_world": _planner_spec(
+        "pixel_to_world",
+        (
+            "Convert a pixel from a previously observed frame into a 3D point "
+            "using the env-side depth frame and calibrated camera intrinsics."
+        ),
+        {
+            "camera": {
+                "type": "string",
+                "enum": ["head", "left_wrist", "right_wrist"],
+            },
+            "frame_id": {"type": "string"},
+            "u": {
+                "type": "integer",
+                "description": "Pixel column coordinate.",
+            },
+            "v": {
+                "type": "integer",
+                "description": "Pixel row coordinate.",
+            },
+            "depth_window_px": {
+                "type": "integer",
+                "default": 7,
+                "minimum": 1,
+            },
+            "output_frame": {
+                "type": "string",
+                "default": "world",
+            },
+        },
+        required=["camera", "frame_id", "u", "v"],
+    ),
+    "navigate_to": _planner_spec(
+        "navigate_to",
+        (
+            "Move the mobile base to a collision-free stand-off pose near a "
+            "target, ensuring the named hand has a feasible collision-free IK "
+            "solution after arrival. Requires a fresh observe afterwards."
+        ),
+        {
+            "hand": _HAND_SCHEMA,
+            "target_xyz": _XYZ_SCHEMA,
+            "frame": _FRAME_SCHEMA,
+            "standoff_m": {"type": "number", "default": 0.85, "minimum": 0.0},
+            "timeout_s": {"type": "number", "default": 90, "minimum": 0.0},
+        },
+        required=["hand", "target_xyz"],
+    ),
+    "move_to": _planner_spec(
+        "move_to",
+        (
+            "Plan and optionally execute a collision-aware cuRobo arm motion "
+            "for the selected R1Pro hand. Primitive success never implies "
+            "official BEHAVIOR task success."
+        ),
+        {
+            "hand": _HAND_SCHEMA,
+            "target_xyz": _XYZ_SCHEMA,
+            "frame": _FRAME_SCHEMA,
+            "target_quat_xyzw": _QUAT_SCHEMA,
+            "plan_only": {"type": "boolean", "default": False},
+            "position_tolerance_m": {
+                "type": "number",
+                "default": 0.02,
+                "minimum": 0.0,
+            },
+            "orientation_tolerance_rad": {
+                "type": "number",
+                "default": 0.087,
+                "minimum": 0.0,
+            },
+            "timeout_s": {"type": "number", "default": 45, "minimum": 0.0},
+        },
+        required=["hand", "target_xyz"],
+    ),
+    "pick": _planner_spec(
+        "pick",
+        (
+            "Execute a guarded grasp with the chosen hand from a depth-derived "
+            "target point, using cuRobo to reach pre-grasp and guarded contact "
+            "for the final approach."
+        ),
+        {
+            "hand": _HAND_SCHEMA,
+            "target_xyz": _XYZ_SCHEMA,
+            "approach_vector": _VECTOR_SCHEMA,
+            "grasp_quat_xyzw": _QUAT_SCHEMA,
+            "pregrasp_offset_m": {
+                "type": "number",
+                "default": 0.08,
+                "minimum": 0.0,
+            },
+            "lift_m": {"type": "number", "default": 0.08, "minimum": 0.0},
+            "timeout_s": {"type": "number", "default": 90, "minimum": 0.0},
+        },
+        required=["hand", "target_xyz"],
+    ),
+    "rotate_wrist": _planner_spec(
+        "rotate_wrist",
+        (
+            "Rotate the selected wrist to an absolute quaternion or by a "
+            "relative axis-angle command. Provide exactly one rotation form."
+        ),
+        {
+            "hand": _HAND_SCHEMA,
+            "target_quat_xyzw": _QUAT_SCHEMA,
+            "relative_axis_angle": {
+                "type": ["array", "null"],
+                "items": {"type": "number"},
+                "minItems": 4,
+                "maxItems": 4,
+                "description": "[axis_x, axis_y, axis_z, angle_rad].",
+            },
+            "frame": {
+                "type": "string",
+                "enum": ["world", "eef"],
+                "default": "world",
+            },
+            "timeout_s": {"type": "number", "default": 45, "minimum": 0.0},
+        },
+        required=["hand"],
+    ),
+    "press": _planner_spec(
+        "press",
+        (
+            "Approach and press a target with guarded contact checks. Any "
+            "unexpected contact before the target neighborhood aborts."
+        ),
+        {
+            "hand": _HAND_SCHEMA,
+            "target_xyz": _XYZ_SCHEMA,
+            "press_direction": _VECTOR_SCHEMA,
+            "approach_distance_m": {
+                "type": "number",
+                "default": 0.04,
+                "minimum": 0.0,
+            },
+            "press_depth_m": {
+                "type": "number",
+                "default": 0.012,
+                "minimum": 0.0,
+            },
+            "timeout_s": {"type": "number", "default": 60, "minimum": 0.0},
+        },
+        required=["hand", "target_xyz"],
+    ),
+    "release": _planner_spec(
+        "release",
+        (
+            "Open the selected gripper and optionally retreat along a vector. "
+            "Returns primitive status and official task_success separately."
+        ),
+        {
+            "hand": _HAND_SCHEMA,
+            "opening": {"type": "number", "default": 1.0, "minimum": 0.0},
+            "retreat_vector": _VECTOR_SCHEMA,
+            "retreat_m": {"type": "number", "default": 0.03, "minimum": 0.0},
+            "timeout_s": {"type": "number", "default": 30, "minimum": 0.0},
+        },
+        required=["hand"],
+    ),
+}
+
+
+if tuple(PLANNER_TOOL_SPECS) != PLANNER_TOOL_NAMES:
+    raise ValueError("planner tool schema order must match PLANNER_TOOL_NAMES")
+
+
 __all__ = [
     "ACTION_DIM",
     "CAMERA_KEYS",
+    "CONTROL_MODES",
     "DEFAULT_ACTION_CHUNK",
     "ENV_ACTION_SEGMENTS",
     "ENV_WIRE_SCHEMA",
+    "FULL_TASK_VLA_MODE",
+    "PLANNER_TOOLS_MODE",
+    "PLANNER_TOOL_NAMES",
+    "PLANNER_TOOL_SPECS",
     "POLICY_STATE_SEGMENTS",
     "RAW_PROPRIO_SEGMENTS",
     "RUN_FULL_TASK_SPEC",

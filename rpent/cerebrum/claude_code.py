@@ -102,7 +102,12 @@ class ClaudeCodeCerebrum:
         recorder = _Recorder(max_turns=max_turns, dashboard=self._dashboard)
 
         init_output_dir(self._output_dir)
-        options = self._build_options(sdk, toolkit=toolkit, max_turns=max_turns)
+        options = self._build_options(
+            sdk,
+            toolkit=toolkit,
+            max_turns=max_turns,
+            on_tool_result=recorder.capture_tool_result,
+        )
 
         logger.info("prompt: %d chars", len(prompt))
         logger.info("output_dir: %s", self._output_dir)
@@ -173,7 +178,14 @@ class ClaudeCodeCerebrum:
 
     # -- options + tool bridge ---------------------------------------------
 
-    def _build_options(self, sdk: Any, *, toolkit: Toolkit, max_turns: int) -> Any:
+    def _build_options(
+        self,
+        sdk: Any,
+        *,
+        toolkit: Toolkit,
+        max_turns: int,
+        on_tool_result: Any = None,
+    ) -> Any:
         allowed = [
             part for part in self._allowed_tools.replace(",", " ").split() if part
         ]
@@ -193,6 +205,7 @@ class ClaudeCodeCerebrum:
                 "rpent": _build_rpent_server(
                     sdk,
                     toolkit=toolkit,
+                    on_tool_result=on_tool_result,
                 ),
             },
             add_dirs=[self._output_dir, *self._extra_dirs],
@@ -242,6 +255,11 @@ class _Recorder:
             "total_cost_usd": self.total_cost_usd,
             **self.usage,
         }
+
+    def capture_tool_result(self, tool_result: Any) -> None:
+        """Capture completion from the executed tool, independent of its name."""
+        if self.finish_result is None and getattr(tool_result, "is_finish", False):
+            self.finish_result = dict(tool_result.result)
 
     def observe(self, message: Any) -> str:
         kind = _kind(message)
@@ -414,7 +432,12 @@ class _Recorder:
 # ---------------------------------------------------------------------------
 
 
-def _build_rpent_server(sdk: Any, *, toolkit: Toolkit) -> Any:
+def _build_rpent_server(
+    sdk: Any,
+    *,
+    toolkit: Toolkit,
+    on_tool_result: Any = None,
+) -> Any:
     sdk_tools = []
     for spec in toolkit.get_tools_spec():
         name = str(spec["name"])
@@ -426,7 +449,10 @@ def _build_rpent_server(sdk: Any, *, toolkit: Toolkit) -> Any:
             *,
             tool_name: str = name,
         ) -> dict[str, Any]:
-            return _tool_result_to_mcp(toolkit.execute_tool(tool_name, args or {}))
+            tool_result = toolkit.execute_tool(tool_name, args or {})
+            if on_tool_result is not None:
+                on_tool_result(tool_result)
+            return _tool_result_to_mcp(tool_result)
 
         run_tool.__name__ = f"rpent_{name}"
         sdk_tools.append(sdk.tool(name, description, input_schema)(run_tool))

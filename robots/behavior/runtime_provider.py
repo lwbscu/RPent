@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from robots.behavior.env_client import BehaviorEnvClient
-from robots.behavior.schemas import DEFAULT_ACTION_CHUNK
+from robots.behavior.prompt_bundle import mode_instructions
+from robots.behavior.schemas import (
+    CONTROL_MODES,
+    DEFAULT_ACTION_CHUNK,
+    FULL_TASK_VLA_MODE,
+    PLANNER_TOOLS_MODE,
+)
 from robots.behavior.vla_client import BehaviorVLAClient
 from rpent.envs.runtime import RuntimeHandle
 from rpent.rpc_driver import create_rpc_client, set_socket_endpoint
@@ -56,7 +62,8 @@ def _runtime_env(args: argparse.Namespace) -> dict[str, str]:
     env["RPENT_REPO_ROOT"] = str(repo_root)
     env["RPENT_RLINF_ROOT"] = str(behavior_root)
     env["RLINF_REPO_PATH"] = str(behavior_root)
-    env["PI05_CHECKPOINT_PATH"] = str(Path(args.policy_checkpoint).resolve())
+    if getattr(args, "policy_checkpoint", None):
+        env["PI05_CHECKPOINT_PATH"] = str(Path(args.policy_checkpoint).resolve())
     if args.cuda_device is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(args.cuda_device)
     env.setdefault("OMNIGIBSON_HEADLESS", "1")
@@ -257,6 +264,16 @@ class BehaviorRuntimeProvider:
 
     def add_cli_args(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--suite", default="behavior_2025_challenge")
+        parser.add_argument(
+            "--behavior-control-mode",
+            choices=CONTROL_MODES,
+            default=FULL_TASK_VLA_MODE,
+            help=(
+                "BEHAVIOR control surface: full_task_vla runs the Pi0.5 "
+                "baseline through run_full_task; planner_tools exposes only "
+                "env-side planner primitives and does not start a VLA server."
+            ),
+        )
         parser.add_argument("--task", type=int, default=0)
         parser.add_argument("--task-name", default="turning_on_radio")
         parser.add_argument("--activity-definition-id", type=int, default=0)
@@ -314,17 +331,23 @@ class BehaviorRuntimeProvider:
             parser.error("--max-episode-steps must be positive")
         if args.env_ready_timeout_s <= 0 or args.vla_ready_timeout_s <= 0:
             parser.error("runtime ready timeouts must be positive")
+        if args.behavior_control_mode not in CONTROL_MODES:
+            parser.error(
+                "--behavior-control-mode must be one of " + ", ".join(CONTROL_MODES)
+            )
         if args.no_driver:
             if args.env_port <= 0:
                 parser.error("--no-driver requires --env-port")
-            if not args.vla_endpoint:
+            if (
+                args.behavior_control_mode == FULL_TASK_VLA_MODE
+                and not args.vla_endpoint
+            ):
                 parser.error("--no-driver requires --vla-endpoint")
             return
 
         root = Path(args.behavior_repo)
         python = Path(args.behavior_python)
         instance_dir = Path(args.activity_instance_dir)
-        checkpoint = Path(args.policy_checkpoint or "")
         if not root.is_dir():
             parser.error(f"--behavior-repo does not exist: {root}")
         if not python.is_file():
@@ -341,17 +364,23 @@ class BehaviorRuntimeProvider:
                 "expected exactly one tro_state file for activity instance "
                 f"{args.activity_instance_id} in {instance_dir}, got {len(instance_matches)}"
             )
-        required_checkpoint_files = [
-            checkpoint / "model.safetensors",
-            checkpoint
-            / "assets"
-            / "behavior-1k"
-            / "2025-challenge-demos"
-            / "norm_stats.json",
-        ]
-        missing = [str(path) for path in required_checkpoint_files if not path.is_file()]
-        if missing:
-            parser.error("BEHAVIOR Pi0.5 checkpoint is incomplete: " + ", ".join(missing))
+        if args.behavior_control_mode == FULL_TASK_VLA_MODE:
+            checkpoint = Path(args.policy_checkpoint or "")
+            required_checkpoint_files = [
+                checkpoint / "model.safetensors",
+                checkpoint
+                / "assets"
+                / "behavior-1k"
+                / "2025-challenge-demos"
+                / "norm_stats.json",
+            ]
+            missing = [
+                str(path) for path in required_checkpoint_files if not path.is_file()
+            ]
+            if missing:
+                parser.error(
+                    "BEHAVIOR Pi0.5 checkpoint is incomplete: " + ", ".join(missing)
+                )
 
     def recipe_tag(self, args: argparse.Namespace) -> str:
         return f"behavior_t{args.task}_i{args.activity_instance_id}_s{args.seed}"
@@ -386,6 +415,8 @@ class BehaviorRuntimeProvider:
             "max_episode_steps": args.max_episode_steps,
             "output_dir": output_dir,
             "recipe_tag": recipe_tag,
+            "behavior_control_mode": args.behavior_control_mode,
+            **mode_instructions(args.behavior_control_mode),
         }
 
     def _expected_meta(self, args: argparse.Namespace) -> dict[str, Any]:
@@ -420,29 +451,45 @@ class BehaviorRuntimeProvider:
                 set_socket_endpoint(output_dir, args.env_endpoint, args.env_port)
             else:
                 env_proc = start_env_server(args, output_dir=output_dir)
-                if not vla_endpoint:
+                if (
+                    args.behavior_control_mode == FULL_TASK_VLA_MODE
+                    and not vla_endpoint
+                ):
                     vla_endpoint, vla_proc = start_vla_server(
                         args,
                         output_dir=output_dir,
                     )
-            model = BehaviorVLAClient(vla_endpoint)
-            if args.no_driver:
-                model.wait_for_healthz(timeout_s=30.0)
             env = BehaviorEnvClient(
                 create_rpc_client(output_dir),
                 expected_meta=self._expected_meta(args),
             )
-            toolkit = get_toolkit(
-                runner_kwargs={
-                    "env": env,
-                    "model": model,
-                    "max_episode_steps": args.max_episode_steps,
-                    "action_horizon": DEFAULT_ACTION_CHUNK,
-                    "output_dir": output_dir,
-                    "video_path": output_dir / "episode.mp4",
-                },
-                dashboard=dashboard,
-            )
+            if args.behavior_control_mode == FULL_TASK_VLA_MODE:
+                model = BehaviorVLAClient(vla_endpoint)
+                if args.no_driver:
+                    model.wait_for_healthz(timeout_s=30.0)
+                toolkit = get_toolkit(
+                    control_mode=args.behavior_control_mode,
+                    runner_kwargs={
+                        "env": env,
+                        "model": model,
+                        "max_episode_steps": args.max_episode_steps,
+                        "action_horizon": DEFAULT_ACTION_CHUNK,
+                        "output_dir": output_dir,
+                        "video_path": output_dir / "episode.mp4",
+                    },
+                    dashboard=dashboard,
+                )
+            elif args.behavior_control_mode == PLANNER_TOOLS_MODE:
+                env.reset()
+                toolkit = get_toolkit(
+                    control_mode=args.behavior_control_mode,
+                    planner_client=env,
+                    dashboard=dashboard,
+                )
+            else:
+                raise ValueError(
+                    f"unknown BEHAVIOR control mode: {args.behavior_control_mode}"
+                )
             return BehaviorRuntimeHandle(
                 toolkit=toolkit,
                 output_dir=output_dir,

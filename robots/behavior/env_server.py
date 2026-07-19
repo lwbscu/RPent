@@ -16,6 +16,16 @@ os.environ.setdefault("OMNIGIBSON_HEADLESS", "1")
 os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
 os.environ.setdefault("ACCEPT_EULA", "Y")
 
+import numpy as np
+
+from robots.behavior.camera_geometry import (
+    CameraGeometryError,
+    CameraIntrinsics,
+    FrameCache,
+    canonical_camera,
+    load_camera_correction_profiles,
+)
+from robots.behavior.planner_executor import PlannerExecutor
 from robots.behavior.schemas import validate_action_chunk
 from rpent.rpc_driver.socket import SocketRpcServer
 from rpent.utils.config import get_repo_root, get_rlinf_repo_path
@@ -56,6 +66,169 @@ def _single_observation(obs: dict[str, Any]) -> dict[str, Any]:
             descriptions[0] if isinstance(descriptions, list) else descriptions
         ),
     }
+
+
+def _first_env_value(value: Any) -> Any:
+    value = _numpy_tree(value)
+    if isinstance(value, list):
+        if not value:
+            return None
+        return value[0]
+    if isinstance(value, tuple):
+        if not value:
+            return None
+        return value[0]
+    if isinstance(value, dict):
+        return value
+    array = np.asarray(value)
+    if array.ndim > 0 and array.shape[0] == 1:
+        return array[0]
+    return value
+
+
+def _iter_sensor_payloads(value: Any, path: tuple[str, ...] = ()):
+    if not isinstance(value, dict):
+        return
+    if any(key in value for key in ("rgb", "depth", "depth_linear")):
+        yield "::".join(path), value
+    for key, item in value.items():
+        if isinstance(item, dict):
+            yield from _iter_sensor_payloads(item, (*path, str(key)))
+
+
+def _payload_camera_name(path: str) -> str | None:
+    lowered = path.lower()
+    if "zed_link" in lowered or "head" in lowered:
+        return "head"
+    if "left_realsense" in lowered or "left_wrist" in lowered:
+        return "left_wrist"
+    if "right_realsense" in lowered or "right_wrist" in lowered:
+        return "right_wrist"
+    return None
+
+
+def _payload_depth(payload: dict[str, Any]) -> Any | None:
+    for key in ("depth_linear", "depth", "depths"):
+        if key in payload:
+            return payload[key]
+    return None
+
+
+def _payload_rgb(payload: dict[str, Any]) -> Any | None:
+    for key in ("rgb", "rgba", "image", "rgb_image"):
+        if key in payload:
+            return payload[key]
+    return None
+
+
+def _matrix_from_pose(position: Any, orientation_xyzw: Any) -> np.ndarray:
+    pos = np.asarray(_numpy_tree(position), dtype=np.float64).reshape(3)
+    quat = np.asarray(_numpy_tree(orientation_xyzw), dtype=np.float64).reshape(4)
+    norm = np.linalg.norm(quat)
+    if norm <= 0:
+        raise CameraGeometryError("camera orientation quaternion has zero norm")
+    x, y, z, w = quat / norm
+    rot = np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = rot
+    out[:3, 3] = pos
+    return out
+
+
+def _payload_matrix(payload: dict[str, Any], names: tuple[str, ...]) -> np.ndarray | None:
+    for name in names:
+        if name not in payload:
+            continue
+        try:
+            matrix = np.asarray(_numpy_tree(payload[name]), dtype=np.float64)
+        except Exception:
+            continue
+        if matrix.shape == (4, 4) and np.isfinite(matrix).all():
+            return matrix
+        if matrix.shape == (3, 4) and np.isfinite(matrix).all():
+            out = np.eye(4, dtype=np.float64)
+            out[:3, :] = matrix
+            return out
+    return None
+
+
+def _payload_intrinsics(
+    payload: dict[str, Any],
+    *,
+    rgb_shape: tuple[int, ...],
+) -> CameraIntrinsics | None:
+    for name in ("intrinsics", "intrinsic_matrix", "camera_intrinsics", "K"):
+        if name not in payload:
+            continue
+        try:
+            return CameraIntrinsics.from_matrix(
+                payload[name],
+                width=int(rgb_shape[1]),
+                height=int(rgb_shape[0]),
+            )
+        except Exception:
+            continue
+    return None
+
+
+def _sensor_intrinsics(sensor: Any, *, rgb_shape: tuple[int, ...]) -> CameraIntrinsics | None:
+    for name in ("intrinsic_matrix", "camera_intrinsics", "K"):
+        try:
+            value = getattr(sensor, name)
+        except Exception:
+            continue
+        try:
+            return CameraIntrinsics.from_matrix(
+                value,
+                width=int(rgb_shape[1]),
+                height=int(rgb_shape[0]),
+            )
+        except Exception:
+            pass
+    for name in ("get_intrinsic_matrix", "get_camera_intrinsics"):
+        fn = getattr(sensor, name, None)
+        if fn is None:
+            continue
+        try:
+            return CameraIntrinsics.from_matrix(
+                fn(),
+                width=int(rgb_shape[1]),
+                height=int(rgb_shape[0]),
+            )
+        except Exception:
+            pass
+    return None
+
+
+def _sensor_camera_to_world(sensor: Any) -> np.ndarray | None:
+    for name in ("camera_to_world", "camera_to_world_matrix"):
+        try:
+            value = getattr(sensor, name)
+        except Exception:
+            continue
+        try:
+            matrix = np.asarray(_numpy_tree(value), dtype=np.float64)
+            if matrix.shape == (4, 4) and np.isfinite(matrix).all():
+                return matrix
+        except Exception:
+            pass
+    for name in ("get_position_orientation", "get_world_pose"):
+        fn = getattr(sensor, name, None)
+        if fn is None:
+            continue
+        try:
+            position, orientation = fn()
+            return _matrix_from_pose(position, orientation)
+        except Exception:
+            pass
+    return None
 
 
 def _scalar_bool(value: Any) -> bool:
@@ -148,6 +321,12 @@ def _load_env_config(args: argparse.Namespace) -> Any:
     cfg.video_cfg.save_video = False
     cfg.action_trace_path = str(Path(args.output_dir) / "behavior_action_trace.jsonl")
     cfg.action_trace_interval = 1
+    for robot_cfg in cfg.omni_config.robots:
+        modalities = list(robot_cfg.get("obs_modalities") or [])
+        for modality in ("rgb", "depth", "proprio"):
+            if modality not in modalities:
+                modalities.append(modality)
+        robot_cfg.obs_modalities = modalities
 
     task = cfg.omni_config.task
     task.activity_name = str(args.task_name)
@@ -198,6 +377,138 @@ class BehaviorEnvFacade:
         self._video_writer = None
         self._video_frames = 0
         self._video_error: str | None = None
+        correction_path = os.environ.get("RPENT_BEHAVIOR_CAMERA_CORRECTION_PROFILE")
+        self._frame_cache = FrameCache(
+            max_frames_per_camera=8,
+            ttl_s=60.0,
+            correction_profiles=load_camera_correction_profiles(correction_path),
+        )
+        self._planner = PlannerExecutor(
+            env=self,
+            frame_cache=self._frame_cache,
+            output_dir=output_dir,
+        )
+        self._last_observation: dict[str, Any] | None = None
+        self._last_info: Any = None
+        self._gripper_latch = {"left": 1.0, "right": 1.0}
+
+    def _robot(self) -> Any | None:
+        candidates = [
+            self._env,
+            getattr(self._env, "_env", None),
+            getattr(self._env, "_direct_process", None),
+            getattr(getattr(self._env, "_direct_process", None), "env", None),
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            robots = getattr(candidate, "robots", None)
+            if robots:
+                return robots[0]
+            envs = getattr(candidate, "envs", None)
+            if envs:
+                env = envs[0]
+                seen: set[int] = set()
+                while env is not None and id(env) not in seen:
+                    seen.add(id(env))
+                    robots = getattr(env, "robots", None)
+                    if robots:
+                        return robots[0]
+                    env = getattr(env, "env", None) or getattr(env, "_env", None)
+        return None
+
+    def _sensor_for_camera(self, camera: str) -> Any | None:
+        robot = self._robot()
+        sensors = getattr(robot, "sensors", None) if robot is not None else None
+        if not sensors:
+            return None
+        camera = canonical_camera(camera)
+        needles = {
+            "head": ("zed", "head"),
+            "left_wrist": ("left_realsense", "left_wrist"),
+            "right_wrist": ("right_realsense", "right_wrist"),
+        }[camera]
+        for name, sensor in sensors.items():
+            lowered = str(name).lower()
+            prim_path = str(getattr(sensor, "prim_path", "")).lower()
+            if any(needle in lowered or needle in prim_path for needle in needles):
+                return sensor
+        return None
+
+    def _camera_to_world(
+        self,
+        *,
+        camera: str,
+        payload: dict[str, Any],
+        sensor: Any | None,
+    ) -> np.ndarray:
+        direct = _payload_matrix(
+            payload,
+            (
+                "camera_to_world",
+                "cam2world",
+                "camera_to_world_matrix",
+                "world_from_camera",
+            ),
+        )
+        if direct is not None:
+            return direct
+        pose = payload.get("pose") or payload.get("camera_pose")
+        if isinstance(pose, dict) and "position" in pose and "orientation" in pose:
+            return _matrix_from_pose(pose["position"], pose["orientation"])
+        view = _payload_matrix(payload, ("view_matrix", "view_transform", "world_to_camera"))
+        if view is not None:
+            return np.linalg.inv(view.T)
+        if sensor is not None:
+            sensor_matrix = _sensor_camera_to_world(sensor)
+            if sensor_matrix is not None:
+                return sensor_matrix
+        raise CameraGeometryError(f"camera pose unavailable for {camera}")
+
+    def _record_rgbd_frames(self, raw_observations: Any, observation: dict[str, Any]) -> None:
+        del observation
+        raw = _first_env_value(raw_observations)
+        if raw is None:
+            return
+        payloads: dict[str, dict[str, Any]] = {}
+        for path, payload in _iter_sensor_payloads(raw):
+            camera = _payload_camera_name(path)
+            if camera is not None:
+                payloads[camera] = payload
+        for camera, payload in payloads.items():
+            rgb = _payload_rgb(payload)
+            depth = _payload_depth(payload)
+            if rgb is None or depth is None:
+                continue
+            sensor = self._sensor_for_camera(camera)
+            try:
+                rgb_array = np.asarray(_numpy_tree(rgb))
+                intrinsics = (
+                    _payload_intrinsics(payload, rgb_shape=rgb_array.shape)
+                    or (
+                        _sensor_intrinsics(sensor, rgb_shape=rgb_array.shape)
+                        if sensor is not None
+                        else None
+                    )
+                )
+                if intrinsics is None:
+                    raise CameraGeometryError(
+                        f"verified camera intrinsics unavailable for {camera}"
+                    )
+                self._frame_cache.add(
+                    camera=camera,
+                    rgb=rgb_array,
+                    depth_m=depth,
+                    intrinsics=intrinsics,
+                    camera_to_world=self._camera_to_world(
+                        camera=camera,
+                        payload=payload,
+                        sensor=sensor,
+                    ),
+                    step_index=self._env_steps,
+                )
+            except Exception:
+                logger.exception("failed to cache BEHAVIOR RGB-D frame for %s", camera)
 
     def _append_video(self, observation: dict[str, Any]) -> None:
         if self._video_error is not None:
@@ -223,6 +534,9 @@ class BehaviorEnvFacade:
         observation = _single_observation(self._env._wrap_obs(raw_observations))
         self._done = False
         self._env_steps = 0
+        self._last_observation = observation
+        self._last_info = _numpy_tree(infos[0])
+        self._record_rgbd_frames(raw_observations, observation)
         self._append_video(observation)
         logger.info(
             "BEHAVIOR reset completed in %.1fs on thread %s",
@@ -261,6 +575,9 @@ class BehaviorEnvFacade:
             terminated = terminated or _scalar_bool(step_term) or _raw_done(step_info)
             truncated = truncated or _scalar_bool(step_trunc)
             final_observation = _single_observation(self._env._wrap_obs(step_obs))
+            self._last_observation = final_observation
+            self._last_info = _numpy_tree(step_info)
+            self._record_rgbd_frames(step_obs, final_observation)
             if self._env_steps % 4 == 0:
                 self._append_video(final_observation)
             if _raw_success(step_info) or terminated or truncated:
@@ -284,6 +601,135 @@ class BehaviorEnvFacade:
 
     def get_env_meta(self) -> dict[str, Any]:
         return dict(self._meta)
+
+    def observe(self, camera: str) -> dict[str, Any]:
+        return self._planner.observe(camera)
+
+    def pixel_to_world(
+        self,
+        camera: str,
+        frame_id: str,
+        u: Any = None,
+        v: Any = None,
+        depth_window_px: int = 7,
+        output_frame: str = "world",
+    ) -> dict[str, Any]:
+        return self._planner.pixel_to_world(
+            camera=camera,
+            frame_id=frame_id,
+            u=u,
+            v=v,
+            depth_window_px=depth_window_px,
+            output_frame=output_frame,
+        )
+
+    def navigate_to(
+        self,
+        hand: str,
+        target_xyz: Any,
+        frame: str = "world",
+        standoff_m: float = 0.85,
+        timeout_s: float = 90.0,
+    ) -> dict[str, Any]:
+        return self._planner.navigate_to(
+            hand=hand,
+            target_xyz=target_xyz,
+            frame=frame,
+            standoff_m=standoff_m,
+            timeout_s=timeout_s,
+        )
+
+    def move_to(
+        self,
+        hand: str,
+        target_xyz: Any,
+        frame: str = "world",
+        target_quat_xyzw: Any | None = None,
+        plan_only: bool = False,
+        position_tolerance_m: float = 0.02,
+        orientation_tolerance_rad: float = 0.087,
+        timeout_s: float = 45.0,
+    ) -> dict[str, Any]:
+        return self._planner.move_to(
+            hand=hand,
+            target_xyz=target_xyz,
+            frame=frame,
+            target_quat_xyzw=target_quat_xyzw,
+            plan_only=plan_only,
+            position_tolerance_m=position_tolerance_m,
+            orientation_tolerance_rad=orientation_tolerance_rad,
+            timeout_s=timeout_s,
+        )
+
+    def pick(
+        self,
+        hand: str,
+        target_xyz: Any,
+        approach_vector: Any | None = None,
+        grasp_quat_xyzw: Any | None = None,
+        pregrasp_offset_m: float = 0.08,
+        lift_m: float = 0.08,
+        timeout_s: float = 90.0,
+    ) -> dict[str, Any]:
+        return self._planner.pick(
+            hand=hand,
+            target_xyz=target_xyz,
+            approach_vector=approach_vector,
+            grasp_quat_xyzw=grasp_quat_xyzw,
+            pregrasp_offset_m=pregrasp_offset_m,
+            lift_m=lift_m,
+            timeout_s=timeout_s,
+        )
+
+    def rotate_wrist(
+        self,
+        hand: str,
+        target_quat_xyzw: Any | None = None,
+        relative_axis_angle: Any | None = None,
+        frame: str = "world",
+        timeout_s: float = 45.0,
+    ) -> dict[str, Any]:
+        return self._planner.rotate_wrist(
+            hand=hand,
+            target_quat_xyzw=target_quat_xyzw,
+            relative_axis_angle=relative_axis_angle,
+            frame=frame,
+            timeout_s=timeout_s,
+        )
+
+    def press(
+        self,
+        hand: str,
+        target_xyz: Any,
+        press_direction: Any | None = None,
+        approach_distance_m: float = 0.04,
+        press_depth_m: float = 0.012,
+        timeout_s: float = 60.0,
+    ) -> dict[str, Any]:
+        return self._planner.press(
+            hand=hand,
+            target_xyz=target_xyz,
+            press_direction=press_direction,
+            approach_distance_m=approach_distance_m,
+            press_depth_m=press_depth_m,
+            timeout_s=timeout_s,
+        )
+
+    def release(
+        self,
+        hand: str,
+        opening: float = 1.0,
+        retreat_vector: Any | None = None,
+        retreat_m: float = 0.03,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        return self._planner.release(
+            hand=hand,
+            opening=opening,
+            retreat_vector=retreat_vector,
+            retreat_m=retreat_m,
+            timeout_s=timeout_s,
+        )
 
     def close(self) -> None:
         try:
@@ -342,6 +788,17 @@ class _MainThreadDispatcher:
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method.startswith("env."):
             return getattr(self._env, method.removeprefix("env."))(*args, **kwargs)
+        if method in {
+            "observe",
+            "pixel_to_world",
+            "navigate_to",
+            "move_to",
+            "pick",
+            "rotate_wrist",
+            "press",
+            "release",
+        }:
+            return getattr(self._env, method)(*args, **kwargs)
         if method == "shutdown":
             self._shutdown_event.set()
             return {"ok": True}

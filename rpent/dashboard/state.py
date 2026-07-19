@@ -49,6 +49,10 @@ class State:
     def on_tool_result(self, name: str, result: Any) -> None:
         if not isinstance(result, dict):
             return
+        task_success = bool(result.get("task_success"))
+        if task_success:
+            with self._lock:
+                self._terminated = True
         self._update_frame(
             step=result.get("step"),
             image=result.get("_image_bytes"),
@@ -64,7 +68,7 @@ class State:
             step = int(result["step"])
         except Exception:
             return
-        terminated = bool(result.get("libero_terminated"))
+        terminated = task_success
         item = {
             "step": step,
             "action": str(command.get("action", name)),
@@ -107,7 +111,9 @@ class State:
         with self._lock:
             self._state = "done"
             if terminated is None:
-                terminated = any(item.get("terminated") for item in self._timeline)
+                terminated = self._terminated or any(
+                    item.get("terminated") for item in self._timeline
+                )
             self._terminated = bool(terminated)
 
     def events_since(self, since: int) -> list[dict[str, Any]]:
