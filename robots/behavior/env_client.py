@@ -49,9 +49,12 @@ class BehaviorEnvClient:
 
     def chunk_step(self, actions) -> tuple[Any, Any, Any, Any, Any]:
         assert not self.episode_done, "env.chunk_step called after episode done"
+        # The local agent and remote BEHAVIOR runtime may use incompatible
+        # NumPy major versions. Keep ndarray pickle internals off this boundary.
+        wire_actions = np.asarray(actions, dtype=np.float32).tolist()
         ret = self._client.call(
             "env.chunk_step",
-            args=(actions,),
+            args=(wire_actions,),
             timeout_s=_TIMEOUT_S["env.chunk_step"],
         )
         _, _, term, trunc, info = ret

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from robots.behavior.env_client import BehaviorEnvClient
 from robots.behavior.env_server import (
     BehaviorEnvFacade,
     _bootstrap_template_path,
@@ -47,6 +48,31 @@ def test_behavior_rpc_executes_env_method_on_dispatcher_thread():
     assert not submitter.is_alive()
     assert result == {"value": "pong"}
     assert env.called_on == threading.get_ident()
+
+
+def test_behavior_env_client_sends_action_chunks_without_numpy_pickle_internals():
+    expected_meta = {"activity_instance_id": 211, "seed": 211}
+
+    class _RpcClient:
+        def __init__(self):
+            self.chunk_args = None
+
+        def call(self, method, args=(), kwargs=None, *, timeout_s=None):
+            del kwargs, timeout_s
+            if method == "env.get_env_meta":
+                return expected_meta
+            assert method == "env.chunk_step"
+            self.chunk_args = args
+            return {}, 0.0, False, False, {"done": {"success": False}}
+
+    rpc = _RpcClient()
+    client = BehaviorEnvClient(rpc, expected_meta=expected_meta)
+
+    client.chunk_step(np.zeros((2, 23), dtype=np.float32))
+
+    assert isinstance(rpc.chunk_args[0], list)
+    assert len(rpc.chunk_args[0]) == 2
+    assert all(isinstance(row, list) and len(row) == 23 for row in rpc.chunk_args[0])
 
 
 def test_behavior_wire_info_replaces_only_unpickleable_leaves():

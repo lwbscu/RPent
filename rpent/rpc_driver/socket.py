@@ -124,6 +124,7 @@ class _RequestHandler(socketserver.StreamRequestHandler):
         try:
             payload = _read_frame(self.rfile)
         except Exception:
+            logger.exception("failed to read RPC request")
             return
         req_id = None
         try:
