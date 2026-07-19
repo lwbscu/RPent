@@ -427,7 +427,7 @@ class RealCuroboBackend:
                 "finetune_trajopt_iters": 100,
             },
             batch_size=2,
-            use_cuda_graph=True,
+            use_cuda_graph=False,
             use_default_embodiment_only=True,
         )
         self._probe_generator_lock_resolution(generator, kind=kind, hand=hand)
