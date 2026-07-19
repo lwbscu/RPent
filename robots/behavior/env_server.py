@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 import sys
 import threading
 import time
@@ -53,6 +54,38 @@ def _numpy_tree(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_numpy_tree(item) for item in value)
     return value
+
+
+def _wire_safe(value: Any) -> Any:
+    """Preserve ordinary simulator data while replacing non-pickleable leaves."""
+    value = _numpy_tree(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            return _wire_safe(value.tolist())
+        return value
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            try:
+                pickle.dumps(key, protocol=pickle.HIGHEST_PROTOCOL)
+                safe_key = key
+            except Exception:
+                safe_key = f"<{type(key).__module__}.{type(key).__qualname__}>"
+            result[safe_key] = _wire_safe(item)
+        return result
+    if isinstance(value, list):
+        return [_wire_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_wire_safe(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return [_wire_safe(item) for item in value]
+    try:
+        pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        return value
+    except Exception:
+        return f"<unserializable:{type(value).__module__}.{type(value).__qualname__}>"
 
 
 def _single_observation(obs: dict[str, Any]) -> dict[str, Any]:
@@ -168,11 +201,13 @@ def _payload_intrinsics(
         if name not in payload:
             continue
         try:
-            return CameraIntrinsics.from_matrix(
+            intrinsics = CameraIntrinsics.from_matrix(
                 payload[name],
                 width=int(rgb_shape[1]),
                 height=int(rgb_shape[0]),
             )
+            intrinsics.validate()
+            return intrinsics
         except Exception:
             continue
     return None
@@ -185,11 +220,13 @@ def _sensor_intrinsics(sensor: Any, *, rgb_shape: tuple[int, ...]) -> CameraIntr
         except Exception:
             continue
         try:
-            return CameraIntrinsics.from_matrix(
+            intrinsics = CameraIntrinsics.from_matrix(
                 value,
                 width=int(rgb_shape[1]),
                 height=int(rgb_shape[0]),
             )
+            intrinsics.validate()
+            return intrinsics
         except Exception:
             pass
     for name in ("get_intrinsic_matrix", "get_camera_intrinsics"):
@@ -197,11 +234,13 @@ def _sensor_intrinsics(sensor: Any, *, rgb_shape: tuple[int, ...]) -> CameraIntr
         if fn is None:
             continue
         try:
-            return CameraIntrinsics.from_matrix(
+            intrinsics = CameraIntrinsics.from_matrix(
                 fn(),
                 width=int(rgb_shape[1]),
                 height=int(rgb_shape[0]),
             )
+            intrinsics.validate()
+            return intrinsics
         except Exception:
             pass
     return None
@@ -587,17 +626,21 @@ class BehaviorEnvFacade:
             raise RuntimeError("BEHAVIOR action chunk executed zero steps")
         task_success = _raw_success(official_info)
         self._done = task_success or terminated or truncated
-        returned_info = _numpy_tree(official_info)
+        returned_info = _wire_safe(official_info)
         if not isinstance(returned_info, dict):
             returned_info = {"raw": returned_info}
         returned_info["_rpent"] = {"executed_steps": executed_steps}
-        return (
+        result = (
             final_observation,
             _numpy_tree(final_reward),
             terminated,
             truncated,
             returned_info,
         )
+        # Catch simulator-owned objects here so the transport can return a
+        # useful RPC error instead of closing the socket without a frame.
+        pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+        return result
 
     def get_env_meta(self) -> dict[str, Any]:
         return dict(self._meta)

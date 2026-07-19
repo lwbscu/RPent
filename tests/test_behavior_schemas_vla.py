@@ -1,4 +1,5 @@
 import base64
+import pickle
 import threading
 
 import numpy as np
@@ -7,6 +8,9 @@ import pytest
 from robots.behavior.env_server import (
     _bootstrap_template_path,
     _MainThreadDispatcher,
+    _payload_intrinsics,
+    _sensor_intrinsics,
+    _wire_safe,
 )
 from robots.behavior.schemas import (
     ENV_ACTION_SEGMENTS,
@@ -42,6 +46,41 @@ def test_behavior_rpc_executes_env_method_on_dispatcher_thread():
     assert not submitter.is_alive()
     assert result == {"value": "pong"}
     assert env.called_on == threading.get_ident()
+
+
+def test_behavior_wire_info_replaces_only_unpickleable_leaves():
+    payload = {
+        "done": {"success": np.bool_(False)},
+        "scores": np.array([1.0, 2.0], dtype=np.float32),
+        "simulator_object": lambda: None,
+        "object_array": np.array([np.int64(3), lambda: None], dtype=object),
+    }
+
+    safe = _wire_safe(payload)
+
+    assert safe["done"]["success"] is False
+    np.testing.assert_array_equal(safe["scores"], payload["scores"])
+    assert safe["simulator_object"].startswith("<unserializable:")
+    assert safe["object_array"][0] == 3
+    assert safe["object_array"][1].startswith("<unserializable:")
+    pickle.dumps(safe, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def test_invalid_payload_intrinsics_fall_through_to_valid_sensor_intrinsics():
+    bad_payload = {"intrinsics": np.diag([0.0, 0.0, 1.0])}
+
+    class _Sensor:
+        intrinsic_matrix = np.array(
+            [[300.0, 0.0, 160.0], [0.0, 301.0, 120.0], [0.0, 0.0, 1.0]]
+        )
+
+    payload_intrinsics = _payload_intrinsics(bad_payload, rgb_shape=(240, 320, 3))
+    sensor_intrinsics = _sensor_intrinsics(_Sensor(), rgb_shape=(240, 320, 3))
+
+    assert payload_intrinsics is None
+    assert sensor_intrinsics is not None
+    assert sensor_intrinsics.fx == 300.0
+    assert sensor_intrinsics.fy == 301.0
 
 
 def test_bootstrap_template_uses_instance_zero_without_changing_target(tmp_path):

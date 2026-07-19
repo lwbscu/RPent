@@ -10,6 +10,7 @@ pickle rather than a more defensive codec.
 """
 from __future__ import annotations
 
+import logging
 import pickle
 import socket
 import socketserver
@@ -19,11 +20,11 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
-
 DEFAULT_CONNECT_TIMEOUT_S = 10.0
 DEFAULT_REQUEST_TIMEOUT_S = 30.0
 
 _LEN_PREFIX = struct.Struct(">I")
+logger = logging.getLogger(__name__)
 
 
 def _read_exact(reader, n: int) -> bytes:
@@ -137,8 +138,17 @@ class _RequestHandler(socketserver.StreamRequestHandler):
             }
         try:
             _write_frame(self.wfile, response)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("failed to write RPC response for %s", req_id)
+            fallback = {
+                "id": req_id,
+                "ok": False,
+                "error": f"response serialization failed: {type(exc).__name__}: {exc}",
+            }
+            try:
+                _write_frame(self.wfile, fallback)
+            except Exception:
+                logger.exception("failed to write RPC serialization error for %s", req_id)
 
 
 class SocketRpcServer(socketserver.ThreadingTCPServer):
