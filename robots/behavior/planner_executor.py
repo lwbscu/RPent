@@ -901,7 +901,9 @@ class RealCuroboBackend:
                 dtype=bool,
             ).reshape(-1)
             success_chunks.append(result_success)
-            paths.extend(list(result.get_paths()))
+            result_paths = result.get_paths()
+            if result_paths is not None:
+                paths.extend(list(result_paths))
             result_statuses.append(
                 {
                     "success": result_success.tolist(),
