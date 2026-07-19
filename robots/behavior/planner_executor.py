@@ -584,15 +584,30 @@ class RealCuroboBackend:
             metrics["reachable_by_candidate_kinematic_ik"] = base_xyyaw is not None
             return {"ok": True, "metrics": metrics}
         path = paths[int(success_indices[0])]
-        q_traj = generator.path_to_joint_trajectory(path, get_full_js=True)
+        try:
+            q_traj = generator.path_to_joint_trajectory(path, get_full_js=True)
+        except Exception as exc:
+            raise RuntimeError(f"path_to_joint_trajectory failed: {exc}") from exc
         if hasattr(generator, "add_linearly_interpolated_waypoints") and len(q_traj) > 1:
-            q_traj = generator.add_linearly_interpolated_waypoints(q_traj, max_inter_dist=0.01)
-        actions = self.q_trajectory_to_actions(q_traj, hand=hand)
-        collision_report = self._check_q_trajectory_collisions(
-            generator,
-            q_traj,
-            attached_obj=attached_obj,
-        )
+            try:
+                q_traj = generator.add_linearly_interpolated_waypoints(
+                    q_traj,
+                    max_inter_dist=0.01,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"trajectory interpolation failed: {exc}") from exc
+        try:
+            actions = self.q_trajectory_to_actions(q_traj, hand=hand)
+        except Exception as exc:
+            raise RuntimeError(f"23D action packing failed: {exc}") from exc
+        try:
+            collision_report = self._check_q_trajectory_collisions(
+                generator,
+                q_traj,
+                attached_obj=attached_obj,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"full trajectory collision check failed: {exc}") from exc
         metrics["collision_report"] = collision_report
         metrics["trajectory_waypoints"] = int(actions.shape[0])
         if not bool(collision_report.get("available", False)):
@@ -1055,11 +1070,19 @@ class RealCuroboBackend:
             self._last_collision_report = report
             return report
         try:
-            colliding = generator.check_collisions(
-                q_traj,
-                self_collision_check=True,
-                skip_obstacle_update=False,
-                attached_obj=attached_obj,
+            collision_chunks = []
+            waypoint_count = int(q_traj.shape[0])
+            for start in range(0, waypoint_count, 16):
+                collision_chunks.append(
+                    generator.check_collisions(
+                        q_traj[start : start + 16],
+                        self_collision_check=True,
+                        skip_obstacle_update=start > 0,
+                        attached_obj=attached_obj,
+                    )
+                )
+            colliding = np.concatenate(
+                [np.asarray(_jsonable(chunk), dtype=bool).reshape(-1) for chunk in collision_chunks]
             )
         except Exception as exc:
             report = {
