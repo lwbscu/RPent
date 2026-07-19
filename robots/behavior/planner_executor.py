@@ -563,9 +563,18 @@ class RealCuroboBackend:
             if base_xyyaw is not None and ik_only
             else ("world_collision_ik" if ik_only else "world_collision_full_trajectory")
         )
+        batch_size = max(int(generator.batch_size), 1)
+        planner_targets = torch.as_tensor(
+            planner_target,
+            dtype=torch.float32,
+        ).reshape(1, 3).repeat(batch_size, 1)
+        planner_quats = torch.as_tensor(
+            target_quat,
+            dtype=torch.float32,
+        ).reshape(1, 4).repeat(batch_size, 1)
         successes, paths = generator.compute_trajectories(
-            torch.as_tensor(planner_target, dtype=torch.float32),
-            torch.as_tensor(target_quat, dtype=torch.float32),
+            planner_targets,
+            planner_quats,
             initial_joint_pos=initial_joint_pos,
             max_attempts=5,
             timeout=min(float(timeout_s), 8.0),
@@ -573,7 +582,7 @@ class RealCuroboBackend:
             enable_finetune_trajopt=not bool(ik_only),
             finetune_attempts=0 if ik_only else 2,
             return_full_result=False,
-            success_ratio=1.0 / max(int(generator.batch_size), 1),
+            success_ratio=1.0 / batch_size,
             attached_obj=attached_obj,
             ik_only=bool(ik_only),
             is_local=False,
@@ -596,7 +605,8 @@ class RealCuroboBackend:
             "curobo_config": str(self._hand_config_path(hand)),
             "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
             "attached_collision_body": {"available": attached_obj is not None},
-            "success_ratio": 1.0 / max(int(generator.batch_size), 1),
+            "success_ratio": 1.0 / batch_size,
+            "planner_seed_count": batch_size,
         }
         if success_indices.size == 0:
             return {
@@ -860,16 +870,25 @@ class RealCuroboBackend:
         base = self._base_xy_yaw(self._find_robot())
         pos = np.array([target_xyyaw[0], target_xyyaw[1], base[3]], dtype=np.float64)
         quat = _yaw_to_quat_xyzw(float(target_xyyaw[2]))
+        batch_size = max(int(generator.batch_size), 1)
+        planner_targets = torch.as_tensor(pos, dtype=torch.float32).reshape(1, 3).repeat(
+            batch_size,
+            1,
+        )
+        planner_quats = torch.as_tensor(quat, dtype=torch.float32).reshape(1, 4).repeat(
+            batch_size,
+            1,
+        )
         successes, paths = generator.compute_trajectories(
-            torch.as_tensor(pos, dtype=torch.float32),
-            torch.as_tensor(quat, dtype=torch.float32),
+            planner_targets,
+            planner_quats,
             max_attempts=5,
             timeout=min(float(timeout_s), 8.0),
             ik_fail_return=5,
             enable_finetune_trajopt=True,
             finetune_attempts=2,
             return_full_result=False,
-            success_ratio=1.0 / max(int(generator.batch_size), 1),
+            success_ratio=1.0 / batch_size,
             ik_only=False,
             skip_obstacle_update=False,
             emb_sel=emb_sel,
@@ -881,7 +900,8 @@ class RealCuroboBackend:
             "ik_only": False,
             "curobo_config": str(self._base_config_path()),
             "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
-            "success_ratio": 1.0 / max(int(generator.batch_size), 1),
+            "success_ratio": 1.0 / batch_size,
+            "planner_seed_count": batch_size,
         }
         if success_indices.size == 0:
             return {"ok": False, "stop_reason": "base_plan_failed", "metrics": metrics}
