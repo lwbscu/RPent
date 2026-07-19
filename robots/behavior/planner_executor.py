@@ -633,6 +633,7 @@ class RealCuroboBackend:
         timeout_s: float,
     ) -> dict[str, Any]:
         hand = _normalize_hand(hand)
+        started = time.monotonic()
         try:
             robot = self._find_robot()
             current = self._base_xy_yaw(robot)
@@ -648,25 +649,57 @@ class RealCuroboBackend:
                     "stop_reason": "navigation_unreachable",
                     "metrics": {"candidate_count": 0, "reason": "no traversable reachable station"},
                 }
-            best = candidates[0]["xyyaw"]
-            base_plan = self._compute_base_plan(
-                target_xyyaw=best,
-                timeout_s=timeout_s,
-            )
-            if not base_plan.get("ok"):
-                return base_plan
+            candidate_trace = [
+                {
+                    "xyyaw": item["xyyaw"].tolist(),
+                    "geodesic_distance_m": item.get("geodesic_distance_m"),
+                    "reachability_reason": item.get("reachability_reason"),
+                    "reachability_stage": item.get("reachability_stage"),
+                }
+                for item in candidates[:8]
+            ]
+            base_plan_attempts = []
+            base_plan = None
+            best = None
+            for rank, candidate in enumerate(candidates):
+                remaining_s = float(timeout_s) - (time.monotonic() - started)
+                if remaining_s <= 0:
+                    break
+                attempt = self._compute_base_plan(
+                    target_xyyaw=candidate["xyyaw"],
+                    timeout_s=remaining_s,
+                )
+                base_plan_attempts.append(
+                    {
+                        "rank": rank,
+                        "xyyaw": candidate["xyyaw"].tolist(),
+                        "ok": bool(attempt.get("ok")),
+                        "stop_reason": attempt.get("stop_reason"),
+                        "metrics": attempt.get("metrics", {}),
+                    }
+                )
+                if attempt.get("ok"):
+                    best = candidate["xyyaw"]
+                    base_plan = attempt
+                    break
+            if base_plan is None or best is None:
+                timed_out = time.monotonic() - started >= float(timeout_s)
+                return {
+                    "ok": False,
+                    "stop_reason": "timeout" if timed_out else "base_plan_failed",
+                    "metrics": {
+                        "candidate_count": len(candidates),
+                        "candidate_trace": candidate_trace,
+                        "base_plan_attempts": base_plan_attempts,
+                        "current_base": current.tolist(),
+                        "elapsed_s": round(time.monotonic() - started, 3),
+                    },
+                }
             metrics = {
                 **base_plan.get("metrics", {}),
                 "candidate_count": len(candidates),
-                "candidate_trace": [
-                    {
-                        "xyyaw": item["xyyaw"].tolist(),
-                        "geodesic_distance_m": item.get("geodesic_distance_m"),
-                        "reachability_reason": item.get("reachability_reason"),
-                        "reachability_stage": item.get("reachability_stage"),
-                    }
-                    for item in candidates[:8]
-                ],
+                "candidate_trace": candidate_trace,
+                "base_plan_attempts": base_plan_attempts,
                 "post_base_reachability_required": True,
                 "base_goal": best.tolist(),
                 "current_base": current.tolist(),

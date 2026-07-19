@@ -202,6 +202,62 @@ def test_move_to_unreachable_suggests_navigation_without_stepping_env():
     assert env.calls == []
 
 
+def test_base_planner_tries_next_ranked_station_after_curobo_failure():
+    class _BaseBackend(RealCuroboBackend):
+        def __init__(self):
+            self.targets = []
+
+        def _find_robot(self):
+            return object()
+
+        def _base_xy_yaw(self, robot):
+            return np.array([0.0, 0.0, 0.0, 0.0])
+
+        def _ranked_base_candidates(self, robot, *, hand, target_xyz, standoff_m):
+            return [
+                {
+                    "xyyaw": np.array([1.0, 0.0, 0.0]),
+                    "geodesic_distance_m": 1.0,
+                    "reachability_reason": "reachable_candidate",
+                    "reachability_stage": "candidate_kinematic_ik",
+                },
+                {
+                    "xyyaw": np.array([0.0, 1.0, 1.57]),
+                    "geodesic_distance_m": 1.2,
+                    "reachability_reason": "reachable_candidate",
+                    "reachability_stage": "candidate_kinematic_ik",
+                },
+            ]
+
+        def _compute_base_plan(self, *, target_xyyaw, timeout_s):
+            self.targets.append(target_xyyaw.copy())
+            if len(self.targets) == 1:
+                return {
+                    "ok": False,
+                    "stop_reason": "base_plan_failed",
+                    "metrics": {"successes": [False]},
+                }
+            return {
+                "ok": True,
+                "joint_trajectory": np.zeros((2, 28), dtype=np.float32),
+                "metrics": {"successes": [True]},
+            }
+
+    backend = _BaseBackend()
+
+    result = backend.plan_base_trajectory(
+        hand="left",
+        target_xyz=np.array([2.0, 0.0, 1.0]),
+        standoff_m=0.85,
+        timeout_s=10.0,
+    )
+
+    assert result["ok"] is True
+    assert len(backend.targets) == 2
+    assert result["base_goal"] == [0.0, 1.0, 1.57]
+    assert [attempt["ok"] for attempt in result["metrics"]["base_plan_attempts"]] == [False, True]
+
+
 def test_move_to_rejects_bad_action_shape_before_env_step():
     executor, env = _executor(_FakeBackend(bad_actions=True))
 
