@@ -588,14 +588,10 @@ class RealCuroboBackend:
             q_traj = generator.path_to_joint_trajectory(path, get_full_js=True)
         except Exception as exc:
             raise RuntimeError(f"path_to_joint_trajectory failed: {exc}") from exc
-        if hasattr(generator, "add_linearly_interpolated_waypoints") and len(q_traj) > 1:
-            try:
-                q_traj = generator.add_linearly_interpolated_waypoints(
-                    q_traj,
-                    max_inter_dist=0.01,
-                )
-            except Exception as exc:
-                raise RuntimeError(f"trajectory interpolation failed: {exc}") from exc
+        try:
+            q_traj = _interpolate_joint_trajectory(q_traj, max_inter_dist=0.01)
+        except Exception as exc:
+            raise RuntimeError(f"trajectory interpolation failed: {exc}") from exc
         try:
             actions = self.q_trajectory_to_actions(q_traj, hand=hand)
         except Exception as exc:
@@ -830,8 +826,7 @@ class RealCuroboBackend:
             return {"ok": False, "stop_reason": "base_plan_failed", "metrics": metrics}
         path = paths[int(success_indices[0])]
         q_traj = generator.path_to_joint_trajectory(path, get_full_js=True)
-        if hasattr(generator, "add_linearly_interpolated_waypoints") and len(q_traj) > 1:
-            q_traj = generator.add_linearly_interpolated_waypoints(q_traj, max_inter_dist=0.01)
+        q_traj = _interpolate_joint_trajectory(q_traj, max_inter_dist=0.01)
         collision_report = self._check_q_trajectory_collisions(generator, q_traj)
         metrics.update(
             {
@@ -1070,12 +1065,19 @@ class RealCuroboBackend:
             self._last_collision_report = report
             return report
         try:
+            torch = self._torch
+            if torch is None:
+                import torch as torch  # type: ignore[no-redef]
+            q_tensor = torch.as_tensor(
+                np.asarray(_jsonable(q_traj), dtype=np.float32),
+                dtype=torch.float32,
+            )
             collision_chunks = []
-            waypoint_count = int(q_traj.shape[0])
+            waypoint_count = int(q_tensor.shape[0])
             for start in range(0, waypoint_count, 16):
                 collision_chunks.append(
                     generator.check_collisions(
-                        q_traj[start : start + 16],
+                        q_tensor[start : start + 16],
                         self_collision_check=True,
                         skip_obstacle_update=start > 0,
                         attached_obj=attached_obj,
@@ -2423,6 +2425,41 @@ def _action_dynamics_report(actions: np.ndarray) -> dict[str, Any]:
         "velocity_limit": velocity_limit,
         "acceleration_limit": acceleration_limit,
     }
+
+
+def _interpolate_joint_trajectory(
+    trajectory: Any,
+    *,
+    max_inter_dist: float,
+) -> np.ndarray:
+    q = np.asarray(_jsonable(trajectory), dtype=np.float32)
+    if q.ndim != 2 or q.shape[0] < 1:
+        raise ValueError(f"joint trajectory must be [T,D], got {q.shape}")
+    if not np.isfinite(q).all():
+        raise ValueError("joint trajectory contains NaN or infinity")
+    if max_inter_dist <= 0:
+        raise ValueError("max_inter_dist must be positive")
+    if q.shape[0] == 1:
+        return q.copy()
+
+    interpolated = []
+    for start, end in zip(q[:-1], q[1:], strict=True):
+        intervals = max(
+            1,
+            int(math.ceil(float(np.max(np.abs(end - start))) / max_inter_dist)),
+        )
+        for index in range(intervals):
+            alpha = index / intervals
+            interpolated.append(start + (end - start) * alpha)
+    interpolated.append(q[-1])
+    result = np.stack(interpolated, axis=0).astype(np.float32, copy=False)
+    if result.shape[0] > 1:
+        max_delta = float(np.max(np.abs(np.diff(result, axis=0))))
+        if max_delta > max_inter_dist + 1e-6:
+            raise RuntimeError(
+                f"interpolated joint delta {max_delta} exceeds {max_inter_dist}"
+            )
+    return result
 
 
 def _approach_vector(value: Any | None) -> np.ndarray:

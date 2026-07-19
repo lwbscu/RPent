@@ -1,7 +1,11 @@
 import numpy as np
 
 from robots.behavior.camera_geometry import CameraIntrinsics, FrameCache
-from robots.behavior.planner_executor import PlannerExecutor, RealCuroboBackend
+from robots.behavior.planner_executor import (
+    PlannerExecutor,
+    RealCuroboBackend,
+    _interpolate_joint_trajectory,
+)
 from robots.behavior.schemas import ENV_ACTION_SEGMENTS
 from rpent.tools.toolkit import ToolResult
 
@@ -411,3 +415,14 @@ def test_traversability_uses_floor_map_row_column_and_fails_closed():
     trav_map.floor_map[0][1, 2] = 0
     assert backend._candidate_is_traversable(trav_map, candidate, floor=0) is False
     assert backend._candidate_is_traversable(object(), candidate, floor=0) is False
+
+
+def test_cpu_joint_interpolation_bounds_every_waypoint_delta():
+    result = _interpolate_joint_trajectory(
+        np.array([[0.0, 0.0], [0.025, -0.011]], dtype=np.float32),
+        max_inter_dist=0.01,
+    )
+
+    np.testing.assert_allclose(result[0], [0.0, 0.0])
+    np.testing.assert_allclose(result[-1], [0.025, -0.011])
+    assert np.max(np.abs(np.diff(result, axis=0))) <= 0.01 + 1e-6
