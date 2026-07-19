@@ -867,9 +867,8 @@ class RealCuroboBackend:
         torch = self._torch
         if torch is None:
             import torch as torch  # type: ignore[no-redef]
-        base = self._base_xy_yaw(self._find_robot())
-        pos = np.array([target_xyyaw[0], target_xyyaw[1], base[3]], dtype=np.float64)
-        quat = _yaw_to_quat_xyzw(float(target_xyyaw[2]))
+        robot = self._find_robot()
+        pos, quat = self._base_target_world_pose(robot, target_xyyaw)
         batch_size = max(int(generator.batch_size), 1)
         planner_targets = torch.as_tensor(pos, dtype=torch.float32).reshape(1, 3).repeat(
             batch_size,
@@ -879,7 +878,7 @@ class RealCuroboBackend:
             batch_size,
             1,
         )
-        successes, paths = generator.compute_trajectories(
+        full_results = generator.compute_trajectories(
             planner_targets,
             planner_quats,
             max_attempts=5,
@@ -887,13 +886,36 @@ class RealCuroboBackend:
             ik_fail_return=5,
             enable_finetune_trajopt=True,
             finetune_attempts=2,
-            return_full_result=False,
+            return_full_result=True,
             success_ratio=1.0 / batch_size,
             ik_only=False,
             skip_obstacle_update=False,
             emb_sel=emb_sel,
         )
-        success_array = np.asarray(_jsonable(successes), dtype=bool).reshape(-1)
+        success_chunks = []
+        paths = []
+        result_statuses = []
+        for result in full_results:
+            result_success = np.asarray(
+                _jsonable(result.success),
+                dtype=bool,
+            ).reshape(-1)
+            success_chunks.append(result_success)
+            paths.extend(list(result.get_paths()))
+            result_statuses.append(
+                {
+                    "success": result_success.tolist(),
+                    "status": str(getattr(result, "status", "unavailable")),
+                    "valid_query": str(
+                        getattr(result, "valid_query", "unavailable")
+                    ),
+                }
+            )
+        success_array = (
+            np.concatenate(success_chunks)
+            if success_chunks
+            else np.zeros((0,), dtype=bool)
+        )
         success_indices = np.flatnonzero(success_array)
         metrics = {
             "successes": success_array.tolist(),
@@ -902,6 +924,7 @@ class RealCuroboBackend:
             "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
             "success_ratio": 1.0 / batch_size,
             "planner_seed_count": batch_size,
+            "motion_gen_results": result_statuses,
         }
         if success_indices.size == 0:
             return {"ok": False, "stop_reason": "base_plan_failed", "metrics": metrics}
@@ -932,6 +955,31 @@ class RealCuroboBackend:
             "joint_trajectory": np.asarray(_jsonable(q_traj), dtype=np.float32),
             "metrics": metrics,
         }
+
+    def _base_target_world_pose(
+        self,
+        robot: Any,
+        target_xyyaw: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        import torch
+        from omnigibson.utils import transform_utils
+
+        q = np.asarray(_jsonable(robot.get_joint_positions()), dtype=np.float64)
+        base_idx = _indices(getattr(robot, "base_idx", []))
+        if len(base_idx) < 6:
+            raise RuntimeError("R1Pro base_idx must expose x/y/z/rx/ry/rz")
+        pos = np.array(
+            [target_xyyaw[0], target_xyyaw[1], q[base_idx[2]]],
+            dtype=np.float64,
+        )
+        intrinsic_xyz = torch.as_tensor(
+            [q[base_idx[3]], q[base_idx[4]], target_xyyaw[2]],
+            dtype=torch.float32,
+        )
+        quat = transform_utils.mat2quat(
+            transform_utils.euler_intrinsic2mat(intrinsic_xyz)
+        )
+        return pos, np.asarray(_jsonable(quat), dtype=np.float64)
 
     def _initial_joint_pos_for_base_candidate(self, robot: Any, base_xyyaw: np.ndarray) -> np.ndarray:
         q = np.asarray(_jsonable(robot.get_joint_positions()), dtype=np.float64).reshape(-1).copy()
