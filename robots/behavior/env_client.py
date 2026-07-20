@@ -37,10 +37,20 @@ class BehaviorEnvClient:
             "env.get_env_meta",
             timeout_s=_TIMEOUT_S["default"],
         )
-        if server_meta != expected_meta:
+        if not isinstance(server_meta, dict):
             raise RuntimeError(
-                f"env_meta mismatch: expected={expected_meta!r} actual={server_meta!r}"
+                f"env_meta must be a mapping, got {type(server_meta)!r}"
             )
+        mismatches = {
+            key: {"expected": expected, "actual": server_meta.get(key)}
+            for key, expected in expected_meta.items()
+            if server_meta.get(key) != expected
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"env_meta mismatch: {mismatches!r}"
+            )
+        self.server_meta = dict(server_meta)
 
     def reset(self) -> tuple[dict[str, Any], Any]:
         ret = self._client.call("env.reset", timeout_s=_TIMEOUT_S["env.reset"])
@@ -68,10 +78,22 @@ class BehaviorEnvClient:
         return self._client.call("env.get_env_meta", timeout_s=_TIMEOUT_S["default"])
 
     def _planner_call(self, method: str, **kwargs: Any) -> dict[str, Any]:
+        rpc_timeout_s = _TIMEOUT_S.get(
+            f"env.{method}", _TIMEOUT_S["default"]
+        )
+        requested_timeout = kwargs.get("timeout_s")
+        if requested_timeout is not None:
+            # The primitive owns the hard deadline.  Keep a bounded transport
+            # grace period for serializing its structured timeout result rather
+            # than leaving every planner RPC blocked for the global 30 minutes.
+            rpc_timeout_s = min(
+                rpc_timeout_s,
+                max(30.0, float(requested_timeout) + 60.0),
+            )
         ret = self._client.call(
             f"env.{method}",
             kwargs=kwargs,
-            timeout_s=_TIMEOUT_S.get(f"env.{method}", _TIMEOUT_S["default"]),
+            timeout_s=rpc_timeout_s,
         )
         if not isinstance(ret, dict):
             raise RuntimeError(f"env.{method} returned non-dict result: {type(ret)!r}")

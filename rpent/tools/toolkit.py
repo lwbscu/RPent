@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import base64
 import json
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
-import traceback
 from typing import Any, ClassVar
 
 from rpent.utils.templates import substitute
@@ -37,6 +37,7 @@ class ToolResult:
     MAX_TEXT_BYTES_IN_RESULT: ClassVar[int] = 60000
 
     def __post_init__(self) -> None:
+        """Build normalized content blocks and official finish semantics."""
         self.content_blocks = self._build_content_blocks()
         self.is_finish = bool(
             isinstance(self.result, dict) and self.result.get("_finish")
@@ -55,6 +56,7 @@ class ToolResult:
 
         result_for_text = dict(result)
         image = result_for_text.pop("_image_bytes", None)
+        depth_image = result_for_text.pop("_depth_image_bytes", None)
         image_cam = result_for_text.pop("_image_cam_bytes", None)
         image_wrist = result_for_text.pop("_image_wrist_bytes", None)
         text = json.dumps(result_for_text, indent=2, default=str)
@@ -76,6 +78,8 @@ class ToolResult:
 
         if image:
             _add_image_bytes(image)
+        if depth_image:
+            _add_image_bytes(depth_image)
         if image_cam:
             _add_image_bytes(image_cam)
         if image_wrist:
@@ -95,6 +99,7 @@ class Toolkit:
     """
 
     def __init__(self, *, dashboard: Any = None) -> None:
+        """Initialize an empty tool registry with an optional dashboard sink."""
         # name -> (spec, handler)
         self._tools: dict[str, tuple[dict[str, Any], Callable[..., dict[str, Any]]]] = {}
         self._dashboard = dashboard

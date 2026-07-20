@@ -28,7 +28,9 @@ class BehaviorVLAClient:
 
     def __init__(self, base_url: str, *, timeout_s: float = 600.0) -> None:
         self._base_url = base_url.rstrip("/")
-        self._client = httpx.Client(timeout=timeout_s)
+        # The VLA endpoint is a runtime-owned local sidecar.  Ambient proxy
+        # variables must never redirect it or make SOCKS extras a dependency.
+        self._client = httpx.Client(timeout=timeout_s, trust_env=False)
 
     def healthz(self, *, timeout_ms: int | None = None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}

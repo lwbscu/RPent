@@ -28,7 +28,17 @@ from robots.behavior.camera_geometry import (
     load_camera_correction_profiles,
 )
 from robots.behavior.planner_executor import PlannerExecutor
-from robots.behavior.schemas import validate_action_chunk
+from robots.behavior.schemas import (
+    CONTROL_MODES,
+    FULL_TASK_VLA_MODE,
+    PI0_PICK_VLA_MODE,
+    PLANNER_TOOLS_MODE,
+    POLICY_STATE_SEGMENTS,
+    extract_policy_state,
+    segment_ranges,
+    validate_action_chunk,
+)
+from robots.behavior.snapshot_manifest import validate_snapshot_manifest
 from rpent.rpc_driver.socket import SocketRpcServer
 from rpent.utils.config import get_repo_root, get_rlinf_repo_path
 from rpent.utils.logging import get_logger
@@ -38,6 +48,26 @@ RPENT_ROOT = get_repo_root()
 RLINF_ROOT = get_rlinf_repo_path() or (RPENT_ROOT.parent / "RLinf_agentic_push")
 if str(RLINF_ROOT) not in sys.path:
     sys.path.insert(0, str(RLINF_ROOT))
+
+_SHARED_ENV_RPC_METHODS = frozenset({"get_env_meta", "reset"})
+_ENV_RPC_METHODS_BY_MODE = {
+    FULL_TASK_VLA_MODE: frozenset({"chunk_step"}),
+    PI0_PICK_VLA_MODE: frozenset({"chunk_step"}),
+    PLANNER_TOOLS_MODE: frozenset(
+        {
+        "observe",
+        "pixel_to_world",
+        "navigate_to",
+        "move_to",
+        "pick",
+        "rotate_wrist",
+        "press",
+        "release",
+        }
+    ),
+}
+
+RESTORE_RENDER_SETTLE_FRAMES = 3
 
 
 def _numpy_tree(value: Any) -> Any:
@@ -55,6 +85,18 @@ def _numpy_tree(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_numpy_tree(item) for item in value)
     return value
+
+
+def _settle_visual_pipeline_after_restore(
+    simulator: Any, *, render_iterations: int = RESTORE_RENDER_SETTLE_FRAMES
+) -> None:
+    """Advance Kit's async renderer without advancing physics after restore."""
+
+    iterations = int(render_iterations)
+    if iterations < 3:
+        raise ValueError("restored RGB-D synchronization requires at least 3 renders")
+    for _ in range(iterations):
+        simulator.render()
 
 
 def _wire_safe(value: Any) -> Any:
@@ -300,6 +342,18 @@ def _sensor_intrinsics(
 
 
 def _sensor_camera_to_world(sensor: Any) -> np.ndarray | None:
+    # Kit publishes the render-synchronous world-to-camera matrix here.  A
+    # sensor pose getter can already reflect a newer articulation state because
+    # the renderer is asynchronous, so prefer this exact frame metadata when
+    # available (the first query may legitimately be all zeros).
+    try:
+        parameters = getattr(sensor, "camera_parameters", None)
+        view = parameters.get("cameraViewTransform") if parameters is not None else None
+        matrix = np.asarray(_numpy_tree(view), dtype=np.float64).reshape(4, 4)
+        if np.isfinite(matrix).all() and not np.allclose(matrix, 0.0):
+            return np.linalg.inv(matrix.T)
+    except Exception:
+        pass
     for name in ("camera_to_world", "camera_to_world_matrix"):
         try:
             value = getattr(sensor, name)
@@ -421,6 +475,7 @@ def _load_env_config(args: argparse.Namespace) -> Any:
             if modality not in modalities:
                 modalities.append(modality)
         robot_cfg.obs_modalities = modalities
+    _configure_control_mode(cfg, getattr(args, "control_mode", None))
 
     task = cfg.omni_config.task
     task.activity_name = str(args.task_name)
@@ -450,10 +505,57 @@ def _load_env_config(args: argparse.Namespace) -> Any:
     return cfg
 
 
+def _configure_control_mode(cfg: Any, control_mode: str | None) -> None:
+    """Keep VLA controllers intact and use OG's cuRobo BASE controller in planner mode."""
+    if control_mode != PLANNER_TOOLS_MODE:
+        return
+    robots = list(cfg.omni_config.robots)
+    if len(robots) != 1 or str(robots[0].type) != "R1Pro":
+        raise ValueError("planner_tools requires exactly one R1Pro robot")
+    base = robots[0].controller_config.base
+    if str(base.name) != "HolonomicBaseJointController":
+        raise ValueError(
+            "planner_tools requires OmniGibson HolonomicBaseJointController"
+        )
+    base.motor_type = "position"
+    base.command_input_limits = None
+    base.command_output_limits = None
+    base.use_impedances = False
+    base.isaac_kp = 2_000_000.0
+    base.isaac_kd = 100_000.0
+
+
+def _resize_video_tile(rgb: Any, *, height: int, width: int) -> np.ndarray:
+    """Resize one RGB camera image for a synchronized audit mosaic."""
+
+    array = np.asarray(rgb, dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] < 3:
+        raise RuntimeError(f"video camera frame must be HxWxC, got {array.shape}")
+    array = np.ascontiguousarray(array[..., :3])
+    if array.shape[:2] == (int(height), int(width)):
+        return array
+    from PIL import Image
+
+    return np.asarray(
+        Image.fromarray(array, mode="RGB").resize(
+            (int(width), int(height)),
+            resample=Image.Resampling.BILINEAR,
+        ),
+        dtype=np.uint8,
+    )
+
+
 class BehaviorEnvFacade:
     """Single-env raw-info facade with streaming 15 FPS video."""
 
-    def __init__(self, *, cfg: Any, meta: dict[str, Any], output_dir: Path) -> None:
+    def __init__(
+        self,
+        *,
+        cfg: Any,
+        meta: dict[str, Any],
+        output_dir: Path,
+        control_mode: str | None = None,
+    ) -> None:
         from rlinf.envs.behavior.behavior_env import BehaviorEnv
 
         self._env = BehaviorEnv(
@@ -465,26 +567,36 @@ class BehaviorEnvFacade:
             record_metrics=False,
         )
         self._meta = dict(meta)
+        self._control_mode = control_mode
         self._done = False
         self._env_steps = 0
         self._video_path = output_dir / "episode.mp4"
         self._video_writer = None
         self._video_frames = 0
         self._video_error: str | None = None
+        self._video_source_shapes: dict[str, list[int]] = {}
+        self._planner_video_interval_steps = max(
+            1, int(os.environ.get("RPENT_PLANNER_VIDEO_INTERVAL_STEPS", "4"))
+        )
         correction_path = os.environ.get("RPENT_BEHAVIOR_CAMERA_CORRECTION_PROFILE")
         self._frame_cache = FrameCache(
             max_frames_per_camera=8,
             ttl_s=60.0,
             correction_profiles=load_camera_correction_profiles(correction_path),
         )
-        self._planner = PlannerExecutor(
-            env=self,
-            frame_cache=self._frame_cache,
-            output_dir=output_dir,
+        self._planner = (
+            PlannerExecutor(
+                env=self,
+                frame_cache=self._frame_cache,
+                output_dir=output_dir,
+            )
+            if self._control_mode == PLANNER_TOOLS_MODE
+            else None
         )
         self._last_observation: dict[str, Any] | None = None
         self._last_info: Any = None
         self._gripper_latch = {"left": 1.0, "right": 1.0}
+        self._restored_state: dict[str, Any] | None = None
 
     def _robot(self) -> Any | None:
         candidates = [
@@ -511,6 +623,13 @@ class BehaviorEnvFacade:
                     env = getattr(env, "env", None) or getattr(env, "_env", None)
         return None
 
+    def _require_planner(self) -> PlannerExecutor:
+        if self._control_mode != PLANNER_TOOLS_MODE or self._planner is None:
+            raise RuntimeError(
+                "planner primitives are unavailable outside planner_tools mode"
+            )
+        return self._planner
+
     def _sensor_for_camera(self, camera: str) -> Any | None:
         robot = self._robot()
         sensors = getattr(robot, "sensors", None) if robot is not None else None
@@ -536,6 +655,18 @@ class BehaviorEnvFacade:
         payload: dict[str, Any],
         sensor: Any | None,
     ) -> np.ndarray:
+        # Explicit Kit view matrices and the sensor's render annotator are tied
+        # to the pixels just returned. Pose-like payload fields may already
+        # reflect a newer articulation state, especially for wrist cameras.
+        view = _payload_matrix(
+            payload, ("view_matrix", "view_transform", "world_to_camera")
+        )
+        if view is not None:
+            return np.linalg.inv(view.T)
+        if sensor is not None:
+            sensor_matrix = _sensor_camera_to_world(sensor)
+            if sensor_matrix is not None:
+                return sensor_matrix
         direct = _payload_matrix(
             payload,
             (
@@ -550,21 +681,11 @@ class BehaviorEnvFacade:
         pose = payload.get("pose") or payload.get("camera_pose")
         if isinstance(pose, dict) and "position" in pose and "orientation" in pose:
             return _matrix_from_pose(pose["position"], pose["orientation"])
-        view = _payload_matrix(
-            payload, ("view_matrix", "view_transform", "world_to_camera")
-        )
-        if view is not None:
-            return np.linalg.inv(view.T)
-        if sensor is not None:
-            sensor_matrix = _sensor_camera_to_world(sensor)
-            if sensor_matrix is not None:
-                return sensor_matrix
         raise CameraGeometryError(f"camera pose unavailable for {camera}")
 
     def _record_rgbd_frames(
         self, raw_observations: Any, observation: dict[str, Any]
     ) -> None:
-        del observation
         raw = _first_env_value(raw_observations)
         if raw is None:
             return
@@ -573,13 +694,23 @@ class BehaviorEnvFacade:
             camera = _payload_camera_name(path)
             if camera is not None:
                 payloads[camera] = payload
-        for camera, payload in payloads.items():
-            rgb = _payload_rgb(payload)
-            depth = _payload_depth(payload)
-            if rgb is None or depth is None:
-                continue
-            sensor = self._sensor_for_camera(camera)
-            try:
+        expected_cameras = ("head", "left_wrist", "right_wrist")
+        try:
+            missing = [camera for camera in expected_cameras if camera not in payloads]
+            if missing:
+                raise CameraGeometryError(
+                    f"same-step RGB-D capture missing cameras: {missing}"
+                )
+            frames: dict[str, dict[str, Any]] = {}
+            for camera in expected_cameras:
+                payload = payloads[camera]
+                rgb = _payload_rgb(payload)
+                depth = _payload_depth(payload)
+                if rgb is None or depth is None:
+                    raise CameraGeometryError(
+                        f"same-step capture missing RGB or depth for {camera}"
+                    )
+                sensor = self._sensor_for_camera(camera)
                 rgb_array = np.asarray(_numpy_tree(rgb))
                 intrinsics = _payload_intrinsics(
                     payload, rgb_shape=rgb_array.shape
@@ -592,20 +723,36 @@ class BehaviorEnvFacade:
                     raise CameraGeometryError(
                         f"verified camera intrinsics unavailable for {camera}"
                     )
-                self._frame_cache.add(
-                    camera=camera,
-                    rgb=rgb_array,
-                    depth_m=depth,
-                    intrinsics=intrinsics,
-                    camera_to_world=self._camera_to_world(
+                frames[camera] = {
+                    "rgb": rgb_array,
+                    "depth_m": depth,
+                    "intrinsics": intrinsics,
+                    "camera_to_world": self._camera_to_world(
                         camera=camera,
                         payload=payload,
                         sensor=sensor,
                     ),
-                    step_index=self._env_steps,
-                )
-            except Exception:
-                logger.exception("failed to cache BEHAVIOR RGB-D frame for %s", camera)
+                }
+            compact_proprio = extract_policy_state(observation["states"])
+            self._frame_cache.add_capture_group(
+                frames=frames,
+                step_index=self._env_steps,
+                capture_metadata={
+                    "proprio": {
+                        "values": compact_proprio.astype(float).tolist(),
+                        "dimension": int(compact_proprio.size),
+                        "layout": "POLICY_STATE_SEGMENTS",
+                        "segments": segment_ranges(POLICY_STATE_SEGMENTS),
+                    }
+                },
+            )
+        except Exception:
+            # Atomicity is intentional: never publish one camera from a newer
+            # simulator step beside two cameras from an older step.
+            logger.exception(
+                "failed to cache atomic BEHAVIOR RGB-D capture group at sim step %s",
+                self._env_steps,
+            )
 
     def _append_video(self, observation: dict[str, Any]) -> None:
         if self._video_error is not None:
@@ -614,15 +761,124 @@ class BehaviorEnvFacade:
             import imageio.v2 as imageio
             import numpy as np
 
+            head = np.asarray(observation["main_images"], dtype=np.uint8)
+            if head.ndim != 3 or head.shape[2] < 3:
+                raise RuntimeError(
+                    f"planner head video must be HxWxC, got {head.shape}"
+                )
+            self._video_source_shapes["head"] = list(head.shape)
+            frame = head[..., :3]
+            if self._control_mode in (PLANNER_TOOLS_MODE, PI0_PICK_VLA_MODE):
+                wrists = np.asarray(observation["wrist_images"], dtype=np.uint8)
+                if wrists.ndim != 4 or wrists.shape[0] != 2:
+                    raise RuntimeError(
+                        "planner video requires synchronized left/right wrist RGB"
+                    )
+                height, width = head.shape[:2]
+                self._video_source_shapes["left_wrist"] = list(wrists[0].shape)
+                self._video_source_shapes["right_wrist"] = list(wrists[1].shape)
+                left_wrist = _resize_video_tile(
+                    wrists[0], height=height, width=width
+                )
+                right_wrist = _resize_video_tile(
+                    wrists[1], height=height, width=width
+                )
+                frame = np.zeros((height * 2, width * 2, 3), dtype=np.uint8)
+                frame[:height, :width] = head[..., :3]
+                frame[:height, width:] = left_wrist
+                frame[height:, :width] = right_wrist
+            self._video_source_shapes["output"] = list(frame.shape)
+            # Open the encoder only after a complete frame has validated.  A
+            # malformed first capture must not leave an empty MP4 handle.
             if self._video_writer is None:
                 self._video_path.parent.mkdir(parents=True, exist_ok=True)
                 self._video_writer = imageio.get_writer(self._video_path, fps=15)
-            frame = np.asarray(observation["main_images"], dtype=np.uint8)
             self._video_writer.append_data(frame)
             self._video_frames += 1
         except Exception as exc:
             self._video_error = f"{type(exc).__name__}: {exc}"
             logger.exception("failed to append BEHAVIOR video frame")
+
+    def _finalize_video_segment(self) -> None:
+        if self._video_writer is not None:
+            self._video_writer.close()
+            self._video_writer = None
+        video_meta = {
+            "path": str(self._video_path),
+            "fps": 15,
+            "sample_every_env_steps": self._planner_video_interval_steps,
+            "frames": self._video_frames,
+            "error": self._video_error,
+            "source_shapes": dict(self._video_source_shapes),
+            "layout": (
+                "2x2:head,left_wrist/right_wrist,blank"
+                if self._control_mode in (PLANNER_TOOLS_MODE, PI0_PICK_VLA_MODE)
+                else "head"
+            ),
+        }
+        self._video_path.parent.mkdir(parents=True, exist_ok=True)
+        (self._video_path.parent / "video_meta.json").write_text(
+            json.dumps(video_meta, indent=2), encoding="utf-8"
+        )
+
+    def start_video_segment(self, path: str | Path) -> None:
+        """Rotate acceptance video without exposing a new planner RPC method."""
+
+        self._finalize_video_segment()
+        self._video_path = Path(path).expanduser().resolve()
+        self._video_writer = None
+        self._video_frames = 0
+        self._video_error = None
+        self._video_source_shapes = {}
+        if self._last_observation is not None:
+            self._append_video(self._last_observation)
+
+    def dump_simulator_state(self, *, serialized: bool = True) -> Any:
+        """Capture the complete in-process simulator state for test isolation."""
+
+        import omnigibson as og
+
+        return og.sim.dump_state(serialized=bool(serialized))
+
+    def restore_simulator_state(
+        self, state: Any, *, serialized: bool = True
+    ) -> None:
+        """Restore a trusted in-process snapshot and invalidate stale caches."""
+
+        from copy import deepcopy
+
+        import omnigibson as og
+
+        restore_state = deepcopy(state)
+        if serialized:
+            template = og.sim.dump_state(serialized=True)
+            if int(restore_state.numel()) != int(template.numel()):
+                raise RuntimeError(
+                    "simulator snapshot size does not match loaded scene: "
+                    f"snapshot={int(restore_state.numel())} "
+                    f"scene={int(template.numel())}"
+                )
+            restore_state = restore_state.to(
+                device=template.device, dtype=template.dtype
+            )
+        og.sim.load_state(restore_state, serialized=bool(serialized))
+        # OmniGibson documents that one physics update is required after load
+        # for spatial object states to become current.
+        og.sim.step_physics()
+        self._done = False
+        self._last_info = None
+        self._gripper_latch = {"left": 1.0, "right": 1.0}
+        self._frame_cache.clear()
+        if self._planner is not None:
+            self._planner.on_simulator_state_restored()
+        # Kit camera annotators trail articulation changes.  OmniGibson's own
+        # camera wrapper documents that at least three render calls are needed
+        # before RGB/depth/cameraViewTransform describe the restored pose.
+        # Rendering does not advance task physics or alter official success.
+        _settle_visual_pipeline_after_restore(og.sim)
+        self._refresh_observation_without_step()
+        if self._last_observation is not None:
+            self._append_video(self._last_observation)
 
     def reset(self) -> tuple[dict[str, Any], Any]:
         started_at = time.monotonic()
@@ -633,8 +889,64 @@ class BehaviorEnvFacade:
         self._env_steps = 0
         self._last_observation = observation
         self._last_info = _numpy_tree(infos[0])
-        self._record_rgbd_frames(raw_observations, observation)
-        self._append_video(observation)
+        restore_path_value = os.environ.get("RPENT_BEHAVIOR_RESTORE_STATE")
+        if restore_path_value:
+            if self._control_mode not in (PLANNER_TOOLS_MODE, PI0_PICK_VLA_MODE):
+                raise RuntimeError(
+                    "RPENT_BEHAVIOR_RESTORE_STATE is acceptance-only and "
+                    "forbidden outside planner_tools or pi0_pick_vla"
+                )
+            import torch
+
+            restore_path = Path(restore_path_value).expanduser().resolve()
+            if not restore_path.is_file():
+                raise RuntimeError(
+                    f"configured simulator restore state is missing: {restore_path}"
+                )
+            state = torch.load(
+                restore_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            if not torch.is_tensor(state) or state.ndim != 1:
+                raise RuntimeError(
+                    "simulator restore artifact must contain one serialized tensor"
+                )
+            state_finite = bool(torch.isfinite(state).all().item())
+            if not state_finite:
+                raise RuntimeError("simulator restore tensor contains NaN or Inf")
+            restore_manifest = validate_snapshot_manifest(
+                restore_path,
+                serialized_elements=int(state.numel()),
+                serialized_dtype=str(state.dtype),
+                serialized_shape=list(state.shape),
+                serialized_finite=state_finite,
+                meta={**self._meta, "control_mode": self._control_mode},
+            )
+            self.restore_simulator_state(state, serialized=True)
+            observation = self._last_observation
+            assert observation is not None
+            self._last_info = _numpy_tree(infos[0])
+            self._restored_state = {
+                "path": str(restore_path),
+                "sha256": restore_manifest["state"]["sha256"],
+                "elements": int(state.numel()),
+                "manifest_path": str(
+                    Path(f"{restore_path}.manifest.json")
+                ),
+                "manifest_schema_version": restore_manifest["schema_version"],
+            }
+        else:
+            self._record_rgbd_frames(raw_observations, observation)
+            self._append_video(observation)
+            self._restored_state = None
+        if self._control_mode == PLANNER_TOOLS_MODE:
+            warmup = self._require_planner().warmup()
+            logger.info(
+                "BEHAVIOR planner cuRobo warmup completed in %.1fs artifact=%s",
+                float(warmup.get("elapsed_s", 0.0)),
+                warmup.get("artifact"),
+            )
         logger.info(
             "BEHAVIOR reset completed in %.1fs on thread %s",
             time.monotonic() - started_at,
@@ -643,6 +955,29 @@ class BehaviorEnvFacade:
         return observation, _numpy_tree(infos[0])
 
     def chunk_step(self, actions: Any) -> tuple[Any, Any, bool, bool, Any]:
+        return self._step_action_chunk(actions, observe_final=True)
+
+    def planner_step(self, action: Any) -> tuple[Any, Any, bool, bool, Any]:
+        """Execute one internal planner action without forcing RGB-D rendering.
+
+        The same official info and termination path as ``chunk_step`` is used;
+        synchronized observations and video are sampled every four env steps by
+        default (configurable only for internal acceptance runs);
+        a later public ``observe`` can refresh all three cameras at the same
+        simulator step without executing an action.
+        This method is intentionally absent from the RPC allowlist.
+        """
+        action_array = validate_action_chunk(action)
+        if action_array.shape[0] != 1:
+            raise ValueError("planner_step requires exactly one 23D action")
+        return self._step_action_chunk(action_array, observe_final=False)
+
+    def _step_action_chunk(
+        self,
+        actions: Any,
+        *,
+        observe_final: bool,
+    ) -> tuple[Any, Any, bool, bool, Any]:
         import torch
 
         if self._done:
@@ -659,7 +994,13 @@ class BehaviorEnvFacade:
         executed_steps = 0
         for step_index in range(action_tensor.shape[1]):
             is_last_action = step_index == action_tensor.shape[1] - 1
-            need_observation = is_last_action or (self._env_steps + 1) % 4 == 0
+            observation_interval = (
+                4 if bool(observe_final) else self._planner_video_interval_steps
+            )
+            need_observation = (
+                (bool(observe_final) and is_last_action)
+                or (self._env_steps + 1) % observation_interval == 0
+            )
             step_obs, step_reward, step_term, step_trunc, step_infos = (
                 self._env._direct_process.step_env(
                     action_tensor[:, step_index],
@@ -680,7 +1021,7 @@ class BehaviorEnvFacade:
                 final_observation = _single_observation(self._env._wrap_obs(step_obs))
                 self._last_observation = final_observation
                 self._record_rgbd_frames(step_obs, final_observation)
-                if self._env_steps % 4 == 0:
+                if self._env_steps % observation_interval == 0:
                     self._append_video(final_observation)
             if _raw_success(step_info) or terminated or truncated:
                 break
@@ -708,10 +1049,42 @@ class BehaviorEnvFacade:
         return result
 
     def get_env_meta(self) -> dict[str, Any]:
-        return dict(self._meta)
+        return {
+            **self._meta,
+            "control_mode": self._control_mode,
+            "restored_state": self._restored_state,
+        }
+
+    def _refresh_observation_without_step(self) -> None:
+        """Capture current synchronized sensors without advancing simulation time.
+
+        Planning can legitimately take longer than the RGB-D cache TTL while no
+        controller waypoint is executed.  A later ``observe`` must therefore
+        obtain a new capture (and new frame ids) at the same simulator step,
+        rather than renewing or returning the expired capture.
+        """
+
+        omni_env = self._env.omnigibson_env
+        raw_observation, _sensor_info = omni_env.get_obs()
+        observation = _single_observation(self._env._wrap_obs([raw_observation]))
+        self._last_observation = observation
+        self._record_rgbd_frames([raw_observation], observation)
 
     def observe(self, camera: str) -> dict[str, Any]:
-        return self._planner.observe(camera)
+        camera = canonical_camera(camera)
+        try:
+            frame = self._frame_cache.latest(camera)
+            self._frame_cache.get_current(camera, frame.frame_id)
+            # Planner warmup can consume nearly the entire cache TTL without
+            # advancing simulation.  Do not hand a VLM a frame that is valid
+            # at observe() time but likely to expire before pixel_to_world().
+            if time.monotonic() - frame.timestamp_s > 5.0:
+                self._refresh_observation_without_step()
+        except CameraGeometryError:
+            self._refresh_observation_without_step()
+            refreshed = self._frame_cache.latest(camera)
+            self._frame_cache.get_current(camera, refreshed.frame_id)
+        return self._require_planner().observe(camera)
 
     def pixel_to_world(
         self,
@@ -722,7 +1095,7 @@ class BehaviorEnvFacade:
         depth_window_px: int = 7,
         output_frame: str = "world",
     ) -> dict[str, Any]:
-        return self._planner.pixel_to_world(
+        return self._require_planner().pixel_to_world(
             camera=camera,
             frame_id=frame_id,
             u=u,
@@ -739,7 +1112,7 @@ class BehaviorEnvFacade:
         standoff_m: float = 0.85,
         timeout_s: float = 90.0,
     ) -> dict[str, Any]:
-        return self._planner.navigate_to(
+        return self._require_planner().navigate_to(
             hand=hand,
             target_xyz=target_xyz,
             frame=frame,
@@ -758,7 +1131,7 @@ class BehaviorEnvFacade:
         orientation_tolerance_rad: float = 0.087,
         timeout_s: float = 45.0,
     ) -> dict[str, Any]:
-        return self._planner.move_to(
+        return self._require_planner().move_to(
             hand=hand,
             target_xyz=target_xyz,
             frame=frame,
@@ -779,7 +1152,7 @@ class BehaviorEnvFacade:
         lift_m: float = 0.08,
         timeout_s: float = 90.0,
     ) -> dict[str, Any]:
-        return self._planner.pick(
+        return self._require_planner().pick(
             hand=hand,
             target_xyz=target_xyz,
             approach_vector=approach_vector,
@@ -797,7 +1170,7 @@ class BehaviorEnvFacade:
         frame: str = "world",
         timeout_s: float = 45.0,
     ) -> dict[str, Any]:
-        return self._planner.rotate_wrist(
+        return self._require_planner().rotate_wrist(
             hand=hand,
             target_quat_xyzw=target_quat_xyzw,
             relative_axis_angle=relative_axis_angle,
@@ -814,7 +1187,7 @@ class BehaviorEnvFacade:
         press_depth_m: float = 0.012,
         timeout_s: float = 60.0,
     ) -> dict[str, Any]:
-        return self._planner.press(
+        return self._require_planner().press(
             hand=hand,
             target_xyz=target_xyz,
             press_direction=press_direction,
@@ -831,7 +1204,7 @@ class BehaviorEnvFacade:
         retreat_m: float = 0.03,
         timeout_s: float = 30.0,
     ) -> dict[str, Any]:
-        return self._planner.release(
+        return self._require_planner().release(
             hand=hand,
             opening=opening,
             retreat_vector=retreat_vector,
@@ -841,21 +1214,9 @@ class BehaviorEnvFacade:
 
     def close(self) -> None:
         try:
-            if self._video_writer is not None:
-                self._video_writer.close()
-                self._video_writer = None
+            self._finalize_video_segment()
         finally:
             self._env.close()
-        video_meta = {
-            "path": str(self._video_path),
-            "fps": 15,
-            "sample_every_env_steps": 4,
-            "frames": self._video_frames,
-            "error": self._video_error,
-        }
-        (self._video_path.parent / "video_meta.json").write_text(
-            json.dumps(video_meta, indent=2), encoding="utf-8"
-        )
 
 
 _INITIAL_PPID = os.getppid()
@@ -895,18 +1256,14 @@ class _MainThreadDispatcher:
 
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method.startswith("env."):
-            return getattr(self._env, method.removeprefix("env."))(*args, **kwargs)
-        if method in {
-            "observe",
-            "pixel_to_world",
-            "navigate_to",
-            "move_to",
-            "pick",
-            "rotate_wrist",
-            "press",
-            "release",
-        }:
-            return getattr(self._env, method)(*args, **kwargs)
+            env_method = method.removeprefix("env.")
+            mode = getattr(self._env, "_control_mode", None)
+            allowed = _SHARED_ENV_RPC_METHODS | _ENV_RPC_METHODS_BY_MODE.get(
+                mode, frozenset()
+            )
+            if env_method not in allowed:
+                raise ValueError(f"unknown BEHAVIOR env RPC method: {method!r}")
+            return getattr(self._env, env_method)(*args, **kwargs)
         if method == "shutdown":
             self._shutdown_event.set()
             return {"ok": True}
@@ -943,6 +1300,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episode-steps", type=int, required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--config-path")
+    parser.add_argument("--control-mode", choices=CONTROL_MODES, required=True)
     parser.add_argument("--transport-host", default="127.0.0.1")
     parser.add_argument("--transport-port", type=int, default=0)
     return parser.parse_args()
@@ -967,6 +1325,7 @@ def main() -> None:
         cfg=_load_env_config(args),
         meta=meta,
         output_dir=output_dir,
+        control_mode=args.control_mode,
     )
     shutdown_event = threading.Event()
     dispatcher = _MainThreadDispatcher(env, shutdown_event)

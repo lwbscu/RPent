@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -103,6 +104,7 @@ def _heldout_metrics_pass_gate(
         after_median <= before_median * (1.0 - float(min_median_improvement))
         and after_p95 <= before_p95
         and after_median <= float(max_final_median_error_m)
+        and after_p95 <= float(max_final_median_error_m)
     )
 
 
@@ -359,6 +361,8 @@ class RgbdFrame:
     intrinsics: CameraIntrinsics
     camera_to_world: np.ndarray
     step_index: int
+    capture_group_id: str | None = None
+    capture_metadata: dict[str, Any] = field(default_factory=dict)
     correction_profile: CameraCorrectionProfile | None = None
     timestamp_s: float = field(default_factory=time.monotonic)
 
@@ -376,6 +380,9 @@ class RgbdFrame:
             raise CameraGeometryError("intrinsics dimensions do not match rgb image")
         self.intrinsics.validate()
         self.camera_to_world = _homogeneous(self.camera_to_world)
+        if self.capture_group_id is not None:
+            self.capture_group_id = str(self.capture_group_id)
+        self.capture_metadata = deepcopy(dict(self.capture_metadata))
         if self.correction_profile is None:
             self.correction_profile = CameraCorrectionProfile.identity(self.camera)
         elif self.correction_profile.camera != self.camera:
@@ -412,6 +419,40 @@ def _png_bytes(rgb: Any) -> bytes:
     except Exception as exc:
         raise CameraGeometryError(f"failed to encode RGB observation as PNG: {exc}") from exc
     return buffer.getvalue()
+
+
+def _depth_png_bytes(depth_m: Any) -> tuple[bytes, dict[str, Any]]:
+    """Encode metric depth as a robust inverse-depth visualization.
+
+    The visualization is intentionally lossy. Metric depth stays simulator-side
+    for :func:`backproject_pixel_to_world`; the VLM receives an inspectable image
+    without a large numeric pixel dump.
+    """
+    depth = _normalize_depth(depth_m)
+    valid_mask = np.isfinite(depth) & (depth > 0)
+    valid = depth[valid_mask]
+    if valid.size == 0:
+        raise CameraGeometryError("cannot visualize depth without valid samples")
+    near_m, far_m = np.percentile(valid, [2.0, 98.0]).astype(np.float64)
+    if not np.isfinite([near_m, far_m]).all():
+        raise CameraGeometryError("cannot visualize non-finite depth bounds")
+    if far_m <= near_m:
+        half_span = max(0.001, abs(float(near_m)) * 0.025)
+        near_m = max(0.0, float(near_m) - half_span)
+        far_m = float(far_m) + half_span
+    normalized = np.clip((depth - near_m) / (far_m - near_m), 0.0, 1.0)
+    intensity = np.rint((1.0 - normalized) * 255.0).astype(np.uint8)
+    visual = np.repeat(intensity[..., None], 3, axis=2)
+    # Magenta is reserved for missing / invalid sensor depth.
+    visual[~valid_mask] = np.array([255, 0, 255], dtype=np.uint8)
+    return _png_bytes(visual), {
+        "format": "png",
+        "mapping": "inverse_linear_percentile_2_98",
+        "near_m": float(near_m),
+        "far_m": float(far_m),
+        "invalid_color_rgb": [255, 0, 255],
+        "valid_ratio": float(valid.size / depth.size),
+    }
 
 
 def _to_int_pixel(name: str, value: Any) -> int:
@@ -455,15 +496,25 @@ def _cluster_depth(
     if valid.size < max(3, crop.size // 5):
         raise CameraGeometryError("not enough valid depth samples around pixel")
 
-    median = float(np.median(valid))
-    p10, p90 = np.percentile(valid, [10, 90])
-    if float(p90 - p10) > max(0.08, 0.12 * max(median, 1e-6)):
-        raise CameraGeometryError("depth window has no stable foreground cluster")
-    abs_dev = np.abs(valid - median)
-    mad = float(np.median(abs_dev))
-    scale = max(0.002, 2.5 * 1.4826 * mad)
-    cluster = valid[abs_dev <= scale]
-    if cluster.size < max(3, int(valid.size * 0.35)):
+    center_radius = min(1, radius)
+    center_crop = frame.depth_m[
+        v - center_radius : v + center_radius + 1,
+        u - center_radius : u + center_radius + 1,
+    ]
+    center_valid = _valid_depth_values(center_crop)
+    if center_valid.size < max(1, center_crop.size // 3):
+        raise CameraGeometryError("not enough valid center depth samples around pixel")
+    center_median = float(np.median(center_valid))
+    center_mad = float(np.median(np.abs(center_valid - center_median)))
+    center_scale = max(
+        0.002,
+        0.015 * max(center_median, 1e-6),
+        2.5 * 1.4826 * center_mad,
+    )
+    cluster = valid[np.abs(valid - center_median) <= center_scale]
+    # A substantial second population means the requested window straddles an
+    # object boundary. Refuse it instead of averaging foreground/background.
+    if cluster.size < max(3, int(math.ceil(valid.size * 0.60))):
         raise CameraGeometryError("depth window has no stable foreground cluster")
     cluster_median = float(np.median(cluster))
     cluster_mad = float(np.median(np.abs(cluster - cluster_median)))
@@ -481,6 +532,44 @@ def _cluster_depth(
         "valid_count": int(valid.size),
         "cluster_count": int(cluster.size),
     }
+
+
+def robust_depth_sample(
+    frame_or_depth: RgbdFrame | Any,
+    *,
+    u: Any,
+    v: Any,
+    window_px: int = 7,
+) -> dict[str, Any]:
+    """Return the same center-cluster median/MAD used by public projection."""
+    if isinstance(frame_or_depth, RgbdFrame):
+        frame = frame_or_depth
+    else:
+        depth = _normalize_depth(frame_or_depth)
+        height, width = depth.shape
+        intrinsics = CameraIntrinsics(
+            fx=1.0,
+            fy=1.0,
+            cx=(width - 1) * 0.5,
+            cy=(height - 1) * 0.5,
+            width=width,
+            height=height,
+        )
+        frame = RgbdFrame(
+            camera="head",
+            frame_id="robust-depth-sample",
+            rgb=np.zeros((height, width, 3), dtype=np.uint8),
+            depth_m=depth,
+            intrinsics=intrinsics,
+            camera_to_world=np.eye(4),
+            step_index=0,
+        )
+    return _cluster_depth(
+        frame,
+        u=_to_int_pixel("u", u),
+        v=_to_int_pixel("v", v),
+        depth_window_px=int(window_px),
+    )
 
 
 def camera_point_from_pixel(
@@ -539,10 +628,14 @@ def _neighbor_world_point(frame: RgbdFrame, u: int, v: int, du: int, dv: int) ->
     depth = frame.depth_m[vv, uu]
     if not np.isfinite(depth) or depth <= 0:
         return None
-    return transform_point(
-        frame.camera_to_world,
-        camera_point_from_pixel(frame.intrinsics, u=uu, v=vv, depth_m=float(depth)),
+    point_camera = camera_point_from_pixel(
+        frame.intrinsics,
+        u=uu,
+        v=vv,
+        depth_m=float(depth),
     )
+    point_camera = frame.correction_profile.apply_camera_point(point_camera)
+    return transform_point(frame.camera_to_world, point_camera)
 
 
 def _surface_normal(frame: RgbdFrame, *, u: int, v: int, xyz_world: np.ndarray) -> np.ndarray | None:
@@ -593,6 +686,10 @@ def backproject_pixel_to_world(
     xyz_world = transform_point(frame.camera_to_world, point_camera)
     reproj_u, reproj_v, reproj_depth = project_world_to_pixel(frame, xyz_world)
     reproj_error_px = math.hypot(reproj_u - float(uu), reproj_v - float(vv))
+    if reproj_error_px > 1.0 + 1e-6:
+        raise CameraGeometryError(
+            f"projection round-trip error {reproj_error_px:.6f}px exceeds 1px"
+        )
     normal = _surface_normal(frame, u=uu, v=vv, xyz_world=xyz_world)
     confidence = max(
         0.0,
@@ -639,6 +736,7 @@ class FrameCache:
         for camera, profile in (correction_profiles or {}).items():
             self.set_correction_profile(camera, profile)
         self._frames: dict[str, list[RgbdFrame]] = {}
+        self._latest_capture_group_id: str | None = None
 
     def set_correction_profile(
         self,
@@ -649,6 +747,12 @@ class FrameCache:
         if profile.camera != cam:
             raise CameraGeometryError("correction profile camera does not match cache camera")
         self._correction_profiles[cam] = profile
+
+    def clear(self) -> None:
+        """Invalidate every frame after an explicit simulator state restore."""
+
+        self._frames.clear()
+        self._latest_capture_group_id = None
 
     def add(
         self,
@@ -661,6 +765,8 @@ class FrameCache:
         step_index: int,
         timestamp_s: float | None = None,
         frame_id: str | None = None,
+        capture_group_id: str | None = None,
+        capture_metadata: dict[str, Any] | None = None,
     ) -> RgbdFrame:
         cam = canonical_camera(camera)
         frame = RgbdFrame(
@@ -671,6 +777,8 @@ class FrameCache:
             intrinsics=intrinsics,
             camera_to_world=_homogeneous(camera_to_world),
             step_index=int(step_index),
+            capture_group_id=capture_group_id,
+            capture_metadata=dict(capture_metadata or {}),
             correction_profile=self._correction_profiles[cam],
             timestamp_s=time.monotonic() if timestamp_s is None else float(timestamp_s),
         )
@@ -678,6 +786,61 @@ class FrameCache:
         bucket.append(frame)
         del bucket[:-self.max_frames_per_camera]
         return frame
+
+    def add_capture_group(
+        self,
+        *,
+        frames: dict[str, dict[str, Any]],
+        step_index: int,
+        capture_metadata: dict[str, Any] | None = None,
+        timestamp_s: float | None = None,
+        capture_group_id: str | None = None,
+    ) -> dict[str, RgbdFrame]:
+        """Atomically add one same-sim-step capture for all planner cameras."""
+        expected = {"head", "left_wrist", "right_wrist"}
+        canonical: dict[str, dict[str, Any]] = {}
+        for camera, values in frames.items():
+            cam = canonical_camera(camera)
+            if cam in canonical:
+                raise CameraGeometryError(f"duplicate camera in capture group: {cam}")
+            canonical[cam] = dict(values)
+        if set(canonical) != expected:
+            missing = sorted(expected - set(canonical))
+            extra = sorted(set(canonical) - expected)
+            raise CameraGeometryError(
+                f"capture group must contain exactly head/left_wrist/right_wrist; "
+                f"missing={missing}, extra={extra}"
+            )
+
+        captured_at = time.monotonic() if timestamp_s is None else float(timestamp_s)
+        group_id = capture_group_id or (
+            f"capture:{int(step_index)}:{uuid.uuid4().hex[:10]}"
+        )
+        metadata = deepcopy(dict(capture_metadata or {}))
+        pending: dict[str, RgbdFrame] = {}
+        # Construct every frame before mutating any bucket. A malformed camera
+        # therefore leaves the previous three-camera group entirely intact.
+        for cam in ("head", "left_wrist", "right_wrist"):
+            values = canonical[cam]
+            pending[cam] = RgbdFrame(
+                camera=cam,
+                frame_id=f"{cam}:{int(step_index)}:{group_id.rsplit(':', 1)[-1]}",
+                rgb=_as_array(values["rgb"]),
+                depth_m=_normalize_depth(values["depth_m"]),
+                intrinsics=values["intrinsics"],
+                camera_to_world=_homogeneous(values["camera_to_world"]),
+                step_index=int(step_index),
+                capture_group_id=group_id,
+                capture_metadata=metadata,
+                correction_profile=self._correction_profiles[cam],
+                timestamp_s=captured_at,
+            )
+        for cam, frame in pending.items():
+            bucket = self._frames.setdefault(cam, [])
+            bucket.append(frame)
+            del bucket[:-self.max_frames_per_camera]
+        self._latest_capture_group_id = group_id
+        return pending
 
     def latest(self, camera: str) -> RgbdFrame:
         cam = canonical_camera(camera)
@@ -691,6 +854,11 @@ class FrameCache:
         latest = self.latest(cam)
         if latest.frame_id != frame_id:
             raise CameraGeometryError("stale frame_id; call observe() again before pixel_to_world")
+        if (
+            latest.capture_group_id is not None
+            and self._latest_capture_group_id != latest.capture_group_id
+        ):
+            raise CameraGeometryError("stale capture group; call observe() again before pixel_to_world")
         now = time.monotonic() if now_s is None else float(now_s)
         if now - latest.timestamp_s > self.ttl_s:
             raise CameraGeometryError("frame_id expired; call observe() again before pixel_to_world")
@@ -698,26 +866,48 @@ class FrameCache:
 
     def observe_payload(self, camera: str) -> dict[str, Any]:
         frame = self.latest(camera)
-        # Simulator state only changes through facade calls that add a new frame.
-        # Reissue the unchanged latest capture so a just-returned frame_id can
-        # always be consumed, while any ID returned by an earlier observe call
-        # remains stale.
-        frame.frame_id = (
-            f"{frame.camera}:{int(frame.step_index)}:{uuid.uuid4().hex[:8]}"
-        )
-        frame.timestamp_s = time.monotonic()
-        return {
+        now = time.monotonic()
+        age_s = now - frame.timestamp_s
+        if age_s > self.ttl_s:
+            raise CameraGeometryError(
+                "latest RGB-D capture expired; a new simulator observation is required"
+            )
+        if (
+            frame.capture_group_id is not None
+            and self._latest_capture_group_id != frame.capture_group_id
+        ):
+            raise CameraGeometryError("latest camera frame is not in the current capture group")
+        depth_image, depth_metadata = _depth_png_bytes(frame.depth_m)
+        payload = {
             "camera": frame.camera,
             "frame_id": frame.frame_id,
+            "capture_group": {
+                "id": frame.capture_group_id,
+                "sim_step": int(frame.step_index),
+                "cameras": (
+                    ["head", "left_wrist", "right_wrist"]
+                    if frame.capture_group_id is not None
+                    else [frame.camera]
+                ),
+                "age_s": float(max(0.0, age_s)),
+            },
             "width": int(frame.intrinsics.width),
             "height": int(frame.intrinsics.height),
             "_image_bytes": _png_bytes(frame.rgb),
+            "_depth_image_bytes": depth_image,
             "image_format": "png",
+            "image_blocks": ["rgb", "depth_visualization"],
+            "depth_visualization": depth_metadata,
             "correction": {
                 "enabled": bool(frame.correction_profile.enabled),
                 "metrics": dict(frame.correction_profile.metrics),
             },
         }
+        # Keep the public observation boundary explicit. New simulator-side
+        # metadata cannot become VLM-visible merely by being added to a frame.
+        if "proprio" in frame.capture_metadata:
+            payload["proprio"] = deepcopy(frame.capture_metadata["proprio"])
+        return payload
 
 
 __all__ = [
@@ -735,5 +925,6 @@ __all__ = [
     "load_camera_correction_profiles",
     "pixel_from_camera_point",
     "project_world_to_pixel",
+    "robust_depth_sample",
     "transform_point",
 ]

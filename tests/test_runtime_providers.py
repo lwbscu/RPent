@@ -28,6 +28,20 @@ def _behavior_args(*extra):
     return provider, parser, args
 
 
+def _write_behavior_checkpoint(path):
+    path.mkdir()
+    (path / "model.safetensors").write_bytes(b"weights")
+    stats = (
+        path
+        / "assets"
+        / "behavior-1k"
+        / "2025-challenge-demos"
+        / "norm_stats.json"
+    )
+    stats.parent.mkdir(parents=True)
+    stats.write_text("{}", encoding="utf-8")
+
+
 def test_get_runtime_provider_and_cli_load_behavior_arguments_dynamically():
     assert _preparse_env(["--env", "behavior", "--task-name", "folding_towels"]) == (
         "behavior"
@@ -60,6 +74,8 @@ def test_get_runtime_provider_and_cli_load_behavior_arguments_dynamically():
 def test_behavior_attach_constructs_runtime_without_owning_external_servers(
     monkeypatch, tmp_path
 ):
+    checkpoint = tmp_path / "checkpoint"
+    _write_behavior_checkpoint(checkpoint)
     provider, parser, args = _behavior_args(
         "--no-driver",
         "--env-endpoint",
@@ -68,6 +84,8 @@ def test_behavior_attach_constructs_runtime_without_owning_external_servers(
         "4321",
         "--vla-endpoint",
         "http://external-vla:8000",
+        "--policy-checkpoint",
+        str(checkpoint),
     )
     provider.validate_args(args, parser)
     endpoint_calls = []
@@ -303,3 +321,5 @@ def test_behavior_server_command_preserves_virtualenv_python_symlink(
 
     assert captured["command"][0] == str(venv_python.absolute())
     assert captured["command"][0] != str(venv_python.resolve())
+    mode_index = captured["command"].index("--control-mode")
+    assert captured["command"][mode_index + 1] == "full_task_vla"

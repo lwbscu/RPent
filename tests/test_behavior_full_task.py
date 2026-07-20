@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from robots.behavior.toolkit import BehaviorToolkit
-from robots.behavior.tools import FullTaskRunner
+from robots.behavior.tools import BehaviorPrimitives
 from rpent.tools import common
 
 
@@ -59,7 +59,7 @@ def test_run_full_task_tool_is_called_once_and_stops_on_official_success(tmp_pat
     )
     model = _Model(np.zeros((2, 23), dtype=np.float32))
     toolkit = BehaviorToolkit(
-        runner_kwargs={
+        primitives_kwargs={
             "env": env,
             "model": model,
             "max_episode_steps": 20,
@@ -78,6 +78,68 @@ def test_run_full_task_tool_is_called_once_and_stops_on_official_success(tmp_pat
     assert model.calls == 1
     assert len(env.step_calls) == 1
     assert json.loads((tmp_path / "final_result.json").read_text()) == tool_result.result
+    assert json.loads((tmp_path / "raw_final_info.json").read_text())["done"]["success"] is True
+    assert tool_result.result["action_trace_path"].endswith(
+        "behavior_action_trace.jsonl"
+    )
+
+
+def test_run_full_task_short_chunks_continue_until_env_step_horizon(tmp_path):
+    outcomes = [
+        (
+            _observation(),
+            0.0,
+            False,
+            False,
+            {"done": {"success": False}, "_rpent": {"executed_steps": 1}},
+        )
+        for _ in range(5)
+    ]
+    env = _Env(outcomes)
+    model = _Model(np.zeros((1, 23), dtype=np.float32))
+    primitives = BehaviorPrimitives(
+        env=env,
+        model=model,
+        max_episode_steps=5,
+        action_horizon=4,
+        output_dir=tmp_path,
+    )
+
+    result = primitives.run_full_task()
+
+    assert result["stop_reason"] == "horizon"
+    assert result["env_steps_used"] == 5
+    assert result["chunks_used"] == 5
+    assert model.calls == 5
+
+
+@pytest.mark.parametrize("executed_steps", [False, -1, 0, 2])
+def test_run_full_task_rejects_invalid_executed_steps(tmp_path, executed_steps):
+    env = _Env(
+        [
+            (
+                _observation(),
+                0.0,
+                False,
+                False,
+                {
+                    "done": {"success": False},
+                    "_rpent": {"executed_steps": executed_steps},
+                },
+            )
+        ]
+    )
+    primitives = BehaviorPrimitives(
+        env=env,
+        model=_Model(np.zeros((1, 23), dtype=np.float32)),
+        max_episode_steps=5,
+        output_dir=tmp_path,
+    )
+
+    result = primitives.run_full_task()
+
+    assert result["stop_reason"] == "error"
+    assert result["error"].startswith("RuntimeError: invalid env executed_steps")
 
 
 @pytest.mark.parametrize(
@@ -103,7 +165,7 @@ def test_termination_or_truncation_without_official_done_is_not_success(
         ]
     )
     model = _Model(np.zeros((2, 23), dtype=np.float32))
-    runner = FullTaskRunner(
+    primitives = BehaviorPrimitives(
         env=env,
         model=model,
         max_episode_steps=20,
@@ -111,7 +173,7 @@ def test_termination_or_truncation_without_official_done_is_not_success(
         output_dir=tmp_path,
     )
 
-    result = runner.run_full_task()
+    result = primitives.run_full_task()
 
     assert result["success"] is False
     assert result["task_success"] is False
@@ -131,7 +193,7 @@ def test_malformed_action_is_rejected_before_env_step_and_writes_final_result(
         actions = np.zeros((1, 23), dtype=np.float32)
         actions[0, 5] = np.nan
     env = _Env([])
-    runner = FullTaskRunner(
+    primitives = BehaviorPrimitives(
         env=env,
         model=_Model(actions),
         max_episode_steps=20,
@@ -139,7 +201,7 @@ def test_malformed_action_is_rejected_before_env_step_and_writes_final_result(
         output_dir=tmp_path,
     )
 
-    result = runner.run_full_task()
+    result = primitives.run_full_task()
 
     assert result["success"] is False
     assert result["stop_reason"] == "error"
@@ -152,7 +214,7 @@ def test_malformed_action_is_rejected_before_env_step_and_writes_final_result(
 
 def test_behavior_toolkit_has_only_one_behavior_specific_tool(tmp_path):
     toolkit = BehaviorToolkit(
-        runner_kwargs={
+        primitives_kwargs={
             "env": _Env([]),
             "model": _Model(np.zeros((1, 23), dtype=np.float32)),
             "max_episode_steps": 1,
@@ -160,7 +222,6 @@ def test_behavior_toolkit_has_only_one_behavior_specific_tool(tmp_path):
         }
     )
     names = [spec["name"] for spec in toolkit.get_tools_spec()]
-    common_names = {spec["name"] for spec in common.TOOLS_SPEC}
 
-    assert [name for name in names if name not in common_names] == ["run_full_task"]
-    assert names.count("run_full_task") == 1
+    assert names == ["run_full_task"]
+    assert not {spec["name"] for spec in common.TOOLS_SPEC}.intersection(names)

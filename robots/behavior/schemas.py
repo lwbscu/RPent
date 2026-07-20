@@ -9,9 +9,11 @@ import numpy as np
 ACTION_DIM = 23
 DEFAULT_ACTION_CHUNK = 32
 CAMERA_KEYS = ("main", "left_wrist", "right_wrist")
-CONTROL_MODES = ("full_task_vla", "planner_tools")
 FULL_TASK_VLA_MODE = "full_task_vla"
 PLANNER_TOOLS_MODE = "planner_tools"
+PI0_PICK_VLA_MODE = "pi0_pick_vla"
+CONTROL_MODES = (FULL_TASK_VLA_MODE, PLANNER_TOOLS_MODE, PI0_PICK_VLA_MODE)
+VLA_CONTROL_MODES = (FULL_TASK_VLA_MODE, PI0_PICK_VLA_MODE)
 PLANNER_TOOL_NAMES = (
     "observe",
     "pixel_to_world",
@@ -168,6 +170,59 @@ RUN_FULL_TASK_SPEC: dict[str, Any] = {
     },
 }
 
+PI0_PICK_SPEC: dict[str, Any] = {
+    "name": "pi0_pick",
+    "description": (
+        "Run a local Pi0.5/VLA grasp loop from the current BEHAVIOR observation. "
+        "Each iteration predicts and executes one validated [T,23] whole-body "
+        "action chunk. The loop stops at the first local gripper-closure "
+        "candidate, an "
+        "official environment stop, the configured horizon, or an error. "
+        "Closure alone is not pick success: primitive_success requires a "
+        "configured local grasp validator and the result always requires MP4 "
+        "visual verification. It never implies official task_success."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "hand": {
+                "type": "string",
+                "enum": ["left", "right"],
+                "description": (
+                    "Hand whose gripper closure triggers a local grasp candidate."
+                ),
+            },
+            "instruction": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Local VLA grasp instruction for the current observation.",
+            },
+            "max_chunks": {
+                "type": "integer",
+                "default": 24,
+                "minimum": 1,
+            },
+            "gripper_closed_threshold": {
+                "type": "number",
+                "default": 0.045,
+                "minimum": 0.0,
+                "description": (
+                    "Maximum selected-hand compact gripper opening for a local "
+                    "grasp candidate. Closure alone is not success."
+                ),
+            },
+            "required_closed_chunks": {
+                "type": "integer",
+                "default": 1,
+                "minimum": 1,
+                "description": "Consecutive completed chunks satisfying closure.",
+            },
+        },
+        "required": ["hand", "instruction"],
+        "additionalProperties": False,
+    },
+}
+
 
 _HAND_SCHEMA: dict[str, Any] = {
     "type": "string",
@@ -211,8 +266,9 @@ def _planner_spec(
     properties: dict[str, Any],
     *,
     required: list[str] | None = None,
+    one_of: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    return {
+    spec = {
         "name": name,
         "description": description,
         "input_schema": {
@@ -222,6 +278,9 @@ def _planner_spec(
             "additionalProperties": False,
         },
     }
+    if one_of is not None:
+        spec["input_schema"]["oneOf"] = one_of
+    return spec
 
 
 PLANNER_TOOL_SPECS: dict[str, dict[str, Any]] = {
@@ -361,6 +420,22 @@ PLANNER_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "timeout_s": {"type": "number", "default": 45, "minimum": 0.0},
         },
         required=["hand"],
+        one_of=[
+            {
+                "required": ["target_quat_xyzw"],
+                "properties": {
+                    "target_quat_xyzw": {"type": "array"},
+                    "relative_axis_angle": {"type": "null"},
+                },
+            },
+            {
+                "required": ["relative_axis_angle"],
+                "properties": {
+                    "target_quat_xyzw": {"type": "null"},
+                    "relative_axis_angle": {"type": "array"},
+                },
+            },
+        ],
     ),
     "press": _planner_spec(
         "press",
@@ -407,6 +482,15 @@ PLANNER_TOOL_SPECS: dict[str, dict[str, Any]] = {
 if tuple(PLANNER_TOOL_SPECS) != PLANNER_TOOL_NAMES:
     raise ValueError("planner tool schema order must match PLANNER_TOOL_NAMES")
 
+PUBLIC_PRIMITIVE_ENTRYPOINTS: dict[str, str] = {
+    "run_full_task": "BehaviorPrimitives.run_full_task",
+    **{
+        name: f"BehaviorPrimitives.{name}"
+        for name in PLANNER_TOOL_NAMES
+    },
+    "pi0_pick": "BehaviorPrimitives.pi0_pick",
+}
+
 
 __all__ = [
     "ACTION_DIM",
@@ -416,13 +500,17 @@ __all__ = [
     "ENV_ACTION_SEGMENTS",
     "ENV_WIRE_SCHEMA",
     "FULL_TASK_VLA_MODE",
+    "PI0_PICK_SPEC",
+    "PI0_PICK_VLA_MODE",
     "PLANNER_TOOLS_MODE",
     "PLANNER_TOOL_NAMES",
     "PLANNER_TOOL_SPECS",
     "POLICY_STATE_SEGMENTS",
+    "PUBLIC_PRIMITIVE_ENTRYPOINTS",
     "RAW_PROPRIO_SEGMENTS",
     "RUN_FULL_TASK_SPEC",
     "VLA_WIRE_SCHEMA",
+    "VLA_CONTROL_MODES",
     "extract_policy_state",
     "segment_ranges",
     "validate_action_chunk",

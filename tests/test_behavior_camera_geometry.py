@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import pytest
 
@@ -29,6 +31,19 @@ def _cache():
         frame_id="f0",
     )
     return cache, frame
+
+
+def _capture_group_frames(*, depth_value=1.0):
+    intr = CameraIntrinsics(fx=2.0, fy=2.0, cx=2.0, cy=2.0, width=5, height=5)
+    return {
+        camera: {
+            "rgb": np.zeros((5, 5, 3), dtype=np.uint8),
+            "depth_m": np.full((5, 5), depth_value, dtype=np.float32),
+            "intrinsics": intr,
+            "camera_to_world": np.eye(4),
+        }
+        for camera in ("head", "left_wrist", "right_wrist")
+    }
 
 
 def test_usd_minus_z_backprojection_round_trips_center_pixel():
@@ -80,6 +95,34 @@ def test_pixel_projection_rejects_missing_or_mixed_depth():
         backproject_pixel_to_world(frame, u=2, v=2, depth_window_px=3)
 
 
+def test_pixel_projection_uses_center_depth_cluster_with_sparse_outliers():
+    cache = FrameCache(ttl_s=100.0)
+    depth = np.ones((9, 9), dtype=np.float32)
+    depth[1, 1] = 4.0
+    depth[1, 7] = 4.0
+    depth[7, 1] = 4.0
+    frame = cache.add(
+        camera="head",
+        rgb=np.zeros((9, 9, 3), dtype=np.uint8),
+        depth_m=depth,
+        intrinsics=CameraIntrinsics(
+            fx=4.0,
+            fy=4.0,
+            cx=4.0,
+            cy=4.0,
+            width=9,
+            height=9,
+        ),
+        camera_to_world=np.eye(4),
+        step_index=0,
+    )
+
+    result = backproject_pixel_to_world(frame, u=4, v=4, depth_window_px=7)
+
+    assert result["depth"]["median_m"] == pytest.approx(1.0)
+    assert result["depth"]["cluster_count"] == 46
+
+
 def test_pixel_projection_rejects_window_on_image_edge():
     _, frame = _cache()
 
@@ -94,26 +137,92 @@ def test_observe_payload_returns_png_bytes_for_tool_result_without_pixel_dump():
 
     assert payload["camera"] == "head"
     assert payload["_image_bytes"].startswith(b"\x89PNG")
+    assert payload["_depth_image_bytes"].startswith(b"\x89PNG")
+    assert payload["image_blocks"] == ["rgb", "depth_visualization"]
     assert "rgb" not in payload
     tool_result = ToolResult(name="observe", result=payload)
-    assert any(block["type"] == "image" for block in tool_result.content_blocks)
+    assert [block["type"] for block in tool_result.content_blocks] == [
+        "text",
+        "image",
+        "image",
+    ]
     text = tool_result.content_blocks[0]["text"]
     assert "_image_bytes" not in text
+    assert "_depth_image_bytes" not in text
     assert "array(" not in text
     assert "[[[" not in text
 
 
-def test_observe_reissues_expired_unchanged_frame_and_invalidates_old_id():
+def test_observe_never_refreshes_or_reissues_an_expired_capture():
     cache, frame = _cache()
     old_frame_id = frame.frame_id
+    old_timestamp = frame.timestamp_s
     frame.timestamp_s -= cache.ttl_s + 1.0
 
-    payload = cache.observe_payload("head")
+    with pytest.raises(CameraGeometryError, match="capture expired"):
+        cache.observe_payload("head")
 
-    assert payload["frame_id"] != old_frame_id
-    assert cache.get_current("head", payload["frame_id"]) is frame
-    with pytest.raises(CameraGeometryError, match="stale frame_id"):
-        cache.get_current("head", old_frame_id)
+    assert frame.frame_id == old_frame_id
+    assert frame.timestamp_s == pytest.approx(old_timestamp - cache.ttl_s - 1.0)
+
+
+def test_observe_reuses_same_real_capture_without_renewing_its_identity():
+    cache, frame = _cache()
+    timestamp = frame.timestamp_s
+
+    first = cache.observe_payload("head")
+    second = cache.observe_payload("head")
+
+    assert first["frame_id"] == second["frame_id"] == frame.frame_id
+    assert frame.timestamp_s == timestamp
+
+
+def test_three_camera_capture_group_is_same_step_and_commits_atomically():
+    cache = FrameCache(ttl_s=100.0)
+    captured_at = time.monotonic()
+    first = cache.add_capture_group(
+        frames=_capture_group_frames(),
+        step_index=7,
+        capture_metadata={"proprio": {"values": list(range(23))}},
+        timestamp_s=captured_at,
+        capture_group_id="capture:7:first",
+    )
+
+    assert {frame.capture_group_id for frame in first.values()} == {"capture:7:first"}
+    assert {frame.step_index for frame in first.values()} == {7}
+    assert {frame.timestamp_s for frame in first.values()} == {captured_at}
+    assert cache.observe_payload("left_wrist")["capture_group"] == {
+        "id": "capture:7:first",
+        "sim_step": 7,
+        "cameras": ["head", "left_wrist", "right_wrist"],
+        "age_s": pytest.approx(time.monotonic() - captured_at, abs=0.1),
+    }
+
+    malformed = _capture_group_frames(depth_value=2.0)
+    malformed["right_wrist"]["depth_m"] = np.ones((4, 5), dtype=np.float32)
+    with pytest.raises(CameraGeometryError, match="depth shape"):
+        cache.add_capture_group(frames=malformed, step_index=8)
+
+    assert {
+        camera: cache.latest(camera).capture_group_id
+        for camera in ("head", "left_wrist", "right_wrist")
+    } == {
+        "head": "capture:7:first",
+        "left_wrist": "capture:7:first",
+        "right_wrist": "capture:7:first",
+    }
+
+
+def test_capture_group_requires_all_three_cameras_without_partial_publish():
+    cache = FrameCache(ttl_s=100.0)
+    frames = _capture_group_frames()
+    del frames["right_wrist"]
+
+    with pytest.raises(CameraGeometryError, match="missing=.*right_wrist"):
+        cache.add_capture_group(frames=frames, step_index=3)
+
+    with pytest.raises(CameraGeometryError, match="no cached"):
+        cache.latest("head")
 
 
 def _calibration_samples(offset):

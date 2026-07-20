@@ -19,16 +19,16 @@ def get_env_spec() -> EnvSpec:
 def get_toolkit(
     *,
     control_mode: str = "full_task_vla",
-    runner_kwargs: dict[str, Any] | None = None,
+    primitives_kwargs: dict[str, Any] | None = None,
     planner_client: Any = None,
     dashboard: Any = None,
 ):
-    """Return common RPent tools plus the selected BEHAVIOR control surface."""
+    """Return the selected closed BEHAVIOR control surface."""
     from robots.behavior.toolkit import BehaviorToolkit
 
     return BehaviorToolkit(
         control_mode=control_mode,
-        runner_kwargs=runner_kwargs,
+        primitives_kwargs=primitives_kwargs,
         planner_client=planner_client,
         dashboard=dashboard,
     )

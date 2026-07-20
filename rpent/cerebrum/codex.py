@@ -47,6 +47,7 @@ class CodexCerebrum:
         timeout_s: int = 600,
         extra_dirs: list[str] | None = None,
         output_path: str | Path | None = None,
+        tool_only: bool = False,
     ):
         """Initialize the Codex SDK backend."""
         self._output_dir = str(output_dir)
@@ -54,6 +55,7 @@ class CodexCerebrum:
         self._timeout_s = timeout_s
         self._extra_dirs = extra_dirs or []
         self._output_path = Path(output_path) if output_path else None
+        self._tool_only = bool(tool_only)
         self._model = os.environ.get("CODEX_MODEL", None)
         self._base_url = os.environ.get("CODEX_BASE_URL", None)
         self._api_key = os.environ.get("CODEX_API_KEY", None)
@@ -178,7 +180,11 @@ class CodexCerebrum:
     ) -> None:
         try:
             approval = openai_codex.ApprovalMode.deny_all
-            sandbox = openai_codex.Sandbox.full_access
+            sandbox = (
+                openai_codex.Sandbox.read_only
+                if self._tool_only
+                else openai_codex.Sandbox.full_access
+            )
             chunks: list[str] = []
             with openai_codex.Codex(config=self._build_config(mcp_url)) as codex:
                 state["codex"] = codex
@@ -234,6 +240,7 @@ class CodexCerebrum:
                     mcp_url=mcp_url,
                     base_url=self._base_url,
                     tool_timeout_sec=self._timeout_s,
+                    tool_only=self._tool_only,
                 )
             ),
             "cwd": self._repo_root,
@@ -403,11 +410,41 @@ def _codex_mcp_config_overrides(
     mcp_url: str,
     base_url: str | None,
     tool_timeout_sec: int,
+    tool_only: bool = False,
 ) -> list[str]:
-    config: list[tuple[str, Any]] = [
+    config: list[tuple[str, Any]] = []
+    if tool_only:
+        # Clear inherited MCP configuration before adding the one closed RPent
+        # surface below.  This prevents a machine-global MCP server from
+        # becoming an accidental second observation or action channel.
+        config.append(("mcp_servers", {}))
+    config.extend([
         ("mcp_servers.rpent.url", mcp_url),
         ("mcp_servers.rpent.tool_timeout_sec", tool_timeout_sec),
-    ]
+    ])
+    if tool_only:
+        # BEHAVIOR observations and actions must flow only through the RPent
+        # MCP surface.  Disable Codex's built-in shell, connectors, delegation,
+        # and web search in addition to using a read-only sandbox.
+        config.extend(
+            [
+                # This one closed RPent MCP surface is the authorized robot
+                # boundary. ApprovalMode.deny_all maps to a non-interactive
+                # policy, so an MCP tool whose default is "prompt" would be
+                # rejected instead of executed unless it is pre-approved.
+                ("mcp_servers.rpent.default_tools_approval_mode", "approve"),
+                ("features.shell_tool", False),
+                ("features.unified_exec", False),
+                ("features.apps", False),
+                ("features.multi_agent", False),
+                ("features.remote_plugin", False),
+                ("features.memories", False),
+                ("features.goals", False),
+                ("features.hooks", False),
+                ("web_search", "disabled"),
+                ("tools_view_image", False),
+            ]
+        )
     if base_url:
         normalized = base_url.rstrip("/")
         if not normalized.endswith("/v1"):

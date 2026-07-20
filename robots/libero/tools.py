@@ -5,13 +5,14 @@ import base64
 import io
 import json
 import os
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import imageio.v2 as imageio
 import numpy as np
 
-from rpent.rpc_driver.vla_client import VLAClient
 from robots.libero.env_client import LiberoEnvClient
+from rpent.rpc_driver.vla_client import VLAClient
 from rpent.utils.logging import get_logger, get_output_dir
 
 logger = get_logger("libero")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from rpent.tools.toolkit import Toolkit
 from rpent.utils.config import (
@@ -177,9 +177,10 @@ def build_cerebrum(
             )
         return CodexCerebrum(
             output_dir=output_dir,
-            repo_root=get_repo_root(),
+            repo_root=output_dir if env_name.lower() == "behavior" else get_repo_root(),
             timeout_s=cx_timeout_s,
             extra_dirs=[str(get_memory_dir(env_name))],
             output_path=Path(output_dir) / f"codex_{recipe_tag}.txt",
+            tool_only=env_name.lower() == "behavior",
         )
     raise ValueError(f"unknown cerebrum_type: {cerebrum_type}")
