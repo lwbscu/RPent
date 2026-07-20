@@ -55,7 +55,7 @@ def test_env_rpc_dispatcher_rejects_private_and_legacy_unprefixed_methods():
     ("mode", "allowed_method", "rejected_method"),
     [
         (FULL_TASK_VLA_MODE, "env.chunk_step", "env.observe"),
-        (PI0_PICK_VLA_MODE, "env.chunk_step", "env.pick"),
+        (PI0_PICK_VLA_MODE, "env.pi0_chunk_step", "env.chunk_step"),
         (PLANNER_TOOLS_MODE, "env.observe", "env.chunk_step"),
     ],
 )
@@ -70,6 +70,10 @@ def test_env_rpc_dispatcher_isolates_control_mode_methods(
             return "chunk"
 
         @staticmethod
+        def pi0_chunk_step(*_args, **_kwargs):
+            return "pi0_chunk"
+
+        @staticmethod
         def observe(*_args, **_kwargs):
             return "observe"
 
@@ -79,9 +83,41 @@ def test_env_rpc_dispatcher_isolates_control_mode_methods(
 
     dispatcher = _MainThreadDispatcher(Env(), threading.Event())
 
-    assert dispatcher._dispatch(allowed_method, (), {}) in {"chunk", "observe"}
+    assert dispatcher._dispatch(allowed_method, (), {}) in {
+        "chunk",
+        "pi0_chunk",
+        "observe",
+    }
     with pytest.raises(ValueError, match="unknown BEHAVIOR env RPC"):
         dispatcher._dispatch(rejected_method, (), {})
+
+
+def test_env_rpc_dispatcher_keeps_chunk_interfaces_mode_private():
+    class Env:
+        def __init__(self, mode):
+            self._control_mode = mode
+
+        @staticmethod
+        def chunk_step(*_args, **_kwargs):
+            return "chunk"
+
+        @staticmethod
+        def pi0_chunk_step(*_args, **_kwargs):
+            return "pi0_chunk"
+
+    for mode, allowed, rejected in (
+        (FULL_TASK_VLA_MODE, "env.chunk_step", "env.pi0_chunk_step"),
+        (PI0_PICK_VLA_MODE, "env.pi0_chunk_step", "env.chunk_step"),
+    ):
+        dispatcher = _MainThreadDispatcher(Env(mode), threading.Event())
+        dispatcher._dispatch(allowed, (), {})
+        with pytest.raises(ValueError, match="unknown BEHAVIOR env RPC"):
+            dispatcher._dispatch(rejected, (), {})
+
+    planner = _MainThreadDispatcher(Env(PLANNER_TOOLS_MODE), threading.Event())
+    for method in ("env.chunk_step", "env.pi0_chunk_step"):
+        with pytest.raises(ValueError, match="unknown BEHAVIOR env RPC"):
+            planner._dispatch(method, (), {})
 
 
 for _tool_name in PLANNER_TOOL_NAMES:
@@ -195,6 +231,45 @@ def test_behavior_env_client_planner_methods_use_env_rpc_names():
     assert rpc.calls[2][0] == "env.move_to"
     with pytest.raises(ValueError, match="exactly one"):
         client.rotate_wrist(hand="left")
+
+
+def test_behavior_env_client_pi0_chunk_uses_private_rpc_and_tracks_done():
+    class Rpc:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, method, args=(), kwargs=None, *, timeout_s=None):
+            self.calls.append((method, args, kwargs or {}, timeout_s))
+            if method == "env.get_env_meta":
+                return {"control_mode": PI0_PICK_VLA_MODE}
+            return ({"states": [0.0] * 256}, 0.0, False, False, {"done": {"success": True}})
+
+    rpc = Rpc()
+    client = BehaviorEnvClient(
+        rpc,
+        expected_meta={"control_mode": PI0_PICK_VLA_MODE},
+    )
+    actions = [[0.0] * 23]
+
+    result = client.pi0_chunk_step(
+        actions,
+        hand="right",
+        gripper_closed_threshold=0.04,
+        required_closed_steps=3,
+        stop_on_candidate=True,
+    )
+
+    assert result[-1]["done"]["success"] is True
+    assert client.episode_done is True
+    method, args, kwargs, _timeout = rpc.calls[1]
+    assert method == "env.pi0_chunk_step"
+    assert args == (actions,)
+    assert kwargs == {
+        "hand": "right",
+        "gripper_closed_threshold": 0.04,
+        "required_closed_steps": 3,
+        "stop_on_candidate": True,
+    }
 
 
 def test_planner_mode_validation_does_not_require_checkpoint_or_vla(tmp_path):

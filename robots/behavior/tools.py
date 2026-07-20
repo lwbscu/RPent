@@ -69,6 +69,20 @@ def _public_info_summary(info: Any) -> Any:
     }
 
 
+def _public_validator_observation(obs: dict[str, Any]) -> dict[str, Any]:
+    """Copy only RGB and proprio fields into the local-grasp validator."""
+    if not isinstance(obs, dict):
+        raise TypeError("local grasp validator observation must be a mapping")
+    required = ("main_images", "wrist_images", "states")
+    missing = [key for key in required if key not in obs]
+    if missing:
+        raise KeyError(f"local grasp validator observation missing {missing}")
+    return {
+        key: np.asarray(obs[key]).copy()
+        for key in required
+    }
+
+
 def _write_json_atomic(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -530,6 +544,7 @@ class BehaviorPrimitives:
         instruction: str,
         gripper_closed_threshold: float,
         closed_streak: int,
+        gripper_monitor: Any = None,
         model_info: Any = None,
     ) -> dict[str, Any]:
         opening, compact = self._selected_gripper_opening(obs, hand)
@@ -542,6 +557,7 @@ class BehaviorPrimitives:
             "gripper_closed_threshold": float(gripper_closed_threshold),
             "gripper_closed": bool(opening <= gripper_closed_threshold),
             "consecutive_closed_chunks": int(closed_streak),
+            "local_gripper_monitor": _jsonable(gripper_monitor),
             "raw_proprio": _jsonable(np.asarray(obs["states"], dtype=np.float32)),
             "policy_state": _jsonable(compact),
             "policy_state_segments": segment_ranges(POLICY_STATE_SEGMENTS),
@@ -593,6 +609,7 @@ class BehaviorPrimitives:
         last_info: Any = self._current_info
         last_gripper_opening: float | None = None
         validator_result: bool | None = None
+        last_gripper_monitor: dict[str, Any] | None = None
         error: str | None = None
         model_instruction: str | None = None
 
@@ -608,8 +625,13 @@ class BehaviorPrimitives:
             if not isinstance(instruction, str) or not instruction.strip():
                 raise ValueError("instruction must be a non-empty string")
             instruction = instruction.strip()
-            model_instruction = (
-                f"Use only the {hand} hand for this local grasp. {instruction}"
+            # Preserve a caller-supplied policy instruction verbatim. Pi0.5 is
+            # trained on natural task language, and injecting a second policy
+            # sentence can materially change its action distribution. The hand
+            # parameter selects the measured gripper and local validator; the
+            # standard CLI instruction names that hand explicitly.
+            model_instruction = instruction.replace(
+                "selected hand", f"{hand} hand"
             )
             if isinstance(max_chunks, bool) or int(max_chunks) != max_chunks:
                 raise ValueError("max_chunks must be a positive integer")
@@ -678,7 +700,20 @@ class BehaviorPrimitives:
                 )
                 remaining = self.max_episode_steps - env_steps_used
                 actions = actions[:remaining]
-                obs, reward, term, trunc, info = self.env.chunk_step(actions)
+                pi0_chunk_step = getattr(self.env, "pi0_chunk_step", None)
+                if callable(pi0_chunk_step):
+                    obs, reward, term, trunc, info = pi0_chunk_step(
+                        actions,
+                        hand=hand,
+                        gripper_closed_threshold=threshold,
+                        required_closed_steps=3,
+                        stop_on_candidate=self._local_grasp_validator is not None,
+                    )
+                else:
+                    # Direct unit fakes written before the isolated PI0 RPC may
+                    # still implement the common env protocol. Production
+                    # BehaviorEnvClient always uses pi0_chunk_step in this mode.
+                    obs, reward, term, trunc, info = self.env.chunk_step(actions)
 
                 chunks_used += 1
                 executed_steps: Any = actions.shape[0]
@@ -689,7 +724,7 @@ class BehaviorPrimitives:
                 if (
                     isinstance(executed_steps, bool)
                     or int(executed_steps) != executed_steps
-                    or not 0 <= int(executed_steps) <= actions.shape[0]
+                    or not 1 <= int(executed_steps) <= actions.shape[0]
                 ):
                     raise RuntimeError(
                         f"invalid env executed_steps for pi0_pick: {executed_steps!r}"
@@ -701,7 +736,20 @@ class BehaviorPrimitives:
                 truncated = _as_bool(trunc)
                 opening, _compact = self._selected_gripper_opening(obs, hand)
                 last_gripper_opening = opening
-                if opening <= threshold:
+                monitor: dict[str, Any] | None = None
+                if isinstance(info, dict):
+                    rpent_info = info.get("_rpent")
+                    if isinstance(rpent_info, dict):
+                        candidate_monitor = rpent_info.get(
+                            "local_gripper_monitor"
+                        )
+                        if isinstance(candidate_monitor, dict):
+                            monitor = candidate_monitor
+                last_gripper_monitor = monitor
+                monitored_candidate = bool(
+                    monitor is not None and monitor.get("candidate", False)
+                )
+                if monitored_candidate or opening <= threshold:
                     closed_streak += 1
                 else:
                     closed_streak = 0
@@ -720,6 +768,7 @@ class BehaviorPrimitives:
                     instruction=instruction,
                     gripper_closed_threshold=threshold,
                     closed_streak=closed_streak,
+                    gripper_monitor=monitor,
                     model_info=model_info,
                 )
                 states.append(state)
@@ -727,7 +776,12 @@ class BehaviorPrimitives:
                 self._current_info = info
 
                 # Environment stop flags are never evidence of a local grasp.
-                if closure_candidate and not terminated and not truncated:
+                if (
+                    closure_candidate
+                    and not task_success
+                    and not terminated
+                    and not truncated
+                ):
                     local_gripper_closure_detected = True
                     if self._local_grasp_validator is not None:
                         context = {
@@ -739,10 +793,12 @@ class BehaviorPrimitives:
                             "gripper_closed_threshold": threshold,
                             "consecutive_closed_chunks": closed_streak,
                             "required_closed_chunks": required_closed_chunks,
-                            "task_success": task_success,
+                            "local_gripper_monitor": _jsonable(monitor),
                         }
                         validator_result = bool(
-                            self._local_grasp_validator(obs, context)
+                            self._local_grasp_validator(
+                                _public_validator_observation(obs), context
+                            )
                         )
                         local_grasp_success = validator_result
 
@@ -803,6 +859,7 @@ class BehaviorPrimitives:
             "required_closed_chunks": required_closed_chunks,
             "consecutive_closed_chunks": closed_streak,
             "final_selected_gripper_opening": last_gripper_opening,
+            "last_local_gripper_monitor": _jsonable(last_gripper_monitor),
             "elapsed_s": round(time.time() - started, 2),
             "states_path": str(states_path),
             "result_path": str(result_path),

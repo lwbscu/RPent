@@ -37,7 +37,12 @@ def _observation(
     states = np.zeros(256, dtype=np.float32)
     states[193:195] = left_gripper / 2.0
     states[232:234] = right_gripper / 2.0
-    return {"states": states, "task_descriptions": task}
+    return {
+        "main_images": np.zeros((2, 2, 3), dtype=np.uint8),
+        "wrist_images": np.zeros((2, 2, 2, 3), dtype=np.uint8),
+        "states": states,
+        "task_descriptions": task,
+    }
 
 
 class _FakeModel:
@@ -318,15 +323,42 @@ def test_pi0_pick_validates_every_action_chunk_and_keeps_prompt_local(tmp_path):
     assert result["stop_reason"] == "chunk_limit"
     assert [action.shape for action in env.actions] == [(2, 23), (3, 23)]
     assert [obs["task_descriptions"] for obs in model.observations] == [
-        "Use only the right hand for this local grasp. "
         "grasp only the red radio handle",
-        "Use only the right hand for this local grasp. "
         "grasp only the red radio handle",
     ]
-    assert result["model_instruction"].startswith("Use only the right hand")
+    assert result["model_instruction"] == "grasp only the red radio handle"
     assert original["task_descriptions"] == "official full task"
     assert first["task_descriptions"] == "official full task"
     assert second["task_descriptions"] == "official full task"
+
+
+def test_pi0_pick_resolves_selected_hand_without_rewriting_explicit_instruction(
+    tmp_path,
+):
+    model = _FakeModel(np.zeros((1, 23), dtype=np.float32))
+    primitives = _pi0_primitives(
+        tmp_path,
+        model=model,
+        env=_FakeEnv(
+            (
+                _observation(),
+                0.0,
+                False,
+                False,
+                {"done": {"success": False}},
+            )
+        ),
+        initial_observation=_observation(),
+    )
+
+    result = primitives.pi0_pick(
+        hand="left",
+        instruction="Grasp the radio with the selected hand.",
+        max_chunks=1,
+    )
+
+    assert result["model_instruction"] == "Grasp the radio with the left hand."
+    assert model.observations[0]["task_descriptions"] == result["model_instruction"]
 
 
 def test_pi0_pick_closed_gripper_is_only_a_visual_candidate_by_default(tmp_path):
@@ -388,6 +420,76 @@ def test_pi0_pick_validator_acceptance_is_required_for_local_success(tmp_path):
     assert result["stop_reason"] == "local_grasp_success"
     assert len(validator_calls) == 1
     assert validator_calls[0][1]["hand"] == "left"
+
+
+def test_pi0_pick_uses_pi0_step_monitor_and_sanitizes_validator_input(tmp_path):
+    class _MonitoredEnv(_FakeEnv):
+        def __init__(self):
+            super().__init__(
+                (
+                    _observation(right_gripper=0.02),
+                    0.0,
+                    False,
+                    False,
+                    {
+                        "done": {"success": False},
+                        "obs_info": {"forbidden": "object pose"},
+                        "_rpent": {
+                            "executed_steps": 5,
+                            "local_gripper_monitor": {
+                                "hand": "right",
+                                "candidate": True,
+                                "opening": 0.02,
+                                "minimum_opening": 0.019,
+                                "closed_streak_steps": 3,
+                                "candidate_env_step": 5,
+                            },
+                        },
+                    },
+                )
+            )
+            self.monitor_kwargs = None
+
+        def pi0_chunk_step(self, actions, **kwargs):
+            self.monitor_kwargs = kwargs
+            return self.chunk_step(actions)
+
+    validator_calls = []
+
+    def validator(obs, context):
+        validator_calls.append((obs, context))
+        return True
+
+    env = _MonitoredEnv()
+    primitives = _pi0_primitives(
+        tmp_path,
+        model=_FakeModel(np.zeros((8, 23), dtype=np.float32)),
+        env=env,
+        initial_observation=_observation(right_gripper=0.08),
+        local_grasp_validator=validator,
+    )
+
+    result = primitives.pi0_pick(hand="right", instruction="grasp the radio")
+
+    assert result["local_grasp_success"] is True
+    assert result["env_steps_used"] == 5
+    assert env.monitor_kwargs == {
+        "hand": "right",
+        "gripper_closed_threshold": 0.045,
+        "required_closed_steps": 3,
+        "stop_on_candidate": True,
+    }
+    assert set(validator_calls[0][0]) == {
+        "main_images",
+        "wrist_images",
+        "states",
+    }
+    assert "task_success" not in validator_calls[0][1]
+    assert "info" not in validator_calls[0][1]
+    assert "reward" not in validator_calls[0][1]
+    assert result["last_info"]["_rpent"]["local_gripper_monitor"][
+        "candidate"
+    ] is True
 
 
 def test_pi0_pick_validator_rejection_continues_to_bound(tmp_path):

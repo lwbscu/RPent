@@ -52,7 +52,7 @@ if str(RLINF_ROOT) not in sys.path:
 _SHARED_ENV_RPC_METHODS = frozenset({"get_env_meta", "reset"})
 _ENV_RPC_METHODS_BY_MODE = {
     FULL_TASK_VLA_MODE: frozenset({"chunk_step"}),
-    PI0_PICK_VLA_MODE: frozenset({"chunk_step"}),
+    PI0_PICK_VLA_MODE: frozenset({"pi0_chunk_step"}),
     PLANNER_TOOLS_MODE: frozenset(
         {
         "observe",
@@ -957,6 +957,50 @@ class BehaviorEnvFacade:
     def chunk_step(self, actions: Any) -> tuple[Any, Any, bool, bool, Any]:
         return self._step_action_chunk(actions, observe_final=True)
 
+    def pi0_chunk_step(
+        self,
+        actions: Any,
+        *,
+        hand: str,
+        gripper_closed_threshold: float = 0.045,
+        required_closed_steps: int = 3,
+        stop_on_candidate: bool = False,
+    ) -> tuple[Any, Any, bool, bool, Any]:
+        """Execute a Pi0 chunk while monitoring the selected physical gripper.
+
+        This Pi0-only RPC samples the actual selected gripper joints and the
+        public raw proprio at every simulator step.  It fails closed if the two
+        same-step openings disagree.  The configured number of consecutive
+        closed steps (three by default) establishes only a local closure
+        *candidate*, never a grasp or task success.
+        """
+
+        if hand not in {"left", "right"}:
+            raise ValueError("hand must be 'left' or 'right'")
+        threshold = float(gripper_closed_threshold)
+        if not np.isfinite(threshold) or threshold < 0.0:
+            raise ValueError(
+                "gripper_closed_threshold must be finite and non-negative"
+            )
+        if (
+            isinstance(required_closed_steps, bool)
+            or int(required_closed_steps) != required_closed_steps
+            or int(required_closed_steps) <= 0
+        ):
+            raise ValueError("required_closed_steps must be a positive integer")
+        if not isinstance(stop_on_candidate, bool):
+            raise ValueError("stop_on_candidate must be a boolean")
+        return self._step_action_chunk(
+            actions,
+            observe_final=True,
+            local_gripper_monitor={
+                "hand": hand,
+                "threshold": threshold,
+                "required_closed_steps": int(required_closed_steps),
+                "stop_on_candidate": stop_on_candidate,
+            },
+        )
+
     def planner_step(self, action: Any) -> tuple[Any, Any, bool, bool, Any]:
         """Execute one internal planner action without forcing RGB-D rendering.
 
@@ -977,6 +1021,7 @@ class BehaviorEnvFacade:
         actions: Any,
         *,
         observe_final: bool,
+        local_gripper_monitor: dict[str, Any] | None = None,
     ) -> tuple[Any, Any, bool, bool, Any]:
         import torch
 
@@ -992,13 +1037,38 @@ class BehaviorEnvFacade:
         terminated = False
         truncated = False
         executed_steps = 0
+        monitor_result: dict[str, Any] | None = None
+        monitor_candidate_env_step: int | None = None
+        monitor_closed_streak = 0
+        monitor_min_opening = float("inf")
+        monitor_opening: float | None = None
+        monitor_hand = (
+            str(local_gripper_monitor["hand"])
+            if local_gripper_monitor is not None
+            else None
+        )
+        monitor_threshold = (
+            float(local_gripper_monitor["threshold"])
+            if local_gripper_monitor is not None
+            else None
+        )
+        monitor_stop_on_candidate = bool(
+            local_gripper_monitor is not None
+            and local_gripper_monitor["stop_on_candidate"]
+        )
+        monitor_required_closed_steps = (
+            int(local_gripper_monitor["required_closed_steps"])
+            if local_gripper_monitor is not None
+            else None
+        )
         for step_index in range(action_tensor.shape[1]):
             is_last_action = step_index == action_tensor.shape[1] - 1
             observation_interval = (
                 4 if bool(observe_final) else self._planner_video_interval_steps
             )
             need_observation = (
-                (bool(observe_final) and is_last_action)
+                local_gripper_monitor is not None
+                or (bool(observe_final) and is_last_action)
                 or (self._env_steps + 1) % observation_interval == 0
             )
             step_obs, step_reward, step_term, step_trunc, step_infos = (
@@ -1023,6 +1093,55 @@ class BehaviorEnvFacade:
                 self._record_rgbd_frames(step_obs, final_observation)
                 if self._env_steps % observation_interval == 0:
                     self._append_video(final_observation)
+            if local_gripper_monitor is not None:
+                if not need_observation or final_observation is None:
+                    raise RuntimeError(
+                        "Pi0 gripper monitoring requires a same-step public observation"
+                    )
+                assert monitor_hand is not None
+                assert monitor_threshold is not None
+                assert monitor_required_closed_steps is not None
+                monitor_opening = self._validated_selected_gripper_opening(
+                    observation=final_observation,
+                    hand=monitor_hand,
+                )
+                monitor_min_opening = min(monitor_min_opening, monitor_opening)
+                if monitor_opening <= monitor_threshold:
+                    monitor_closed_streak += 1
+                else:
+                    monitor_closed_streak = 0
+                if (
+                    monitor_candidate_env_step is None
+                    and monitor_closed_streak >= monitor_required_closed_steps
+                ):
+                    monitor_candidate_env_step = self._env_steps
+                monitor_result = {
+                    "hand": monitor_hand,
+                    "opening": monitor_opening,
+                    "min_opening": monitor_min_opening,
+                    "closed_streak": monitor_closed_streak,
+                    "candidate": monitor_candidate_env_step is not None,
+                    "candidate_env_step": monitor_candidate_env_step,
+                    "executed_steps": executed_steps,
+                }
+                if (
+                    monitor_stop_on_candidate
+                    and monitor_candidate_env_step is not None
+                    and not _raw_success(step_info)
+                    and not terminated
+                    and not truncated
+                ):
+                    # Synchronize the returned RGB/proprio with the stopped
+                    # articulation without taking an additional physics step.
+                    self._refresh_observation_without_step()
+                    final_observation = self._last_observation
+                    if final_observation is None:
+                        raise RuntimeError(
+                            "Pi0 candidate refresh produced no observation"
+                        )
+                    if self._env_steps % observation_interval != 0:
+                        self._append_video(final_observation)
+                    break
             if _raw_success(step_info) or terminated or truncated:
                 break
 
@@ -1034,6 +1153,8 @@ class BehaviorEnvFacade:
         if not isinstance(returned_info, dict):
             returned_info = {"raw": returned_info}
         returned_info["_rpent"] = {"executed_steps": executed_steps}
+        if monitor_result is not None:
+            returned_info["_rpent"]["local_gripper_monitor"] = monitor_result
         result = _wire_safe(
             (
                 final_observation,
@@ -1047,6 +1168,60 @@ class BehaviorEnvFacade:
         # useful RPC error instead of closing the socket without a frame.
         pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
         return result
+
+    def _validated_selected_gripper_opening(
+        self,
+        *,
+        observation: dict[str, Any],
+        hand: str,
+    ) -> float:
+        """Return physical opening after matching same-step public proprio."""
+
+        robot = self._robot()
+        if robot is None:
+            raise RuntimeError("R1Pro robot unavailable for Pi0 gripper monitoring")
+        control_indices = getattr(robot, "gripper_control_idx", None)
+        if not isinstance(control_indices, dict) or hand not in control_indices:
+            raise RuntimeError(
+                f"R1Pro {hand} gripper control indices are unavailable"
+            )
+        indices = np.asarray(
+            _numpy_tree(control_indices[hand]), dtype=np.int64
+        ).reshape(-1)
+        if indices.size != 2 or np.any(indices < 0):
+            raise RuntimeError(
+                f"R1Pro {hand} gripper must contain exactly two joint indices"
+            )
+        qpos = np.asarray(
+            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
+        ).reshape(-1)
+        if int(indices.max()) >= qpos.size:
+            raise RuntimeError(f"R1Pro {hand} gripper joint index is out of bounds")
+        actual_opening = float(qpos[indices].sum())
+        if not np.isfinite(actual_opening):
+            raise RuntimeError(
+                f"R1Pro {hand} physical gripper opening is not finite"
+            )
+
+        compact = extract_policy_state(observation["states"])
+        public_values = compact[POLICY_STATE_SEGMENTS[f"{hand}_gripper"]]
+        if public_values.shape != (1,) or not np.isfinite(public_values[0]):
+            raise RuntimeError(
+                f"R1Pro {hand} public proprio gripper opening is invalid"
+            )
+        public_opening = float(public_values[0])
+        if not np.isclose(
+            actual_opening,
+            public_opening,
+            rtol=1e-5,
+            atol=1e-5,
+        ):
+            raise RuntimeError(
+                "same-step physical/public gripper opening mismatch: "
+                f"hand={hand!r}, physical={actual_opening:.9g}, "
+                f"public={public_opening:.9g}"
+            )
+        return actual_opening
 
     def get_env_meta(self) -> dict[str, Any]:
         return {

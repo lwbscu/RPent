@@ -175,7 +175,8 @@ PI0_PICK_SPEC: dict[str, Any] = {
     "description": (
         "Run a local Pi0.5/VLA grasp loop from the current BEHAVIOR observation. "
         "Each iteration predicts and executes one validated [T,23] whole-body "
-        "action chunk. A gripper-closure candidate is recorded but does not "
+        "action chunk. The PI0 env path monitors actual selected-gripper "
+        "proprio at every simulator step. A closure candidate is recorded but does not "
         "stop the loop unless a configured local validator accepts the grasp. "
         "Otherwise the loop remains bounded by its local chunk limit, an "
         "official environment stop, the episode horizon, or an error. "

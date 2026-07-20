@@ -11,6 +11,7 @@ _TIMEOUT_S = {
     "default": 30.0,
     "env.reset": 1800.0,
     "env.chunk_step": 1800.0,
+    "env.pi0_chunk_step": 1800.0,
     "env.observe": 120.0,
     "env.pixel_to_world": 120.0,
     "env.navigate_to": 1800.0,
@@ -66,6 +67,35 @@ class BehaviorEnvClient:
             "env.chunk_step",
             args=(wire_actions,),
             timeout_s=_TIMEOUT_S["env.chunk_step"],
+        )
+        _, _, term, trunc, info = ret
+        if np.asarray(term).any() or np.asarray(trunc).any():
+            self.episode_done = True
+        if isinstance(info, dict) and bool((info.get("done") or {}).get("success")):
+            self.episode_done = True
+        return ret
+
+    def pi0_chunk_step(
+        self,
+        actions,
+        *,
+        hand: str,
+        gripper_closed_threshold: float = 0.045,
+        required_closed_steps: int = 3,
+        stop_on_candidate: bool = False,
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        assert not self.episode_done, "env.pi0_chunk_step called after episode done"
+        wire_actions = np.asarray(actions, dtype=np.float32).tolist()
+        ret = self._client.call(
+            "env.pi0_chunk_step",
+            args=(wire_actions,),
+            kwargs={
+                "hand": hand,
+                "gripper_closed_threshold": gripper_closed_threshold,
+                "required_closed_steps": required_closed_steps,
+                "stop_on_candidate": stop_on_candidate,
+            },
+            timeout_s=_TIMEOUT_S["env.pi0_chunk_step"],
         )
         _, _, term, trunc, info = ret
         if np.asarray(term).any() or np.asarray(trunc).any():
