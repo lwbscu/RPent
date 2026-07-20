@@ -175,9 +175,10 @@ PI0_PICK_SPEC: dict[str, Any] = {
     "description": (
         "Run a local Pi0.5/VLA grasp loop from the current BEHAVIOR observation. "
         "Each iteration predicts and executes one validated [T,23] whole-body "
-        "action chunk. The loop stops at the first local gripper-closure "
-        "candidate, an "
-        "official environment stop, the configured horizon, or an error. "
+        "action chunk. A gripper-closure candidate is recorded but does not "
+        "stop the loop unless a configured local validator accepts the grasp. "
+        "Otherwise the loop remains bounded by its local chunk limit, an "
+        "official environment stop, the episode horizon, or an error. "
         "Closure alone is not pick success: primitive_success requires a "
         "configured local grasp validator and the result always requires MP4 "
         "visual verification. It never implies official task_success."
@@ -207,8 +208,9 @@ PI0_PICK_SPEC: dict[str, Any] = {
                 "default": 0.045,
                 "minimum": 0.0,
                 "description": (
-                    "Maximum selected-hand compact gripper opening for a local "
-                    "grasp candidate. Closure alone is not success."
+                    "Maximum selected-hand compact gripper opening recorded as "
+                    "a local grasp candidate. Closure alone neither stops the "
+                    "loop nor establishes success."
                 ),
             },
             "required_closed_chunks": {

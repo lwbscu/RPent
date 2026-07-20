@@ -58,6 +58,17 @@ def official_task_success(info: Any) -> bool:
     return bool(done.get("success", False)) if isinstance(done, dict) else False
 
 
+def _public_info_summary(info: Any) -> Any:
+    """Expose only stop/accounting fields, never simulator observation metadata."""
+    if not isinstance(info, dict):
+        return _jsonable(info)
+    return {
+        key: _jsonable(info[key])
+        for key in ("done", "_rpent")
+        if key in info
+    }
+
+
 def _write_json_atomic(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -272,7 +283,7 @@ class _FullTaskRunner:
             "video_fps": 15,
             "video_sample_every_env_steps": 4,
             "last_reward": _jsonable(last_reward),
-            "last_info": _jsonable(last_info),
+            "last_info": _public_info_summary(last_info),
             "error": error,
         }
         _write_json_atomic(self.output_dir / "final_result.json", result)
@@ -562,7 +573,8 @@ class BehaviorPrimitives:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         states_path = self.output_dir / "pi0_pick_states.json"
         result_path = self.output_dir / "pi0_pick_result.json"
-        for path in (states_path, result_path):
+        raw_final_info_path = self.output_dir / "pi0_pick_raw_final_info.json"
+        for path in (states_path, result_path, raw_final_info_path):
             if path.exists():
                 path.unlink()
 
@@ -650,10 +662,6 @@ class BehaviorPrimitives:
             while (
                 not task_success
                 and not local_grasp_success
-                and not (
-                    local_gripper_closure_detected
-                    and self._local_grasp_validator is None
-                )
                 and not terminated
                 and not truncated
                 and chunks_used < max_chunks
@@ -746,11 +754,6 @@ class BehaviorPrimitives:
                     stop_reason = "truncated"
                 elif local_grasp_success:
                     stop_reason = "local_grasp_success"
-                elif (
-                    local_gripper_closure_detected
-                    and self._local_grasp_validator is None
-                ):
-                    stop_reason = "local_gripper_closure_detected"
                 elif env_steps_used >= self.max_episode_steps:
                     stop_reason = "horizon"
                 elif chunks_used >= max_chunks:
@@ -810,10 +813,12 @@ class BehaviorPrimitives:
             "video_path": str(self.video_path),
             "video_fps": 15,
             "last_reward": _jsonable(last_reward),
-            "last_info": _jsonable(last_info),
+            "last_info": _public_info_summary(last_info),
+            "raw_final_info_path": str(raw_final_info_path),
             "error": error,
         }
         _write_json_atomic(states_path, states)
+        _write_json_atomic(raw_final_info_path, _jsonable(last_info))
         _write_json_atomic(result_path, result)
         self.last_result = result
         return result

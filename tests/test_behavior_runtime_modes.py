@@ -352,6 +352,7 @@ def test_pi0_mode_starts_vla_and_registers_only_local_primitive(monkeypatch, tmp
     }
     assert 'hand="left"' in prompt_vars["behavior_user_instructions"]
     assert "grasp only the radio handle" in prompt_vars["behavior_user_instructions"]
+    assert "max_chunks=24" in prompt_vars["behavior_user_instructions"]
     manifest = json.loads(
         (tmp_path / "pi0-run" / "run_manifest.json").read_text(encoding="utf-8")
     )

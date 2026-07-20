@@ -68,11 +68,11 @@ PI0_PICK_SYSTEM_INSTRUCTIONS = """
 Call BehaviorPrimitives.pi0_pick through the pi0_pick tool exactly once. This
 is a local Pi0.5/VLA grasp loop, not a full-task run and not the planner pick.
 It executes validated 23D whole-body action chunks only until a local gripper
-closure candidate, an official environment stop, the local chunk limit, or an
-error. A closure candidate is not proof that the object was picked: inspect the
-saved MP4 before accepting the grasp. Never infer official task success from
-primitive_success or local_grasp_success; only task_success mirrors raw
-info.done.success.
+grasp validator accepts the grasp, an official environment stop, the local
+chunk limit, or an error. A closure candidate is recorded but is neither a stop
+condition nor proof that the object was picked: inspect the saved MP4 before
+accepting the grasp. Never infer official task success from primitive_success
+or local_grasp_success; only task_success mirrors raw info.done.success.
 """
 
 
@@ -84,6 +84,7 @@ def mode_instructions(
         "Grasp the radio securely with the selected hand and stop as soon as "
         "the local grasp is achieved."
     ),
+    pi0_max_chunks: int = 24,
 ) -> dict[str, str]:
     if control_mode == PLANNER_TOOLS_MODE:
         return {
@@ -94,7 +95,8 @@ def mode_instructions(
         pi0_user_instructions = (
             "Call pi0_pick exactly once with "
             f"hand={json.dumps(str(pi0_hand))} and "
-            f"instruction={json.dumps(str(pi0_instruction))}. "
+            f"instruction={json.dumps(str(pi0_instruction))} and "
+            f"max_chunks={int(pi0_max_chunks)}. "
             "Do not call run_full_task or planner tools in this mode."
         )
         return {

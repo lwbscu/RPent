@@ -482,6 +482,12 @@ class BehaviorRuntimeProvider:
             ),
             help="Local VLA instruction passed to the isolated pi0_pick tool.",
         )
+        parser.add_argument(
+            "--behavior-pi0-pick-max-chunks",
+            type=int,
+            default=24,
+            help="Bounded number of Pi0.5 chunks passed to pi0_pick.",
+        )
         parser.add_argument("--cuda-device", default=None)
         parser.add_argument("--no-driver", action="store_true")
         parser.add_argument("--env-endpoint", default="127.0.0.1")
@@ -536,6 +542,11 @@ class BehaviorRuntimeProvider:
             and not str(args.behavior_pi0_pick_instruction).strip()
         ):
             parser.error("--behavior-pi0-pick-instruction must be non-empty")
+        if (
+            args.behavior_control_mode == PI0_PICK_VLA_MODE
+            and args.behavior_pi0_pick_max_chunks <= 0
+        ):
+            parser.error("--behavior-pi0-pick-max-chunks must be positive")
         if args.behavior_control_mode in VLA_CONTROL_MODES:
             checkpoint = Path(args.policy_checkpoint or "")
             required_checkpoint_files = [
@@ -620,10 +631,12 @@ class BehaviorRuntimeProvider:
             "behavior_control_mode": args.behavior_control_mode,
             "behavior_pi0_pick_hand": args.behavior_pi0_pick_hand,
             "behavior_pi0_pick_instruction": args.behavior_pi0_pick_instruction,
+            "behavior_pi0_pick_max_chunks": args.behavior_pi0_pick_max_chunks,
             **mode_instructions(
                 args.behavior_control_mode,
                 pi0_hand=args.behavior_pi0_pick_hand,
                 pi0_instruction=args.behavior_pi0_pick_instruction,
+                pi0_max_chunks=args.behavior_pi0_pick_max_chunks,
             ),
         }
 

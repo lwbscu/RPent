@@ -333,16 +333,22 @@ def test_pi0_pick_closed_gripper_is_only_a_visual_candidate_by_default(tmp_path)
     initial = _observation(right_gripper=0.08)
     closed = _observation(right_gripper=0.02)
     env = _FakeEnv(
-        (closed, 0.0, False, False, {"done": {"success": False}})
+        (closed, 0.0, False, False, {"done": {"success": False}}),
+        (closed, 0.0, False, False, {"done": {"success": False}}),
     )
     primitives = _pi0_primitives(
         tmp_path,
-        model=_FakeModel(np.zeros((1, 23), dtype=np.float32)),
+        model=_FakeModel(
+            np.zeros((1, 23), dtype=np.float32),
+            np.zeros((1, 23), dtype=np.float32),
+        ),
         env=env,
         initial_observation=initial,
     )
 
-    result = primitives.pi0_pick(hand="right", instruction="grasp the radio")
+    result = primitives.pi0_pick(
+        hand="right", instruction="grasp the radio", max_chunks=2
+    )
 
     assert result["local_gripper_closure_detected"] is True
     assert result["primitive_success"] is False
@@ -350,7 +356,8 @@ def test_pi0_pick_closed_gripper_is_only_a_visual_candidate_by_default(tmp_path)
     assert result["local_grasp_validator_configured"] is False
     assert result["local_grasp_validator_result"] is None
     assert result["visual_verification_required"] is True
-    assert result["stop_reason"] == "local_gripper_closure_detected"
+    assert result["stop_reason"] == "chunk_limit"
+    assert result["chunks_used"] == 2
 
 
 def test_pi0_pick_validator_acceptance_is_required_for_local_success(tmp_path):
@@ -472,6 +479,7 @@ def test_pi0_pick_raw_done_success_only_sets_task_success_and_finish(tmp_path):
                     "done": {"success": True},
                     "task_success": False,
                     "success": False,
+                    "obs_info": {"privileged_object_pose": [1.0, 2.0, 3.0]},
                 },
             )
         ),
@@ -485,6 +493,9 @@ def test_pi0_pick_raw_done_success_only_sets_task_success_and_finish(tmp_path):
     assert result["primitive_success"] is False
     assert result["local_grasp_success"] is False
     assert result["stop_reason"] == "task_success"
+    assert result["last_info"] == {"done": {"success": True}}
+    raw_info = json.loads(Path(result["raw_final_info_path"]).read_text())
+    assert raw_info["obs_info"]["privileged_object_pose"] == [1.0, 2.0, 3.0]
 
 
 @pytest.mark.parametrize("failure", ["shape", "nan"])
