@@ -61,7 +61,7 @@ def official_task_success(info: Any) -> bool:
 def _public_info_summary(info: Any) -> Any:
     """Expose only stop/accounting fields, never simulator observation metadata."""
     if not isinstance(info, dict):
-        return _jsonable(info)
+        return {}
     return {
         key: _jsonable(info[key])
         for key in ("done", "_rpent")

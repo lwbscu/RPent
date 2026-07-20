@@ -142,6 +142,21 @@ def test_run_full_task_rejects_invalid_executed_steps(tmp_path, executed_steps):
     assert result["error"].startswith("RuntimeError: invalid env executed_steps")
 
 
+def test_run_full_task_public_result_fails_closed_for_non_mapping_info(tmp_path):
+    env = _Env([(_observation(), 0.0, True, False, ["private", "metadata"])])
+    primitives = BehaviorPrimitives(
+        env=env,
+        model=_Model(np.zeros((1, 23), dtype=np.float32)),
+        max_episode_steps=5,
+        output_dir=tmp_path,
+    )
+
+    result = primitives.run_full_task()
+
+    assert result["task_success"] is False
+    assert result["last_info"] == {}
+
+
 @pytest.mark.parametrize(
     ("terminated", "truncated", "stop_reason"),
     [(True, False, "terminated"), (False, True, "truncated")],
