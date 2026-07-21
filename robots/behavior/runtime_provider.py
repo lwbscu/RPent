@@ -23,6 +23,8 @@ from robots.behavior.schemas import (
     CONTROL_MODES,
     DEFAULT_ACTION_CHUNK,
     FULL_TASK_VLA_MODE,
+    HYBRID_VLM_PI0_MODE,
+    PI0_NAV_PICK_VLA_MODE,
     PI0_PICK_VLA_MODE,
     PLANNER_TOOLS_MODE,
     VLA_CONTROL_MODES,
@@ -34,6 +36,11 @@ from rpent.utils.config import get_repo_root
 from rpent.utils.logging import get_logger
 
 logger = get_logger("behavior_runtime")
+
+_PI0_TOOL_MODES = frozenset(
+    {PI0_PICK_VLA_MODE, HYBRID_VLM_PI0_MODE, PI0_NAV_PICK_VLA_MODE}
+)
+_PI0_MAX_CHUNK_MODES = frozenset({PI0_PICK_VLA_MODE, HYBRID_VLM_PI0_MODE})
 
 _ACTIVE_RUN_MANIFEST: contextvars.ContextVar[RunManifest | None] = (
     contextvars.ContextVar("behavior_run_manifest", default=None)
@@ -222,6 +229,13 @@ def start_env_server(
     ]
     if args.behavior_config:
         command.extend(["--config-path", str(Path(args.behavior_config).resolve())])
+    if getattr(args, "behavior_post_pick_debug_mirror", None):
+        command.extend(
+            [
+                "--post-pick-debug-mirror",
+                str(Path(args.behavior_post_pick_debug_mirror).expanduser().resolve()),
+            ]
+        )
     log_path = output_dir / "env_server.log"
     logger.info(
         "BEHAVIOR env server cmd: %s",
@@ -386,11 +400,161 @@ class BehaviorRuntimeHandle(RuntimeHandle):
     manifest: RunManifest | None = None
     _closed: bool = False
 
+    def _wait_while_resident(self) -> None:
+        """Keep the owning runtime alive until interrupted or a child exits."""
+
+        if self.env_proc is None or self.vla_proc is None:
+            raise RuntimeError("resident BEHAVIOR runtime lacks owned env or VLA")
+        logger.info(
+            "BEHAVIOR runtime paused and resident: env_pid=%s vla_pid=%s; "
+            "press Ctrl-C to stop",
+            self.env_proc.pid,
+            self.vla_proc.pid,
+        )
+        while self.env_proc.poll() is None and self.vla_proc.poll() is None:
+            time.sleep(2.0)
+        raise RuntimeError(
+            "resident BEHAVIOR child exited unexpectedly: "
+            f"env_returncode={self.env_proc.poll()} "
+            f"vla_returncode={self.vla_proc.poll()}"
+        )
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        paused_runtime_path = self.output_dir / "paused_runtime.json"
+        preserve_runtime = False
+        paused_runtime: dict[str, Any] = {}
+        if paused_runtime_path.is_file():
+            try:
+                paused_runtime = json.loads(
+                    paused_runtime_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                paused_runtime = {}
+            env_pid = getattr(self.env_proc, "pid", None)
+            vla_pid = getattr(self.vla_proc, "pid", None)
+            vla_process = (
+                self.manifest.data.get("processes", {}).get("vla", {})
+                if self.manifest is not None
+                else {}
+            )
+            expected_vla_endpoint = (
+                f"http://{vla_process.get('host')}:{vla_process.get('port')}"
+                if vla_process.get("host") and vla_process.get("port")
+                else None
+            )
+            preserve_runtime = bool(
+                paused_runtime.get("control_mode") == PI0_NAV_PICK_VLA_MODE
+                and paused_runtime.get("handoff_state") == "PAUSED"
+                and paused_runtime.get("lifecycle_finalized") is True
+                and paused_runtime.get("vla_actions_enabled") is False
+                and paused_runtime.get("action_source") == "curobo"
+                and isinstance(env_pid, int)
+                and paused_runtime.get("env_pid") == env_pid
+                and isinstance(vla_pid, int)
+                and paused_runtime.get("vla_pid") == vla_pid
+                and isinstance(expected_vla_endpoint, str)
+                and paused_runtime.get("vla_endpoint") == expected_vla_endpoint
+                and self.env_proc is not None
+                and self.env_proc.poll() is None
+                and self.vla_proc is not None
+                and self.vla_proc.poll() is None
+                and _owned_process_group_alive(self.env_proc)
+                and _owned_process_group_alive(self.vla_proc)
+            )
+        lifecycle_path = paused_runtime_path
+        lifecycle_status = "paused"
+        if not preserve_runtime and getattr(
+            self.toolkit, "control_mode", None
+        ) == PI0_NAV_PICK_VLA_MODE:
+            primitives = getattr(self.toolkit, "_primitives", None)
+            result = getattr(primitives, "last_result", None)
+            if (
+                isinstance(result, dict)
+                and result.get("primitive_success") is False
+                and result.get("task_success") is not True
+            ):
+                model = getattr(primitives, "model", None)
+                gate: dict[str, Any] = {}
+                gate_confirmed = False
+                try:
+                    disabled = model.disable_actions()
+                    health = model.healthz()
+                    gate = {
+                        "disable_confirmation": disabled,
+                        "healthz": health,
+                    }
+                    gate_confirmed = bool(
+                        isinstance(disabled, dict)
+                        and disabled.get("actions_enabled") is False
+                        and isinstance(health, dict)
+                        and health.get("actions_enabled") is False
+                        and isinstance(health.get("pid"), int)
+                        and health.get("pid") == getattr(self.vla_proc, "pid", None)
+                    )
+                except Exception as error:
+                    gate = {
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                env_pid = getattr(self.env_proc, "pid", None)
+                vla_pid = getattr(self.vla_proc, "pid", None)
+                failed_payload = {
+                    "schema_version": 1,
+                    "control_mode": PI0_NAV_PICK_VLA_MODE,
+                    "handoff_state": "FAILED",
+                    "env_pid": env_pid,
+                    "vla_pid": vla_pid,
+                    "action_source": "pi0_vla",
+                    "result_path": result.get("result_path"),
+                    "stop_reason": result.get("stop_reason"),
+                    "vla_gate": gate,
+                    "vla_gate_confirmed": gate_confirmed,
+                    "lifecycle_finalized": True,
+                }
+                lifecycle_path = self.output_dir / "failed_runtime.json"
+                temporary = lifecycle_path.with_suffix(".json.tmp")
+                temporary.write_text(
+                    json.dumps(failed_payload, indent=2, ensure_ascii=True),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, lifecycle_path)
+                lifecycle_status = "resident_failed"
+                preserve_runtime = bool(
+                    gate_confirmed
+                    and isinstance(env_pid, int)
+                    and isinstance(vla_pid, int)
+                    and self.env_proc is not None
+                    and self.env_proc.poll() is None
+                    and self.vla_proc is not None
+                    and self.vla_proc.poll() is None
+                    and _owned_process_group_alive(self.env_proc)
+                    and _owned_process_group_alive(self.vla_proc)
+                )
         failure: BaseException | None = None
+        if preserve_runtime:
+            if self.manifest is not None:
+                try:
+                    self.manifest._update(
+                        lambda data: data.update(
+                            {
+                                "status": lifecycle_status,
+                                "paused_runtime_path": str(lifecycle_path),
+                                "stopped_at": None,
+                            }
+                        )
+                    )
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+            if failure is None:
+                try:
+                    self._wait_while_resident()
+                except KeyboardInterrupt:
+                    logger.info("resident BEHAVIOR runtime stop requested by user")
+                except BaseException as error:
+                    failure = error
         if self.manifest is not None:
             try:
                 self.manifest.stopping()
@@ -453,7 +617,11 @@ class BehaviorRuntimeProvider:
                 "BEHAVIOR control surface: full_task_vla runs the Pi0.5 "
                 "baseline through run_full_task; planner_tools exposes only "
                 "the eight env-side planner primitives and does not start a "
-                "VLA server; pi0_pick_vla exposes only the local pi0_pick loop."
+                "VLA server; pi0_pick_vla exposes only the local pi0_pick loop; "
+                "pi0_nav_pick_vla runs unmodified Pi0 chunks until a strict "
+                "env-side grasp and CuRobo handoff; "
+                "hybrid_vlm_pi0 uses bounded pi0_navigate_to and pi0_pick "
+                "segments with visual planner review in one episode."
             ),
         )
         parser.add_argument("--task", type=int, default=0)
@@ -468,6 +636,14 @@ class BehaviorRuntimeProvider:
         parser.add_argument("--behavior-python", default=None)
         parser.add_argument("--behavior-config", default=None)
         parser.add_argument("--policy-checkpoint", default=None)
+        parser.add_argument(
+            "--behavior-post-pick-debug-mirror",
+            default=None,
+            help=(
+                "Load an attachment-faithful debug_mirror_post_pick scene into "
+                "pi0_nav_pick_vla and begin directly from the PAUSED post-pick state."
+            ),
+        )
         parser.add_argument(
             "--behavior-pi0-pick-hand",
             choices=("left", "right"),
@@ -537,13 +713,25 @@ class BehaviorRuntimeProvider:
             parser.error(
                 "--behavior-control-mode must be one of " + ", ".join(CONTROL_MODES)
             )
+        if args.behavior_post_pick_debug_mirror:
+            if args.behavior_control_mode != PI0_NAV_PICK_VLA_MODE:
+                parser.error(
+                    "--behavior-post-pick-debug-mirror requires "
+                    "--behavior-control-mode pi0_nav_pick_vla"
+                )
+            mirror = Path(args.behavior_post_pick_debug_mirror).expanduser().resolve()
+            if mirror.is_dir():
+                mirror = mirror / "debug_mirror_post_pick.scene.json"
+            if not mirror.is_file():
+                parser.error(f"post-pick debug mirror does not exist: {mirror}")
+            args.behavior_post_pick_debug_mirror = str(mirror)
         if (
-            args.behavior_control_mode == PI0_PICK_VLA_MODE
+            args.behavior_control_mode in _PI0_TOOL_MODES
             and not str(args.behavior_pi0_pick_instruction).strip()
         ):
             parser.error("--behavior-pi0-pick-instruction must be non-empty")
         if (
-            args.behavior_control_mode == PI0_PICK_VLA_MODE
+            args.behavior_control_mode in _PI0_MAX_CHUNK_MODES
             and args.behavior_pi0_pick_max_chunks <= 0
         ):
             parser.error("--behavior-pi0-pick-max-chunks must be positive")
@@ -607,7 +795,14 @@ class BehaviorRuntimeProvider:
             task=args.task,
             seed=args.seed,
             output_dir=str(output_dir),
-            video_path=str(output_dir / "episode.mp4"),
+            video_path=str(
+                output_dir
+                / (
+                    "pi0_nav_pick_episode.mp4"
+                    if args.behavior_control_mode == PI0_NAV_PICK_VLA_MODE
+                    else "episode.mp4"
+                )
+            ),
         )
 
     def prompt_vars(
@@ -634,6 +829,7 @@ class BehaviorRuntimeProvider:
             "behavior_pi0_pick_max_chunks": args.behavior_pi0_pick_max_chunks,
             **mode_instructions(
                 args.behavior_control_mode,
+                task_name=args.task_name,
                 pi0_hand=args.behavior_pi0_pick_hand,
                 pi0_instruction=args.behavior_pi0_pick_instruction,
                 pi0_max_chunks=args.behavior_pi0_pick_max_chunks,
@@ -689,6 +885,7 @@ class BehaviorRuntimeProvider:
             )
             if args.behavior_control_mode in VLA_CONTROL_MODES:
                 model = BehaviorVLAClient(vla_endpoint)
+                env.vla_endpoint = str(vla_endpoint)
                 if args.no_driver:
                     model.wait_for_healthz(timeout_s=30.0)
             if args.behavior_control_mode == FULL_TASK_VLA_MODE:
@@ -718,6 +915,58 @@ class BehaviorRuntimeProvider:
                         "initial_observation": initial_observation,
                         "initial_info": initial_info,
                     },
+                    dashboard=dashboard,
+                )
+            elif args.behavior_control_mode == PI0_NAV_PICK_VLA_MODE:
+                debug_mirror_vla_status = None
+                if args.behavior_post_pick_debug_mirror:
+                    disabled = model.disable_actions()
+                    health = model.healthz()
+                    debug_mirror_vla_status = {
+                        "actions_enabled": disabled.get("actions_enabled"),
+                        "endpoint": str(vla_endpoint),
+                        "healthz": health,
+                        "debug_mirror_restore": True,
+                    }
+                    if (
+                        disabled.get("actions_enabled") is not False
+                        or health.get("actions_enabled") is not False
+                    ):
+                        raise RuntimeError(
+                            "post-pick debug mirror VLA gate did not disable"
+                        )
+                initial_observation, initial_info = env.reset()
+                if debug_mirror_vla_status is not None:
+                    env.finalize_paused_runtime(debug_mirror_vla_status)
+                toolkit = get_toolkit(
+                    control_mode=args.behavior_control_mode,
+                    primitives_kwargs={
+                        "env": env,
+                        "model": model,
+                        "max_episode_steps": args.max_episode_steps,
+                        "action_horizon": DEFAULT_ACTION_CHUNK,
+                        "output_dir": output_dir,
+                        "video_path": output_dir / "pi0_nav_pick_episode.mp4",
+                        "initial_observation": initial_observation,
+                        "initial_info": initial_info,
+                    },
+                    dashboard=dashboard,
+                )
+            elif args.behavior_control_mode == HYBRID_VLM_PI0_MODE:
+                initial_observation, initial_info = env.reset()
+                toolkit = get_toolkit(
+                    control_mode=args.behavior_control_mode,
+                    primitives_kwargs={
+                        "env": env,
+                        "model": model,
+                        "max_episode_steps": args.max_episode_steps,
+                        "action_horizon": DEFAULT_ACTION_CHUNK,
+                        "output_dir": output_dir,
+                        "video_path": output_dir / "episode.mp4",
+                        "initial_observation": initial_observation,
+                        "initial_info": initial_info,
+                    },
+                    planner_client=env,
                     dashboard=dashboard,
                 )
             elif args.behavior_control_mode == PLANNER_TOOLS_MODE:

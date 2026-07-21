@@ -14,6 +14,7 @@ from robots.behavior.env_server import _MainThreadDispatcher
 from robots.behavior.run_manifest import RunManifest, redact_command
 from robots.behavior.schemas import (
     FULL_TASK_VLA_MODE,
+    PI0_NAV_PICK_VLA_MODE,
     PI0_PICK_VLA_MODE,
     PLANNER_TOOL_NAMES,
     PLANNER_TOOLS_MODE,
@@ -28,6 +29,120 @@ class _PlannerClient:
 
     def close(self):
         self.calls.append(("close", {}))
+
+
+def test_post_pick_env_client_routes_exact_core_rpc_signatures():
+    class Rpc:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, method, args=(), kwargs=None, *, timeout_s=None):
+            self.calls.append((method, args, kwargs or {}, timeout_s))
+            if method == "env.get_env_meta":
+                return {"control_mode": PI0_NAV_PICK_VLA_MODE}
+            return {
+                "primitive_success": True,
+                "task_success": False,
+                "stop_reason": method,
+                "total_env_steps": 1819,
+            }
+
+    rpc = Rpc()
+    client = BehaviorEnvClient(
+        rpc,
+        expected_meta={"control_mode": PI0_NAV_PICK_VLA_MODE},
+    )
+    client.inspect_post_pick_state()
+    client.observe(camera="head")
+    client.declare_button_visibility(
+        camera="head",
+        frame_id="head:1819:abc",
+        button_visible=False,
+        negative_case="clear_slotted_back_face",
+    )
+    client.pixel_to_world(
+        camera="head",
+        frame_id="head:1819:abc",
+        u=10,
+        v=12,
+    )
+    client.evaluate_prepress_geometry(projection_id="projection-1")
+    client.prepress_move_to(
+        role="press",
+        button_goal={
+            "kind": "press_staging",
+            "projection_id": "projection-1",
+            "standoff_m": 0.055,
+        },
+        plan_only=True,
+    )
+    client.prepress_rotate_wrist(
+        role="press",
+        relative_axis_angle=[0.0, 0.0, 1.0, 0.01],
+        plan_only=True,
+    )
+    client.save_prepress_checkpoint()
+    client.save_post_pick_debug_mirror()
+
+    assert [call[0] for call in rpc.calls[1:]] == [
+        "env.inspect_post_pick_state",
+        "env.observe",
+        "env.declare_button_visibility",
+        "env.pixel_to_world",
+        "env.evaluate_prepress_geometry",
+        "env.prepress_move_to",
+        "env.prepress_rotate_wrist",
+        "env.save_prepress_checkpoint",
+        "env.save_post_pick_debug_mirror",
+    ]
+    assert rpc.calls[3][2]["bbox_xyxy"] is None
+    assert rpc.calls[3][2]["negative_case"] == "clear_slotted_back_face"
+    assert "hand" not in rpc.calls[6][2]
+    assert rpc.calls[6][2]["role"] == "press"
+    assert "hand" not in rpc.calls[7][2]
+    assert rpc.calls[7][2]["role"] == "press"
+    assert rpc.calls[8][2]["checkpoint_name"] == "state_checkpoint_2"
+
+
+@pytest.mark.parametrize(
+    "negative_case",
+    ["clear_slotted_back_face", "side_port", "ambiguous"],
+)
+def test_post_pick_env_client_preserves_canonical_negative_face_class(
+    negative_case,
+):
+    class Rpc:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, method, args=(), kwargs=None, *, timeout_s=None):
+            self.calls.append((method, args, kwargs or {}, timeout_s))
+            if method == "env.get_env_meta":
+                return {"control_mode": PI0_NAV_PICK_VLA_MODE}
+            return {
+                "primitive_success": True,
+                "task_success": False,
+                "stop_reason": "button_not_visible",
+                "face_class": negative_case,
+                "total_env_steps": 1819,
+            }
+
+    rpc = Rpc()
+    client = BehaviorEnvClient(
+        rpc,
+        expected_meta={"control_mode": PI0_NAV_PICK_VLA_MODE},
+    )
+
+    result = client.declare_button_visibility(
+        camera="held_wrist",
+        frame_id="right_wrist:1819:abc",
+        button_visible=False,
+        negative_case=negative_case,
+    )
+
+    assert result["face_class"] == negative_case
+    assert rpc.calls[-1][0] == "env.declare_button_visibility"
+    assert rpc.calls[-1][2]["negative_case"] == negative_case
 
 
 def test_env_rpc_dispatcher_rejects_private_and_legacy_unprefixed_methods():
@@ -121,6 +236,7 @@ def test_env_rpc_dispatcher_keeps_chunk_interfaces_mode_private():
 
 
 for _tool_name in PLANNER_TOOL_NAMES:
+
     def _make(name):
         def _method(self, **kwargs):
             self.calls.append((name, kwargs))
@@ -242,7 +358,13 @@ def test_behavior_env_client_pi0_chunk_uses_private_rpc_and_tracks_done():
             self.calls.append((method, args, kwargs or {}, timeout_s))
             if method == "env.get_env_meta":
                 return {"control_mode": PI0_PICK_VLA_MODE}
-            return ({"states": [0.0] * 256}, 0.0, False, False, {"done": {"success": True}})
+            return (
+                {"states": [0.0] * 256},
+                0.0,
+                False,
+                False,
+                {"done": {"success": True}},
+            )
 
     rpc = Rpc()
     client = BehaviorEnvClient(
@@ -534,9 +656,7 @@ def test_run_manifest_full_records_redacted_owned_process(monkeypatch, tmp_path)
 def test_behavior_owned_process_uses_new_session_and_targeted_pgid(
     monkeypatch, tmp_path
 ):
-    _, _, args = _provider_args(
-        tmp_path, "--behavior-control-mode", "planner_tools"
-    )
+    _, _, args = _provider_args(tmp_path, "--behavior-control-mode", "planner_tools")
     captured = {}
 
     def capture(command, **kwargs):
@@ -604,9 +724,173 @@ def test_behavior_stop_cleans_recorded_group_after_leader_already_exited(
     assert terminated == [process]
 
 
-def test_runtime_start_failure_atomically_marks_manifest_failed(
+def test_failed_pi0_nav_pick_runtime_enters_mocked_resident_wait(monkeypatch, tmp_path):
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+
+        @staticmethod
+        def poll():
+            return None
+
+    class Model:
+        def __init__(self, pid):
+            self.pid = pid
+            self.calls = []
+
+        def disable_actions(self):
+            self.calls.append("disable")
+            return {"pid": self.pid, "actions_enabled": False}
+
+        def healthz(self):
+            self.calls.append("healthz")
+            return {"pid": self.pid, "actions_enabled": False}
+
+    class Toolkit:
+        control_mode = PI0_NAV_PICK_VLA_MODE
+
+        def __init__(self, model):
+            self._primitives = type(
+                "Primitives",
+                (),
+                {
+                    "last_result": {
+                        "primitive_success": False,
+                        "task_success": False,
+                        "result_path": str(tmp_path / "result.json"),
+                        "stop_reason": "insufficient_handoff_horizon",
+                    },
+                    "model": model,
+                },
+            )()
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    env_proc = Process(81240)
+    vla_proc = Process(81241)
+    model = Model(vla_proc.pid)
+    toolkit = Toolkit(model)
+    waited = []
+    stopped = []
+    monkeypatch.setattr(
+        behavior_runtime,
+        "_owned_process_group_alive",
+        lambda _process: True,
+    )
+    monkeypatch.setattr(
+        behavior_runtime.BehaviorRuntimeHandle,
+        "_wait_while_resident",
+        lambda self: waited.append((self.env_proc.pid, self.vla_proc.pid)),
+    )
+    monkeypatch.setattr(
+        behavior_runtime,
+        "stop_env_server",
+        lambda process, *, output_dir: stopped.append(("env", process.pid)),
+    )
+    monkeypatch.setattr(
+        behavior_runtime,
+        "_terminate_process",
+        lambda process: stopped.append(("vla", process.pid)),
+    )
+    handle = behavior_runtime.BehaviorRuntimeHandle(
+        toolkit=toolkit,
+        output_dir=tmp_path,
+        env_proc=env_proc,
+        vla_proc=vla_proc,
+    )
+
+    handle.close()
+
+    assert waited == [(env_proc.pid, vla_proc.pid)]
+    assert model.calls == ["disable", "healthz"]
+    failed = json.loads((tmp_path / "failed_runtime.json").read_text(encoding="utf-8"))
+    assert failed["handoff_state"] == "FAILED"
+    assert failed["vla_gate_confirmed"] is True
+    assert failed["stop_reason"] == "insufficient_handoff_horizon"
+    assert toolkit.closed is True
+    assert stopped == [("env", env_proc.pid), ("vla", vla_proc.pid)]
+
+
+def test_officially_successful_pi0_nav_pick_never_enters_failed_resident_state(
     monkeypatch, tmp_path
 ):
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+
+        @staticmethod
+        def poll():
+            return None
+
+    class Model:
+        @staticmethod
+        def disable_actions():
+            raise AssertionError("official success must not enter FAILED gating")
+
+        @staticmethod
+        def healthz():
+            raise AssertionError("official success must not enter FAILED gating")
+
+    class Toolkit:
+        control_mode = PI0_NAV_PICK_VLA_MODE
+
+        def __init__(self):
+            self._primitives = type(
+                "Primitives",
+                (),
+                {
+                    "last_result": {
+                        "primitive_success": False,
+                        "task_success": True,
+                        "result_path": str(tmp_path / "result.json"),
+                        "stop_reason": "task_success",
+                    },
+                    "model": Model(),
+                },
+            )()
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    toolkit = Toolkit()
+    waited = []
+    stopped = []
+    monkeypatch.setattr(
+        behavior_runtime.BehaviorRuntimeHandle,
+        "_wait_while_resident",
+        lambda _self: waited.append(True),
+    )
+    monkeypatch.setattr(
+        behavior_runtime,
+        "stop_env_server",
+        lambda process, *, output_dir: stopped.append(("env", process.pid)),
+    )
+    monkeypatch.setattr(
+        behavior_runtime,
+        "_terminate_process",
+        lambda process: stopped.append(("vla", process.pid)),
+    )
+    env_proc = Process(81242)
+    vla_proc = Process(81243)
+    handle = behavior_runtime.BehaviorRuntimeHandle(
+        toolkit=toolkit,
+        output_dir=tmp_path,
+        env_proc=env_proc,
+        vla_proc=vla_proc,
+    )
+
+    handle.close()
+
+    assert waited == []
+    assert not (tmp_path / "failed_runtime.json").exists()
+    assert toolkit.closed is True
+    assert stopped == [("env", env_proc.pid), ("vla", vla_proc.pid)]
+
+
+def test_runtime_start_failure_atomically_marks_manifest_failed(monkeypatch, tmp_path):
     provider, parser, args = _provider_args(
         tmp_path,
         "--behavior-control-mode",
@@ -626,9 +910,7 @@ def test_runtime_start_failure_atomically_marks_manifest_failed(
     with pytest.raises(RuntimeError, match="rpc failed"):
         provider.start(args, output_dir=output_dir)
 
-    payload = json.loads(
-        (output_dir / "run_manifest.json").read_text(encoding="utf-8")
-    )
+    payload = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
     assert payload["stopped_at"] is not None
     assert payload["error"] == {"message": "rpc failed", "type": "RuntimeError"}

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import os
 import sys
 import threading
 import time
@@ -45,6 +46,8 @@ class PredictRequest(BaseModel):
 _MODEL: Any = None
 _MODEL_META: dict[str, Any] = {}
 _MODEL_LOCK = threading.Lock()
+_ACTIONS_ENABLED = True
+_ACTIONS_LOCK = threading.Lock()
 
 
 def validate_checkpoint(path: str | Path) -> Path:
@@ -89,7 +92,7 @@ def build_model_config(checkpoint: str | Path) -> Any:
 
 
 def load_model(checkpoint: str | Path, *, seed: int) -> None:
-    global _MODEL, _MODEL_META
+    global _ACTIONS_ENABLED, _MODEL, _MODEL_META
     import torch
     from rlinf.models.embodiment.openpi import get_model
 
@@ -101,6 +104,8 @@ def load_model(checkpoint: str | Path, *, seed: int) -> None:
     model = get_model(build_model_config(checkpoint))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _MODEL = model.to(device).eval()
+    with _ACTIONS_LOCK:
+        _ACTIONS_ENABLED = True
     _MODEL_META = {
         "status": "ok",
         "config_name": "pi05_behavior",
@@ -169,22 +174,64 @@ def build_app() -> Any:
     def healthz():
         if _MODEL is None:
             raise HTTPException(status_code=503, detail="model not loaded")
-        return _MODEL_META
+        with _ACTIONS_LOCK:
+            actions_enabled = bool(_ACTIONS_ENABLED)
+        return {
+            **_MODEL_META,
+            "pid": os.getpid(),
+            "actions_enabled": actions_enabled,
+        }
+
+    @app.post("/control/disable-actions")
+    def disable_actions():
+        """Keep health monitoring alive while irreversibly gating inference."""
+
+        global _ACTIONS_ENABLED
+        # Lock ordering matches predict(): once this returns, no inference is
+        # in flight and no later request can enter the model.
+        with _MODEL_LOCK, _ACTIONS_LOCK:
+            _ACTIONS_ENABLED = False
+        return {
+            "status": "ok",
+            "pid": os.getpid(),
+            "actions_enabled": False,
+        }
 
     @app.post("/predict")
     def predict(request: PredictRequest):
         if _MODEL is None:
             raise HTTPException(status_code=503, detail="model not loaded")
+        # Fast rejection avoids image decoding after handoff. The identical
+        # check under _MODEL_LOCK below is the authoritative race-free gate.
+        with _ACTIONS_LOCK:
+            if not _ACTIONS_ENABLED:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "VLA action inference is disabled after controller "
+                        "handoff"
+                    ),
+                )
         try:
             import torch
 
             env_obs = build_env_observation(request.model_dump())
-            with _MODEL_LOCK, torch.no_grad():
-                actions, _ = _MODEL.predict_action_batch(
-                    env_obs,
-                    mode="eval",
-                    compute_values=False,
-                )
+            with _MODEL_LOCK:
+                with _ACTIONS_LOCK:
+                    if not _ACTIONS_ENABLED:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "VLA action inference is disabled after controller "
+                                "handoff"
+                            ),
+                        )
+                with torch.no_grad():
+                    actions, _ = _MODEL.predict_action_batch(
+                        env_obs,
+                        mode="eval",
+                        compute_values=False,
+                    )
             if torch.is_tensor(actions):
                 actions = actions.detach().float().cpu().numpy()
             actions = np.asarray(actions, dtype=np.float32)
@@ -203,6 +250,8 @@ def build_app() -> Any:
                 "shape": list(actions.shape),
                 "dtype": "float32",
             }
+        except HTTPException:
+            raise
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:

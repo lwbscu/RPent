@@ -2303,6 +2303,14 @@ def test_planner_warmup_delegates_to_backend_and_requires_implementation(tmp_pat
         def warmup(self):
             return {"status": "complete", "elapsed_s": 1.25}
 
+        def warmup_prepress(self, *, hand, expected_attached_root):
+            return {
+                "status": "complete",
+                "generator_kind": "prepress_arm",
+                "held_hand": hand,
+                "expected_attached_root": expected_attached_root,
+            }
+
     planner = PlannerExecutor(
         env=object(),
         frame_cache=FrameCache(),
@@ -2310,10 +2318,130 @@ def test_planner_warmup_delegates_to_backend_and_requires_implementation(tmp_pat
         backend=Backend(),
     )
     assert planner.warmup() == {"status": "complete", "elapsed_s": 1.25}
+    expected_root = object()
+    assert planner.warmup_prepress(
+        hand="left", expected_attached_root=expected_root
+    ) == {
+        "status": "complete",
+        "generator_kind": "prepress_arm",
+        "held_hand": "left",
+        "expected_attached_root": expected_root,
+    }
 
     planner.backend = object()
     with pytest.raises(RuntimeError, match="safety warmup"):
         planner.warmup()
+    with pytest.raises(RuntimeError, match="pre-press safety warmup"):
+        planner.warmup_prepress(hand="left", expected_attached_root=expected_root)
+
+
+@pytest.mark.parametrize("hand", ["left", "right"])
+def test_prepress_warmup_is_attachment_aware_and_phase_scoped(tmp_path, hand):
+    calls = []
+    q = np.linspace(-0.2, 0.2, 24, dtype=np.float32)
+
+    class Robot:
+        @staticmethod
+        def get_joint_positions():
+            return q.copy()
+
+    class Root:
+        prim_path = "/World/radio/root"
+
+    expected_root = Root()
+    attached = {f"{hand}_eef": expected_root}
+    generator = object()
+    backend = RealCuroboBackend.__new__(RealCuroboBackend)
+    backend.output_dir = tmp_path
+    backend._find_robot = lambda: Robot()
+    backend.get_attached_object = lambda selected: (
+        calls.append(("attachment", selected)) or attached
+    )
+    backend._generator = lambda *, kind, hand: (
+        calls.append(("generator", kind, hand)) or generator
+    )
+    backend._check_q_trajectory_collisions = (
+        lambda selected_generator, selected_q, *, attached_obj, skip_obstacle_update: (
+            calls.append(
+                (
+                    "collision",
+                    selected_generator,
+                    np.asarray(selected_q).copy(),
+                    attached_obj,
+                    skip_obstacle_update,
+                )
+            )
+            or {"available": True, "colliding": False, "checked_waypoints": 1}
+        )
+    )
+    backend.get_eef_pose = lambda selected: (
+        calls.append(("eef", selected))
+        or (np.array([0.4, 0.5, 0.6]), np.array([0.0, 0.0, 0.0, 1.0]))
+    )
+    backend._compute_arm_plan = lambda **kwargs: (
+        calls.append(("plan", kwargs))
+        or {"ok": True, "joint_trajectory": q.reshape(1, -1), "metrics": {}}
+    )
+
+    report = backend.warmup_prepress(
+        hand=hand, expected_attached_root=expected_root
+    )
+
+    assert report["status"] == "complete"
+    assert report["generator_kind"] == "prepress_arm"
+    assert report["held_hand"] == hand
+    assert report["base_generator_warmed"] is False
+    assert report["unrelated_press_arm_generator_warmed"] is False
+    assert report["robot_q_pose_jump_max"] == pytest.approx(0.0)
+    assert calls[0] == ("attachment", hand)
+    assert calls[1] == ("generator", "prepress_arm", hand)
+    collision = next(item for item in calls if item[0] == "collision")
+    assert collision[1] is generator
+    assert collision[3] is attached
+    assert collision[4] is False
+    connected_collision = [item for item in calls if item[0] == "collision"][1]
+    assert connected_collision[2].shape[0] == 2
+    np.testing.assert_allclose(connected_collision[2][0], q)
+    np.testing.assert_allclose(connected_collision[2][1], q)
+    assert connected_collision[3] is attached
+    plan = next(item[1] for item in calls if item[0] == "plan")
+    assert plan["hand"] == hand
+    assert plan["attached_obj"] is attached
+    assert plan["generator_kind"] == "prepress_arm"
+    assert plan["ik_only"] is False
+    assert (tmp_path / "planner_prepress_warmup.json").is_file()
+
+
+def test_prepress_warmup_fails_closed_on_current_attached_collision(tmp_path):
+    class Robot:
+        @staticmethod
+        def get_joint_positions():
+            return np.zeros(24, dtype=np.float32)
+
+    backend = RealCuroboBackend.__new__(RealCuroboBackend)
+    backend.output_dir = tmp_path
+    backend._find_robot = lambda: Robot()
+    expected_root = object()
+    backend.get_attached_object = lambda _hand: {"eef": expected_root}
+    backend._generator = lambda **_kwargs: object()
+    backend._check_q_trajectory_collisions = lambda *_args, **_kwargs: {
+        "available": True,
+        "colliding": True,
+    }
+    backend._compute_arm_plan = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("planning must not run from a colliding current state")
+    )
+
+    with pytest.raises(RuntimeError, match="attached collision check failed"):
+        backend.warmup_prepress(
+            hand="right", expected_attached_root=expected_root
+        )
+
+    artifact = json.loads(
+        (tmp_path / "planner_prepress_warmup.json").read_text(encoding="utf-8")
+    )
+    assert artifact["status"] == "error"
+    assert artifact["stages"]["current_q_attached_combined_collision"]["ok"] is False
 
 
 def test_q_trajectory_repeats_each_waypoint_until_closed_loop_reached():

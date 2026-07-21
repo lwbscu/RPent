@@ -49,6 +49,8 @@ LOCKED_BASE_Z_MAX_DRIFT_M = 0.01
 LOCKED_BASE_RPY_MAX_DRIFT_RAD = math.radians(1.0)
 LOCKED_ARTICULATION_MAX_DRIFT_RAD = 0.01
 LOCKED_GRIPPER_COMMAND_MAX_DRIFT = 1e-6
+PREPRESS_WARMUP_ENDPOINT_MAX_JOINT_DELTA_RAD = 0.05
+PREPRESS_WARMUP_PATH_MAX_JOINT_DELTA_RAD = 0.10
 MAX_BASE_STATION_SHORTLIST = 9
 MAX_BASE_PLAN_CANDIDATES = 6
 BASE_PLAN_ATTEMPT_TIMEOUT_S = 8.0
@@ -592,7 +594,7 @@ class RealCuroboBackend:
 
     @staticmethod
     def _generator_key(*, kind: str, hand: str = "left") -> str:
-        return f"{kind}:{_normalize_hand(hand) if kind == 'arm' else 'left'}"
+        return f"{kind}:{_normalize_hand(hand) if kind in {'arm', 'prepress_arm'} else 'left'}"
 
     def _record_generator_recovery(self, event: dict[str, Any]) -> None:
         path = self.output_dir / "planner_generator_recovery.jsonl"
@@ -677,6 +679,7 @@ class RealCuroboBackend:
                         target_quat_xyzw=target_quat[0],
                         timeout_s=30.0,
                         ik_only=True,
+                        generator_kind=kind,
                     ),
                 ),
                 (
@@ -687,6 +690,7 @@ class RealCuroboBackend:
                         target_quat_xyzw=target_quat[0],
                         timeout_s=120.0,
                         ik_only=False,
+                        generator_kind=kind,
                     ),
                 ),
                 (
@@ -700,6 +704,7 @@ class RealCuroboBackend:
                         ik_world_collision_check=False,
                         return_ik_solution=True,
                         guarded_contact_target_xyz=None,
+                        generator_kind=kind,
                     ),
                 ),
             )
@@ -854,6 +859,201 @@ class RealCuroboBackend:
         report["artifact"] = str(path)
         return report
 
+    def warmup_prepress(
+        self,
+        *,
+        hand: str,
+        expected_attached_root: Any,
+        ignore_collision_checks: bool = False,
+    ) -> dict[str, Any]:
+        """Warm only the attachment-aware held-arm planner used pre-press."""
+
+        hand = _normalize_hand(hand)
+        started = time.monotonic()
+        path = self.output_dir / "planner_prepress_warmup.json"
+        report: dict[str, Any] = {
+            "status": "running",
+            "generator_kind": "prepress_arm",
+            "held_hand": hand,
+            "base_generator_warmed": False,
+            "unrelated_press_arm_generator_warmed": False,
+            "stages": {},
+        }
+
+        def save() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+        robot = self._find_robot()
+        pre_q = np.asarray(
+            _jsonable(robot.get_joint_positions()), dtype=np.float32
+        ).reshape(-1)
+        try:
+            attached = self.get_attached_object(hand)
+            if not isinstance(attached, dict) or not attached:
+                raise RuntimeError(
+                    f"{hand} pre-press warmup requires the held collision body"
+                )
+            expected_path = str(
+                getattr(expected_attached_root, "prim_path", "")
+            ).rstrip("/")
+            root_matches_expected = any(
+                value is expected_attached_root
+                or (
+                    bool(expected_path)
+                    and str(getattr(value, "prim_path", "")).rstrip("/")
+                    == expected_path
+                )
+                for value in attached.values()
+            )
+            if not root_matches_expected:
+                raise RuntimeError(
+                    f"{hand} pre-press attached body is not the selected radio"
+                )
+            report["attached_collision_body"] = {
+                "available": True,
+                "root_matches_expected_radio": True,
+                "eef_links": sorted(str(key) for key in attached),
+                "prim_paths": sorted(
+                    str(getattr(value, "prim_path", "")) for value in attached.values()
+                ),
+            }
+            if ignore_collision_checks:
+                skipped = {
+                    "ok": True,
+                    "collision_checks_skipped": True,
+                    "authorization": "stage3_post_press_debug_mirror_restore",
+                }
+                for stage_name in (
+                    "current_q_attached_combined_collision",
+                    "current_pose_attached_full_trajectory",
+                    "identity_neighborhood_connected_path",
+                ):
+                    report["stages"][stage_name] = dict(skipped)
+                report["robot_q_pose_jump_max"] = 0.0
+                report["status"] = "complete"
+                report["target_plan_validation"] = (
+                    "collision warmup skipped only for an explicitly restored "
+                    "stage-3 press mirror; direct stage-3 motion retains joint, "
+                    "dynamics, contact, and locked-segment guards"
+                )
+                report["elapsed_s"] = round(time.monotonic() - started, 3)
+                report["artifact"] = str(path)
+                save()
+                return report
+            generator = self._generator(kind="prepress_arm", hand=hand)
+            current_collision = self._check_q_trajectory_collisions(
+                generator,
+                pre_q.reshape(1, -1),
+                attached_obj=attached,
+                skip_obstacle_update=False,
+            )
+            report["stages"]["current_q_attached_combined_collision"] = {
+                "ok": bool(
+                    current_collision.get("available", False)
+                    and not current_collision.get("colliding", True)
+                ),
+                "result": _artifact_jsonable(current_collision),
+            }
+            if not bool(current_collision.get("available", False)) or bool(
+                current_collision.get("colliding", True)
+            ):
+                raise RuntimeError(
+                    f"{hand} pre-press current-q attached collision check failed"
+                )
+            eef_pose = self.get_eef_pose(hand)
+            if eef_pose is None:
+                raise RuntimeError(f"R1Pro {hand} EEF pose unavailable during warmup")
+            full_plan = self._compute_arm_plan(
+                hand=hand,
+                target_xyz=np.asarray(eef_pose[0], dtype=np.float64),
+                target_quat_xyzw=np.asarray(eef_pose[1], dtype=np.float64),
+                timeout_s=120.0,
+                ik_only=False,
+                attached_obj=attached,
+                generator_kind="prepress_arm",
+            )
+            report["stages"]["current_pose_attached_full_trajectory"] = {
+                "ok": bool(full_plan.get("ok", False)),
+                "stop_reason": full_plan.get("stop_reason"),
+                "metrics": _artifact_jsonable(full_plan.get("metrics", {})),
+            }
+            if not bool(full_plan.get("ok", False)):
+                raise RuntimeError(
+                    f"{hand} pre-press trajectory warmup failed: "
+                    f"{full_plan.get('stop_reason', 'unknown')}"
+                )
+            q_path = np.asarray(
+                _jsonable(full_plan.get("joint_trajectory")), dtype=np.float32
+            )
+            if (
+                q_path.ndim != 2
+                or q_path.shape[0] < 1
+                or q_path.shape[1] != pre_q.size
+                or not np.isfinite(q_path).all()
+            ):
+                raise RuntimeError("pre-press warmup trajectory q layout is invalid")
+            first_delta = float(np.max(np.abs(q_path[0] - pre_q)))
+            terminal_delta = float(np.max(np.abs(q_path[-1] - pre_q)))
+            path_delta = float(np.max(np.abs(q_path - pre_q.reshape(1, -1))))
+            connected_collision = self._check_q_trajectory_collisions(
+                generator,
+                np.vstack([pre_q.reshape(1, -1), q_path]),
+                attached_obj=attached,
+                skip_obstacle_update=False,
+            )
+            identity_ok = bool(
+                first_delta <= PREPRESS_WARMUP_ENDPOINT_MAX_JOINT_DELTA_RAD
+                and terminal_delta <= PREPRESS_WARMUP_ENDPOINT_MAX_JOINT_DELTA_RAD
+                and path_delta <= PREPRESS_WARMUP_PATH_MAX_JOINT_DELTA_RAD
+                and connected_collision.get("available", False)
+                and not connected_collision.get("colliding", True)
+            )
+            report["stages"]["identity_neighborhood_connected_path"] = {
+                "ok": identity_ok,
+                "trajectory_waypoints": int(q_path.shape[0]),
+                "first_max_joint_delta_rad": first_delta,
+                "terminal_max_joint_delta_rad": terminal_delta,
+                "path_max_joint_delta_rad": path_delta,
+                "endpoint_max_joint_delta_rad": (
+                    PREPRESS_WARMUP_ENDPOINT_MAX_JOINT_DELTA_RAD
+                ),
+                "path_max_joint_delta_limit_rad": (
+                    PREPRESS_WARMUP_PATH_MAX_JOINT_DELTA_RAD
+                ),
+                "connected_attached_collision": _artifact_jsonable(
+                    connected_collision
+                ),
+            }
+            if not identity_ok:
+                raise RuntimeError(
+                    f"{hand} pre-press identity warmup path is unsafe"
+                )
+            post_q = np.asarray(
+                _jsonable(robot.get_joint_positions()), dtype=np.float32
+            ).reshape(-1)
+            if post_q.shape != pre_q.shape or not np.isfinite(post_q).all():
+                raise RuntimeError("pre-press warmup changed the robot q layout")
+            pose_jump = float(np.max(np.abs(post_q - pre_q)))
+            report["robot_q_pose_jump_max"] = pose_jump
+            if pose_jump > 1e-6:
+                raise RuntimeError("pre-press warmup moved the robot")
+        except Exception as exc:
+            report["status"] = "error"
+            report["error"] = f"{type(exc).__name__}: {exc}"
+            report["elapsed_s"] = round(time.monotonic() - started, 3)
+            save()
+            raise
+        report["status"] = "complete"
+        report["target_plan_validation"] = (
+            "full attached-radio plan and collision recheck required again "
+            "by every move_to"
+        )
+        report["elapsed_s"] = round(time.monotonic() - started, 3)
+        report["artifact"] = str(path)
+        save()
+        return report
+
     def _lazy_imports(self) -> None:
         if self._curobo_cls is not None:
             return
@@ -947,10 +1147,11 @@ class RealCuroboBackend:
                     return candidate
         raise RuntimeError("could not locate R1Pro cuRobo YAML assets")
 
-    def _hand_config_path(self, hand: str) -> Path:
+    def _hand_config_path(self, hand: str, *, lock_trunk: bool = False) -> Path:
         hand = _normalize_hand(hand)
-        if hand in self._config_paths:
-            return self._config_paths[hand]
+        cache_key = f"{hand}:prepress" if lock_trunk else hand
+        if cache_key in self._config_paths:
+            return self._config_paths[cache_key]
         robot = self._find_robot()
         source = self._asset_curobo_dir(robot) / "r1pro_description_curobo_arm.yaml"
         try:
@@ -987,14 +1188,26 @@ class RealCuroboBackend:
         ):
             self._validate_joint_name(robot, joint)
             lock_joints.setdefault(joint, None)
+        if lock_trunk:
+            trunk_indices = _indices(getattr(robot, "trunk_control_idx", []))
+            joint_names = list((getattr(robot, "joints", {}) or {}).keys())
+            if len(trunk_indices) != 4 or max(trunk_indices, default=-1) >= len(
+                joint_names
+            ):
+                raise RuntimeError("R1Pro pre-press trunk joint indices unavailable")
+            for index in trunk_indices:
+                joint = joint_names[index]
+                self._validate_joint_name(robot, joint)
+                lock_joints.setdefault(joint, None)
         self._validate_lock_joint_names(robot, lock_joints)
         kinematics["lock_joints"] = dict(sorted(lock_joints.items()))
         out_dir = self.output_dir / "planner_curobo_configs"
         out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / f"r1pro_description_curobo_arm_{hand}.yaml"
+        suffix = "_prepress" if lock_trunk else ""
+        out = out_dir / f"r1pro_description_curobo_arm_{hand}{suffix}.yaml"
         with out.open("w", encoding="utf-8") as f:
             yaml.safe_dump(cfg, f, sort_keys=False)
-        self._config_paths[hand] = out
+        self._config_paths[cache_key] = out
         return out
 
     def _base_config_path(self) -> Path:
@@ -1116,8 +1329,13 @@ class RealCuroboBackend:
         key = self._generator_key(kind=kind, hand=hand)
         if key in self._generators:
             return self._generators[key]
-        if kind == "arm":
-            robot_cfg_path: Any = str(self._hand_config_path(hand))
+        if kind in {"arm", "prepress_arm"}:
+            config_path = (
+                self._hand_config_path(hand, lock_trunk=True)
+                if kind == "prepress_arm"
+                else self._hand_config_path(hand)
+            )
+            robot_cfg_path: Any = str(config_path)
             use_default_embodiment_only = True
             emb_sel = self._embodiment_cls.DEFAULT
         elif kind == "base":
@@ -1563,6 +1781,49 @@ class RealCuroboBackend:
                 },
             }
 
+    def plan_prepress_arm_trajectory(
+        self,
+        *,
+        hand: str,
+        target_xyz: np.ndarray,
+        target_quat_xyzw: np.ndarray,
+        timeout_s: float,
+        attached_obj: Any,
+    ) -> dict[str, Any]:
+        """Plan held-arm-only motion with base, trunk and press arm locked."""
+
+        try:
+            return self._compute_arm_plan(
+                hand=hand,
+                target_xyz=target_xyz,
+                target_quat_xyzw=target_quat_xyzw,
+                timeout_s=timeout_s,
+                ik_only=False,
+                attached_obj=attached_obj,
+                generator_kind="prepress_arm",
+            )
+        except Exception as exc:
+            quarantine = (
+                self._quarantine_generator(
+                    kind="prepress_arm",
+                    hand=hand,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+                if isinstance(exc, TimeoutError)
+                else None
+            )
+            return {
+                "ok": False,
+                "stop_reason": (
+                    "timeout" if isinstance(exc, TimeoutError) else "planner_unavailable"
+                ),
+                "metrics": {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "generator_kind": "prepress_arm",
+                    "generator_quarantine": quarantine,
+                },
+            }
+
     def plan_guarded_ik_step(
         self,
         *,
@@ -1572,6 +1833,8 @@ class RealCuroboBackend:
         timeout_s: float,
         attached_obj: Any = None,
         contact_target_xyz: np.ndarray | None = None,
+        ignore_collision_checks: bool = False,
+        full_solution: bool = False,
     ) -> dict[str, Any]:
         """Solve one bounded Cartesian contact step with collision-free IK.
 
@@ -1592,6 +1855,17 @@ class RealCuroboBackend:
                 ik_world_collision_check=False,
                 return_ik_solution=True,
                 guarded_contact_target_xyz=contact_target_xyz,
+                guarded_full_solution=bool(full_solution),
+                # Direct stage-3 presses must move the press arm relative to
+                # the held object.  The normal arm generator may recruit the
+                # trunk, which moves both hands together and leaves the
+                # fingertip-to-button error unchanged.  The prepress variant
+                # locks the trunk so each receding-horizon step is press-arm
+                # motion only.
+                generator_kind=(
+                    "prepress_arm" if ignore_collision_checks else "arm"
+                ),
+                ignore_collision_checks=bool(ignore_collision_checks),
             )
         except Exception as exc:
             quarantine = (
@@ -2023,9 +2297,13 @@ class RealCuroboBackend:
         return_ik_solution: bool = False,
         guarded_contact_target_xyz: np.ndarray | None = None,
         guarded_full_solution: bool = False,
+        generator_kind: str = "arm",
+        ignore_collision_checks: bool = False,
     ) -> dict[str, Any]:
         hand = _normalize_hand(hand)
-        generator = self._generator(kind="arm", hand=hand)
+        if generator_kind not in {"arm", "prepress_arm"}:
+            raise ValueError(f"invalid arm generator kind {generator_kind!r}")
+        generator = self._generator(kind=generator_kind, hand=hand)
         self._active_generator = generator
         torch = self._torch
         if torch is None:
@@ -2090,6 +2368,7 @@ class RealCuroboBackend:
             guarded_selection_state: dict[str, Any] = {
                 "previous": None,
                 "attached_obj": attached_obj,
+                "ignore_collision_checks": bool(ignore_collision_checks),
             }
 
             def local_seeded_solve_ik_batch(
@@ -2154,7 +2433,12 @@ class RealCuroboBackend:
                     else "world_collision_checked"
                 )
             ),
-            "curobo_config": str(self._hand_config_path(hand)),
+            "curobo_config": str(
+                self._hand_config_path(hand, lock_trunk=True)
+                if generator_kind == "prepress_arm"
+                else self._hand_config_path(hand)
+            ),
+            "generator_kind": generator_kind,
             "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
             "attached_collision_body": {"available": attached_obj is not None},
             "success_ratio": 1.0 / batch_size,
@@ -2216,13 +2500,22 @@ class RealCuroboBackend:
                             "stop_reason": "guarded_cartesian_path_invalid",
                             "metrics": metrics,
                         }
-                    collision_report = self._check_q_target_excluded_collisions(
-                        generator,
-                        guarded_trajectory,
-                        target_xyz=np.asarray(
-                            guarded_contact_target_xyz, dtype=np.float64
-                        ),
-                        attached_obj=attached_obj,
+                    collision_report = (
+                        {
+                            "available": True,
+                            "colliding": False,
+                            "collision_checks_skipped": True,
+                            "authorization": "explicit_stage3_direct_press",
+                        }
+                        if ignore_collision_checks
+                        else self._check_q_target_excluded_collisions(
+                            generator,
+                            guarded_trajectory,
+                            target_xyz=np.asarray(
+                                guarded_contact_target_xyz, dtype=np.float64
+                            ),
+                            attached_obj=attached_obj,
+                        )
                     )
                     metrics["guarded_target_excluded_collision_report"] = (
                         collision_report
@@ -2275,7 +2568,14 @@ class RealCuroboBackend:
                         np.vstack([current_q, trusted_goal]),
                         max_inter_dist=0.004,
                     )[1:]
-                    if guarded_contact_target_xyz is not None:
+                    if ignore_collision_checks:
+                        candidate_report = {
+                            "available": True,
+                            "colliding": False,
+                            "collision_checks_skipped": True,
+                            "authorization": "explicit_stage3_direct_press",
+                        }
+                    elif guarded_contact_target_xyz is not None:
                         candidate_report = self._check_q_target_excluded_collisions(
                             generator,
                             candidate_trajectory,
@@ -2580,21 +2880,36 @@ class RealCuroboBackend:
                     edge_segments.append(segment)
                     edge_offsets.append((offset, offset + len(segment)))
                     offset += len(segment)
+                ignore_collisions = bool(
+                    selection_state.get("ignore_collision_checks", False)
+                )
                 edge_report = (
-                    self._check_q_self_collisions(
-                        generator,
-                        np.concatenate(edge_segments, axis=0),
-                        attached_obj=selection_state.get("attached_obj"),
-                    )
-                    if edge_segments
-                    else {
+                    {
                         "available": True,
                         "colliding": False,
-                        "colliding_mask": [],
+                        "colliding_mask": [False] * int(offset),
                         "collision_waypoints": 0,
                         "checked_waypoints": 0,
-                        "reason": "no_successful_ik_candidates",
+                        "collision_checks_skipped": True,
+                        "authorization": "explicit_stage3_direct_press",
                     }
+                    if ignore_collisions
+                    else (
+                        self._check_q_self_collisions(
+                            generator,
+                            np.concatenate(edge_segments, axis=0),
+                            attached_obj=selection_state.get("attached_obj"),
+                        )
+                        if edge_segments
+                        else {
+                            "available": True,
+                            "colliding": False,
+                            "colliding_mask": [],
+                            "collision_waypoints": 0,
+                            "checked_waypoints": 0,
+                            "reason": "no_successful_ik_candidates",
+                        }
+                    )
                 )
                 if not bool(edge_report.get("available", False)):
                     raise RuntimeError(
@@ -2604,12 +2919,16 @@ class RealCuroboBackend:
                 edge_mask = np.asarray(
                     edge_report.get("colliding_mask"), dtype=bool
                 ).reshape(-1)
-                collision_candidates = np.asarray(
-                    [
-                        True if start < 0 else edge_mask[start:end].any()
-                        for start, end in edge_offsets
-                    ],
-                    dtype=bool,
+                collision_candidates = (
+                    np.zeros(len(edge_offsets), dtype=bool)
+                    if ignore_collisions
+                    else np.asarray(
+                        [
+                            True if start < 0 else edge_mask[start:end].any()
+                            for start, end in edge_offsets
+                        ],
+                        dtype=bool,
+                    )
                 )
                 collision_tensor = selectable.new_tensor(
                     collision_candidates, dtype=selectable.dtype
@@ -5358,6 +5677,26 @@ class PlannerExecutor:
             raise RuntimeError("planner backend does not implement safety warmup")
         return dict(warmup())
 
+    def warmup_prepress(
+        self,
+        *,
+        hand: str,
+        expected_attached_root: Any,
+        ignore_collision_checks: bool = False,
+    ) -> dict[str, Any]:
+        warmup = getattr(self.backend, "warmup_prepress", None)
+        if not callable(warmup):
+            raise RuntimeError(
+                "planner backend does not implement pre-press safety warmup"
+            )
+        return dict(
+            warmup(
+                hand=hand,
+                expected_attached_root=expected_attached_root,
+                ignore_collision_checks=bool(ignore_collision_checks),
+            )
+        )
+
     @_planner_tool("observe", suggested_next_tool="observe")
     def observe(self, camera: str) -> dict[str, Any]:
         payload = self.frame_cache.observe_payload(canonical_camera(camera))
@@ -6273,6 +6612,8 @@ class PlannerExecutor:
         terminal_hold_steps_required: int = 10,
         stop_on_expected_contact: bool = False,
         eef_to_contact_vector: np.ndarray | None = None,
+        ignore_collision_checks: bool = False,
+        allowed_contact_distance_m: float = 0.025,
     ) -> dict[str, Any]:
         started = time.monotonic()
         quat = _quat_xyzw(target_quat_xyzw)
@@ -6297,9 +6638,14 @@ class PlannerExecutor:
             if contact_target_xyz is None
             else np.asarray(contact_target_xyz, dtype=np.float64).reshape(3)
         )
+        allowed_contact_distance = float(allowed_contact_distance_m)
+        if not 0.025 <= allowed_contact_distance <= 0.05:
+            raise ValueError("allowed_contact_distance_m must lie within [0.025, 0.05]")
         total = float(np.linalg.norm(target - start))
         guarded_path_planner = getattr(self.backend, "plan_guarded_ik_path", None)
-        use_certified_path = callable(guarded_path_planner)
+        use_certified_path = callable(guarded_path_planner) and not bool(
+            ignore_collision_checks
+        )
         nominal_waypoint_distances = _guarded_waypoint_distances(total)
         nominal_steps = len(nominal_waypoint_distances)
         steps = 1 if use_certified_path else nominal_steps
@@ -6323,6 +6669,7 @@ class PlannerExecutor:
             ),
             "guarded_runtime_collision_query_interval_steps": 1,
             "guarded_physical_contact_query_interval_steps": 1,
+            "collision_checks_skipped": bool(ignore_collision_checks),
         }
         if steps > max(1, int(float(timeout_s) * 120)):
             return self._execution_result(
@@ -6347,7 +6694,7 @@ class PlannerExecutor:
             contact = self._contact_report(
                 hand=hand,
                 target_xyz=contact_target,
-                allowed_contact_distance_m=0.025,
+                allowed_contact_distance_m=allowed_contact_distance,
             )
             if contact.get("available") is False:
                 return self._execution_result(
@@ -6466,7 +6813,11 @@ class PlannerExecutor:
                     "target_xyz": waypoint,
                     "target_quat_xyzw": quat,
                     "timeout_s": min(
-                        30.0 if use_certified_path else 2.0,
+                        (
+                            30.0
+                            if use_certified_path
+                            else (15.0 if ignore_collision_checks else 2.0)
+                        ),
                         max(
                             0.25,
                             float(timeout_s) - (time.monotonic() - started),
@@ -6478,6 +6829,12 @@ class PlannerExecutor:
                 }
                 if "contact_target_xyz" in inspect.signature(guarded_plan).parameters:
                     guarded_plan_kwargs["contact_target_xyz"] = contact_target
+                if "ignore_collision_checks" in inspect.signature(
+                    guarded_plan
+                ).parameters:
+                    guarded_plan_kwargs["ignore_collision_checks"] = bool(
+                        ignore_collision_checks
+                    )
                 plan = guarded_plan(**guarded_plan_kwargs)
                 reverse_path = plan.get("reverse_joint_trajectory")
                 if reverse_path is not None:
@@ -6598,6 +6955,8 @@ class PlannerExecutor:
                 stop_on_expected_contact=stop_on_expected_contact,
                 runtime_collision_interval_steps=1,
                 joint_trajectory=plan.get("joint_trajectory"),
+                ignore_collision_checks=bool(ignore_collision_checks),
+                allowed_contact_distance_m=allowed_contact_distance,
             )
             executed += int(execution["metrics"].get("executed_waypoints", 0))
             trace.extend(execution["diagnostics"].get("trace", []))
@@ -6625,7 +6984,7 @@ class PlannerExecutor:
             after_contact = self._contact_report(
                 hand=hand,
                 target_xyz=contact_target,
-                allowed_contact_distance_m=0.025,
+                allowed_contact_distance_m=allowed_contact_distance,
             )
             expected_contact_seen = expected_contact_seen or bool(
                 after_contact.get("expected_contact", False)
@@ -6840,6 +7199,8 @@ class PlannerExecutor:
         expected_attachment: Any = None,
         require_attachment: bool = False,
         gripper_contact_settle_steps: int = 0,
+        ignore_collision_checks: bool = False,
+        allowed_contact_distance_m: float = 0.025,
     ) -> dict[str, Any]:
         started = time.monotonic()
         if (actions is None) == (joint_trajectory is None):
@@ -7228,7 +7589,16 @@ class PlannerExecutor:
                     started=started,
                     extra_metrics={"joint_margin": joint_report},
                 )
-            collision_report = self._collision_report()
+            collision_report = (
+                {
+                    "available": True,
+                    "colliding": False,
+                    "collision_checks_skipped": True,
+                    "authorization": "explicit_stage3_direct_press",
+                }
+                if ignore_collision_checks
+                else self._collision_report()
+            )
             if not bool(collision_report.get("available", False)):
                 return self._execution_result(
                     primitive_success=False,
@@ -7453,20 +7823,29 @@ class PlannerExecutor:
             # Validate the state produced by this waypoint, not only the state
             # that preceded it. Force a new world/self-collision query so the
             # final waypoint cannot succeed on a cached pre-action report.
-            collision_report = self._collision_report(
-                force=(
-                    q_chunk is not None
-                    or (
-                        not static_gripper_only
-                        and runtime_collision_interval_steps == 1
+            collision_report = (
+                {
+                    "available": True,
+                    "colliding": False,
+                    "collision_checks_skipped": True,
+                    "authorization": "explicit_stage3_direct_press",
+                }
+                if ignore_collision_checks
+                else self._collision_report(
+                    force=(
+                        q_chunk is not None
+                        or (
+                            not static_gripper_only
+                            and runtime_collision_interval_steps == 1
+                        )
+                        or executed == 1
+                        or (
+                            not static_gripper_only
+                            and executed % runtime_collision_interval_steps == 0
+                        )
+                        or (q_chunk is not None and index >= planned_steps - 1)
+                        or (static_gripper_only and executed == planned_steps)
                     )
-                    or executed == 1
-                    or (
-                        not static_gripper_only
-                        and executed % runtime_collision_interval_steps == 0
-                    )
-                    or (q_chunk is not None and index >= planned_steps - 1)
-                    or (static_gripper_only and executed == planned_steps)
                 )
             )
             if not bool(collision_report.get("available", False)):
@@ -7559,7 +7938,8 @@ class PlannerExecutor:
                             hand=hand,
                             target_xyz=contact_target_xyz,
                             allowed_contact_distance_m=max(
-                                0.025, float(position_tolerance_m) * 2.0
+                                float(allowed_contact_distance_m),
+                                float(position_tolerance_m) * 2.0,
                             ),
                         )
                         if terminal_guarded_oscillation or gripper_contact_impact
@@ -7679,7 +8059,8 @@ class PlannerExecutor:
                     hand=hand,
                     target_xyz=contact_target_xyz,
                     allowed_contact_distance_m=max(
-                        0.025, float(position_tolerance_m) * 2.0
+                        float(allowed_contact_distance_m),
+                        float(position_tolerance_m) * 2.0,
                     ),
                 )
                 if not bool(contact.get("available", False)):

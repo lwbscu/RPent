@@ -32,6 +32,10 @@ class BehaviorVLAClient:
         # variables must never redirect it or make SOCKS extras a dependency.
         self._client = httpx.Client(timeout=timeout_s, trust_env=False)
 
+    @property
+    def endpoint(self) -> str:
+        return self._base_url
+
     def healthz(self, *, timeout_ms: int | None = None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
         if timeout_ms is not None:
@@ -59,6 +63,21 @@ class BehaviorVLAClient:
             f"BEHAVIOR vla server not healthy after {timeout_s:.0f}s "
             f"(last error: {last_err})"
         )
+
+    def disable_actions(self, *, timeout_ms: int = 5000) -> dict[str, Any]:
+        """Disable future policy inference while leaving ``healthz`` available."""
+
+        resp = self._client.post(
+            f"{self._base_url}/control/disable-actions",
+            timeout=max(float(timeout_ms) / 1000.0, 0.001),
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("actions_enabled") is not False:
+            raise RuntimeError(
+                f"VLA server did not confirm action disable: {payload!r}"
+            )
+        return payload
 
     def predict_action_batch(
         self,
