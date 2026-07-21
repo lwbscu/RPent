@@ -23,13 +23,14 @@ and Pi0.5 checkpoint:
 
    export RPENT_RLINF_ROOT=/path/to/RLinf_agentic_push
    export PI05_CHECKPOINT_PATH=/path/to/pi05-behavior-checkpoint
+   export RPENT_PYTHON=/path/to/RPent/.venv/bin/python
 
 One Codex SDK episode
 ---------------------
 
 .. code-block:: bash
 
-   python -m rpent.cli.main \
+   "$RPENT_PYTHON" -m rpent.cli.main \
      --env behavior --cerebrum codex --model YOUR_CODEX_MODEL \
      --behavior-control-mode pi0_nav_pick_vla --behavior-stage3-press \
      --task 0 --task-name turning_on_radio \
@@ -63,7 +64,7 @@ Use the checked-in runner when one GPU cannot host parallel simulations:
 
 .. code-block:: bash
 
-   python scripts/run_behavior_serial_eval.py \
+   "$RPENT_PYTHON" scripts/run_behavior_serial_eval.py \
      --split official_first10 --cuda-device 0 \
      --model YOUR_CODEX_MODEL \
      --policy-checkpoint "$PI05_CHECKPOINT_PATH" \
@@ -74,7 +75,9 @@ order, freezes an immutable plan, runs one fresh top-level process per
 instance, and permits no automatic retry. It records ``eval_plan.json``,
 ``eval_results.jsonl``, and ``eval_summary.json``. It refuses dirty source,
 nonempty run directories, reordered IDs, lingering managed processes, and
-temporary-checkpoint residue. This is RPent's binary public-slice evaluation,
-not the full challenge leaderboard scorer.
+temporary-checkpoint residue. Before plan creation it also verifies that the
+frozen RPent Python imports HTTPX, the Codex SDK, the CLI, and the BEHAVIOR
+runtime. This is RPent's binary public-slice evaluation, not the full challenge
+leaderboard scorer.
 
 See ``robots/behavior/README.md`` for prompt ownership and contributor checks.

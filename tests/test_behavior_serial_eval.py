@@ -3,6 +3,7 @@ import io
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,11 +11,13 @@ from robots.behavior.serial_eval import (
     TURNING_ON_RADIO_PUBLIC_IDS,
     EvalEntry,
     _checkout_identity,
+    _file_fingerprint,
     _gpu_lock_path,
     _owned_group_members,
     _run_entry,
     _terminal_press_wrist_image,
     _unverified_group_members,
+    _validate_entry_python,
     build_entry_argv,
     read_turning_on_radio_instances,
     select_instances,
@@ -190,6 +193,22 @@ def test_result_classification_uses_raw_success_not_exit_code(tmp_path):
     )
     assert outcome == "run_error"
     assert "top-level RPent process returned nonzero" in errors
+
+
+def test_missing_final_result_with_nonzero_exit_is_run_error(tmp_path):
+    entry = _entry(tmp_path)
+    _write_bound_artifacts(entry, success=False)
+    (entry.output_dir / "final_result.json").unlink()
+
+    outcome, errors, _ = validate_instance_result(
+        entry,
+        source_commit="abc",
+        subprocess_exit_code=1,
+        timed_out=False,
+    )
+
+    assert outcome == "run_error"
+    assert "missing or invalid final_result.json" in errors
 
 
 def test_success_requires_post_hold_press_wrist_evidence(tmp_path):
@@ -384,6 +403,32 @@ def test_dirty_checkout_fingerprint_tracks_content_not_only_status(tmp_path):
 
     assert first["status_sha256"] == second["status_sha256"]
     assert first["dirty_content_sha256"] != second["dirty_content_sha256"]
+
+
+def test_entry_python_dependency_preflight_fails_before_eval(monkeypatch, tmp_path):
+    completed = SimpleNamespace(
+        returncode=1,
+        stdout="",
+        stderr="ModuleNotFoundError: No module named 'httpx'\n",
+    )
+    monkeypatch.setattr(
+        "robots.behavior.serial_eval.subprocess.run", lambda *args, **kwargs: completed
+    )
+
+    with pytest.raises(RuntimeError, match="No module named 'httpx'"):
+        _validate_entry_python(tmp_path / "python", repo_root=tmp_path)
+
+
+def test_executable_fingerprint_preserves_virtualenv_symlink_path(tmp_path):
+    target = tmp_path / "python-real"
+    target.write_bytes(b"python")
+    link = tmp_path / "venv-python"
+    link.symlink_to(target)
+
+    fingerprint = _file_fingerprint(link)
+
+    assert fingerprint["path"] == str(link.absolute())
+    assert fingerprint["resolved_path"] == str(target.resolve())
 
 
 def test_timeout_launches_once_and_cleans_manifest_groups(monkeypatch, tmp_path):

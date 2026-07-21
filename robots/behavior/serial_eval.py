@@ -170,10 +170,12 @@ def _git(repo_root: Path, *arguments: str, check: bool = True) -> str | None:
 
 
 def _file_fingerprint(path: Path) -> dict[str, Any]:
-    resolved = path.expanduser().resolve()
+    requested = path.expanduser().absolute()
+    resolved = requested.resolve()
     stat = resolved.stat()
     return {
-        "path": str(resolved),
+        "path": str(requested),
+        "resolved_path": str(resolved),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "sha256": _sha256(resolved),
@@ -252,6 +254,32 @@ def source_identity(repo_root: Path) -> dict[str, Any]:
         "worktree": str(repo_root.resolve()),
         "worktree_dirty": False,
     }
+
+
+def _validate_entry_python(python: Path, *, repo_root: Path) -> None:
+    """Fail before plan creation unless the frozen RPent SDK Python is usable."""
+
+    completed = subprocess.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import httpx, openai_codex; "
+                "import rpent.cli.main; "
+                "import robots.behavior.runtime_provider"
+            ),
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip().splitlines()
+        suffix = detail[-1] if detail else f"exit {completed.returncode}"
+        raise RuntimeError(
+            f"RPent entry Python dependency preflight failed: {python}: {suffix}"
+        )
 
 
 def _normalize_cuda_device(cuda_device: str) -> str:
@@ -671,6 +699,8 @@ def validate_instance_result(
         errors.append("temporary checkpoint JSON was not deleted")
     if final_result is None:
         errors.append("missing or invalid final_result.json")
+        if timed_out or subprocess_exit_code not in {0, None}:
+            return "run_error", errors, None
         return "incomplete", errors, None
     if subprocess_exit_code not in {0, None}:
         errors.append("top-level RPent process returned nonzero")
@@ -835,8 +865,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.behavior_python or behavior_repo / ".venv-behavior" / "bin" / "python"
         )
         .expanduser()
-        .resolve()
+        .absolute()
     )
+    entry_python = Path(args.python).expanduser().absolute()
     checkpoint_raw = args.policy_checkpoint or os.environ.get("PI05_CHECKPOINT_PATH")
     if not checkpoint_raw:
         raise SystemExit("--policy-checkpoint or PI05_CHECKPOINT_PATH is required")
@@ -864,6 +895,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     for required in (
         repo_root / "pyproject.toml",
+        entry_python,
         behavior_python,
         checkpoint / "model.safetensors",
         checkpoint
@@ -876,6 +908,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     ):
         if not required.exists():
             raise SystemExit(f"required path is missing: {required}")
+
+    try:
+        _validate_entry_python(entry_python, repo_root=repo_root)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+        raise SystemExit(str(error)) from error
 
     source = source_identity(repo_root)
     public_ids = read_turning_on_radio_instances(
@@ -900,6 +937,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "model": _file_fingerprint(model_path),
         "norm_stats": _file_fingerprint(norm_stats_path),
         "test_instances_csv": _file_fingerprint(csv_path),
+        "rpent_python": _file_fingerprint(entry_python),
         "behavior_python": _file_fingerprint(behavior_python),
         "behavior_checkout": _checkout_identity(behavior_repo),
         "behavior_dataset_checkout": _checkout_identity(behavior_dataset_repo),
@@ -946,7 +984,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 f"instance{instance_id}_seed{args.seed}"
             )
             entry_argv = build_entry_argv(
-                python=Path(args.python).expanduser().resolve(),
+                python=entry_python,
                 repo_root=repo_root,
                 output_dir=output_dir,
                 behavior_repo=behavior_repo,
@@ -1052,13 +1090,21 @@ def main(argv: Iterable[str] | None = None) -> int:
             exit_code: int | None = None
             timed_out = False
             launch_error: str | None = None
-            fingerprint_errors = _verify_input_fingerprints(
-                repo_root=repo_root,
-                source=source,
-                global_inputs=global_inputs,
-                entry=entry,
-            )
-            if fingerprint_errors:
+            try:
+                fingerprint_errors = _verify_input_fingerprints(
+                    repo_root=repo_root,
+                    source=source,
+                    global_inputs=global_inputs,
+                    entry=entry,
+                )
+            except BaseException as error:
+                fingerprint_errors = []
+                launch_error = f"{type(error).__name__}: {error}"
+                interrupted = not isinstance(error, Exception)
+                abort_remaining = True
+            if launch_error is not None:
+                pass
+            elif fingerprint_errors:
                 launch_error = "; ".join(fingerprint_errors)
                 abort_remaining = True
             else:

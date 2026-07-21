@@ -21,13 +21,14 @@ Pi0.5 权重。一次正式评测必须新建并完整清理这组进程，不�
 
    export RPENT_RLINF_ROOT=/path/to/RLinf_agentic_push
    export PI05_CHECKPOINT_PATH=/path/to/pi05-behavior-checkpoint
+   export RPENT_PYTHON=/path/to/RPent/.venv/bin/python
 
 单个 Codex SDK episode
 ----------------------
 
 .. code-block:: bash
 
-   python -m rpent.cli.main \
+   "$RPENT_PYTHON" -m rpent.cli.main \
      --env behavior --cerebrum codex --model YOUR_CODEX_MODEL \
      --behavior-control-mode pi0_nav_pick_vla --behavior-stage3-press \
      --task 0 --task-name turning_on_radio \
@@ -59,7 +60,7 @@ runtime 必须删除全部临时 checkpoint JSON。
 
 .. code-block:: bash
 
-   python scripts/run_behavior_serial_eval.py \
+   "$RPENT_PYTHON" scripts/run_behavior_serial_eval.py \
      --split official_first10 --cuda-device 0 \
      --model YOUR_CODEX_MODEL \
      --policy-checkpoint "$PI05_CHECKPOINT_PATH" \
@@ -71,5 +72,7 @@ runner 按 authoritative CSV 原顺序使用前十个 instance，先固化不可
 ``eval_plan.json``、``eval_results.jsonl`` 和 ``eval_summary.json``。脏源码、
 非空目录、ID 重排、残留子进程或残留临时 checkpoint 都会使结果失效。这是
 RPent 的 public slice 二值评测，不等同于完整 challenge leaderboard scorer。
+runner 会在写 plan 和启动任何 instance 之前，验证固化的 RPent Python 能导入
+HTTPX、Codex SDK、CLI 与 BEHAVIOR runtime。
 
 prompt 的文件职责与 contributor 检查见 ``robots/behavior/README.md``。

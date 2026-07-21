@@ -59,8 +59,9 @@ run a fresh owned process stack:
 ```bash
 export RPENT_RLINF_ROOT=/path/to/RLinf_agentic_push
 export PI05_CHECKPOINT_PATH=/path/to/pi05-behavior-checkpoint
+export RPENT_PYTHON=/path/to/RPent/.venv/bin/python
 
-python -m rpent.cli.main \
+"$RPENT_PYTHON" -m rpent.cli.main \
   --env behavior --cerebrum codex --model YOUR_CODEX_MODEL \
   --behavior-control-mode pi0_nav_pick_vla --behavior-stage3-press \
   --task 0 --task-name turning_on_radio \
@@ -85,13 +86,18 @@ attempt, never retries, and never adapts a later command from an earlier
 result.
 
 ```bash
-python scripts/run_behavior_serial_eval.py \
+"$RPENT_PYTHON" scripts/run_behavior_serial_eval.py \
   --split official_first10 \
   --cuda-device 0 \
   --model YOUR_CODEX_MODEL \
   --policy-checkpoint "$PI05_CHECKPOINT_PATH" \
   --output-root /path/to/new-empty-eval-root
 ```
+
+The runner validates that this frozen RPent interpreter can import `httpx`,
+the Codex SDK, the CLI, and the BEHAVIOR runtime before it writes the plan or
+starts any instance. `--python` can pin a different validated interpreter when
+the runner itself is launched from another environment.
 
 The root contains `eval_plan.json`, `eval_results.jsonl`, and
 `eval_summary.json`. A `passed` entry requires bound manifests, clean runtime
