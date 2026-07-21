@@ -4,13 +4,14 @@
 during ``__init__`` via :meth:`Toolkit.add_tool`; the cerebrum calls the tools through :meth:`Toolkit.get_tools_spec` and
 :meth:`Toolkit.execute_tool`.
 """
+
 from __future__ import annotations
 
 import base64
 import json
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
-import traceback
 from typing import Any, ClassVar
 
 from rpent.utils.templates import substitute
@@ -37,6 +38,7 @@ class ToolResult:
     MAX_TEXT_BYTES_IN_RESULT: ClassVar[int] = 60000
 
     def __post_init__(self) -> None:
+        """Build normalized content blocks and official finish semantics."""
         self.content_blocks = self._build_content_blocks()
         self.is_finish = bool(
             isinstance(self.result, dict) and self.result.get("_finish")
@@ -51,31 +53,38 @@ class ToolResult:
         """
         result = self.result
         if not isinstance(result, dict):
-            return [{"type": "text", "text": str(result)[:self.MAX_TEXT_BYTES_IN_RESULT]}]
+            return [
+                {"type": "text", "text": str(result)[: self.MAX_TEXT_BYTES_IN_RESULT]}
+            ]
 
         result_for_text = dict(result)
         image = result_for_text.pop("_image_bytes", None)
+        depth_image = result_for_text.pop("_depth_image_bytes", None)
         image_cam = result_for_text.pop("_image_cam_bytes", None)
         image_wrist = result_for_text.pop("_image_wrist_bytes", None)
         text = json.dumps(result_for_text, indent=2, default=str)
         if len(text) > self.MAX_TEXT_BYTES_IN_RESULT:
-            text = text[:self.MAX_TEXT_BYTES_IN_RESULT] + "\n[truncated]"
+            text = text[: self.MAX_TEXT_BYTES_IN_RESULT] + "\n[truncated]"
 
         blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
 
         def _add_image_bytes(data_bytes: bytes) -> None:
             data = base64.b64encode(data_bytes).decode("utf-8")
-            blocks.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": data,
-                },
-            })
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": data,
+                    },
+                }
+            )
 
         if image:
             _add_image_bytes(image)
+        if depth_image:
+            _add_image_bytes(depth_image)
         if image_cam:
             _add_image_bytes(image_cam)
         if image_wrist:
@@ -95,9 +104,14 @@ class Toolkit:
     """
 
     def __init__(self, *, dashboard: Any = None) -> None:
+        """Initialize an empty tool registry with an optional dashboard sink."""
         # name -> (spec, handler)
-        self._tools: dict[str, tuple[dict[str, Any], Callable[..., dict[str, Any]]]] = {}
+        self._tools: dict[
+            str, tuple[dict[str, Any], Callable[..., dict[str, Any]]]
+        ] = {}
         self._dashboard = dashboard
+        self._last_tool_result: dict[str, Any] | None = None
+        self._official_task_success: bool | None = None
         self._register_common_tools()
 
     # ------------------------------------------------------------------
@@ -135,9 +149,7 @@ class Toolkit:
 
     def get_tools_spec(self) -> list[dict[str, Any]]:
         """Return the tool schemas the LLM sees."""
-        return substitute(
-            [spec for spec, _ in self._tools.values()]
-        )
+        return substitute([spec for spec, _ in self._tools.values()])
 
     def execute_tool(self, name: str, input_dict: dict[str, Any]) -> ToolResult:
         """Dispatch a tool call to its registered handler."""
@@ -151,9 +163,27 @@ class Toolkit:
             result = {"error": f"bad arguments for {name}: {e}", "got": input_dict}
         except Exception as e:
             result = {"error": str(e), "traceback": traceback.format_exc()}
+        if isinstance(result, dict):
+            self._last_tool_result = result
+            if "task_success" in result:
+                self._official_task_success = bool(result["task_success"])
+            elif "libero_terminated" in result:
+                self._official_task_success = bool(result["libero_terminated"])
         if self._dashboard is not None:
             self._dashboard.on_tool_result(name, result)
         return ToolResult(name=name, result=result)
+
+    @property
+    def last_tool_result(self) -> dict[str, Any] | None:
+        """Return the most recent raw tool result, if a tool has run."""
+
+        return self._last_tool_result
+
+    @property
+    def official_task_success(self) -> bool | None:
+        """Return the latest explicit environment success bit, or ``None``."""
+
+        return self._official_task_success
 
     # ------------------------------------------------------------------
     # Server lifecycle hooks (overridden by env toolkits)

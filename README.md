@@ -68,6 +68,7 @@ RPent is built upon three core design principles: **service-oriented, standardiz
       <td style="text-align: left; padding-left: 8px;">
         <ul style="margin-left: 0; padding-left: 16px;">
           <li>LIBERO-PRO ✅</li>
+          <li>BEHAVIOR-1K (R1Pro) ✅</li>
           <li>RoboCasa </li>
         </ul>
       </td>
@@ -146,6 +147,22 @@ bash scripts/run_robocasa.sh PickPlaceCounterToCabinet 0 0    # <task> <gpu> <se
 
 See [SETUP_ROBOCASA.zh.md](docs/SETUP_ROBOCASA.zh.md) for the full RoboCasa365 + RLDX-1 walkthrough.
 
+### BEHAVIOR
+
+BEHAVIOR uses a fresh Codex SDK context and an owned OmniGibson/Pi0.5 process
+stack. The checked-in serial runner evaluates the ordered public
+`turning_on_radio` slice one instance at a time, with no automatic retry:
+
+```bash
+python scripts/run_behavior_serial_eval.py --split official_first10 \
+  --cuda-device 0 --model YOUR_CODEX_MODEL \
+  --policy-checkpoint "$PI05_CHECKPOINT_PATH" \
+  --output-root /path/to/new-empty-eval-root
+```
+
+See [the BEHAVIOR guide](robots/behavior/README.md) for installation, prompt,
+checkpoint, success, and reproducibility rules.
+
 ## Key CLI Options
 
 | Flag | Default | Description |
@@ -169,6 +186,7 @@ See [SETUP_ROBOCASA.zh.md](docs/SETUP_ROBOCASA.zh.md) for the full RoboCasa365 +
 
 - [Adding a new environment](https://rpent.readthedocs.io/en/latest/rst_source/extending/new_env.html) — plug a new simulator / robot into the runner ([中文](https://rpent.readthedocs.io/zh-cn/latest/rst_source/extending/new_env.html)).
 - [RoboCasa setup](docs/SETUP_ROBOCASA.zh.md) — RoboCasa365 + RLDX-1 install and run guide.
+- [BEHAVIOR evaluation](robots/behavior/README.md) — R1Pro + Pi0.5 + Codex SDK, strict serial public-instance protocol.
 - [`docs/`](docs/README.md) — local Sphinx build and preview instructions.
 
 ## Citation and Acknowledgement

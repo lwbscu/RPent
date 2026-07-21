@@ -11,21 +11,21 @@ Usage::
 
     server = HttpMcpServer(toolkit)
     server.start()  # binds 127.0.0.1 on a free port
-    codex_url = server.url   # e.g. "http://127.0.0.1:54321/mcp/"
+    codex_url = server.url  # e.g. "http://127.0.0.1:54321/mcp/"
     ...
     server.stop()
 """
+
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import socket
 import threading
+from collections.abc import Callable
 from typing import Any
 
 import httpx
-
 import uvicorn
 from mcp import types
 from mcp.server.lowlevel import Server
@@ -69,11 +69,15 @@ def _strip_mcp_prefix(name: str) -> str:
     """``mcp__rpent__mcp_list_dir`` -> ``mcp_list_dir`` ; passthrough."""
     prefix = f"mcp__{SERVER_NAME}__"
     if name.startswith(prefix):
-        return name[len(prefix):]
+        return name[len(prefix) :]
     return name
 
 
-def _build_asgi_app(toolkit: Toolkit) -> Any:
+def _build_asgi_app(
+    toolkit: Toolkit,
+    *,
+    on_tool_result: Callable[[Any], None] | None = None,
+) -> Any:
     """Build a raw ASGI3 app wrapping an MCP ``Server`` + streamable HTTP."""
     mcp_app: Server = Server(SERVER_NAME, version="0.1.0")
 
@@ -91,13 +95,13 @@ def _build_asgi_app(toolkit: Toolkit) -> Any:
         return tools
 
     @mcp_app.call_tool()
-    async def _call_tool(
-        name: str, arguments: dict[str, Any]
-    ) -> types.CallToolResult:
+    async def _call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
         lookup = _strip_mcp_prefix(name)
         tr = await asyncio.get_running_loop().run_in_executor(
             None, toolkit.execute_tool, lookup, arguments or {}
         )
+        if on_tool_result is not None:
+            on_tool_result(tr)
         content, is_error = _toolkit_to_mcp_content(tr)
         return types.CallToolResult(content=content, isError=is_error)
 
@@ -108,9 +112,7 @@ def _build_asgi_app(toolkit: Toolkit) -> Any:
     )
 
     # minimal ASGI wrapper
-    async def asgi_app(
-        scope: dict[str, Any], receive: Any, send: Any
-    ) -> None:
+    async def asgi_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
             while True:
                 event = await receive()
@@ -150,7 +152,9 @@ def _wait_for_ready(url: str, *, timeout_s: float) -> None:
         },
     }
     transport = httpx.HTTPTransport(retries=10)
-    with httpx.Client(transport=transport, timeout=httpx.Timeout(timeout_s, connect=2)) as c:
+    with httpx.Client(
+        transport=transport, timeout=httpx.Timeout(timeout_s, connect=2)
+    ) as c:
         resp = c.post(url, json=body, headers={"Accept": "application/json"})
         if not (resp.is_success and "result" in resp.json()):
             raise RuntimeError(f"HttpMcpServer not ready: {resp.status_code}")
@@ -171,11 +175,13 @@ class HttpMcpServer:
         host: str = "127.0.0.1",
         port: int = 0,
         path: str = "/mcp",
+        on_tool_result: Callable[[Any], None] | None = None,
     ) -> None:
         self._toolkit = toolkit
         self._host = host
         self._port = port or _pick_free_port(host)
         self._path = path if path.startswith("/") else f"/{path}"
+        self._on_tool_result = on_tool_result
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
 
@@ -188,7 +194,7 @@ class HttpMcpServer:
         if self._thread is not None:
             return self.url
 
-        app = _build_asgi_app(self._toolkit)
+        app = _build_asgi_app(self._toolkit, on_tool_result=self._on_tool_result)
 
         config = uvicorn.Config(
             app,

@@ -26,6 +26,7 @@ from rpent.cerebrum.base import (
 from rpent.tools.toolkit import Toolkit
 from rpent.utils.config import get_repo_root
 from rpent.utils.logging import get_logger, init_output_dir
+from rpent.utils.redaction import redact_text, redact_value
 
 logger = get_logger("claude")
 
@@ -49,6 +50,7 @@ class ClaudeCodeCerebrum:
         extra_dirs: list[str] | None = None,
         output_path: str | Path | None = None,
         dashboard: Any = None,
+        tool_only: bool = False,
     ):
         """Initialize the Claude Agent SDK backend."""
         self._output_dir = str(output_dir)
@@ -60,6 +62,7 @@ class ClaudeCodeCerebrum:
         self._extra_dirs = extra_dirs or []
         self._output_path = Path(output_path) if output_path else None
         self._dashboard = dashboard
+        self._tool_only = bool(tool_only)
 
     def solve(
         self,
@@ -89,6 +92,7 @@ class ClaudeCodeCerebrum:
         max_turns: int,
     ) -> CerebrumResult:
         import claude_agent_sdk
+
         sdk = claude_agent_sdk
         if self._output_path is None:
             with tempfile.NamedTemporaryFile(
@@ -102,7 +106,12 @@ class ClaudeCodeCerebrum:
         recorder = _Recorder(max_turns=max_turns, dashboard=self._dashboard)
 
         init_output_dir(self._output_dir)
-        options = self._build_options(sdk, toolkit=toolkit, max_turns=max_turns)
+        options = self._build_options(
+            sdk,
+            toolkit=toolkit,
+            max_turns=max_turns,
+            on_tool_result=recorder.capture_tool_result,
+        )
 
         logger.info("prompt: %d chars", len(prompt))
         logger.info("output_dir: %s", self._output_dir)
@@ -127,6 +136,11 @@ class ClaudeCodeCerebrum:
                             out_f.write(rendered)
                             out_f.flush()
                             logger.info(rendered.rstrip())
+                        if recorder.finish_result is not None:
+                            logger.info(
+                                "FINISH returned by tool: %s", recorder.finish_result
+                            )
+                            break
 
                 await asyncio.wait_for(consume_stream(), timeout=self._timeout_s)
             except asyncio.TimeoutError:
@@ -138,7 +152,7 @@ class ClaudeCodeCerebrum:
                 _write_jsonl(raw_f, {"type": "timeout", "message": error})
                 logger.info(rendered.rstrip())
             except Exception as e:
-                error = f"{type(e).__name__}: {e}"
+                error = redact_text(f"{type(e).__name__}: {e}")
                 rendered = f"\n[cc-cerebrum] {error}\n"
                 rendered_chunks.append(rendered)
                 out_f.write(rendered)
@@ -148,7 +162,9 @@ class ClaudeCodeCerebrum:
 
         elapsed = time.time() - started
         text = "".join(rendered_chunks) or output_path.read_text(errors="replace")
-        error = error or recorder.error
+        error = (
+            redact_text(error or recorder.error) if error or recorder.error else None
+        )
 
         logger.info("Claude Agent SDK finished in %.1fs", elapsed)
         logger.info("output: %s", output_path)
@@ -170,10 +186,21 @@ class ClaudeCodeCerebrum:
 
     # -- options + tool bridge ---------------------------------------------
 
-    def _build_options(self, sdk: Any, *, toolkit: Toolkit, max_turns: int) -> Any:
-        allowed = [
-            part for part in self._allowed_tools.replace(",", " ").split() if part
-        ]
+    def _build_options(
+        self,
+        sdk: Any,
+        *,
+        toolkit: Toolkit,
+        max_turns: int,
+        on_tool_result: Any = None,
+    ) -> Any:
+        allowed = (
+            []
+            if self._tool_only
+            else [
+                part for part in self._allowed_tools.replace(",", " ").split() if part
+            ]
+        )
         builtins = [name for name in allowed if "__" not in name]
         allowed.extend(
             add_mcp_prefix(str(spec["name"])) for spec in toolkit.get_tools_spec()
@@ -184,18 +211,21 @@ class ClaudeCodeCerebrum:
             model=self._model,
             max_turns=max_turns,
             max_budget_usd=self._max_budget_usd,
-            tools=builtins or None,
+            tools=[] if self._tool_only else (builtins or None),
             allowed_tools=list(dict.fromkeys(allowed)),
             mcp_servers={
                 "rpent": _build_rpent_server(
                     sdk,
                     toolkit=toolkit,
+                    on_tool_result=on_tool_result,
                 ),
             },
             add_dirs=[self._output_dir, *self._extra_dirs],
             # Ignore user/project .claude configuration; RPent owns the loop.
             setting_sources=[],
-            stderr=lambda line: logger.debug("[claude-sdk] %s", line.rstrip()),
+            stderr=lambda line: logger.debug(
+                "[claude-sdk] %s", redact_text(line.rstrip())
+            ),
         )
 
 
@@ -240,6 +270,11 @@ class _Recorder:
             "total_cost_usd": self.total_cost_usd,
             **self.usage,
         }
+
+    def capture_tool_result(self, tool_result: Any) -> None:
+        """Capture completion from the executed tool, independent of its name."""
+        if self.finish_result is None and getattr(tool_result, "is_finish", False):
+            self.finish_result = dict(tool_result.result)
 
     def observe(self, message: Any) -> str:
         kind = _kind(message)
@@ -414,7 +449,12 @@ class _Recorder:
 # ---------------------------------------------------------------------------
 
 
-def _build_rpent_server(sdk: Any, *, toolkit: Toolkit) -> Any:
+def _build_rpent_server(
+    sdk: Any,
+    *,
+    toolkit: Toolkit,
+    on_tool_result: Any = None,
+) -> Any:
     sdk_tools = []
     for spec in toolkit.get_tools_spec():
         name = str(spec["name"])
@@ -426,14 +466,15 @@ def _build_rpent_server(sdk: Any, *, toolkit: Toolkit) -> Any:
             *,
             tool_name: str = name,
         ) -> dict[str, Any]:
-            return _tool_result_to_mcp(toolkit.execute_tool(tool_name, args or {}))
+            tool_result = toolkit.execute_tool(tool_name, args or {})
+            if on_tool_result is not None:
+                on_tool_result(tool_result)
+            return _tool_result_to_mcp(tool_result)
 
         run_tool.__name__ = f"rpent_{name}"
         sdk_tools.append(sdk.tool(name, description, input_schema)(run_tool))
 
-    return sdk.create_sdk_mcp_server(
-        name="rpent", version="0.1.0", tools=sdk_tools
-    )
+    return sdk.create_sdk_mcp_server(name="rpent", version="0.1.0", tools=sdk_tools)
 
 
 def _tool_result_to_mcp(tr: Any) -> dict[str, Any]:
@@ -503,7 +544,9 @@ def _jsonable(value: Any) -> Any:
 
 
 def _write_jsonl(file_obj, value: dict[str, Any]) -> None:
-    file_obj.write(json.dumps(value, ensure_ascii=False, default=str) + "\n")
+    file_obj.write(
+        json.dumps(redact_value(value), ensure_ascii=False, default=str) + "\n"
+    )
     file_obj.flush()
 
 

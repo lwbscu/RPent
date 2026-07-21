@@ -25,6 +25,7 @@ from rpent.cerebrum.utils.http_mcp_server import HttpMcpServer
 from rpent.tools.toolkit import Toolkit
 from rpent.utils.config import get_repo_root
 from rpent.utils.logging import get_logger
+from rpent.utils.redaction import redact_text, redact_value
 
 logger = get_logger("codex")
 
@@ -48,7 +49,10 @@ class CodexCerebrum:
         extra_dirs: list[str] | None = None,
         output_path: str | Path | None = None,
         model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
         dashboard: Any = None,
+        tool_only: bool = False,
     ):
         """Initialize the Codex SDK backend."""
         self._output_dir = str(output_dir)
@@ -56,9 +60,14 @@ class CodexCerebrum:
         self._timeout_s = timeout_s
         self._extra_dirs = extra_dirs or []
         self._output_path = Path(output_path) if output_path else None
+        self._tool_only = bool(tool_only)
         self._model = model or os.environ.get("CODEX_MODEL", None)
-        self._base_url = os.environ.get("CODEX_BASE_URL", None)
-        self._api_key = os.environ.get("CODEX_API_KEY", None)
+        self._base_url = (
+            base_url if base_url is not None else os.environ.get("CODEX_BASE_URL")
+        )
+        self._api_key = (
+            api_key if api_key is not None else os.environ.get("CODEX_API_KEY")
+        )
         self._dashboard = dashboard
 
     def solve(
@@ -86,7 +95,7 @@ class CodexCerebrum:
 
         # Start the in-thread MCP HTTP server so Codex can reach the
         # shared toolkit without spawning a subprocess.
-        mcp_server = HttpMcpServer(toolkit)
+        mcp_server = HttpMcpServer(toolkit, on_tool_result=recorder.capture_tool_result)
         mcp_url = mcp_server.start()
         logger.info("mcp http endpoint: %s", mcp_url)
 
@@ -131,7 +140,7 @@ class CodexCerebrum:
                 worker.join(timeout=15)
             elif "error" in state:
                 exc = state["error"]
-                error = f"{type(exc).__name__}: {exc}"
+                error = redact_text(f"{type(exc).__name__}: {exc}")
                 rendered = f"\n[codex-cerebrum] {error}\n"
                 with open(output_path, "a") as out_f:
                     out_f.write(rendered)
@@ -143,7 +152,9 @@ class CodexCerebrum:
 
         elapsed = time.time() - started
         text = state.get("text", "") or output_path.read_text(errors="replace")
-        error = error or recorder.error
+        error = (
+            redact_text(error or recorder.error) if error or recorder.error else None
+        )
 
         logger.info("Codex SDK finished in %.1fs", elapsed)
         logger.info("output: %s", output_path)
@@ -179,7 +190,11 @@ class CodexCerebrum:
     ) -> None:
         try:
             approval = openai_codex.ApprovalMode.deny_all
-            sandbox = openai_codex.Sandbox.full_access
+            sandbox = (
+                openai_codex.Sandbox.read_only
+                if self._tool_only
+                else openai_codex.Sandbox.full_access
+            )
             chunks: list[str] = []
             with openai_codex.Codex(config=self._build_config(mcp_url)) as codex:
                 state["codex"] = codex
@@ -210,6 +225,12 @@ class CodexCerebrum:
                             out_f.write(rendered)
                             out_f.flush()
                             logger.info(rendered.rstrip())
+                        if recorder.finish_result is not None:
+                            logger.info(
+                                "FINISH returned by tool: %s",
+                                recorder.finish_result,
+                            )
+                            break
 
             state["text"] = "".join(chunks)
             if recorder.final_response is not None:
@@ -221,13 +242,17 @@ class CodexCerebrum:
 
     def _build_config(self, mcp_url: str) -> Any:
         env = {**os.environ}
-        if self._api_key:
+        if self._api_key and self._base_url:
             env[PROVIDER_ENV_KEY] = self._api_key
+        elif self._api_key:
+            env["OPENAI_API_KEY"] = self._api_key
         kwargs: dict[str, Any] = {
             "config_overrides": tuple(
                 _codex_mcp_config_overrides(
                     mcp_url=mcp_url,
                     base_url=self._base_url,
+                    tool_timeout_sec=self._timeout_s,
+                    tool_only=self._tool_only,
                 )
             ),
             "cwd": self._repo_root,
@@ -271,6 +296,11 @@ class _Recorder:
 
     def stats(self) -> dict[str, int]:
         return {"turns_used": self.turns, "tool_calls": self.tool_calls, **self.usage}
+
+    def capture_tool_result(self, tool_result: Any) -> None:
+        """Capture completion from the executed tool, independent of its name."""
+        if self.finish_result is None and getattr(tool_result, "is_finish", False):
+            self.finish_result = dict(tool_result.result)
 
     def observe(self, event: Any) -> str:
         method = str(_get(event, "method", ""))
@@ -410,10 +440,44 @@ def _codex_mcp_config_overrides(
     *,
     mcp_url: str,
     base_url: str | None,
+    tool_timeout_sec: int,
+    tool_only: bool = False,
 ) -> list[str]:
-    config: list[tuple[str, Any]] = [
-        ("mcp_servers.rpent.url", mcp_url),
-    ]
+    config: list[tuple[str, Any]] = []
+    if tool_only:
+        # Clear inherited MCP configuration before adding the one closed RPent
+        # surface below.  This prevents a machine-global MCP server from
+        # becoming an accidental second observation or action channel.
+        config.append(("mcp_servers", {}))
+    config.extend(
+        [
+            ("mcp_servers.rpent.url", mcp_url),
+            ("mcp_servers.rpent.tool_timeout_sec", tool_timeout_sec),
+        ]
+    )
+    if tool_only:
+        # BEHAVIOR observations and actions must flow only through the RPent
+        # MCP surface.  Disable Codex's built-in shell, connectors, delegation,
+        # and web search in addition to using a read-only sandbox.
+        config.extend(
+            [
+                # This one closed RPent MCP surface is the authorized robot
+                # boundary. ApprovalMode.deny_all maps to a non-interactive
+                # policy, so an MCP tool whose default is "prompt" would be
+                # rejected instead of executed unless it is pre-approved.
+                ("mcp_servers.rpent.default_tools_approval_mode", "approve"),
+                ("features.shell_tool", False),
+                ("features.unified_exec", False),
+                ("features.apps", False),
+                ("features.multi_agent", False),
+                ("features.remote_plugin", False),
+                ("features.memories", False),
+                ("features.goals", False),
+                ("features.hooks", False),
+                ("web_search", "disabled"),
+                ("tools_view_image", False),
+            ]
+        )
     if base_url:
         normalized = base_url.rstrip("/")
         if not normalized.endswith("/v1"):
@@ -449,7 +513,9 @@ def _interrupt(state: dict[str, Any]) -> None:
 
 
 def _write_jsonl(file_obj, value: dict[str, Any]) -> None:
-    file_obj.write(json.dumps(value, ensure_ascii=False, default=str) + "\n")
+    file_obj.write(
+        json.dumps(redact_value(value), ensure_ascii=False, default=str) + "\n"
+    )
     file_obj.flush()
 
 

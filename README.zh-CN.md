@@ -66,6 +66,7 @@ RPent 是一个把大语言模型放进「决策回路」的**具身智能体框
           <ul>
             <li>PickPlace* · Open/Close* · TurnOn/Off* …</li>
           </ul>
+          <li><b>BEHAVIOR-1K</b>（R1Pro）✅</li>
         </ul>
       </td>
       <td>
@@ -154,6 +155,22 @@ bash scripts/run_robocasa.sh PickPlaceCounterToCabinet 0 0    # <任务> <GPU> <
 
 完整的 RoboCasa365 + RLDX-1 部署流程见 [SETUP_ROBOCASA.zh.md](docs/SETUP_ROBOCASA.zh.md)。
 
+### BEHAVIOR
+
+BEHAVIOR 每次使用全新的 Codex SDK 上下文和独立持有的 OmniGibson/Pi0.5
+进程组。仓库内的串行 runner 会按 authoritative CSV 原顺序逐个评测
+`turning_on_radio` public slice，且不自动重试：
+
+```bash
+python scripts/run_behavior_serial_eval.py --split official_first10 \
+  --cuda-device 0 --model YOUR_CODEX_MODEL \
+  --policy-checkpoint "$PI05_CHECKPOINT_PATH" \
+  --output-root /path/to/new-empty-eval-root
+```
+
+安装、prompt、checkpoint、成功字段与复现规则见
+[BEHAVIOR 指南](robots/behavior/README.md)。
+
 ## 主要命令行参数
 
 | 参数 | 默认值 | 说明 |
@@ -177,6 +194,7 @@ bash scripts/run_robocasa.sh PickPlaceCounterToCabinet 0 0    # <任务> <GPU> <
 
 - [接入新环境](https://rpent.readthedocs.io/zh-cn/latest/rst_source/extending/new_env.html) —— 把新的仿真器 / 机器人接入 runner（[English](https://rpent.readthedocs.io/en/latest/rst_source/extending/new_env.html)）。
 - [RoboCasa 安装](docs/SETUP_ROBOCASA.zh.md) —— RoboCasa365 + RLDX-1 安装与运行指南。
+- [BEHAVIOR 评测](robots/behavior/README.md) —— R1Pro + Pi0.5 + Codex SDK 严格串行 public-instance 协议。
 - [`docs/`](docs/README.md) —— 本地 Sphinx 构建与预览说明。
 
 ## 致谢

@@ -1,18 +1,20 @@
 """LIBERO + OpenPI tool implementation."""
+
 from __future__ import annotations
 
 import base64
 import io
 import json
 import os
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import imageio.v2 as imageio
 import numpy as np
 
-from rpent.utils.vla_client import VLAClient
 from robots.libero.env_client import LiberoEnvClient
 from rpent.utils.logging import get_logger, get_output_dir
+from rpent.utils.vla_client import VLAClient
 
 logger = get_logger("libero")
 
@@ -65,8 +67,9 @@ class LiberoPrimitives:
     def recorded_frame_count(self) -> int:
         return len(self._frames)
 
-    def stop_recording_and_save(self, path: str, fps: int = 20,
-                                 keep_recording: bool = False):
+    def stop_recording_and_save(
+        self, path: str, fps: int = 20, keep_recording: bool = False
+    ):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         n = len(self._frames)
         if n > 0:
@@ -78,7 +81,7 @@ class LiberoPrimitives:
 
     def save_frame_slice(self, start: int, path: str, fps: int = 20):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        frames = list(self._frames[int(start):])
+        frames = list(self._frames[int(start) :])
         n = len(frames)
         if n > 0:
             imageio.mimwrite(path, frames, fps=fps)
@@ -112,10 +115,10 @@ class LiberoPrimitives:
         # runs in a single env.chunk_step RPC; the env owns the per-step
         # loop server-side.
         if not self._recording:
-            chunk_obs,  _r, _t, _tr, _i = self.env.chunk_step(actions)
+            chunk_obs, _r, _t, _tr, _i = self.env.chunk_step(actions)
             obs = chunk_obs[-1] if self.env.return_all_frames else chunk_obs
         else:
-            chunk_obs,  _r, _t, _tr, _i = self.env.chunk_step(
+            chunk_obs, _r, _t, _tr, _i = self.env.chunk_step(
                 actions, return_all_frames=True
             )
             for obs in chunk_obs:
@@ -314,11 +317,13 @@ class LiberoPrimitives:
             cur = self._last_obs_eef_pos
             diff = target - cur
             dist = float(np.linalg.norm(diff))
-            traj.append({
-                "step": step,
-                "eef_pos": [round(float(x), 4) for x in cur],
-                "dist_to_target_m": round(dist, 4),
-            })
+            traj.append(
+                {
+                    "step": step,
+                    "eef_pos": [round(float(x), 4) for x in cur],
+                    "dist_to_target_m": round(dist, 4),
+                }
+            )
             if dist < tol:
                 break
             step_dxyz = np.clip(diff, -step_clip, step_clip)
@@ -332,6 +337,7 @@ class LiberoPrimitives:
                 # gripper-down configs (R[2,2]≈-1) and silently flips the
                 # commanded rotation direction. See feedback_rotate_wrist_yaw_sign.
                 from scipy.spatial.transform import Rotation as _R
+
                 q = self.env.raw_obs()["robot0_eef_quat"]
                 _R_mat = _R.from_quat([q[0], q[1], q[2], q[3]]).as_matrix()
                 cur_yaw = float(np.arctan2(_R_mat[1, 0], _R_mat[0, 0]))
@@ -427,7 +433,9 @@ class LiberoPrimitives:
             "start_yaw": round(start_yaw, 4),
             "target_yaw": round(float(target_yaw), 4),
             "final_yaw": round(final_yaw, 4),
-            "final_err": round(float((target_yaw - final_yaw + np.pi) % (2 * np.pi) - np.pi), 4),
+            "final_err": round(
+                float((target_yaw - final_yaw + np.pi) % (2 * np.pi) - np.pi), 4
+            ),
             "steps_used": len(traj),
             "libero_terminated": self.env.episode_done,
         }
@@ -477,8 +485,7 @@ class LiberoPrimitives:
         raw = self.env.raw_obs()
         start_pitch = _pitch_of(raw["robot0_eef_quat"])
         if target_pitch is None and delta_pitch is None:
-            return {"name": "rotate_pitch",
-                    "error": "need target_pitch or delta_pitch"}
+            return {"name": "rotate_pitch", "error": "need target_pitch or delta_pitch"}
         if target_pitch is None:
             target_pitch = start_pitch + float(delta_pitch)
 
@@ -488,9 +495,9 @@ class LiberoPrimitives:
             cur_pitch = _pitch_of(raw["robot0_eef_quat"])
             err = float(target_pitch - cur_pitch)
             err = (err + np.pi) % (2 * np.pi) - np.pi
-            traj.append({"step": step,
-                         "pitch": round(cur_pitch, 4),
-                         "err": round(err, 4)})
+            traj.append(
+                {"step": step, "pitch": round(cur_pitch, 4), "err": round(err, 4)}
+            )
             if abs(err) < tol:
                 break
             step_dpitch = float(np.clip(err, -step_clip, step_clip))
@@ -510,8 +517,9 @@ class LiberoPrimitives:
             "start_pitch": round(start_pitch, 4),
             "target_pitch": round(float(target_pitch), 4),
             "final_pitch": round(final_pitch, 4),
-            "final_err": round(float(
-                (target_pitch - final_pitch + np.pi) % (2 * np.pi) - np.pi), 4),
+            "final_err": round(
+                float((target_pitch - final_pitch + np.pi) % (2 * np.pi) - np.pi), 4
+            ),
             "steps_used": len(traj),
             "libero_terminated": self.env.episode_done,
         }
@@ -558,19 +566,35 @@ class LiberoPrimitives:
             q = self.env.raw_obs()["robot0_eef_quat"]
             diff = target - cur
             dist = float(np.linalg.norm(diff))
-            p_err = 0.0 if target_pitch is None else \
-                float((target_pitch - _pitch_of(q) + np.pi) % (2 * np.pi) - np.pi)
-            y_err = 0.0 if target_yaw is None else \
-                float((target_yaw - _yaw_of(q) + np.pi) % (2 * np.pi) - np.pi)
-            traj.append({"step": step, "eef": [round(float(x), 4) for x in cur],
-                         "dist": round(dist, 4), "p_err": round(p_err, 3)})
+            p_err = (
+                0.0
+                if target_pitch is None
+                else float((target_pitch - _pitch_of(q) + np.pi) % (2 * np.pi) - np.pi)
+            )
+            y_err = (
+                0.0
+                if target_yaw is None
+                else float((target_yaw - _yaw_of(q) + np.pi) % (2 * np.pi) - np.pi)
+            )
+            traj.append(
+                {
+                    "step": step,
+                    "eef": [round(float(x), 4) for x in cur],
+                    "dist": round(dist, 4),
+                    "p_err": round(p_err, 3),
+                }
+            )
             if dist < tol and abs(p_err) < ori_tol and abs(y_err) < ori_tol:
                 break
             action = np.zeros(7, dtype=np.float32)
             sd = np.clip(diff, -step_clip, step_clip)
             action[:3] = np.clip(sd / action_scale, -1.0, 1.0)
-            action[3] = float(np.clip(np.clip(p_err, -pitch_step, pitch_step) / 0.10, -1.0, 1.0))
-            action[5] = float(np.clip(np.clip(y_err, -yaw_step, yaw_step) / 0.10, -1.0, 1.0))
+            action[3] = float(
+                np.clip(np.clip(p_err, -pitch_step, pitch_step) / 0.10, -1.0, 1.0)
+            )
+            action[5] = float(
+                np.clip(np.clip(y_err, -yaw_step, yaw_step) / 0.10, -1.0, 1.0)
+            )
             action[6] = float(gripper)
             obs, _r, _t, _tr, _i = self.env.step(action)
             self.set_obs(obs)
@@ -686,7 +710,7 @@ class LiberoPrimitives:
             # _vlm_chunk overrides prompt; but we want the ORIGINAL. Bypass.
             self._last_obs.setdefault("extra_view_images", None)
             actions, _ = self.model.predict_action_batch(self._last_obs, mode="eval")
-            chunk_obs,  _r, _t, _tr, _i = self.env.chunk_step(actions)
+            chunk_obs, _r, _t, _tr, _i = self.env.chunk_step(actions)
             obs = chunk_obs[-1] if self.env.return_all_frames else chunk_obs
             self.set_obs(obs)
             chunks_used = c + 1
@@ -812,8 +836,12 @@ def _world_from_depth(depth_metric: np.ndarray, camera_meta: dict) -> np.ndarray
     return (camera_points @ extrinsic.T)[..., :3]
 
 
-def dump_state(primitives: LiberoPrimitives, output_dir: str, step_idx: int,
-               log: dict | None = None) -> dict:
+def dump_state(
+    primitives: LiberoPrimitives,
+    output_dir: str,
+    step_idx: int,
+    log: dict | None = None,
+) -> dict:
     """Dump state snapshot, images, and depth for step *step_idx*.
 
     Writes:
@@ -877,8 +905,13 @@ def dump_state(primitives: LiberoPrimitives, output_dir: str, step_idx: int,
         )
         img = np.asarray(img)
         img = np.ascontiguousarray(img[::-1, ::-1])
-        if img.dtype != np.uint8 or img.ndim != 3 or img.shape[2] != 3 \
-                or img.shape[0] < 32 or img.shape[1] < 32:
+        if (
+            img.dtype != np.uint8
+            or img.ndim != 3
+            or img.shape[2] != 3
+            or img.shape[0] < 32
+            or img.shape[1] < 32
+        ):
             raise ValueError(f"bad img shape/dtype: {img.shape} {img.dtype}")
     except Exception:
         # cached_image() is already 180°-flipped (get_libero_image does
@@ -914,11 +947,13 @@ def dump_state(primitives: LiberoPrimitives, output_dir: str, step_idx: int,
                 "col=q[0]/q[2], row=q[1]/q[2], metric_depth=q[2]. "
                 "Back-project a pixel with z=depth_NN[row,col] by computing "
                 "camera_xyz = inv(K) @ [col,row,1] * z, then "
-                "P_world = extrinsic_cam2world @ [camera_xyz,1].")
+                "P_world = extrinsic_cam2world @ [camera_xyz,1]."
+            )
             cam_meta_out["note"] = (
                 "depth_NN.npy is in this camera frame (vertical-flipped raw "
                 "buffer). image_NN.png is rotated 180deg (Pi0 convention) and "
-                "is NOT in the same frame as depth/K.")
+                "is NOT in the same frame as depth/K."
+            )
             with open(os.path.join(output_dir, "camera_meta.json"), "w") as f:
                 json.dump(cam_meta_out, f, indent=2)
 
@@ -955,8 +990,10 @@ def dump_state(primitives: LiberoPrimitives, output_dir: str, step_idx: int,
             # camera_meta.json (NOT the same frame as the 180°-rotated
             # image_NN.png — see camera_meta note).
             d = _metric_depth(d, agentview_meta)[::-1]
-            np.save(os.path.join(depths_dir, f"depth_{step_idx:02d}.npy"),
-                    d.astype(np.float32))
+            np.save(
+                os.path.join(depths_dir, f"depth_{step_idx:02d}.npy"),
+                d.astype(np.float32),
+            )
             world = _world_from_depth(d, agentview_meta).astype(np.float32)
             world_name = f"world_{step_idx:02d}.npy"
             np.save(os.path.join(world_dir, world_name), world)
@@ -1056,9 +1093,7 @@ def dump_state(primitives: LiberoPrimitives, output_dir: str, step_idx: int,
             width=1024,
             depth=True,
         )
-        meta_wrist_hi = primitives.env.get_camera_meta(
-            "robot0_eye_in_hand", 1024, 1024
-        )
+        meta_wrist_hi = primitives.env.get_camera_meta("robot0_eye_in_hand", 1024, 1024)
         if meta_wrist_hi is None:
             raise RuntimeError("robot0_eye_in_hand camera metadata missing")
         imageio.imwrite(
@@ -1183,15 +1218,30 @@ TOOLS_SPEC = [
                     "type": "number",
                     "description": "Gripper command: -1 open, +1 close (default -1)",
                 },
-                "tol": {"type": "number", "description": "Position tolerance, m (default 0.012)"},
-                "step_clip": {"type": "number", "description": "Per-step Δxyz cap before action_scale, m (default 0.025)"},
-                "max_steps": {"type": "integer", "description": "Step budget (default 80)"},
-                "action_scale": {"type": "number", "description": "OSC action scale (default 0.05)"},
+                "tol": {
+                    "type": "number",
+                    "description": "Position tolerance, m (default 0.012)",
+                },
+                "step_clip": {
+                    "type": "number",
+                    "description": "Per-step Δxyz cap before action_scale, m (default 0.025)",
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Step budget (default 80)",
+                },
+                "action_scale": {
+                    "type": "number",
+                    "description": "OSC action scale (default 0.05)",
+                },
                 "target_yaw": {
                     "type": ["number", "null"],
                     "description": "Optional world-frame yaw target in radians",
                 },
-                "yaw_step_clip": {"type": "number", "description": "Per-step yaw clip, rad (default 0.10)"},
+                "yaw_step_clip": {
+                    "type": "number",
+                    "description": "Per-step yaw clip, rad (default 0.10)",
+                },
             },
             "required": ["xyz"],
         },
@@ -1210,9 +1260,18 @@ TOOLS_SPEC = [
                     "type": "string",
                     "description": "Pi0 prompt (e.g. 'pick up the akita black bowl').",
                 },
-                "max_chunks": {"type": "integer", "description": "Action-chunk budget (default 24)"},
-                "lift_thresh": {"type": "number", "description": "EEF post-descent ascent threshold for success, m (default 0.05)"},
-                "gripper_closed_thresh": {"type": "number", "description": "Finger-separation closed threshold (default 0.06)"},
+                "max_chunks": {
+                    "type": "integer",
+                    "description": "Action-chunk budget (default 24)",
+                },
+                "lift_thresh": {
+                    "type": "number",
+                    "description": "EEF post-descent ascent threshold for success, m (default 0.05)",
+                },
+                "gripper_closed_thresh": {
+                    "type": "number",
+                    "description": "Finger-separation closed threshold (default 0.06)",
+                },
             },
             "required": ["prompt"],
         },
@@ -1234,7 +1293,10 @@ TOOLS_SPEC = [
                     "type": "string",
                     "description": "Contact-skill prompt, e.g. 'turn on the stove'.",
                 },
-                "max_chunks": {"type": "integer", "description": "Action-chunk budget (default 20)"},
+                "max_chunks": {
+                    "type": "integer",
+                    "description": "Action-chunk budget (default 20)",
+                },
             },
             "required": ["prompt"],
         },
@@ -1249,7 +1311,10 @@ TOOLS_SPEC = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "max_steps": {"type": "integer", "description": "Step budget (default 20)"},
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Step budget (default 20)",
+                },
             },
         },
     },
@@ -1266,7 +1331,10 @@ TOOLS_SPEC = [
                     "type": "number",
                     "description": "Gripper command: -1 open, +1 close (default -1)",
                 },
-                "steps": {"type": "integer", "description": "Number of env steps (default 5)"},
+                "steps": {
+                    "type": "integer",
+                    "description": "Number of env steps (default 5)",
+                },
             },
         },
     },
@@ -1279,12 +1347,30 @@ TOOLS_SPEC = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "target_yaw": {"type": ["number", "null"], "description": "Absolute world-frame yaw target, rad"},
-                "delta_yaw": {"type": ["number", "null"], "description": "Relative yaw delta, rad"},
-                "gripper": {"type": "number", "description": "Gripper command held during rotation (default +1)"},
-                "max_steps": {"type": "integer", "description": "Step budget (default 40)"},
-                "tol": {"type": "number", "description": "Yaw tolerance, rad (default 0.02)"},
-                "step_clip": {"type": "number", "description": "Per-step yaw clip, rad (default 0.10)"},
+                "target_yaw": {
+                    "type": ["number", "null"],
+                    "description": "Absolute world-frame yaw target, rad",
+                },
+                "delta_yaw": {
+                    "type": ["number", "null"],
+                    "description": "Relative yaw delta, rad",
+                },
+                "gripper": {
+                    "type": "number",
+                    "description": "Gripper command held during rotation (default +1)",
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Step budget (default 40)",
+                },
+                "tol": {
+                    "type": "number",
+                    "description": "Yaw tolerance, rad (default 0.02)",
+                },
+                "step_clip": {
+                    "type": "number",
+                    "description": "Per-step yaw clip, rad (default 0.10)",
+                },
             },
         },
     },
@@ -1300,12 +1386,30 @@ TOOLS_SPEC = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "target_pitch": {"type": ["number", "null"], "description": "Absolute world-frame pitch target, rad"},
-                "delta_pitch": {"type": ["number", "null"], "description": "Relative pitch delta, rad"},
-                "gripper": {"type": "number", "description": "Gripper command held during rotation (default +1)"},
-                "max_steps": {"type": "integer", "description": "Step budget (default 40)"},
-                "tol": {"type": "number", "description": "Pitch tolerance, rad (default 0.02)"},
-                "step_clip": {"type": "number", "description": "Per-step pitch clip, rad (default 0.10)"},
+                "target_pitch": {
+                    "type": ["number", "null"],
+                    "description": "Absolute world-frame pitch target, rad",
+                },
+                "delta_pitch": {
+                    "type": ["number", "null"],
+                    "description": "Relative pitch delta, rad",
+                },
+                "gripper": {
+                    "type": "number",
+                    "description": "Gripper command held during rotation (default +1)",
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Step budget (default 40)",
+                },
+                "tol": {
+                    "type": "number",
+                    "description": "Pitch tolerance, rad (default 0.02)",
+                },
+                "step_clip": {
+                    "type": "number",
+                    "description": "Per-step pitch clip, rad (default 0.10)",
+                },
             },
         },
     },
@@ -1328,15 +1432,42 @@ TOOLS_SPEC = [
                     "minItems": 3,
                     "maxItems": 3,
                 },
-                "target_pitch": {"type": ["number", "null"], "description": "Absolute pitch target, rad"},
-                "target_yaw": {"type": ["number", "null"], "description": "Absolute yaw target, rad"},
-                "gripper": {"type": "number", "description": "Gripper command held during the move (default -1)"},
-                "step_clip": {"type": "number", "description": "Per-step Δxyz cap, m (default 0.02)"},
-                "pitch_step": {"type": "number", "description": "Per-step pitch clip, rad (default 0.08)"},
-                "yaw_step": {"type": "number", "description": "Per-step yaw clip, rad (default 0.08)"},
-                "tol": {"type": "number", "description": "Position tolerance, m (default 0.012)"},
-                "ori_tol": {"type": "number", "description": "Orientation tolerance, rad (default 0.05)"},
-                "max_steps": {"type": "integer", "description": "Step budget (default 150)"},
+                "target_pitch": {
+                    "type": ["number", "null"],
+                    "description": "Absolute pitch target, rad",
+                },
+                "target_yaw": {
+                    "type": ["number", "null"],
+                    "description": "Absolute yaw target, rad",
+                },
+                "gripper": {
+                    "type": "number",
+                    "description": "Gripper command held during the move (default -1)",
+                },
+                "step_clip": {
+                    "type": "number",
+                    "description": "Per-step Δxyz cap, m (default 0.02)",
+                },
+                "pitch_step": {
+                    "type": "number",
+                    "description": "Per-step pitch clip, rad (default 0.08)",
+                },
+                "yaw_step": {
+                    "type": "number",
+                    "description": "Per-step yaw clip, rad (default 0.08)",
+                },
+                "tol": {
+                    "type": "number",
+                    "description": "Position tolerance, m (default 0.012)",
+                },
+                "ori_tol": {
+                    "type": "number",
+                    "description": "Orientation tolerance, rad (default 0.05)",
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Step budget (default 150)",
+                },
             },
             "required": ["xyz"],
         },
@@ -1596,9 +1727,7 @@ def view_driver_state(step: int | None = None) -> dict:
         out["image_wrist_path"] = image_wrist_path
     out_dir = get_output_dir()
     image_cam_hi_path = out_dir / "images_cam_hi" / f"image_cam_hi_{nn:02d}.png"
-    image_wrist_hi_path = (
-        out_dir / "images_wrist_hi" / f"image_wrist_hi_{nn:02d}.png"
-    )
+    image_wrist_hi_path = out_dir / "images_wrist_hi" / f"image_wrist_hi_{nn:02d}.png"
     if image_cam_hi_path.exists():
         out["image_cam_hi_path"] = str(image_cam_hi_path)
     if image_wrist_hi_path.exists():
@@ -1686,8 +1815,9 @@ def _decode_sam3_mask(mask_b64: str, shape) -> np.ndarray:
         ) from e
 
 
-def _mask_to_world(mask: np.ndarray, world_map: np.ndarray,
-                   min_valid: int = 10) -> dict:
+def _mask_to_world(
+    mask: np.ndarray, world_map: np.ndarray, min_valid: int = 10
+) -> dict:
     if world_map.ndim != 3 or world_map.shape[2] < 3:
         return {
             "world_xyz": None,
@@ -1726,10 +1856,12 @@ def _mask_to_world(mask: np.ndarray, world_map: np.ndarray,
         "mask_resized_to_world_shape": False,
     }
     if pts.shape[0] < min_valid:
-        result.update({
-            "world_xyz": None,
-            "world_error": f"too few valid depth pixels ({int(pts.shape[0])})",
-        })
+        result.update(
+            {
+                "world_xyz": None,
+                "world_error": f"too few valid depth pixels ({int(pts.shape[0])})",
+            }
+        )
         return result
 
     result["world_xyz"] = [
@@ -1758,8 +1890,9 @@ def _write_segment_overlay(image_path, mask: np.ndarray, overlay_path) -> bool:
         return False
 
 
-def _sam3_segment(server_url: str, image_path, prompt: str,
-                  point: list[int] | None, min_score: float) -> dict:
+def _sam3_segment(
+    server_url: str, image_path, prompt: str, point: list[int] | None, min_score: float
+) -> dict:
     import httpx
 
     image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
@@ -1879,9 +2012,13 @@ def _summarize_segment_response(data) -> dict:
             "overlay_base64",
             "image_base64",
         }:
-            return f"<base64 {len(value)} chars>" if isinstance(value, str) else "<base64>"
+            return (
+                f"<base64 {len(value)} chars>" if isinstance(value, str) else "<base64>"
+            )
         if isinstance(value, list):
-            if len(value) <= 8 and all(not isinstance(item, (dict, list)) for item in value):
+            if len(value) <= 8 and all(
+                not isinstance(item, (dict, list)) for item in value
+            ):
                 return value
             return [summarize_value(key, item) for item in value[:3]]
         if isinstance(value, dict):
@@ -1954,8 +2091,8 @@ def segment(
         }
 
     out_dir = get_output_dir()
-    segment_path, overlay_candidate_path, segment_index = (
-        _next_segment_artifact_paths(out_dir, nn)
+    segment_path, overlay_candidate_path, segment_index = _next_segment_artifact_paths(
+        out_dir, nn
     )
     overlay_path = None
     mask = data.get("mask") if isinstance(data, dict) else None
@@ -1995,7 +2132,8 @@ def segment(
         "min_score": min_score,
         "score": (
             round(float(data["score"]), 3)
-            if isinstance(data, dict) and "score" in data else None
+            if isinstance(data, dict) and "score" in data
+            else None
         ),
         "box": data.get("box") if isinstance(data, dict) else None,
         "mask_shape": data.get("mask_shape") if isinstance(data, dict) else None,
@@ -2108,8 +2246,7 @@ def back_project(
     if not source_artifact:
         return {
             "error": (
-                f"{camera} {resolution}-resolution world map not recorded "
-                f"for step {nn}"
+                f"{camera} {resolution}-resolution world map not recorded for step {nn}"
             )
         }
 
@@ -2144,8 +2281,8 @@ def back_project(
                     f"rows [{r0},{r1}] cols [{c0},{c1}]"
                 )
             }
-        window = world_map[r0:r1, c0:c1].reshape(-1, world_map.shape[2]).astype(
-            np.float64
+        window = (
+            world_map[r0:r1, c0:c1].reshape(-1, world_map.shape[2]).astype(np.float64)
         )
         finite = np.isfinite(window).all(axis=1) & (
             np.abs(window[:, :3]).sum(axis=1) > 1e-6
@@ -2192,8 +2329,7 @@ def back_project(
     if row < 0 or row >= height or col < 0 or col >= width:
         return {
             "error": (
-                f"pixel ({row},{col}) out of bounds; {camera} image is "
-                f"{height}x{width}"
+                f"pixel ({row},{col}) out of bounds; {camera} image is {height}x{width}"
             )
         }
 

@@ -99,6 +99,7 @@ def build_cerebrum(
     recipe_tag: str,
     env_name: str,
     base_url: str | None = None,
+    api_key: str | None = None,
     model: str | None = None,
     max_tokens: int = 8192,
     cerebrum_timeout_s: int | None = None,
@@ -132,18 +133,18 @@ def build_cerebrum(
             ``base_url`` is given it overrides the provider's base URL env
             var (e.g. ``ANTHROPIC_BASE_URL`` / ``OPENAI_BASE_URL``).
             """
-            if not base_url:
+            if not base_url and not api_key:
                 return infer_provider(provider_name)
             provider_cls = infer_provider_class(provider_name)
             params = inspect.signature(provider_cls.__init__).parameters
             kwargs = {}
             if "base_url" in params:
                 kwargs["base_url"] = base_url
+            if api_key and "api_key" in params:
+                kwargs["api_key"] = api_key
             return provider_cls(**kwargs)
 
-        api_model = infer_model(
-            model, provider_factory=_provider_factory
-        )
+        api_model = infer_model(model, provider_factory=_provider_factory)
         return ApiAgentLoop(model=api_model, max_tokens=max_tokens, dashboard=dashboard)
     if cerebrum_type == "claude_code":
         from rpent.cerebrum.claude_code import ClaudeCodeCerebrum
@@ -156,13 +157,18 @@ def build_cerebrum(
             cc_budget = float(os.environ.get("MAX_BUDGET_USD", "10"))
         return ClaudeCodeCerebrum(
             output_dir=output_dir,
-            repo_root=get_repo_root(),
+            repo_root=output_dir if env_name.lower() == "behavior" else get_repo_root(),
             model=model or "sonnet",
             timeout_s=cc_timeout_s,
             max_budget_usd=cc_budget,
-            extra_dirs=[str(get_memory_dir(env_name))],
+            extra_dirs=(
+                []
+                if env_name.lower() == "behavior"
+                else [str(get_memory_dir(env_name))]
+            ),
             output_path=Path(output_dir) / f"claude_{recipe_tag}.txt",
             dashboard=dashboard,
+            tool_only=env_name.lower() == "behavior",
         )
     if cerebrum_type == "codex":
         from rpent.cerebrum.codex import CodexCerebrum
@@ -177,11 +183,18 @@ def build_cerebrum(
             )
         return CodexCerebrum(
             output_dir=output_dir,
-            repo_root=get_repo_root(),
+            repo_root=output_dir if env_name.lower() == "behavior" else get_repo_root(),
             model=model,
+            base_url=base_url,
+            api_key=api_key,
             timeout_s=cx_timeout_s,
-            extra_dirs=[str(get_memory_dir(env_name))],
+            extra_dirs=(
+                []
+                if env_name.lower() == "behavior"
+                else [str(get_memory_dir(env_name))]
+            ),
             output_path=Path(output_dir) / f"codex_{recipe_tag}.txt",
             dashboard=dashboard,
+            tool_only=env_name.lower() == "behavior",
         )
     raise ValueError(f"unknown cerebrum_type: {cerebrum_type}")

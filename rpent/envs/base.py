@@ -1,4 +1,4 @@
-"""Env registry: maps env name to its ``get_env_spec`` / ``get_toolkit`` factories.
+"""Env registry: maps env name to environment factories.
 
 Env implementations live in the top-level ``robots/`` directory (a sibling of
 the ``rpent`` package); an env is resolved by importing ``robots.<name>``. The
@@ -6,6 +6,7 @@ the ``rpent`` package); an env is resolved by importing ``robots.<name>``. The
 so cerebrums and envs share the same contract types without crossing module
 layers.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -13,6 +14,7 @@ import sys
 from typing import Any
 
 from rpent.envs.env_spec import EnvSpec
+from rpent.envs.runtime import RuntimeProvider
 from rpent.tools.toolkit import Toolkit
 from rpent.utils.config import get_repo_root
 
@@ -36,9 +38,21 @@ def _resolve_env(name: str) -> Any:
 
 
 def get_env_spec(name: str) -> EnvSpec:
+    """Load an environment's declarative specification."""
     return _resolve_env(name).get_env_spec()
 
 
 def get_toolkit(name: str, **kwargs) -> Toolkit:
     """Build the env toolkit (common tools + env-specific tools)."""
     return _resolve_env(name).get_toolkit(**kwargs)
+
+
+def get_runtime_provider(name: str) -> RuntimeProvider:
+    """Build the env runtime provider used by the main CLI."""
+    env_module = _resolve_env(name)
+    try:
+        factory = env_module.get_runtime_provider
+    except AttributeError as e:
+        env_name = name.lower()
+        raise ValueError(f"env {env_name!r} does not provide a runtime provider") from e
+    return factory()

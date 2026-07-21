@@ -83,8 +83,13 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["rpent*"]
+include = ["rpent*", "robots*"]
 exclude = ["tests*", "docs*", "examples*", "docker*", "toolkits*"]
+
+[tool.setuptools.package-data]
+"robots.behavior" = ["README.md", "prompts/*.md"]
+"robots.libero" = ["README.md", "guides/*.md", "prompts/*.md"]
+"rpent.dashboard" = ["*.html"]
 
 [tool.ruff]
 line-length = 88
