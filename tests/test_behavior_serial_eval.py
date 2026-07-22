@@ -13,6 +13,7 @@ from robots.behavior.serial_eval import (
     _checkout_identity,
     _file_fingerprint,
     _gpu_lock_path,
+    _green_center_marker_visible,
     _owned_group_members,
     _run_entry,
     _terminal_press_wrist_image,
@@ -28,6 +29,18 @@ from robots.behavior.serial_eval import (
 def _write_json(path: Path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_png(path: Path, *, center_color=(0, 190, 0)) -> None:
+    from PIL import Image, ImageDraw
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.new("RGB", (96, 96), color=(210, 10, 10))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((8, 8, 88, 88), fill=(205, 200, 190))
+    draw.ellipse((18, 18, 78, 78), fill=(24, 22, 18))
+    draw.ellipse((40, 40, 56, 56), fill=center_color)
+    image.save(path, format="PNG")
 
 
 def _entry(tmp_path, instance_id=242, seed=0):
@@ -100,14 +113,129 @@ def _write_bound_artifacts(entry, *, success, commit="abc", status="stopped"):
     )
     if success:
         image = entry.output_dir / "live" / "press.png"
-        image.parent.mkdir(parents=True, exist_ok=True)
-        image.write_bytes(b"png")
+        _write_png(image)
+        checkpoint_root = entry.output_dir / "state_checkpoints"
+        checkpoint1 = checkpoint_root / "state_checkpoint_1.json"
+        run_binding = {
+            "nonce": "same-run-test",
+            "suite": "behavior_2025_challenge",
+            "task": 0,
+            "task_name": "turning_on_radio",
+            "activity_definition_id": 0,
+            "activity_instance_id": entry.activity_instance_id,
+            "scene_model": "house_double_floor_lower",
+            "seed": entry.seed,
+        }
+        _write_json(
+            checkpoint1,
+            {
+                "schema_version": 1,
+                "kind": "robot_motion_checkpoint",
+                "not_simulator_restore": True,
+                "checkpoint_name": "state_checkpoint_1",
+                "stage": "post_pi0_nav_pick",
+                "held_hand": "left",
+                "press_hand": "right",
+                "object_name": "radio_test",
+                "run_binding": run_binding,
+            },
+        )
+        projection_id = "button_projection_test"
+        checkpoint2 = checkpoint_root / "state_checkpoint_2.json"
+        _write_json(
+            checkpoint2,
+            {
+                "schema_version": 1,
+                "kind": "robot_motion_checkpoint",
+                "not_simulator_restore": True,
+                "checkpoint_name": "state_checkpoint_2",
+                "stage": "pre_press_alignment",
+                "env_step": 100,
+                "held_hand": "left",
+                "press_hand": "right",
+                "object_name": "radio_test",
+                "run_binding": run_binding,
+                "prepress": {
+                    "source_checkpoint_path": str(checkpoint1),
+                    "source_checkpoint_sha256": hashlib.sha256(
+                        checkpoint1.read_bytes()
+                    ).hexdigest(),
+                    "button_gate": {
+                        "button_visible": True,
+                        "face_class": "BUTTON_FACE",
+                        "positive_signature_complete": True,
+                        "camera": "press_wrist",
+                        "resolved_camera": "right_wrist",
+                        "frame_id": "capture:100:right_wrist",
+                        "capture_group_id": "capture:100",
+                        "env_step": 100,
+                        "gate_id": "button_gate_test",
+                    },
+                    "button_projection": {
+                        "projection_id": projection_id,
+                        "gate_id": "button_gate_test",
+                        "camera": "press_wrist",
+                        "resolved_camera": "right_wrist",
+                        "frame_id": "capture:100:right_wrist",
+                        "capture_group_id": "capture:100",
+                        "env_step": 100,
+                        "projection_metrics": {
+                            "camera": "right_wrist",
+                            "frame_id": "capture:100:right_wrist",
+                            "step_index": 100,
+                        },
+                    },
+                },
+            },
+        )
+        frame_id = "capture:104:right_wrist"
+        capture_group = {"id": "capture:104"}
+        metadata = entry.output_dir / "live" / "press.json"
+        _write_json(
+            metadata,
+            {
+                "camera": "right_wrist",
+                "frame_id": frame_id,
+                "capture_group": capture_group,
+                "total_env_steps": 104,
+                "rgb_path": str(image),
+                "metadata_path": str(metadata),
+            },
+        )
         trace = [
+            {
+                "step": 8,
+                "tool": "save_robot_state_checkpoint",
+                "result": {
+                    "state_checkpoint_2_path": str(checkpoint2),
+                    "state_checkpoint_2_sha256": hashlib.sha256(
+                        checkpoint2.read_bytes()
+                    ).hexdigest(),
+                    "held_hand": "left",
+                    "press_hand": "right",
+                },
+            },
+            {
+                "step": 9,
+                "tool": "post_pick_direct_finger_toggle",
+                "result": {
+                    "task_success": True,
+                    "press_hand": "right",
+                    "projection_id": projection_id,
+                },
+            },
             {
                 "step": 10,
                 "tool": "post_success_hold_frames",
                 "input": {"frames": 4},
-                "result": {"task_success": True},
+                "result": {
+                    "primitive_success": True,
+                    "task_success": True,
+                    "requested_frames": 4,
+                    "executed_frames": 4,
+                    "start_env_step": 100,
+                    "end_env_step": 104,
+                },
             },
             {
                 "step": 11,
@@ -115,7 +243,15 @@ def _write_bound_artifacts(entry, *, success, commit="abc", status="stopped"):
                 "input": {"camera": "press_wrist"},
                 "result": {
                     "task_success": True,
-                    "visual_review": {"rgb_path": str(image)},
+                    "camera": "press_wrist",
+                    "resolved_camera": "right_wrist",
+                    "frame_id": frame_id,
+                    "capture_group": capture_group,
+                    "total_env_steps": 104,
+                    "visual_review": {
+                        "rgb_path": str(image),
+                        "metadata_path": str(metadata),
+                    },
                 },
             },
         ]
@@ -215,6 +351,233 @@ def test_success_requires_post_hold_press_wrist_evidence(tmp_path):
     entry = _entry(tmp_path)
     _write_bound_artifacts(entry, success=True)
     (entry.output_dir / "pi0_nav_pick_tool_trace.jsonl").unlink()
+
+    outcome, errors, _ = validate_instance_result(
+        entry,
+        source_commit="abc",
+        subprocess_exit_code=0,
+        timed_out=False,
+    )
+
+    assert outcome == "incomplete"
+    assert "successful run lacks post-success render hold" in errors
+    assert "successful run lacks fresh post-hold press-wrist image" in errors
+
+
+def test_embedded_pi0_terminal_evidence_is_accepted(tmp_path):
+    entry = _entry(tmp_path)
+    _write_bound_artifacts(entry, success=True)
+    terminal_dir = entry.output_dir / "visual_review" / "terminal_success"
+    image = terminal_dir / "right_wrist.png"
+    _write_png(image)
+    view = {
+        "camera": "right_wrist",
+        "path": str(image),
+        "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+        "width": 96,
+        "height": 96,
+        "frame_id": "capture:104:right",
+        "capture_group_id": "capture:104",
+        "env_step": 104,
+    }
+    metadata_path = terminal_dir / "terminal_success_evidence.json"
+    evidence = {
+        "source": "pi0_nav_pick_internal_terminal_finalize",
+        "complete": True,
+        "task_success_before_hold": True,
+        "task_success_after_hold": True,
+        "hold_frames_requested": 4,
+        "hold_frames_executed": 4,
+        "start_env_step": 100,
+        "end_env_step": 104,
+        "held_hand": "left",
+        "press_hand": "right",
+        "role_resolution_source": "unique_terminal_attachment_evidence",
+        "logical_camera": "press_wrist",
+        "resolved_camera": "right_wrist",
+        "capture_group_id": "capture:104",
+        "terminal_press_wrist": view,
+        "metadata_path": str(metadata_path),
+    }
+    _write_json(metadata_path, evidence)
+    trace = {
+        "step": 1,
+        "tool": "pi0_nav_pick",
+        "result": {
+            "task_success": True,
+            "terminal_success_evidence": evidence,
+        },
+    }
+    (entry.output_dir / "pi0_nav_pick_tool_trace.jsonl").write_text(
+        json.dumps(trace) + "\n", encoding="utf-8"
+    )
+
+    outcome, errors, _ = validate_instance_result(
+        entry,
+        source_commit="abc",
+        subprocess_exit_code=0,
+        timed_out=False,
+    )
+
+    assert outcome == "passed"
+    assert errors == []
+    assert _terminal_press_wrist_image(entry.output_dir) == str(image.resolve())
+
+
+def test_terminal_image_must_decode_as_png(tmp_path):
+    entry = _entry(tmp_path)
+    _write_bound_artifacts(entry, success=True)
+    image = entry.output_dir / "live" / "press.png"
+    image.write_bytes(b"png")
+
+    assert _terminal_press_wrist_image(entry.output_dir) is None
+
+
+def test_green_center_marker_requires_button_context(tmp_path):
+    green = tmp_path / "green.png"
+    red = tmp_path / "red.png"
+    solid_green = tmp_path / "solid_green.png"
+    unrelated_white_patch = tmp_path / "unrelated_white_patch.png"
+    disconnected_white_patches = tmp_path / "disconnected_white_patches.png"
+    white_semicircle = tmp_path / "white_semicircle.png"
+    _write_png(green)
+    _write_png(red, center_color=(210, 10, 10))
+    from PIL import Image, ImageDraw
+
+    Image.new("RGB", (96, 96), color=(0, 190, 0)).save(solid_green, format="PNG")
+    false_image = Image.new("RGB", (96, 96), color=(205, 10, 10))
+    false_draw = ImageDraw.Draw(false_image)
+    false_draw.rectangle((22, 24, 70, 72), fill=(20, 20, 20))
+    false_draw.ellipse((40, 40, 56, 56), fill=(0, 190, 0))
+    false_draw.rectangle((72, 30, 92, 66), fill=(210, 205, 195))
+    false_image.save(unrelated_white_patch, format="PNG")
+    patches = Image.new("RGB", (96, 96), color=(205, 10, 10))
+    patch_draw = ImageDraw.Draw(patches)
+    patch_draw.rectangle((18, 18, 78, 78), fill=(20, 20, 20))
+    patch_draw.ellipse((40, 40, 56, 56), fill=(0, 190, 0))
+    for box in (
+        (15, 15, 34, 28),
+        (62, 15, 81, 28),
+        (15, 68, 34, 81),
+        (62, 68, 81, 81),
+    ):
+        patch_draw.rectangle(box, fill=(210, 205, 195))
+    patches.save(disconnected_white_patches, format="PNG")
+    semicircle = Image.new("RGB", (96, 96), color=(205, 10, 10))
+    semicircle_draw = ImageDraw.Draw(semicircle)
+    semicircle_draw.ellipse((18, 18, 78, 78), fill=(20, 20, 20))
+    semicircle_draw.ellipse((40, 40, 56, 56), fill=(0, 190, 0))
+    semicircle_draw.arc((12, 12, 84, 84), 0, 180, fill=(210, 205, 195), width=8)
+    semicircle.save(white_semicircle, format="PNG")
+
+    assert _green_center_marker_visible(green) is True
+    assert _green_center_marker_visible(red) is False
+    assert _green_center_marker_visible(solid_green) is False
+    assert _green_center_marker_visible(unrelated_white_patch) is False
+    assert _green_center_marker_visible(disconnected_white_patches) is False
+    assert _green_center_marker_visible(white_semicircle) is False
+
+
+def test_success_with_red_terminal_marker_is_incomplete(tmp_path):
+    entry = _entry(tmp_path)
+    _write_bound_artifacts(entry, success=True)
+    _write_png(
+        entry.output_dir / "live" / "press.png",
+        center_color=(210, 10, 10),
+    )
+
+    outcome, errors, _ = validate_instance_result(
+        entry,
+        source_commit="abc",
+        subprocess_exit_code=0,
+        timed_out=False,
+    )
+
+    assert outcome == "incomplete"
+    assert (
+        "successful run terminal press-wrist image does not show green center marker"
+        in errors
+    )
+
+
+def test_external_stage3_success_requires_same_run_checkpoint2(tmp_path):
+    entry = _entry(tmp_path)
+    _write_bound_artifacts(entry, success=True)
+    (entry.output_dir / "state_checkpoints" / "state_checkpoint_2.json").unlink()
+
+    outcome, errors, _ = validate_instance_result(
+        entry,
+        source_commit="abc",
+        subprocess_exit_code=0,
+        timed_out=False,
+    )
+
+    assert outcome == "incomplete"
+    assert "successful run lacks fresh post-hold press-wrist image" in errors
+
+
+def test_external_stage3_rejects_non_press_wrist_checkpoint_projection(tmp_path):
+    entry = _entry(tmp_path)
+    _write_bound_artifacts(entry, success=True)
+    checkpoint2 = entry.output_dir / "state_checkpoints" / "state_checkpoint_2.json"
+    payload = json.loads(checkpoint2.read_text(encoding="utf-8"))
+    payload["prepress"]["button_projection"]["camera"] = "head"
+    _write_json(checkpoint2, payload)
+    trace_path = entry.output_dir / "pi0_nav_pick_tool_trace.jsonl"
+    trace = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    saved = next(
+        record for record in trace if record["tool"] == "save_robot_state_checkpoint"
+    )
+    saved["result"]["state_checkpoint_2_sha256"] = hashlib.sha256(
+        checkpoint2.read_bytes()
+    ).hexdigest()
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace), encoding="utf-8"
+    )
+
+    assert _terminal_press_wrist_image(entry.output_dir) is None
+
+
+def test_external_stage3_rejects_in_root_swapped_terminal_image(tmp_path):
+    entry = _entry(tmp_path)
+    _write_bound_artifacts(entry, success=True)
+    swapped = entry.output_dir / "live" / "unrelated_green.png"
+    _write_png(swapped)
+    trace_path = entry.output_dir / "pi0_nav_pick_tool_trace.jsonl"
+    trace = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    observation = next(record for record in trace if record["tool"] == "observe")
+    observation["result"]["visual_review"]["rgb_path"] = str(swapped)
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace), encoding="utf-8"
+    )
+
+    assert _terminal_press_wrist_image(entry.output_dir) is None
+
+
+def test_external_stage3_malformed_hold_step_fails_closed(tmp_path):
+    entry = _entry(tmp_path)
+    _write_bound_artifacts(entry, success=True)
+    trace_path = entry.output_dir / "pi0_nav_pick_tool_trace.jsonl"
+    trace = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    hold = next(
+        record for record in trace if record["tool"] == "post_success_hold_frames"
+    )
+    hold["step"] = "malformed"
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace), encoding="utf-8"
+    )
 
     outcome, errors, _ = validate_instance_result(
         entry,
@@ -341,24 +704,15 @@ def test_terminal_image_must_be_inside_output_and_not_symlink(tmp_path):
     entry = _entry(tmp_path)
     _write_bound_artifacts(entry, success=True)
     outside = tmp_path / "outside.png"
-    outside.write_bytes(b"png")
+    _write_png(outside)
     trace_path = entry.output_dir / "pi0_nav_pick_tool_trace.jsonl"
     trace = [
-        {
-            "step": 10,
-            "tool": "post_success_hold_frames",
-            "result": {"task_success": True},
-        },
-        {
-            "step": 11,
-            "tool": "observe",
-            "input": {"camera": "press_wrist"},
-            "result": {
-                "task_success": True,
-                "visual_review": {"rgb_path": str(outside)},
-            },
-        },
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
     ]
+    observation = next(record for record in trace if record["tool"] == "observe")
+    observation["result"]["visual_review"]["rgb_path"] = str(outside)
     trace_path.write_text(
         "".join(json.dumps(record) + "\n" for record in trace), encoding="utf-8"
     )
@@ -367,7 +721,7 @@ def test_terminal_image_must_be_inside_output_and_not_symlink(tmp_path):
 
     link = entry.output_dir / "linked.png"
     link.symlink_to(outside)
-    trace[-1]["result"]["visual_review"]["rgb_path"] = str(link)
+    observation["result"]["visual_review"]["rgb_path"] = str(link)
     trace_path.write_text(
         "".join(json.dumps(record) + "\n" for record in trace), encoding="utf-8"
     )

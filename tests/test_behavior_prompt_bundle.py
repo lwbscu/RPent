@@ -193,12 +193,18 @@ def test_nav_pick_stage3_press_prompt_is_injected_only_when_enabled():
     )
     system = prompts["behavior_system_instructions"]
     user = prompts["behavior_user_instructions"]
+    normalized_system = " ".join(system.split())
+    normalized_user = " ".join(user.split())
 
     assert "Post-pick pre-press phase" in system
     assert "Post-prepress button-press phase" in system
     assert "tmp_state_checkpoint_<label>.json" in system
     assert "runtime deletes every temporary checkpoint" in system
+    assert "Never overwrite an existing temporary checkpoint" in normalized_system
+    assert "continue into that phase immediately" in normalized_system
     assert "Resume only the explicitly authorized stage-3 press" in user
+    assert "explicit approval for stage 3" in user
+    assert "continue immediately without asking for another review" in normalized_user
 
 
 def test_markdown_user_prompt_templates_render_runtime_values():

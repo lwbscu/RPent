@@ -34,6 +34,11 @@ _TIMEOUT_S = {
     "env.rotate_wrist": 1800.0,
     "env.press": 1800.0,
     "env.release": 1800.0,
+    "env.post_pick_close_press_gripper": 120.0,
+    "env.inspect_toggle_geometry": 120.0,
+    "env.post_pick_recenter_held_button": 1800.0,
+    "env.post_pick_direct_finger_toggle": 1800.0,
+    "env.post_success_hold_frames": 120.0,
 }
 
 
@@ -380,6 +385,47 @@ class BehaviorEnvClient:
             stage=stage,
             visual_review=visual_review,
         )
+
+    def post_pick_close_press_gripper(
+        self, *, timeout_s: float = 30.0
+    ) -> dict[str, Any]:
+        return self._planner_call("post_pick_close_press_gripper", timeout_s=timeout_s)
+
+    def inspect_toggle_geometry(self) -> dict[str, Any]:
+        return self._planner_call("inspect_toggle_geometry")
+
+    def post_pick_recenter_held_button(
+        self,
+        *,
+        target_finger_standoff_m: float = 0.04,
+        max_held_travel_m: float = 0.08,
+        timeout_s: float = 240.0,
+    ) -> dict[str, Any]:
+        return self._planner_call(
+            "post_pick_recenter_held_button",
+            target_finger_standoff_m=target_finger_standoff_m,
+            max_held_travel_m=max_held_travel_m,
+            timeout_s=timeout_s,
+        )
+
+    def post_pick_direct_finger_toggle(
+        self,
+        *,
+        projection_id: str,
+        penetration_m: float = 0.008,
+        max_travel_m: float = 0.15,
+        timeout_s: float = 300.0,
+    ) -> dict[str, Any]:
+        return self._planner_call(
+            "post_pick_direct_finger_toggle",
+            projection_id=projection_id,
+            penetration_m=penetration_m,
+            max_travel_m=max_travel_m,
+            timeout_s=timeout_s,
+        )
+
+    def post_success_hold_frames(self, *, frames: int = 4) -> dict[str, Any]:
+        return self._planner_call("post_success_hold_frames", frames=frames)
 
     def pixel_to_world(
         self,

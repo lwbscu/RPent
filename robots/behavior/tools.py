@@ -55,6 +55,8 @@ _PI0_NAV_PICK_OPTIONAL_MONITOR_FIELDS = (
     "usable_post_pick_saved",
     "save_policy",
     "warnings",
+    "terminal_evidence_env_steps",
+    "terminal_success_evidence",
 )
 _TEMP_STATE_CHECKPOINT_NAME = re.compile(TEMP_STATE_CHECKPOINT_PATTERN)
 
@@ -1552,6 +1554,7 @@ class BehaviorPrimitives:
         env_steps_used = 0
         vla_env_steps_used = 0
         handoff_env_steps_used = 0
+        terminal_evidence_env_steps_used = 0
         chunk_visual_reviews: list[dict[str, Any]] = []
         total_env_steps = 0
         task_success = False
@@ -1750,12 +1753,25 @@ class BehaviorPrimitives:
                     raise RuntimeError(
                         f"invalid pi0_nav_pick handoff_env_steps: {handoff_env_steps!r}"
                     )
+                terminal_evidence_env_steps = monitor.get(
+                    "terminal_evidence_env_steps", 0
+                )
+                if (
+                    isinstance(terminal_evidence_env_steps, bool)
+                    or not isinstance(terminal_evidence_env_steps, (int, np.integer))
+                    or int(terminal_evidence_env_steps) < 0
+                ):
+                    raise RuntimeError(
+                        "invalid pi0_nav_pick terminal_evidence_env_steps: "
+                        f"{terminal_evidence_env_steps!r}"
+                    )
                 reported_total = monitor["total_env_steps"]
                 if (
                     isinstance(reported_total, bool)
                     or not isinstance(reported_total, (int, np.integer))
                     or int(reported_total) < previous_total + int(executed_steps)
-                    or int(reported_total) > self.max_episode_steps
+                    or int(reported_total) - int(terminal_evidence_env_steps)
+                    > self.max_episode_steps
                 ):
                     raise RuntimeError(
                         f"invalid pi0_nav_pick total_env_steps: {reported_total!r}"
@@ -1783,7 +1799,10 @@ class BehaviorPrimitives:
                 derived_handoff_steps = (
                     int(reported_total) - previous_total - int(executed_steps)
                 )
-                if int(handoff_env_steps) != derived_handoff_steps:
+                accounted_non_vla_steps = int(handoff_env_steps) + int(
+                    terminal_evidence_env_steps
+                )
+                if accounted_non_vla_steps != derived_handoff_steps:
                     # Preserve a strict local-grasp result even when a failed
                     # handoff exception under-reports the reload/hold steps.
                     # The monotonic env total is authoritative for accounting;
@@ -1799,6 +1818,10 @@ class BehaviorPrimitives:
                     for field, expected in (
                         ("executed_steps", int(executed_steps)),
                         ("handoff_env_steps", int(handoff_env_steps)),
+                        (
+                            "terminal_evidence_env_steps",
+                            int(terminal_evidence_env_steps),
+                        ),
                         ("total_env_steps", int(reported_total)),
                     ):
                         value = rpent.get(field, expected)
@@ -1813,6 +1836,9 @@ class BehaviorPrimitives:
                 # the narrow FAILED reconciliation above.
                 public_rpent["executed_steps"] = int(executed_steps)
                 public_rpent["handoff_env_steps"] = int(handoff_env_steps)
+                public_rpent["terminal_evidence_env_steps"] = int(
+                    terminal_evidence_env_steps
+                )
                 public_rpent["total_env_steps"] = int(reported_total)
                 public_rpent["pi0_nav_pick_monitor"] = monitor
                 public_info["_rpent"] = public_rpent
@@ -1891,8 +1917,10 @@ class BehaviorPrimitives:
                 # strict local validator evidence.
                 env_steps_used += int(executed_steps)
                 env_steps_used += int(handoff_env_steps)
+                env_steps_used += int(terminal_evidence_env_steps)
                 vla_env_steps_used += int(executed_steps)
                 handoff_env_steps_used += int(handoff_env_steps)
+                terminal_evidence_env_steps_used += int(terminal_evidence_env_steps)
                 total_env_steps = int(reported_total)
                 if int(executed_steps) == DEFAULT_ACTION_CHUNK:
                     full_chunks_executed += 1
@@ -2137,6 +2165,7 @@ class BehaviorPrimitives:
             "env_steps_used": env_steps_used,
             "vla_env_steps_used": vla_env_steps_used,
             "handoff_env_steps_used": handoff_env_steps_used,
+            "terminal_evidence_env_steps_used": terminal_evidence_env_steps_used,
             "total_env_steps": total_env_steps,
             "max_episode_steps": self.max_episode_steps,
             "action_horizon": self.action_horizon,
@@ -2208,6 +2237,11 @@ class BehaviorPrimitives:
                 else None
             ),
             "last_pi0_nav_pick_monitor": monitor_public,
+            "terminal_success_evidence": (
+                _jsonable(last_monitor.get("terminal_success_evidence"))
+                if isinstance(last_monitor, dict)
+                else None
+            ),
             "elapsed_s": round(time.time() - started, 2),
             "states_path": str(states_path),
             "result_path": str(result_path),

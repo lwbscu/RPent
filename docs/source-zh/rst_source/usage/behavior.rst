@@ -37,7 +37,8 @@ Pi0.5 权重。一次正式评测必须新建并完整清理这组进程，不�
 
 Stage 3 开关只允许用于 ``turning_on_radio`` 的 ``pi0_nav_pick_vla`` 模式；
 它在 post-pick/pre-press 工具面之后增加有界的按钮接触 handler，但 LLM 仍只能
-调用一次 ``pi0_nav_pick``。
+调用一次 ``pi0_nav_pick``。启用后，保存并验证 ``state_checkpoint_2`` 即在同一
+evaluation 中立即进入 Stage 3，不再等待额外的用户审核。
 
 Checkpoint 与成功规则
 ----------------------
@@ -52,6 +53,11 @@ runtime 必须删除全部临时 checkpoint JSON。
 ``info["done"]["success"]``。退出码 0、局部抓取、保存 checkpoint、接触或 LLM
 文字都不能替代它。成功按压还必须在 render hold 后保留 fresh press-wrist 图片，
 供绿点审核。
+如果唯一一次 ``pi0_nav_pick`` 内部直接得到 raw success，env 会在该终止型工具
+返回前完成 4 帧静止 hold，并保存 fresh 同步终态视图；动态腕部来源不明确时仍按
+fail-closed 处理，不猜测左右手。
+串行 validator 还要求终态中心标记为绿色；若成功来自外部 Stage 3，则必须绑定
+同 run 的 ``state_checkpoint_2``、动态 press hand 与按钮反投影 lineage。
 
 串行 public instance 评测
 -------------------------

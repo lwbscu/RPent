@@ -15,6 +15,7 @@ import threading
 import time
 from concurrent.futures import Future
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
@@ -876,6 +877,7 @@ class BehaviorEnvFacade:
             _HANDOFF_VLA_ACTIVE if self._control_mode == PI0_NAV_PICK_VLA_MODE else None
         )
         self._held_hand: str | None = None
+        self._pi0_terminal_success_finalized = False
         self._reset_completed = False
         self._handoff_validator_frames: list[dict[str, Any]] = []
         self._handoff_target_objects: tuple[Any, Any] | None = None
@@ -2604,6 +2606,231 @@ class BehaviorEnvFacade:
         metadata["metadata_path"] = str(metadata_path)
         _write_json_atomic(metadata_path, metadata)
         return metadata
+
+    @staticmethod
+    def _terminal_success_roles(validator: dict[str, Any]) -> dict[str, Any]:
+        """Resolve terminal wrist roles only from same-run grasp evidence."""
+
+        held = validator.get("held_hand")
+        source = "strict_handoff" if held in {"left", "right"} else None
+        if held not in {"left", "right"}:
+            criteria = validator.get("current_criteria")
+            candidates: list[str] = []
+            if isinstance(criteria, dict):
+                for hand in ("left", "right"):
+                    hand_criteria = criteria.get(hand)
+                    if not isinstance(hand_criteria, dict):
+                        continue
+                    if (
+                        hand_criteria.get("selected_attachment_or_two_finger_contact")
+                        is not True
+                    ):
+                        continue
+                    if not all(
+                        hand_criteria.get(field) is True
+                        for field in ("radio_lift", "support_gap")
+                    ):
+                        continue
+                    if all(
+                        hand_criteria.get(field) is True
+                        for field in (
+                            "other_hand_no_assisted_attachment",
+                            "other_hand_no_backend_attachment",
+                            "other_hand_no_radio_contact",
+                        )
+                    ):
+                        candidates.append(hand)
+            if len(candidates) == 1:
+                held = candidates[0]
+                source = "unique_terminal_attachment_evidence"
+        if held not in {"left", "right"}:
+            return {
+                "held_hand": None,
+                "press_hand": None,
+                "role_resolution_source": None,
+            }
+        return {
+            "held_hand": held,
+            "press_hand": "right" if held == "left" else "left",
+            "role_resolution_source": source,
+        }
+
+    def _post_success_stationary_action(self) -> tuple[np.ndarray, str]:
+        """Build a controller-compatible stationary action after raw success."""
+
+        if self._base_controller_mode == "velocity":
+            velocity_hold = getattr(
+                self._require_planner().backend, "velocity_base_hold_action", None
+            )
+            if not callable(velocity_hold):
+                raise RuntimeError("velocity-mode terminal hold adapter is unavailable")
+            action = np.asarray(velocity_hold(), dtype=np.float32).reshape(23)
+            return action, "current_joint_targets_zero_velocity_base"
+        action = np.asarray(
+            self._require_planner().backend.hold_action(), dtype=np.float32
+        ).reshape(23)
+        return action, "planner_current_target_hold"
+
+    def _persist_terminal_success_views(
+        self,
+        *,
+        roles: dict[str, Any],
+        end_env_step: int,
+    ) -> dict[str, Any]:
+        """Persist one fresh same-step terminal head/two-wrist capture."""
+
+        from PIL import Image
+
+        root = self._output_dir / "visual_review" / "terminal_success"
+        if root.exists():
+            raise RuntimeError("terminal success evidence is non-overwritable")
+        self._refresh_observation_without_step()
+        views: dict[str, Any] = {}
+        capture_group_id: str | None = None
+        for camera in ("head", "left_wrist", "right_wrist"):
+            payload = self._require_planner().observe(camera)
+            image = payload.get("_image_bytes")
+            if not isinstance(image, bytes):
+                raise RuntimeError(f"terminal {camera} PNG is unavailable")
+            group = payload.get("capture_group")
+            group_id = str(group.get("id")) if isinstance(group, dict) else None
+            if not group_id:
+                raise RuntimeError("terminal capture lacks capture-group identity")
+            if capture_group_id is None:
+                capture_group_id = group_id
+            elif capture_group_id != group_id:
+                raise RuntimeError("terminal views are not synchronized")
+            frame_id = payload.get("frame_id")
+            if not isinstance(frame_id, str) or not frame_id:
+                raise RuntimeError(f"terminal {camera} frame identity is missing")
+            frame = self._frame_cache.get_current(camera, frame_id)
+            if (
+                int(frame.step_index) != int(end_env_step)
+                or frame.capture_group_id != group_id
+            ):
+                raise RuntimeError(
+                    f"terminal {camera} frame is stale or capture-mismatched"
+                )
+            with Image.open(BytesIO(image)) as decoded:
+                decoded.verify()
+            with Image.open(BytesIO(image)) as decoded:
+                width, height = decoded.size
+            image_path = root / f"{camera}.png"
+            _write_bytes_atomic(image_path, image)
+            views[camera] = {
+                "camera": camera,
+                "path": str(image_path),
+                "sha256": _sha256_file(image_path),
+                "width": int(width),
+                "height": int(height),
+                "frame_id": frame_id,
+                "capture_group_id": group_id,
+                "env_step": int(end_env_step),
+            }
+        press_hand = roles.get("press_hand")
+        resolved_camera = (
+            f"{press_hand}_wrist" if press_hand in {"left", "right"} else None
+        )
+        return {
+            "root": str(root),
+            "capture_group_id": capture_group_id,
+            "views": views,
+            "logical_camera": "press_wrist" if resolved_camera else None,
+            "resolved_camera": resolved_camera,
+            "terminal_press_wrist": (
+                views.get(resolved_camera) if resolved_camera is not None else None
+            ),
+        }
+
+    def _finalize_pi0_terminal_success(
+        self, *, validator: dict[str, Any], frames: int = 4
+    ) -> dict[str, Any]:
+        """Atomically hold and capture terminal evidence before Pi0 returns."""
+
+        if self._pi0_terminal_success_finalized:
+            raise RuntimeError("Pi0 terminal success finalization is one-shot")
+        self._pi0_terminal_success_finalized = True
+        start_env_step = int(self._env_steps)
+        roles = self._terminal_success_roles(validator)
+        evidence: dict[str, Any] = {
+            "schema_version": 1,
+            "source": "pi0_nav_pick_internal_terminal_finalize",
+            "complete": False,
+            "task_success_before_hold": bool(_raw_success(self._last_info)),
+            "task_success_after_hold": False,
+            "hold_frames_requested": int(frames),
+            "hold_frames_executed": 0,
+            "start_env_step": start_env_step,
+            "end_env_step": start_env_step,
+            **roles,
+            "logical_camera": None,
+            "resolved_camera": None,
+            "terminal_press_wrist": None,
+            "views": {},
+            "error": None,
+        }
+        try:
+            if evidence["task_success_before_hold"] is not True:
+                raise RuntimeError("terminal finalization requires raw task success")
+            hold_result = self.post_success_hold_frames(frames=int(frames))
+            evidence.update(
+                {
+                    "hold_frames_executed": int(hold_result.get("executed_frames", 0)),
+                    "end_env_step": int(self._env_steps),
+                    "task_success_after_hold": bool(
+                        hold_result.get("task_success", False)
+                    ),
+                    "hold_action_source": hold_result.get("hold_action_source"),
+                    "hold_action_sha256": hold_result.get("hold_action_sha256"),
+                }
+            )
+            if roles.get("press_hand") not in {"left", "right"}:
+                raise RuntimeError(
+                    "terminal grasp evidence does not uniquely resolve press_hand"
+                )
+            if evidence["hold_frames_executed"] != int(frames):
+                raise RuntimeError(
+                    "terminal hold did not execute every requested frame"
+                )
+            if evidence["task_success_after_hold"] is not True:
+                raise RuntimeError(
+                    "raw task success did not persist through terminal hold"
+                )
+            views = self._persist_terminal_success_views(
+                roles=roles,
+                end_env_step=int(self._env_steps),
+            )
+            evidence.update(views)
+            evidence["complete"] = True
+        except Exception as exc:
+            logger.exception("Pi0 terminal success evidence failed closed")
+            evidence["error"] = f"{type(exc).__name__}: {exc}"
+            evidence["end_env_step"] = int(self._env_steps)
+            evidence["task_success_after_hold"] = bool(_raw_success(self._last_info))
+        finally:
+            self._done = bool(_raw_success(self._last_info))
+            try:
+                self._finalize_video_segment()
+            except Exception as exc:
+                logger.exception("failed to finalize Pi0 terminal video")
+                evidence["complete"] = False
+                evidence["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                self._video_sealed = True
+        metadata_path = (
+            self._output_dir
+            / "visual_review"
+            / "terminal_success"
+            / "terminal_success_evidence.json"
+        )
+        evidence["metadata_path"] = str(metadata_path)
+        try:
+            _write_json_atomic(metadata_path, evidence)
+        except Exception as exc:
+            logger.exception("failed to persist Pi0 terminal success metadata")
+            evidence["complete"] = False
+            evidence["error"] = f"{type(exc).__name__}: {exc}"
+        return evidence
 
     def _complete_pi0_nav_pick_handoff(
         self, *, held_hand: str, validator: dict[str, Any]
@@ -4334,9 +4561,45 @@ class BehaviorEnvFacade:
             )
             if not isinstance(monitor, dict):
                 raise RuntimeError("pi0_nav_pick monitor was not produced")
-            monitor["visual_review"] = self._persist_pi0_nav_pick_views(
-                chunk_index=int(chunk_index), validator=monitor
-            )
+            if _raw_success(info):
+                terminal = self._finalize_pi0_terminal_success(validator=monitor)
+                terminal_steps = int(self._env_steps) - int(
+                    terminal.get("start_env_step", self._env_steps)
+                )
+                monitor["terminal_evidence_env_steps"] = terminal_steps
+                monitor["terminal_success_evidence"] = terminal
+                monitor["total_env_steps"] = int(self._env_steps)
+                public_info = self._info_with_accounting()
+                public_rpent = public_info.setdefault("_rpent", {})
+                if not isinstance(public_rpent, dict):
+                    raise RuntimeError("terminal accounting envelope is invalid")
+                public_rpent.update(
+                    {
+                        "executed_steps": int(monitor["executed_steps"]),
+                        "handoff_env_steps": int(monitor["handoff_env_steps"]),
+                        "terminal_evidence_env_steps": terminal_steps,
+                        "total_env_steps": int(self._env_steps),
+                        "pi0_nav_pick_monitor": monitor,
+                    }
+                )
+                info = public_info
+                observation = self._last_observation
+                if observation is None:
+                    raise RuntimeError("terminal finalization produced no observation")
+                # The terminal finalizer already persisted a synchronized fresh
+                # head/two-wrist capture.  Reusing that evidence prevents a
+                # redundant second observe/write failure from hiding the raw
+                # success return from this exact-once RPC.
+                monitor["visual_review"] = {
+                    "source": "terminal_success_evidence",
+                    "capture_group_id": terminal.get("capture_group_id"),
+                    "views": terminal.get("views", {}),
+                    "metadata_path": terminal.get("metadata_path"),
+                }
+            else:
+                monitor["visual_review"] = self._persist_pi0_nav_pick_views(
+                    chunk_index=int(chunk_index), validator=monitor
+                )
             result = (observation, reward, terminated, truncated, info)
             pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
             return result
@@ -4352,6 +4615,9 @@ class BehaviorEnvFacade:
             # later visual/tool-envelope step failed.
             self._state_checkpoint_path.with_suffix(".json.tmp").unlink(missing_ok=True)
             self._paused_runtime_path.with_suffix(".json.tmp").unlink(missing_ok=True)
+            if _raw_success(self._last_info):
+                self._handoff_state = _HANDOFF_OFFICIAL_SUCCESS
+                self._done = True
             raise
 
     def pi0_navigate_to_chunk_step(
@@ -4667,6 +4933,14 @@ class BehaviorEnvFacade:
                             self._handoff_state = _HANDOFF_FAILED
                             self._vla_actions_enabled = False
                     break
+            elif pi0_nav_pick and _raw_success(step_info):
+                if not need_observation or final_observation is None:
+                    raise RuntimeError(
+                        "Pi0 terminal role evidence requires a same-step observation"
+                    )
+                # Refresh role evidence on the exact success frame without
+                # entering the normal local-grasp/controller handoff path.
+                handoff_validator = self._update_handoff_validator(final_observation)
             if local_gripper_monitor is not None:
                 if not need_observation or final_observation is None:
                     raise RuntimeError(
@@ -4864,15 +5138,16 @@ class BehaviorEnvFacade:
                     "handoff_failure_diagnostics_path"
                 ),
             }
-            if not local_success and (
-                task_success
-                or terminated
-                or truncated
-                or self._env_steps >= int(self._meta["max_episode_steps"])
-            ):
-                self._handoff_state = (
-                    _HANDOFF_OFFICIAL_SUCCESS if task_success else _HANDOFF_FAILED
+            if (
+                not local_success
+                and not task_success
+                and (
+                    terminated
+                    or truncated
+                    or self._env_steps >= int(self._meta["max_episode_steps"])
                 )
+            ):
+                self._handoff_state = _HANDOFF_FAILED
                 self._vla_actions_enabled = False
                 self._finalize_video_segment()
                 self._video_sealed = True
@@ -8219,14 +8494,17 @@ class BehaviorEnvFacade:
             raise ValueError("frames must be an integer in [1, 16]")
         if not _raw_success(self._last_info):
             raise RuntimeError("post-success hold requires official task success")
+        start_env_step = int(self._env_steps)
+        action, action_source = self._post_success_stationary_action()
+        action = np.asarray(action, dtype=np.float32).reshape(23)
+        if not np.isfinite(action).all():
+            raise RuntimeError("post-success hold action must be finite")
+        action_sha256 = hashlib.sha256(action.tobytes()).hexdigest()
         self._post_success_cleanup_active = True
         self._done = False
         executed = 0
         try:
             for _ in range(int(frames)):
-                action = np.asarray(
-                    self._require_planner().backend.hold_action(), dtype=np.float32
-                ).reshape(23)
                 self.planner_step(action.reshape(1, 23))
                 executed += 1
         finally:
@@ -8238,7 +8516,12 @@ class BehaviorEnvFacade:
             "task_success": bool(_raw_success(self._last_info)),
             "official_success_source": 'info["done"]["success"]',
             "stop_reason": "post_success_frames_held",
+            "requested_frames": int(frames),
             "executed_frames": executed,
+            "start_env_step": start_env_step,
+            "end_env_step": int(self._env_steps),
+            "hold_action_source": action_source,
+            "hold_action_sha256": action_sha256,
             "total_env_steps": int(self._env_steps),
         }
 

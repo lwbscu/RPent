@@ -4606,6 +4606,67 @@ class RealCuroboBackend:
             action[ENV_ACTION_SEGMENTS[f"{side}_gripper"]] = self._gripper_latch(side)
         return validate_action_chunk(action.reshape(1, ACTION_DIM))[0]
 
+    def velocity_base_hold_action(self) -> np.ndarray:
+        """Freeze current joints while commanding zero velocity to the Pi0 base."""
+
+        robot = self._find_robot()
+        torch = self._torch
+        if torch is None:
+            import torch as torch  # type: ignore[no-redef]
+        q = torch.as_tensor(robot.get_joint_positions(), dtype=torch.float32).reshape(
+            -1
+        )
+        actions = []
+        expected_layout = (
+            ("base", 3),
+            ("trunk", 4),
+            ("arm_left", 7),
+            ("gripper_left", 1),
+            ("arm_right", 7),
+            ("gripper_right", 1),
+        )
+        controllers = list(getattr(robot, "controllers", {}).items())
+        actual_layout = tuple(
+            (str(name), int(controller.command_dim)) for name, controller in controllers
+        )
+        if actual_layout != expected_layout:
+            raise RuntimeError(
+                "velocity-base hold requires the canonical R1Pro controller layout"
+            )
+        for name, controller in controllers:
+            mro_names = {cls.__name__ for cls in type(controller).__mro__}
+            if name == "base":
+                if (
+                    "HolonomicBaseJointController" not in mro_names
+                    or str(getattr(controller, "motor_type", "")) != "velocity"
+                ):
+                    raise RuntimeError(
+                        "velocity-base hold requires the Pi0 velocity base controller"
+                    )
+                command = torch.zeros(
+                    int(controller.command_dim), dtype=q.dtype, device=q.device
+                )
+                actions.append(controller._reverse_preprocess_command(command))
+                continue
+            if name in {"gripper_left", "gripper_right"}:
+                side = name.removeprefix("gripper_")
+                actions.append(
+                    torch.as_tensor(
+                        [self._gripper_latch(side)], dtype=q.dtype, device=q.device
+                    )
+                )
+                continue
+            if "JointController" not in mro_names or bool(
+                getattr(controller, "use_delta_commands", False)
+            ):
+                raise RuntimeError(
+                    f"velocity-base hold cannot freeze controller {name!r}"
+                )
+            command = q[controller.dof_idx]
+            actions.append(controller._reverse_preprocess_command(command))
+        action = torch.cat(actions).detach().cpu().numpy().astype(np.float32)
+        return validate_action_chunk(action.reshape(1, ACTION_DIM))[0]
+
     def _apply_latches_and_inactive_segments(
         self,
         action: np.ndarray,

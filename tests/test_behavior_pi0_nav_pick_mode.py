@@ -1,7 +1,9 @@
 import inspect
+import io
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -487,6 +489,65 @@ def test_env_client_exposes_nav_pick_and_checkpoint_rpc_contracts():
         "require_object_still_held": True,
         "timeout_s": 90.0,
     }
+
+
+def test_env_client_exposes_every_stage3_rpc_contract():
+    class Rpc:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, method, args=(), kwargs=None, *, timeout_s=None):
+            self.calls.append((method, args, kwargs or {}, timeout_s))
+            if method == "env.get_env_meta":
+                return {"control_mode": PI0_NAV_PICK_VLA_MODE}
+            return {
+                "primitive_success": True,
+                "task_success": method == "env.post_success_hold_frames",
+                "stop_reason": "ok",
+                "total_env_steps": 12,
+            }
+
+    rpc = Rpc()
+    client = BehaviorEnvClient(
+        rpc,
+        expected_meta={"control_mode": PI0_NAV_PICK_VLA_MODE},
+    )
+    client.post_pick_close_press_gripper(timeout_s=31.0)
+    client.inspect_toggle_geometry()
+    client.post_pick_recenter_held_button(
+        target_finger_standoff_m=0.05,
+        max_held_travel_m=0.07,
+        timeout_s=241.0,
+    )
+    client.post_pick_direct_finger_toggle(
+        projection_id="projection-1",
+        penetration_m=0.01,
+        max_travel_m=0.14,
+        timeout_s=301.0,
+    )
+    client.post_success_hold_frames(frames=4)
+
+    assert [call[0] for call in rpc.calls[1:]] == [
+        "env.post_pick_close_press_gripper",
+        "env.inspect_toggle_geometry",
+        "env.post_pick_recenter_held_button",
+        "env.post_pick_direct_finger_toggle",
+        "env.post_success_hold_frames",
+    ]
+    assert rpc.calls[1][2] == {"timeout_s": 31.0}
+    assert rpc.calls[3][2] == {
+        "target_finger_standoff_m": 0.05,
+        "max_held_travel_m": 0.07,
+        "timeout_s": 241.0,
+    }
+    assert rpc.calls[4][2] == {
+        "projection_id": "projection-1",
+        "penetration_m": 0.01,
+        "max_travel_m": 0.14,
+        "timeout_s": 301.0,
+    }
+    assert rpc.calls[5][2] == {"frames": 4}
+    assert client.episode_done is True
 
 
 def test_robot_motion_checkpoint_payload_is_json_allowlisted_without_sim_state(
@@ -1322,6 +1383,261 @@ def test_official_success_never_fabricates_local_grasp_or_checkpoint(tmp_path):
     assert result["state_checkpoint_path"] is None
     assert "checkpoint_post_pick_path" not in result
     assert result["handoff_state"] != "PAUSED"
+
+
+def test_official_success_preserves_embedded_terminal_evidence_accounting(tmp_path):
+    monitor = _monitor(
+        tmp_path,
+        total_env_steps=DEFAULT_ACTION_CHUNK + 4,
+        local_grasp_success=False,
+        held_hand=None,
+        pose_jump_ok=True,
+        checkpoint=False,
+    )
+    evidence = {
+        "complete": True,
+        "hold_frames_requested": 4,
+        "hold_frames_executed": 4,
+        "start_env_step": DEFAULT_ACTION_CHUNK,
+        "end_env_step": DEFAULT_ACTION_CHUNK + 4,
+        "task_success_before_hold": True,
+        "task_success_after_hold": True,
+    }
+    monitor.update(
+        {
+            "handoff_state": "OFFICIAL_SUCCESS",
+            "vla_actions_enabled": False,
+            "terminal_evidence_env_steps": 4,
+            "terminal_success_evidence": evidence,
+        }
+    )
+
+    result = _primitives(
+        tmp_path, _Env(tmp_path, [monitor], official=True), _Model()
+    ).pi0_nav_pick(instruction="Turn on the radio receiver.")
+
+    assert result["task_success"] is True
+    assert result["env_steps_used"] == DEFAULT_ACTION_CHUNK + 4
+    assert result["terminal_evidence_env_steps_used"] == 4
+    assert result["total_env_steps"] == DEFAULT_ACTION_CHUNK + 4
+    assert result["terminal_success_evidence"] == evidence
+
+
+def test_terminal_success_roles_use_unique_same_run_attachment_evidence():
+    roles = BehaviorEnvFacade._terminal_success_roles(
+        {
+            "held_hand": None,
+            "current_criteria": {
+                "left": {
+                    "radio_lift": True,
+                    "support_gap": True,
+                    "selected_attachment_or_two_finger_contact": True,
+                    "other_hand_no_assisted_attachment": True,
+                    "other_hand_no_backend_attachment": True,
+                    "other_hand_no_radio_contact": True,
+                },
+                "right": {
+                    "selected_attachment_or_two_finger_contact": False,
+                },
+            },
+        }
+    )
+
+    assert roles == {
+        "held_hand": "left",
+        "press_hand": "right",
+        "role_resolution_source": "unique_terminal_attachment_evidence",
+    }
+
+
+def test_velocity_mode_post_success_hold_zeroes_base_and_preserves_latches():
+    facade = BehaviorEnvFacade.__new__(BehaviorEnvFacade)
+    facade._control_mode = PI0_NAV_PICK_VLA_MODE
+    facade._base_controller_mode = "velocity"
+    hold = np.arange(ACTION_DIM, dtype=np.float32)
+    hold[ENV_ACTION_SEGMENTS["base"]] = 0.0
+    hold[ENV_ACTION_SEGMENTS["left_gripper"]] = -1.0
+    hold[ENV_ACTION_SEGMENTS["right_gripper"]] = 1.0
+    facade._planner = type(
+        "Planner",
+        (),
+        {
+            "backend": type(
+                "Backend", (), {"velocity_base_hold_action": lambda _: hold}
+            )()
+        },
+    )()
+
+    action, source = facade._post_success_stationary_action()
+
+    assert np.all(action[ENV_ACTION_SEGMENTS["base"]] == 0.0)
+    assert action[ENV_ACTION_SEGMENTS["left_gripper"]][0] == -1.0
+    assert action[ENV_ACTION_SEGMENTS["right_gripper"]][0] == 1.0
+    assert source == "current_joint_targets_zero_velocity_base"
+
+
+def test_terminal_success_finalizer_holds_and_persists_fresh_dynamic_wrist(
+    tmp_path,
+):
+    from PIL import Image
+
+    stream = io.BytesIO()
+    Image.new("RGB", (16, 12), color=(0, 180, 0)).save(stream, format="PNG")
+    png = stream.getvalue()
+    group_id = "capture:104"
+    frames = {
+        camera: SimpleNamespace(step_index=104, capture_group_id=group_id)
+        for camera in ("head", "left_wrist", "right_wrist")
+    }
+
+    class Planner:
+        def observe(self, camera):
+            return {
+                "_image_bytes": png,
+                "frame_id": f"{group_id}:{camera}",
+                "capture_group": {"id": group_id},
+            }
+
+    facade = BehaviorEnvFacade.__new__(BehaviorEnvFacade)
+    facade._control_mode = PI0_NAV_PICK_VLA_MODE
+    facade._planner = Planner()
+    facade._output_dir = tmp_path
+    facade._env_steps = 100
+    facade._last_info = {"done": {"success": True}}
+    facade._last_observation = _observation()
+    facade._done = False
+    facade._video_sealed = False
+    facade._pi0_terminal_success_finalized = False
+    facade._refresh_observation_without_step = lambda: None
+    facade._frame_cache = SimpleNamespace(
+        get_current=lambda camera, frame_id: frames[camera]
+    )
+    facade._finalize_video_segment = lambda: None
+
+    def hold(*, frames):
+        start = facade._env_steps
+        facade._env_steps += frames
+        return {
+            "task_success": True,
+            "requested_frames": frames,
+            "executed_frames": frames,
+            "start_env_step": start,
+            "end_env_step": facade._env_steps,
+            "hold_action_source": "current_joint_targets_zero_velocity_base",
+            "hold_action_sha256": "abc",
+        }
+
+    facade.post_success_hold_frames = hold
+    validator = {
+        "held_hand": None,
+        "current_criteria": {
+            "left": {
+                "radio_lift": True,
+                "support_gap": True,
+                "selected_attachment_or_two_finger_contact": True,
+                "other_hand_no_assisted_attachment": True,
+                "other_hand_no_backend_attachment": True,
+                "other_hand_no_radio_contact": True,
+            },
+            "right": {"selected_attachment_or_two_finger_contact": False},
+        },
+    }
+
+    evidence = facade._finalize_pi0_terminal_success(validator=validator, frames=4)
+
+    assert evidence["complete"] is True
+    assert evidence["hold_frames_executed"] == 4
+    assert evidence["start_env_step"] == 100
+    assert evidence["end_env_step"] == 104
+    assert evidence["held_hand"] == "left"
+    assert evidence["press_hand"] == "right"
+    assert evidence["resolved_camera"] == "right_wrist"
+    assert Path(evidence["terminal_press_wrist"]["path"]).is_file()
+    assert Path(evidence["metadata_path"]).is_file()
+    assert facade._done is True
+    assert facade._video_sealed is True
+    with pytest.raises(RuntimeError, match="one-shot"):
+        facade._finalize_pi0_terminal_success(validator=validator, frames=4)
+
+
+def test_pi0_raw_success_reuses_terminal_capture_without_second_review(tmp_path):
+    facade = BehaviorEnvFacade.__new__(BehaviorEnvFacade)
+    facade._control_mode = PI0_NAV_PICK_VLA_MODE
+    facade._handoff_state = "VLA_ACTIVE"
+    facade._vla_actions_enabled = True
+    facade._env_steps = 104
+    facade._last_observation = _observation()
+    facade._last_info = {"done": {"success": True}}
+    monitor = {
+        "executed_steps": DEFAULT_ACTION_CHUNK,
+        "handoff_env_steps": 0,
+        "total_env_steps": 100,
+    }
+    facade._step_action_chunk = lambda *_args, **_kwargs: (
+        facade._last_observation,
+        0.0,
+        True,
+        False,
+        {
+            "done": {"success": True},
+            "_rpent": {"pi0_nav_pick_monitor": monitor},
+        },
+    )
+    facade._finalize_pi0_terminal_success = lambda **_kwargs: {
+        "start_env_step": 100,
+        "capture_group_id": "capture:104",
+        "views": {"right_wrist": {"path": "right.png"}},
+        "metadata_path": str(tmp_path / "terminal.json"),
+    }
+    facade._info_with_accounting = lambda: {
+        "done": {"success": True},
+        "_rpent": {},
+    }
+    facade._persist_pi0_nav_pick_views = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("terminal success must not perform a second review capture")
+    )
+
+    _observation_result, _reward, _terminated, _truncated, info = (
+        facade.pi0_nav_pick_chunk_step(
+            np.zeros((DEFAULT_ACTION_CHUNK, ACTION_DIM), dtype=np.float32),
+            chunk_index=1,
+        )
+    )
+
+    returned = info["_rpent"]["pi0_nav_pick_monitor"]
+    assert returned["visual_review"]["source"] == "terminal_success_evidence"
+    assert returned["terminal_evidence_env_steps"] == 4
+    assert info["done"]["success"] is True
+
+
+def test_post_success_hold_restores_cleanup_flags_when_step_raises():
+    facade = BehaviorEnvFacade.__new__(BehaviorEnvFacade)
+    facade._last_info = {"done": {"success": True}}
+    facade._env_steps = 20
+    facade._done = True
+    facade._post_success_cleanup_active = False
+    facade._post_success_stationary_action = lambda: (
+        np.zeros(ACTION_DIM, dtype=np.float32),
+        "stationary-test",
+    )
+    calls = 0
+
+    def step(_actions):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected hold failure")
+        facade._env_steps += 1
+
+    facade.planner_step = step
+
+    with pytest.raises(RuntimeError, match="injected hold failure"):
+        facade.post_success_hold_frames(frames=4)
+
+    assert calls == 2
+    assert facade._post_success_cleanup_active is False
+    assert facade._done is True
+    assert facade._last_info["done"]["success"] is True
 
 
 def test_pose_jump_failure_never_creates_post_pick_checkpoint(tmp_path):

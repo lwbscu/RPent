@@ -80,6 +80,145 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _green_center_marker_visible(path: Path) -> bool:
+    """Recognize the green button center inside its dark disk and white ring."""
+
+    try:
+        import numpy as np
+        from PIL import Image
+
+        with Image.open(path) as image:
+            rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    except Exception:
+        return False
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        return False
+    height, width = rgb.shape[:2]
+    image_area = int(height * width)
+    if image_area < 64:
+        return False
+    red, green, blue = (rgb[:, :, index] for index in range(3))
+    green_mask = (
+        (green >= 70)
+        & (green >= red + 30)
+        & (green >= blue + 25)
+        & (green * 4 >= np.maximum(red, blue) * 5)
+    )
+    visited = np.zeros((height, width), dtype=bool)
+    minimum_area = max(20, int(np.ceil(image_area * 0.0002)))
+    maximum_area = int(np.floor(image_area * 0.08))
+    candidates: list[tuple[int, float, float, int, int, int, int]] = []
+    for seed_y, seed_x in np.argwhere(green_mask):
+        y0, x0 = int(seed_y), int(seed_x)
+        if visited[y0, x0]:
+            continue
+        stack = [(y0, x0)]
+        visited[y0, x0] = True
+        area = 0
+        x_sum = 0
+        y_sum = 0
+        min_x = max_x = x0
+        min_y = max_y = y0
+        while stack:
+            y, x = stack.pop()
+            area += 1
+            x_sum += x
+            y_sum += y
+            min_x, max_x = min(min_x, x), max(max_x, x)
+            min_y, max_y = min(min_y, y), max(max_y, y)
+            for next_y in range(max(0, y - 1), min(height, y + 2)):
+                for next_x in range(max(0, x - 1), min(width, x + 2)):
+                    if not visited[next_y, next_x] and green_mask[next_y, next_x]:
+                        visited[next_y, next_x] = True
+                        stack.append((next_y, next_x))
+        if minimum_area <= area <= maximum_area:
+            candidates.append(
+                (
+                    area,
+                    x_sum / area,
+                    y_sum / area,
+                    min_x,
+                    min_y,
+                    max_x,
+                    max_y,
+                )
+            )
+    if not candidates:
+        return False
+    yy, xx = np.indices((height, width))
+    dark = (rgb.max(axis=2) <= 90) & (rgb.mean(axis=2) <= 65)
+    channel_spread = rgb.max(axis=2) - rgb.min(axis=2)
+    white = (rgb.min(axis=2) >= 110) & (channel_spread <= 90)
+    for area, center_x, center_y, min_x, min_y, max_x, max_y in sorted(
+        candidates, reverse=True
+    ):
+        box_width = max_x - min_x + 1
+        box_height = max_y - min_y + 1
+        aspect = max(box_width, box_height) / max(1, min(box_width, box_height))
+        fill = area / float(box_width * box_height)
+        if aspect > 1.8 or fill < 0.35:
+            continue
+        radius = float(np.sqrt(area / np.pi))
+        distance = np.hypot(xx - center_x, yy - center_y)
+        dark_annulus = (distance >= 1.20 * radius) & (distance < 2.40 * radius)
+        white_annulus = (distance >= 2.50 * radius) & (distance < 4.50 * radius)
+        if dark_annulus.sum() < 30 or white_annulus.sum() < 60:
+            continue
+        if float(dark[dark_annulus].mean()) < 0.45:
+            continue
+        if float(white[white_annulus].mean()) < 0.08:
+            continue
+        ring_mask = white & white_annulus
+        ring_visited = np.zeros((height, width), dtype=bool)
+        largest_ring: list[tuple[int, int]] = []
+        for seed_y, seed_x in np.argwhere(ring_mask):
+            y0, x0 = int(seed_y), int(seed_x)
+            if ring_visited[y0, x0]:
+                continue
+            stack = [(y0, x0)]
+            ring_visited[y0, x0] = True
+            component: list[tuple[int, int]] = []
+            while stack:
+                y, x = stack.pop()
+                component.append((y, x))
+                for next_y in range(max(0, y - 1), min(height, y + 2)):
+                    for next_x in range(max(0, x - 1), min(width, x + 2)):
+                        if (
+                            not ring_visited[next_y, next_x]
+                            and ring_mask[next_y, next_x]
+                        ):
+                            ring_visited[next_y, next_x] = True
+                            stack.append((next_y, next_x))
+            if len(component) > len(largest_ring):
+                largest_ring = component
+        if len(largest_ring) < max(40, int(white_annulus.sum() * 0.06)):
+            continue
+        connected_ring = np.zeros((height, width), dtype=bool)
+        ring_y, ring_x = zip(*largest_ring)
+        connected_ring[np.asarray(ring_y), np.asarray(ring_x)] = True
+        angle = (np.arctan2(yy - center_y, xx - center_x) + 2 * np.pi) % (2 * np.pi)
+        angular_coverage = []
+        for angular_bin in range(72):
+            bin_mask = (
+                white_annulus
+                & (angle >= angular_bin * 2 * np.pi / 72)
+                & (angle < (angular_bin + 1) * 2 * np.pi / 72)
+            )
+            angular_coverage.append(
+                bool(bin_mask.any()) and float(connected_ring[bin_mask].mean()) >= 0.08
+            )
+        doubled = angular_coverage + angular_coverage
+        longest_run = 0
+        current_run = 0
+        for present in doubled:
+            current_run = current_run + 1 if present else 0
+            longest_run = max(longest_run, current_run)
+        if min(longest_run, 72) < 38:
+            continue
+        return True
+    return False
+
+
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as stream:
@@ -583,7 +722,9 @@ def _terminate_manifest_processes(
     return _manifest_owned_groups(output_dir)
 
 
-def _terminal_press_wrist_image(output_dir: Path) -> str | None:
+def _terminal_press_wrist_image(
+    output_dir: Path, *, expected_entry: EvalEntry | None = None
+) -> str | None:
     trace_path = output_dir / "pi0_nav_pick_tool_trace.jsonl"
     try:
         trace = [
@@ -591,40 +732,399 @@ def _terminal_press_wrist_image(output_dir: Path) -> str | None:
             for line in trace_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        trace = [record for record in trace if isinstance(record, dict)]
     except (OSError, json.JSONDecodeError):
         return None
-    hold_steps = [
-        int(record.get("step", -1))
-        for record in trace
-        if record.get("tool") == "post_success_hold_frames"
-        and (record.get("result") or {}).get("task_success") is True
-    ]
-    if not hold_steps:
-        return None
     root = output_dir.resolve()
+
+    def contained_file(value: Any) -> Path | None:
+        if not isinstance(value, str) or not value:
+            return None
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = output_dir / candidate
+        if candidate.is_symlink():
+            return None
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            return None
+        return resolved if resolved.is_file() else None
+
+    def valid_png(path: Path, expected: dict[str, Any] | None = None) -> bool:
+        try:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                image.verify()
+            with Image.open(path) as image:
+                width, height = image.size
+        except Exception:
+            return False
+        if width < 2 or height < 2:
+            return False
+        if isinstance(expected, dict):
+            if expected.get("sha256") != _sha256(path):
+                return False
+            if expected.get("width") != width or expected.get("height") != height:
+                return False
+        return True
+
+    def external_stage3_press_hand(
+        *, trace_records: list[dict[str, Any]], hold_step: int
+    ) -> str | None:
+        checkpoint1 = contained_file(
+            str(output_dir / "state_checkpoints" / "state_checkpoint_1.json")
+        )
+        checkpoint2 = contained_file(
+            str(output_dir / "state_checkpoints" / "state_checkpoint_2.json")
+        )
+        if checkpoint1 is None or checkpoint2 is None:
+            return None
+        try:
+            checkpoint1_payload = json.loads(checkpoint1.read_text(encoding="utf-8"))
+            payload = json.loads(checkpoint2.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(checkpoint1_payload, dict) or not isinstance(payload, dict):
+            return None
+        held_hand = payload.get("held_hand")
+        press_hand = payload.get("press_hand")
+        prepress = payload.get("prepress")
+        projection = (
+            prepress.get("button_projection") if isinstance(prepress, dict) else None
+        )
+        projection_id = (
+            projection.get("projection_id") if isinstance(projection, dict) else None
+        )
+        gate = prepress.get("button_gate") if isinstance(prepress, dict) else None
+        projection_metrics = (
+            projection.get("projection_metrics")
+            if isinstance(projection, dict)
+            else None
+        )
+        checkpoint_env_step = payload.get("env_step")
+        expected_wrist = (
+            f"{press_hand}_wrist" if press_hand in {"left", "right"} else None
+        )
+        if (
+            checkpoint1_payload.get("schema_version") != 1
+            or checkpoint1_payload.get("kind") != "robot_motion_checkpoint"
+            or checkpoint1_payload.get("not_simulator_restore") is not True
+            or checkpoint1_payload.get("checkpoint_name") != "state_checkpoint_1"
+            or checkpoint1_payload.get("stage") != "post_pi0_nav_pick"
+            or payload.get("schema_version") != 1
+            or payload.get("kind") != "robot_motion_checkpoint"
+            or payload.get("not_simulator_restore") is not True
+            or payload.get("checkpoint_name") != "state_checkpoint_2"
+            or payload.get("stage") != "pre_press_alignment"
+            or held_hand not in {"left", "right"}
+            or press_hand not in {"left", "right"}
+            or held_hand == press_hand
+            or checkpoint1_payload.get("held_hand") != held_hand
+            or checkpoint1_payload.get("press_hand") != press_hand
+            or checkpoint1_payload.get("object_name") != payload.get("object_name")
+            or not isinstance(payload.get("object_name"), str)
+            or not payload["object_name"]
+            or checkpoint1_payload.get("run_binding") != payload.get("run_binding")
+            or not isinstance(projection_id, str)
+            or not projection_id
+            or not isinstance(prepress, dict)
+            or prepress.get("source_checkpoint_sha256") != _sha256(checkpoint1)
+            or contained_file(prepress.get("source_checkpoint_path")) != checkpoint1
+            or not isinstance(checkpoint_env_step, int)
+            or isinstance(checkpoint_env_step, bool)
+            or not isinstance(gate, dict)
+            or gate.get("button_visible") is not True
+            or gate.get("face_class") != "BUTTON_FACE"
+            or gate.get("positive_signature_complete") is not True
+            or projection.get("camera") != "press_wrist"
+            or projection.get("resolved_camera") != expected_wrist
+            or not isinstance(projection.get("frame_id"), str)
+            or not projection["frame_id"]
+            or not isinstance(projection.get("capture_group_id"), str)
+            or not projection["capture_group_id"]
+            or projection.get("env_step") != checkpoint_env_step
+            or not isinstance(projection.get("gate_id"), str)
+            or not projection["gate_id"]
+            or gate.get("camera") != projection.get("camera")
+            or gate.get("resolved_camera") != projection.get("resolved_camera")
+            or gate.get("frame_id") != projection.get("frame_id")
+            or gate.get("capture_group_id") != projection.get("capture_group_id")
+            or gate.get("env_step") != projection.get("env_step")
+            or gate.get("gate_id") != projection.get("gate_id")
+            or not isinstance(projection_metrics, dict)
+            or projection_metrics.get("camera") != expected_wrist
+            or projection_metrics.get("frame_id") != projection.get("frame_id")
+            or projection_metrics.get("step_index") != checkpoint_env_step
+        ):
+            return None
+        if expected_entry is not None:
+            binding = payload.get("run_binding")
+            expected_binding = {
+                "suite": "behavior_2025_challenge",
+                "task": TURNING_ON_RADIO_TASK_ID,
+                "task_name": TURNING_ON_RADIO_TASK_NAME,
+                "activity_definition_id": 0,
+                "activity_instance_id": expected_entry.activity_instance_id,
+                "scene_model": "house_double_floor_lower",
+                "seed": expected_entry.seed,
+            }
+            if not isinstance(binding, dict) or any(
+                binding.get(field) != value for field, value in expected_binding.items()
+            ):
+                return None
+            if not isinstance(binding.get("nonce"), str) or not binding["nonce"]:
+                return None
+        checkpoint2_sha = _sha256(checkpoint2)
+        save_steps = []
+        for record in trace_records:
+            result = record.get("result")
+            step = record.get("step")
+            if (
+                record.get("tool") == "save_robot_state_checkpoint"
+                and isinstance(result, dict)
+                and isinstance(step, int)
+                and not isinstance(step, bool)
+                and step < hold_step
+                and result.get("state_checkpoint_2_sha256") == checkpoint2_sha
+                and result.get("held_hand") == held_hand
+                and result.get("press_hand") == press_hand
+            ):
+                saved_path = contained_file(result.get("state_checkpoint_2_path"))
+                if saved_path == checkpoint2:
+                    save_steps.append(step)
+        if not save_steps:
+            return None
+        save_step = max(save_steps)
+        for record in trace_records:
+            result = record.get("result")
+            step = record.get("step")
+            if (
+                record.get("tool") == "post_pick_direct_finger_toggle"
+                and isinstance(result, dict)
+                and result.get("task_success") is True
+                and isinstance(step, int)
+                and not isinstance(step, bool)
+                and save_step < step < hold_step
+                and result.get("press_hand") == press_hand
+                and result.get("projection_id") == projection_id
+            ):
+                return str(press_hand)
+        return None
+
+    # A raw success reached inside pi0_nav_pick is terminal to the Codex SDK,
+    # so the env performs the hold and capture before that one tool returns.
     for record in reversed(trace):
-        result = record.get("result") or {}
+        raw_result = record.get("result")
+        result = raw_result if isinstance(raw_result, dict) else {}
+        evidence = result.get("terminal_success_evidence")
+        if record.get("tool") != "pi0_nav_pick" or not isinstance(evidence, dict):
+            continue
+        requested = evidence.get("hold_frames_requested")
+        executed = evidence.get("hold_frames_executed")
+        start = evidence.get("start_env_step")
+        end = evidence.get("end_env_step")
+        press_hand = evidence.get("press_hand")
+        resolved_camera = evidence.get("resolved_camera")
+        view = evidence.get("terminal_press_wrist")
+        if (
+            result.get("task_success") is not True
+            or evidence.get("complete") is not True
+            or evidence.get("source") != "pi0_nav_pick_internal_terminal_finalize"
+            or evidence.get("task_success_before_hold") is not True
+            or evidence.get("task_success_after_hold") is not True
+            or isinstance(requested, bool)
+            or not isinstance(requested, int)
+            or requested < 4
+            or executed != requested
+            or isinstance(start, bool)
+            or not isinstance(start, int)
+            or end != start + executed
+            or press_hand not in {"left", "right"}
+            or evidence.get("held_hand") not in {"left", "right"}
+            or evidence.get("held_hand") == press_hand
+            or evidence.get("role_resolution_source")
+            not in {"strict_handoff", "unique_terminal_attachment_evidence"}
+            or evidence.get("logical_camera") != "press_wrist"
+            or resolved_camera != f"{press_hand}_wrist"
+            or not isinstance(view, dict)
+            or view.get("camera") != resolved_camera
+            or view.get("env_step") != end
+            or not isinstance(view.get("frame_id"), str)
+            or not view["frame_id"]
+            or view.get("capture_group_id") != evidence.get("capture_group_id")
+        ):
+            continue
+        metadata_path = contained_file(evidence.get("metadata_path"))
+        image_path = contained_file(view.get("path"))
+        if metadata_path is None or image_path is None:
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        metadata_view = metadata.get("terminal_press_wrist")
+        if (
+            metadata.get("complete") is not True
+            or metadata.get("resolved_camera") != resolved_camera
+            or not isinstance(metadata_view, dict)
+            or contained_file(metadata_view.get("path")) != image_path
+            or metadata_view.get("sha256") != view.get("sha256")
+            or metadata_view.get("width") != view.get("width")
+            or metadata_view.get("height") != view.get("height")
+            or metadata_view.get("frame_id") != view.get("frame_id")
+            or metadata_view.get("capture_group_id") != view.get("capture_group_id")
+            or metadata_view.get("env_step") != view.get("env_step")
+            or not valid_png(image_path, view)
+        ):
+            continue
+        return str(image_path)
+
+    def valid_external_hold(record: dict[str, Any]) -> bool:
+        result = record.get("result")
+        step = record.get("step")
+        hold_input = record.get("input")
+        if record.get("tool") != "post_success_hold_frames" or not isinstance(
+            result, dict
+        ):
+            return False
+        requested = result.get("requested_frames")
+        executed = result.get("executed_frames")
+        start = result.get("start_env_step")
+        end = result.get("end_env_step")
+        return bool(
+            result.get("task_success") is True
+            and result.get("primitive_success") is True
+            and isinstance(step, int)
+            and not isinstance(step, bool)
+            and isinstance(requested, int)
+            and not isinstance(requested, bool)
+            and requested >= 4
+            and isinstance(hold_input, dict)
+            and hold_input.get("frames") == requested
+            and executed == requested
+            and isinstance(start, int)
+            and not isinstance(start, bool)
+            and end == start + executed
+        )
+
+    hold_records = [record for record in trace if valid_external_hold(record)]
+    if not hold_records:
+        return None
+    last_hold = max(hold_records, key=lambda record: int(record.get("step", -1)))
+    hold_step = int(last_hold.get("step", -1))
+    hold_end_env_step = (last_hold.get("result") or {}).get("end_env_step")
+    press_hand = external_stage3_press_hand(trace_records=trace, hold_step=hold_step)
+    if press_hand not in {"left", "right"}:
+        return None
+    for record in reversed(trace):
+        raw_result = record.get("result")
+        result = raw_result if isinstance(raw_result, dict) else {}
+        record_step = record.get("step")
         rgb_path = (result.get("visual_review") or {}).get("rgb_path")
         if (
             record.get("tool") == "observe"
             and (record.get("input") or {}).get("camera") == "press_wrist"
             and result.get("task_success") is True
-            and int(record.get("step", -1)) > max(hold_steps)
-            and isinstance(rgb_path, str)
+            and isinstance(record_step, int)
+            and not isinstance(record_step, bool)
+            and record_step > hold_step
+            and result.get("camera") == "press_wrist"
+            and result.get("resolved_camera") == f"{press_hand}_wrist"
+            and result.get("total_env_steps") == hold_end_env_step
+            and isinstance(result.get("frame_id"), str)
+            and bool(result.get("frame_id"))
+            and isinstance(result.get("capture_group"), dict)
+            and isinstance(result["capture_group"].get("id"), str)
+            and bool(result["capture_group"]["id"])
         ):
-            candidate = Path(rgb_path)
-            if not candidate.is_absolute():
-                candidate = output_dir / candidate
-            if candidate.is_symlink():
-                continue
+            candidate = contained_file(rgb_path)
+            metadata_path = contained_file(
+                (result.get("visual_review") or {}).get("metadata_path")
+            )
             try:
-                resolved = candidate.resolve(strict=True)
-                resolved.relative_to(root)
-            except (OSError, ValueError):
-                continue
-            if resolved.is_file():
-                return str(resolved)
+                metadata = (
+                    json.loads(metadata_path.read_text(encoding="utf-8"))
+                    if metadata_path is not None
+                    else None
+                )
+            except (OSError, json.JSONDecodeError):
+                metadata = None
+            metadata_group = (
+                metadata.get("capture_group") if isinstance(metadata, dict) else None
+            )
+            if (
+                candidate is not None
+                and valid_png(candidate)
+                and isinstance(metadata, dict)
+                and contained_file(metadata.get("rgb_path")) == candidate
+                and contained_file(metadata.get("metadata_path")) == metadata_path
+                and metadata.get("camera") == f"{press_hand}_wrist"
+                and metadata.get("frame_id") == result.get("frame_id")
+                and isinstance(metadata_group, dict)
+                and metadata_group.get("id") == result["capture_group"]["id"]
+                and metadata.get("total_env_steps") == hold_end_env_step
+            ):
+                return str(candidate)
     return None
+
+
+def _has_valid_post_success_hold(trace: list[dict[str, Any]]) -> bool:
+    for record in trace:
+        if not isinstance(record, dict):
+            continue
+        raw_result = record.get("result")
+        result = raw_result if isinstance(raw_result, dict) else {}
+        if record.get("tool") == "pi0_nav_pick":
+            evidence = result.get("terminal_success_evidence")
+            if not isinstance(evidence, dict):
+                continue
+            requested = evidence.get("hold_frames_requested")
+            executed = evidence.get("hold_frames_executed")
+            start = evidence.get("start_env_step")
+            end = evidence.get("end_env_step")
+            if (
+                result.get("task_success") is True
+                and evidence.get("task_success_before_hold") is True
+                and evidence.get("task_success_after_hold") is True
+                and isinstance(requested, int)
+                and not isinstance(requested, bool)
+                and requested >= 4
+                and executed == requested
+                and isinstance(start, int)
+                and not isinstance(start, bool)
+                and end == start + executed
+            ):
+                return True
+        if record.get("tool") != "post_success_hold_frames":
+            continue
+        step = record.get("step")
+        hold_input = record.get("input")
+        requested = result.get("requested_frames")
+        executed = result.get("executed_frames")
+        start = result.get("start_env_step")
+        end = result.get("end_env_step")
+        if (
+            result.get("task_success") is True
+            and result.get("primitive_success") is True
+            and isinstance(step, int)
+            and not isinstance(step, bool)
+            and isinstance(requested, int)
+            and not isinstance(requested, bool)
+            and requested >= 4
+            and isinstance(hold_input, dict)
+            and hold_input.get("frames") == requested
+            and executed == requested
+            and isinstance(start, int)
+            and not isinstance(start, bool)
+            and end == start + executed
+        ):
+            return True
+    return False
 
 
 def validate_instance_result(
@@ -727,18 +1227,21 @@ def validate_instance_result(
                 for line in trace_path.read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
+            trace = [record for record in trace if isinstance(record, dict)]
         except (OSError, json.JSONDecodeError):
             trace = []
-        hold_steps = [
-            int(record.get("step", -1))
-            for record in trace
-            if record.get("tool") == "post_success_hold_frames"
-            and (record.get("result") or {}).get("task_success") is True
-        ]
-        if not hold_steps:
+        if not _has_valid_post_success_hold(trace):
             errors.append("successful run lacks post-success render hold")
-        if _terminal_press_wrist_image(entry.output_dir) is None:
+        terminal_image = _terminal_press_wrist_image(
+            entry.output_dir, expected_entry=entry
+        )
+        if terminal_image is None:
             errors.append("successful run lacks fresh post-hold press-wrist image")
+        elif not _green_center_marker_visible(Path(terminal_image)):
+            errors.append(
+                "successful run terminal press-wrist image does not show green "
+                "center marker"
+            )
     if errors:
         if (
             timed_out
@@ -1041,6 +1544,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 ],
                 "max_temporary_checkpoints": 4,
                 "temporary_checkpoint_cleanup_required": True,
+                "terminal_green_marker_required": True,
+                "external_stage3_checkpoint2_lineage_required": True,
             },
             "source": source,
             "input_fingerprints": global_inputs,

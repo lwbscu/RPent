@@ -40,7 +40,9 @@ One Codex SDK episode
 The stage-3 flag is valid only for ``turning_on_radio`` in
 ``pi0_nav_pick_vla`` mode. It extends the normal post-pick/pre-press surface
 with bounded button-contact handlers. The LLM still calls ``pi0_nav_pick``
-exactly once.
+exactly once. When enabled, saving and verifying ``state_checkpoint_2``
+continues immediately into Stage 3 in that same evaluation without another
+user-review pause.
 
 Checkpoint and success rules
 ----------------------------
@@ -56,6 +58,12 @@ raw ``info["done"]["success"]``. Exit code zero, local grasp, checkpoint save,
 contact, or model text cannot replace it. A successful press also preserves a
 fresh press-wrist image after the render-synchronization hold for green-marker
 review.
+When the sole ``pi0_nav_pick`` reaches raw success directly, the env performs
+the four stationary frames and fresh synchronized terminal capture before that
+terminal tool result returns. Ambiguous dynamic wrist provenance fails closed.
+The serial validator requires the center marker to be green and, for an
+external stage-3 press, binds it to the same-run ``state_checkpoint_2``, dynamic
+press hand, and button-projection lineage.
 
 Serial public-instance evaluation
 ---------------------------------

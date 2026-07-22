@@ -37,7 +37,9 @@ git status --short             # must be empty
 
 `--behavior-stage3-press` is an explicit opt-in. It is accepted only for
 `pi0_nav_pick_vla` on `turning_on_radio`; without it, the public surface stops
-at the reviewed pre-press checkpoint.
+at the reviewed pre-press checkpoint. With it, saving and verifying
+`state_checkpoint_2` continues immediately into Stage 3 in the same evaluation
+without another user-review pause.
 
 ## Checkpoint policy
 
@@ -75,6 +77,13 @@ Do not add `--no-driver`, reuse an endpoint, resume another run, or issue a
 second navigation/grasp call. `final_result.json.task_success` is accepted only
 when its source is raw `info["done"]["success"]`; process exit code, local grasp,
 checkpoint creation, contact, and LLM prose are not task success.
+If raw success becomes true inside the sole `pi0_nav_pick`, the env completes
+the four stationary render frames and writes fresh synchronized terminal views
+before the terminal tool result returns. Missing, ambiguous, or invalid
+terminal wrist provenance remains `incomplete`; it is never guessed.
+The serial validator also requires the terminal center marker to be green. For
+an external stage-3 press, it binds that image to the same-run
+`state_checkpoint_2`, dynamic `press_hand`, and button-projection lineage.
 
 ## Strictly serial public evaluation
 

@@ -8,7 +8,8 @@ The only persistent robot-state JSON files are `state_checkpoint_1.json` and
 temporary restore points with checkpoint name
 `tmp_state_checkpoint_<label>` (stored as
 `tmp_state_checkpoint_<label>.json`) and stage `temporary_restore_point`, when
-a risky CuRobo adjustment would benefit from a rollback point. Restore them
+a risky CuRobo adjustment would benefit from a rollback point. Never overwrite
+an existing temporary checkpoint. Restore them
 only through `restore_robot_state_checkpoint`, which plans and executes a
 guarded CuRobo motion; never load a scene, simulator snapshot, tensor state, or
 any alternate state copy. Temporary checkpoints are not success evidence,
@@ -169,11 +170,16 @@ checking. Endpoint review is consolidated: confirm the radio is still held and
 the press hand has not touched it. Do not demand redundant per-waypoint
 co-motion, attachment, contact, air-gap, or press-clear proofs.
 
-Call `save_robot_state_checkpoint` for `state_checkpoint_2` only after fresh press-wrist button projection and
-pre-press geometry show: approach-line distance at most 0.010 m, opposition
+Call `save_robot_state_checkpoint` for `state_checkpoint_2` only after fresh
+press-wrist button projection and pre-press geometry show: approach-line
+distance at most 0.010 m, opposition
 error `angle(button_normal, -press_direction)` at most 15 degrees, and positive
 0.03--0.06 m axial standoff. The same fresh `press_wrist` review must also show
 the true raised red center inside the required image-center region. Use stage
 `pre_press_alignment` and visual review.
-Leave physics paused and wait for user review. Record official
-`info["done"]["success"]` separately; it is not the stage-2 success criterion.
+If this composed system prompt also includes a separately supplied, explicitly
+authorized stage-3 press system fragment, continue into that phase immediately
+in the same evaluation after saving and verifying `state_checkpoint_2`; do not
+ask for another review. Otherwise leave physics paused and wait for user
+review. Record official `info["done"]["success"]` separately; it is not the
+stage-2 success criterion.

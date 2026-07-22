@@ -2037,6 +2037,64 @@ def test_joint_target_conversion_calls_official_robot_q_to_action():
     np.testing.assert_allclose(action[[14, 22]], [1.0, 1.0])
 
 
+def test_velocity_base_hold_uses_current_joint_targets_and_zero_base_velocity():
+    class HolonomicBaseJointController:
+        command_dim = 3
+        motor_type = "velocity"
+        dof_idx = np.array([0, 1, 2])
+
+        @staticmethod
+        def _reverse_preprocess_command(command):
+            return command
+
+    class JointController:
+        use_delta_commands = False
+
+        def __init__(self, indices):
+            self.dof_idx = np.asarray(indices)
+            self.command_dim = len(indices)
+
+        @staticmethod
+        def _reverse_preprocess_command(command):
+            return command
+
+    class MultiFingerGripperController:
+        command_dim = 1
+
+    class Robot:
+        controllers = {
+            "base": HolonomicBaseJointController(),
+            "trunk": JointController(range(3, 7)),
+            "arm_left": JointController(range(7, 14)),
+            "gripper_left": MultiFingerGripperController(),
+            "arm_right": JointController(range(14, 21)),
+            "gripper_right": MultiFingerGripperController(),
+        }
+
+        @staticmethod
+        def get_joint_positions():
+            import torch
+
+            return torch.arange(28, dtype=torch.float32)
+
+    facade = SimpleNamespace(_gripper_latch={"left": -1.0, "right": 1.0})
+    backend = RealCuroboBackend(facade)
+    backend._robot = Robot()
+
+    action = backend.velocity_base_hold_action()
+
+    np.testing.assert_allclose(action[ENV_ACTION_SEGMENTS["base"]], 0.0)
+    np.testing.assert_allclose(action[ENV_ACTION_SEGMENTS["trunk"]], np.arange(3, 7))
+    np.testing.assert_allclose(
+        action[ENV_ACTION_SEGMENTS["left_arm"]], np.arange(7, 14)
+    )
+    np.testing.assert_allclose(
+        action[ENV_ACTION_SEGMENTS["right_arm"]], np.arange(14, 21)
+    )
+    assert action[ENV_ACTION_SEGMENTS["left_gripper"]][0] == -1.0
+    assert action[ENV_ACTION_SEGMENTS["right_gripper"]][0] == 1.0
+
+
 def test_fixed_world_base_q_is_reconverted_to_local_action_after_root_drift():
     class Controller:
         def __init__(self, command_dim):
@@ -2383,9 +2441,7 @@ def test_prepress_warmup_is_attachment_aware_and_phase_scoped(tmp_path, hand):
         or {"ok": True, "joint_trajectory": q.reshape(1, -1), "metrics": {}}
     )
 
-    report = backend.warmup_prepress(
-        hand=hand, expected_attached_root=expected_root
-    )
+    report = backend.warmup_prepress(hand=hand, expected_attached_root=expected_root)
 
     assert report["status"] == "complete"
     assert report["generator_kind"] == "prepress_arm"
@@ -2433,9 +2489,7 @@ def test_prepress_warmup_fails_closed_on_current_attached_collision(tmp_path):
     )
 
     with pytest.raises(RuntimeError, match="attached collision check failed"):
-        backend.warmup_prepress(
-            hand="right", expected_attached_root=expected_root
-        )
+        backend.warmup_prepress(hand="right", expected_attached_root=expected_root)
 
     artifact = json.loads(
         (tmp_path / "planner_prepress_warmup.json").read_text(encoding="utf-8")
