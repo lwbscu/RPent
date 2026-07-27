@@ -5,11 +5,15 @@ from __future__ import annotations
 import base64
 import io
 import time
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 import numpy as np
 
+from robots.behavior.policy_checkpoint import (
+    PolicyCheckpointBinding,
+    assert_matching_policy_checkpoint_binding,
+)
 from robots.behavior.schemas import extract_policy_state, validate_action_chunk
 
 
@@ -27,36 +31,71 @@ def _png_b64(img: np.ndarray) -> str:
 class BehaviorVLAClient:
     """Client for a BEHAVIOR-compatible ``/predict`` endpoint."""
 
-    def __init__(self, base_url: str, *, timeout_s: float = 600.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout_s: float = 600.0,
+        binding_id: str | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._binding_id = str(binding_id) if binding_id is not None else None
         # The VLA endpoint is a runtime-owned local sidecar.  Ambient proxy
         # variables must never redirect it or make SOCKS extras a dependency.
-        self._client = httpx.Client(timeout=timeout_s, trust_env=False)
+        # Do not reuse a sidecar connection across long-running inference
+        # requests: a server-side close can otherwise leave a stale socket in
+        # the pool and fail the next exact-once /predict call before a response.
+        self._client = httpx.Client(
+            timeout=timeout_s,
+            trust_env=False,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=0,
+            ),
+        )
 
     @property
     def endpoint(self) -> str:
         return self._base_url
 
-    def healthz(self, *, timeout_ms: int | None = None) -> dict[str, Any]:
+    def healthz(
+        self,
+        *,
+        timeout_ms: int | None = None,
+        expected_checkpoint_binding: (
+            PolicyCheckpointBinding | Mapping[str, Any] | None
+        ) = None,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
         if timeout_ms is not None:
             kwargs["timeout"] = timeout_ms / 1000.0
         resp = self._client.get(f"{self._base_url}/healthz", **kwargs)
         resp.raise_for_status()
-        return resp.json()
+        payload = resp.json()
+        if expected_checkpoint_binding is not None:
+            assert_matching_policy_checkpoint_binding(
+                payload.get("checkpoint_binding"),
+                expected_checkpoint_binding,
+            )
+        return payload
 
     def wait_for_healthz(
         self,
         *,
         timeout_s: float = 600.0,
         poll_timeout_ms: int = 1000,
-    ) -> None:
+        expected_checkpoint_binding: (
+            PolicyCheckpointBinding | Mapping[str, Any] | None
+        ) = None,
+    ) -> dict[str, Any]:
         deadline = time.time() + timeout_s
         last_err: Exception | None = None
         while time.time() < deadline:
             try:
-                self.healthz(timeout_ms=poll_timeout_ms)
-                return
+                return self.healthz(
+                    timeout_ms=poll_timeout_ms,
+                    expected_checkpoint_binding=expected_checkpoint_binding,
+                )
             except Exception as exc:
                 last_err = exc
                 time.sleep(1.0)
@@ -70,6 +109,11 @@ class BehaviorVLAClient:
 
         resp = self._client.post(
             f"{self._base_url}/control/disable-actions",
+            json=(
+                {"binding_id": self._binding_id}
+                if self._binding_id is not None
+                else None
+            ),
             timeout=max(float(timeout_ms) / 1000.0, 0.001),
         )
         resp.raise_for_status()
@@ -78,6 +122,47 @@ class BehaviorVLAClient:
             raise RuntimeError(
                 f"VLA server did not confirm action disable: {payload!r}"
             )
+        return payload
+
+    def bind_actions(
+        self,
+        binding_id: str,
+        *,
+        timeout_ms: int = 5000,
+    ) -> dict[str, Any]:
+        """Bind the disabled persistent sidecar to one fresh attempt."""
+
+        if not isinstance(binding_id, str) or not binding_id.strip():
+            raise ValueError("binding_id must be a non-empty string")
+        normalized = binding_id.strip()
+        resp = self._client.post(
+            f"{self._base_url}/control/bind-actions",
+            json={"binding_id": normalized},
+            timeout=max(float(timeout_ms) / 1000.0, 0.001),
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("actions_enabled") is not False:
+            raise RuntimeError("VLA binding did not preserve the disabled action gate")
+        self._binding_id = normalized
+        return payload
+
+    def enable_actions(self, *, timeout_ms: int = 5000) -> dict[str, Any]:
+        """Idempotently enable inference after the env-side safety re-arm."""
+
+        resp = self._client.post(
+            f"{self._base_url}/control/enable-actions",
+            json=(
+                {"binding_id": self._binding_id}
+                if self._binding_id is not None
+                else None
+            ),
+            timeout=max(float(timeout_ms) / 1000.0, 0.001),
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("actions_enabled") is not True:
+            raise RuntimeError(f"VLA server did not confirm action enable: {payload!r}")
         return payload
 
     def predict_action_batch(
@@ -109,6 +194,7 @@ class BehaviorVLAClient:
             },
             "state": [states.tolist()],
             "mode": mode,
+            "binding_id": self._binding_id,
         }
         resp = self._client.post(f"{self._base_url}/predict", json=body)
         if resp.status_code != 200:

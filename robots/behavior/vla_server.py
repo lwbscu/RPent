@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import os
 import sys
@@ -15,9 +16,12 @@ from typing import Any
 import numpy as np
 from pydantic import BaseModel
 
+from robots.behavior.policy_checkpoint import (
+    SHARED_POLICY_CHECKPOINT_PATH,
+    validate_policy_checkpoint,
+)
 from robots.behavior.schemas import ACTION_DIM, DEFAULT_ACTION_CHUNK
 from rpent.utils.config import (
-    get_pi05_checkpoint_path,
     get_repo_root,
     get_rlinf_repo_path,
 )
@@ -42,6 +46,11 @@ class PredictRequest(BaseModel):
     images: dict[str, ImageBlock]
     state: list[list[float]]
     mode: str = "eval"
+    binding_id: str | None = None
+
+
+class BindingRequest(BaseModel):
+    binding_id: str
 
 
 _MODEL: Any = None
@@ -49,17 +58,33 @@ _MODEL_META: dict[str, Any] = {}
 _MODEL_LOCK = threading.Lock()
 _ACTIONS_ENABLED = True
 _ACTIONS_LOCK = threading.Lock()
+_ACTION_BINDING_ID: str | None = None
+
+
+def _binding_digest(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _require_matching_binding(value: str | None) -> None:
+    if _ACTION_BINDING_ID is None:
+        if value is not None:
+            raise ValueError("VLA server is not bound to this attempt")
+        return
+    if value != _ACTION_BINDING_ID:
+        raise ValueError("VLA attempt binding mismatch")
 
 
 def validate_checkpoint(path: str | Path) -> Path:
-    checkpoint = Path(path).expanduser().resolve()
-    required = [checkpoint / "model.safetensors", checkpoint / NORM_STATS_REL]
-    missing = [str(item) for item in required if not item.is_file()]
-    if missing:
-        raise FileNotFoundError(
-            "BEHAVIOR Pi0.5 checkpoint is incomplete; missing: " + ", ".join(missing)
-        )
-    return checkpoint
+    """Return the verified shared checkpoint root.
+
+    Kept as a path-returning compatibility shim for callers that build the
+    model configuration directly.  The authoritative validator also verifies
+    the checkpoint fingerprint.
+    """
+
+    return Path(validate_policy_checkpoint(path).resolved_path)
 
 
 def build_model_config(checkpoint: str | Path) -> Any:
@@ -93,11 +118,12 @@ def build_model_config(checkpoint: str | Path) -> Any:
 
 
 def load_model(checkpoint: str | Path, *, seed: int) -> None:
-    global _ACTIONS_ENABLED, _MODEL, _MODEL_META
+    global _ACTION_BINDING_ID, _ACTIONS_ENABLED, _MODEL, _MODEL_META
     import torch
     from rlinf.models.embodiment.openpi import get_model
 
-    checkpoint = validate_checkpoint(checkpoint)
+    checkpoint_binding = validate_policy_checkpoint(checkpoint)
+    checkpoint = Path(checkpoint_binding.resolved_path)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -107,6 +133,7 @@ def load_model(checkpoint: str | Path, *, seed: int) -> None:
     _MODEL = model.to(device).eval()
     with _ACTIONS_LOCK:
         _ACTIONS_ENABLED = True
+        _ACTION_BINDING_ID = None
     _MODEL_META = {
         "status": "ok",
         "config_name": "pi05_behavior",
@@ -114,6 +141,7 @@ def load_model(checkpoint: str | Path, *, seed: int) -> None:
         "action_dim": ACTION_DIM,
         "device": str(device),
         "checkpoint": str(checkpoint),
+        "checkpoint_binding": checkpoint_binding.as_dict(),
         "seed": int(seed),
         "load_elapsed_s": round(time.time() - started, 2),
     }
@@ -177,25 +205,79 @@ def build_app() -> Any:
             raise HTTPException(status_code=503, detail="model not loaded")
         with _ACTIONS_LOCK:
             actions_enabled = bool(_ACTIONS_ENABLED)
+            binding_digest = _binding_digest(_ACTION_BINDING_ID)
         return {
             **_MODEL_META,
             "pid": os.getpid(),
             "actions_enabled": actions_enabled,
+            "binding_digest": binding_digest,
         }
 
     @app.post("/control/disable-actions")
-    def disable_actions():
-        """Keep health monitoring alive while irreversibly gating inference."""
+    def disable_actions(request: BindingRequest | None = None):
+        """Idempotently gate inference after a controller handoff."""
 
         global _ACTIONS_ENABLED
         # Lock ordering matches predict(): once this returns, no inference is
         # in flight and no later request can enter the model.
         with _MODEL_LOCK, _ACTIONS_LOCK:
+            if request is not None:
+                try:
+                    _require_matching_binding(request.binding_id)
+                except ValueError as error:
+                    raise HTTPException(status_code=409, detail=str(error)) from error
             _ACTIONS_ENABLED = False
         return {
             "status": "ok",
             "pid": os.getpid(),
             "actions_enabled": False,
+            "binding_digest": _binding_digest(_ACTION_BINDING_ID),
+        }
+
+    @app.post("/control/bind-actions")
+    def bind_actions(request: BindingRequest):
+        """Replace the attempt binding only while inference is disabled."""
+
+        global _ACTION_BINDING_ID
+        binding_id = request.binding_id.strip()
+        if not binding_id or len(binding_id) > 256:
+            raise HTTPException(status_code=400, detail="invalid binding_id")
+        with _MODEL_LOCK, _ACTIONS_LOCK:
+            if _ACTIONS_ENABLED:
+                raise HTTPException(
+                    status_code=409,
+                    detail="disable VLA actions before binding a fresh attempt",
+                )
+            _ACTION_BINDING_ID = binding_id
+        return {
+            "status": "ok",
+            "pid": os.getpid(),
+            "actions_enabled": False,
+            "binding_digest": _binding_digest(binding_id),
+        }
+
+    @app.post("/control/enable-actions")
+    def enable_actions(request: BindingRequest | None = None):
+        """Idempotently re-arm inference after the env confirms it is safe."""
+
+        global _ACTIONS_ENABLED
+        if _MODEL is None:
+            raise HTTPException(status_code=503, detail="model not loaded")
+        # Use the same lock order as predict() / disable_actions(). Once this
+        # returns there was no in-flight inference during the gate transition.
+        with _MODEL_LOCK, _ACTIONS_LOCK:
+            try:
+                _require_matching_binding(
+                    request.binding_id if request is not None else None
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            _ACTIONS_ENABLED = True
+        return {
+            "status": "ok",
+            "pid": os.getpid(),
+            "actions_enabled": True,
+            "binding_digest": _binding_digest(_ACTION_BINDING_ID),
         }
 
     @app.post("/predict")
@@ -205,6 +287,10 @@ def build_app() -> Any:
         # Fast rejection avoids image decoding after handoff. The identical
         # check under _MODEL_LOCK below is the authoritative race-free gate.
         with _ACTIONS_LOCK:
+            try:
+                _require_matching_binding(request.binding_id)
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
             if not _ACTIONS_ENABLED:
                 raise HTTPException(
                     status_code=409,
@@ -218,6 +304,12 @@ def build_app() -> Any:
             env_obs = build_env_observation(request.model_dump())
             with _MODEL_LOCK:
                 with _ACTIONS_LOCK:
+                    try:
+                        _require_matching_binding(request.binding_id)
+                    except ValueError as error:
+                        raise HTTPException(
+                            status_code=409, detail=str(error)
+                        ) from error
                     if not _ACTIONS_ENABLED:
                         raise HTTPException(
                             status_code=409,
@@ -270,13 +362,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument(
+        "--checkpoint",
+        default=str(SHARED_POLICY_CHECKPOINT_PATH),
+        help=(
+            "Shared BEHAVIOR Pi0.5 checkpoint. Other checkpoints, including "
+            "task-specific SFT checkpoints, are rejected."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    checkpoint = args.checkpoint or get_pi05_checkpoint_path()
-    if not checkpoint:
-        raise RuntimeError("--checkpoint or PI05_CHECKPOINT_PATH is required")
-    load_model(checkpoint, seed=args.seed)
+    load_model(args.checkpoint, seed=args.seed)
 
     import uvicorn
 

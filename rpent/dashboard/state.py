@@ -1,5 +1,4 @@
 """Thread-safe in-memory state for dashboard live runs."""
-
 from __future__ import annotations
 
 import threading
@@ -45,46 +44,17 @@ class State:
 
     def on_usage(self, *, inp: int, out: int, tool_calls: int) -> None:
         with self._lock:
-            self._usage = {
-                "in": int(inp),
-                "out": int(out),
-                "tool_calls": int(tool_calls),
-            }
+            self._usage = {"in": int(inp), "out": int(out), "tool_calls": int(tool_calls)}
 
     def on_tool_result(self, name: str, result: Any) -> None:
         if not isinstance(result, dict):
             return
         image_path = result.get("overlay_path") or result.get("image_path")
         image_cam_path = result.get("image_cam_path")
-        task_success = (
-            bool(result["task_success"])
-            if "task_success" in result
-            else bool(result.get("libero_terminated"))
-        )
-        if task_success:
-            with self._lock:
-                self._terminated = True
-
-        def _read_image(path: Any) -> bytes | None:
-            if not path:
-                return None
-            try:
-                return Path(path).read_bytes()
-            except (OSError, TypeError, ValueError):
-                return None
-
         self._update_frame(
             step=result.get("step"),
-            image=(
-                result.get("_image_bytes")
-                if isinstance(result.get("_image_bytes"), bytes)
-                else _read_image(image_path)
-            ),
-            image_cam=(
-                result.get("_image_cam_bytes")
-                if isinstance(result.get("_image_cam_bytes"), bytes)
-                else _read_image(image_cam_path)
-            ),
+            image=Path(image_path).read_bytes() if image_path else None,
+            image_cam=Path(image_cam_path).read_bytes() if image_cam_path else None,
         )
         log = result.get("log")
         if not isinstance(log, dict):
@@ -96,7 +66,7 @@ class State:
             step = int(result["step"])
         except Exception:
             return
-        terminated = task_success
+        terminated = bool(result.get("libero_terminated"))
         item = {
             "step": step,
             "action": str(command.get("action", name)),
@@ -139,9 +109,7 @@ class State:
         with self._lock:
             self._state = "done"
             if terminated is None:
-                terminated = self._terminated or any(
-                    item.get("terminated") for item in self._timeline
-                )
+                terminated = any(item.get("terminated") for item in self._timeline)
             self._terminated = bool(terminated)
 
     def events_since(self, since: int) -> list[dict[str, Any]]:

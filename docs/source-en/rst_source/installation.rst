@@ -2,14 +2,13 @@ Installation
 ============
 
 RPent installs with a single ``pip install``. The optional-dependency
-extras pull the forked `RLinf <https://github.com/RLinf/RLinf>`_ runtime,
-openpi, and the LIBERO simulator as git dependencies, so there is no
-longer a separate RLinf clone or setup script.
+extras install the published RLinf runtime, openpi, and LIBERO simulator
+packages from PyPI.
 
 Prerequisites
 -------------
 
-- Linux with an NVIDIA GPU (LIBERO / RoboCasa render on EGL).
+- Linux with an NVIDIA GPU (LIBERO renders on EGL).
 - CUDA 12.x drivers matching your GPU.
 - Python 3.10–3.11.
 - ``git``, ``bash``, and a working C toolchain for MuJoCo / robosuite.
@@ -19,8 +18,11 @@ You will also want:
 - An API key for at least one LLM provider — Anthropic, OpenAI, or an
   OpenAI-compatible chat endpoint — for the reasoning brain.
 - A VLA checkpoint. For LIBERO / Pi0.5 the recommended checkpoint lives
-  at `HuggingFace: rlinf-pi05-libero-130-fullshot-sft
-  <https://huggingface.co/datasets/RLinf/rlinf-pi05-libero-130-fullshot-sft>`_.
+  at `HuggingFace: RLinf-Pi05-LIBERO-130-fullshot-SFT
+  <https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-130-fullshot-SFT>`_.
+- A local SAM 3.0 ``sam3.pt`` file, downloaded from `Hugging Face:
+  facebook/sam3 <https://huggingface.co/facebook/sam3>`_ or `ModelScope:
+  facebook/sam3 <https://modelscope.cn/models/facebook/sam3>`_.
 
 1. Install RPent with pip
 -------------------------
@@ -33,8 +35,8 @@ the stack you want:
    git clone https://github.com/RLinf/RPent rpent && cd rpent
    pip install -e ".[full]"
 
-``.[full]`` is the default end-to-end stack — the openpi Pi0.5 VLA and
-the LIBERO-PRO simulator on top of the RLinf runtime.
+``.[full]`` is the default end-to-end stack — the openpi Pi0.5 VLA,
+the LIBERO-PRO simulator, and SAM 3.0 on top of the RLinf runtime.
 
 Available extras:
 
@@ -44,7 +46,7 @@ Available extras:
    * - Extra
      - Installs
    * - ``.[full]``
-     - ``rlinf`` + ``openpi`` + ``libero-pro`` — the default run stack
+     - ``rlinf`` + ``openpi`` + ``libero-pro`` + ``sam3`` — the default run stack
    * - ``.[libero-pro]``
      - Base LIBERO + LIBERO-PRO simulator only
    * - ``.[libero-plus]``
@@ -55,21 +57,29 @@ Available extras:
      - openpi VLA only
    * - ``.[rlinf]``
      - RLinf runtime only
+   * - ``.[sam3]``
+     - SAM 3.0 only
 
-2. (Optional) RoboCasa
-----------------------
+2. Download the simulator assets
+--------------------------------
 
-RoboCasa (kitchen-scale, long-horizon manipulation) has its own
-one-shot setup script:
+The PyPI wheels ship without the large simulation assets. Download them
+once after installing:
 
 .. code-block:: bash
 
-   bash scripts/setup_robocasa.sh
+   libero-download-assets --skip-existing      # base LIBERO
+   liberopro-download-assets --skip-existing   # LIBERO-PRO — .[libero-pro] / .[full]
+   liberoplus-download-assets --skip-existing  # LIBERO-plus — .[libero-plus]
 
-See `docs/SETUP_ROBOCASA.zh.md
-<https://github.com/RLinf/RPent/blob/main/docs/SETUP_ROBOCASA.zh.md>`_
-for the full RoboCasa365 + RLDX-1 walkthrough (assets, controller
-configs, VLA checkpoints).
+.. tip::
+
+   If your connection to Hugging Face is slow, download through the
+   mirror by prefixing the command with ``HF_ENDPOINT``:
+
+   .. code-block:: bash
+
+      HF_ENDPOINT=https://hf-mirror.com liberopro-download-assets --skip-existing
 
 3. (Optional) Real-world robot dependencies
 -------------------------------------------
@@ -83,15 +93,16 @@ Verifying the install
 ---------------------
 
 The quickest way to confirm everything is wired correctly is to run one
-LIBERO task end-to-end — see :doc:`quickstart`. If that succeeds, the
-env server, VLA server, and reasoning brain are all healthy.
+LIBERO task end-to-end — see :doc:`quickstart`. If it succeeds, the env server,
+VLA server, SAM3 server, and reasoning brain are all healthy.
 
 If something breaks:
 
 - The env server writes its stdout / stderr to
   ``<output_dir>/env_server.log``.
 - The VLA server writes to ``<output_dir>/vla_server.log``.
+- The SAM3 server writes to ``<output_dir>/sam3_server.log``.
 - The agent's own run log lives at ``<output_dir>/run.log``.
 
-The three logs are always in that per-run scratch directory, so a
+These logs are always in that per-run scratch directory, so a
 failed run is self-contained and easy to inspect.

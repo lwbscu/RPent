@@ -1,0 +1,1007 @@
+"""Thread-safe, environment-aware state for the shared live dashboard."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+import time
+from pathlib import Path
+from typing import Any, Mapping
+
+_BEHAVIOR_TOOLS = frozenset(
+    {
+        "pi0_nav_pick",
+        "observe",
+        "pixel_to_world",
+        "move_to",
+        "rotate_wrist",
+        "close",
+        "open",
+        "press",
+        "save_robot_state_checkpoint",
+        "navigate_to",
+    }
+)
+_PUBLIC_RUN_METADATA = frozenset(
+    {
+        "planner",
+        "model",
+        "reasoning-effort",
+        "task-name",
+        "task-language",
+        "task-index",
+        "activity-definition-id",
+        "activity-instance-id",
+        "public-instance-id",
+        "candidate-instance-id",
+        "public-seed",
+        "public-seed-max",
+        "scene-model",
+        "behavior-phase",
+        "job-id",
+        "campaign-position",
+        "max-episode-steps",
+        "max-tool-calls",
+        "max-wall-clock-s",
+        "public-tool-contract-version",
+        "public-tool-count",
+        "eval-cohort",
+        "controller",
+        "llm-enabled",
+        "cuda-device",
+        "health-status",
+        "health-checked-at",
+    }
+)
+_PRIVATE_KEYS = frozenset(
+    {
+        "gt",
+        "stage",
+        "ground_truth_pose",
+        "suggested_next_tool",
+        "suggested_tool",
+        "strategy",
+        "hidden_object_path",
+        "path",
+        "rgb_path",
+        "image_path",
+        "image_cam_path",
+        "overlay_path",
+    }
+)
+_BEHAVIOR_CAMERA_ALIASES = {
+    "main": "head",
+    "agent": "head",
+    "head": "head",
+    "left": "left_wrist",
+    "left_wrist": "left_wrist",
+    "right": "right_wrist",
+    "right_wrist": "right_wrist",
+}
+_UNSET = object()
+
+
+def _json_safe(value: Any) -> Any:
+    """Return a bounded JSON-safe value without private/runtime-only fields."""
+
+    if isinstance(value, bytes):
+        return f"<{len(value)} bytes>"
+    if isinstance(value, Mapping):
+        public: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            lowered = name.lower()
+            if (
+                name.startswith("_")
+                or lowered in _PRIVATE_KEYS
+                or lowered.startswith("ground_truth")
+                or lowered.startswith("suggested_")
+            ):
+                continue
+            public[name] = _json_safe(item)
+        return public
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _read_image(path: Any) -> bytes | None:
+    if not path:
+        return None
+    try:
+        return Path(path).read_bytes()
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+class State:
+    """Thread-safe dashboard state for one LIBERO or BEHAVIOR run."""
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        name: str,
+        output_dir: str,
+        video_path: str,
+        suite: str = "",
+        task: int = 0,
+        seed: int = 0,
+        environment: str | None = None,
+        identity: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        frame_roles: Mapping[str, Any] | list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        inferred = "behavior" if str(suite).startswith("behavior") else "libero"
+        self.environment = str(environment or inferred).strip().lower()
+        if self.environment not in {"behavior", "libero"}:
+            self.environment = inferred
+        self.run_id = str(run_id)
+        self.name = str(name)
+        self.suite = str(suite)
+        self.task = int(task)
+        self.seed = int(seed)
+        self.output_dir = Path(output_dir)
+        self._job_output_dir = self.output_dir.resolve(strict=False)
+        self.video_path = Path(video_path)
+        self.identity = _json_safe(
+            dict(
+                identity
+                or {
+                    "suite": self.suite,
+                    "task": self.task,
+                    "seed": self.seed,
+                }
+            )
+        )
+
+        if frame_roles is None:
+            frame_kinds = (
+                ("head", "left_wrist", "right_wrist")
+                if self.environment == "behavior"
+                else ("agent", "camera")
+            )
+        elif isinstance(frame_roles, Mapping):
+            frame_kinds = tuple(str(kind) for kind in frame_roles)
+        else:
+            frame_kinds = tuple(str(kind) for kind in frame_roles)
+        if not frame_kinds:
+            frame_kinds = ("agent", "camera")
+
+        self._lock = threading.RLock()
+        self._state = "running"
+        self._terminated = False
+        self._usage = {"in": 0, "out": 0, "tool_calls": 0}
+        self._events: list[dict[str, Any]] = []
+        self._timeline: list[dict[str, Any]] = []
+        self._timeline_revision = 0
+        self._next_timeline_id = 1
+        self._pending_tool_args: dict[str, list[dict[str, Any]]] = {}
+        self._event_targets: dict[str, list[int]] = {}
+        self._metadata: dict[str, Any] = {}
+        self._frames_png: dict[str, bytes | None] = dict.fromkeys(frame_kinds)
+        self._frame_indices: dict[str, int] = dict.fromkeys(frame_kinds, -1)
+        self._frame_idx = -1
+        self._video_generation = 0
+        self._sealed_video_generation: int | None = None
+        self._sealed_episode_replays: dict[int, dict[str, Any]] = {}
+        self._progress: dict[str, Any] = {
+            "attempt_index": 1,
+            "attempts_completed": 0,
+            "attempt_outcome": None,
+            "job_unlimited": True,
+            "official_task_success": False,
+            "workflow_complete": False,
+            "publication_complete": False,
+            "artifact_seal_complete": False,
+            "artifact_seal_warning": False,
+            "cumulative_env_steps": 0,
+            "cumulative_tool_calls": 0,
+            "cumulative_vla_chunks": 0,
+            "total_env_steps": 0,
+            "global_tool_calls": 0,
+            "global_vla_chunks": 0,
+            "global_vla_invocations": 0,
+            "elapsed_wall_clock_s": 0.0,
+            "max_episode_steps": None,
+            "max_tool_calls": 350 if self.environment == "behavior" else None,
+            "max_wall_clock_s": None,
+        }
+        if metadata:
+            self.set_metadata(dict(metadata))
+
+    # -- public event inputs ----------------------------------------------
+
+    def on_event(self, event: dict[str, Any]) -> None:
+        if not isinstance(event, dict):
+            return
+        event_type = str(event.get("type") or "")
+        tool_name = str(event.get("tool") or "")
+        if self._ignore_tool(tool_name) and event_type in {
+            "tool_call",
+            "tool_result",
+            "tool_progress",
+        }:
+            return
+        safe_event = _json_safe(event)
+        if not isinstance(safe_event, dict):
+            return
+        with self._lock:
+            if event_type == "official_success":
+                if self._trusted_attempt_event(event, required_key="task_success"):
+                    self._progress["official_task_success"] = True
+                    if isinstance(event.get("workflow_complete"), bool):
+                        self._progress["workflow_complete"] = event["workflow_complete"]
+                    if isinstance(event.get("artifact_seal_complete"), bool):
+                        self._progress["artifact_seal_complete"] = event[
+                            "artifact_seal_complete"
+                        ]
+                    if isinstance(event.get("publication_complete"), bool):
+                        self._progress["publication_complete"] = event[
+                            "publication_complete"
+                        ]
+                    self._terminated = True
+                    if self._timeline:
+                        self._timeline[-1]["terminated"] = True
+                self._update_artifact_warning_locked()
+            elif event_type == "publication_complete":
+                if self._trusted_attempt_event(
+                    event, required_key="publication_complete"
+                ):
+                    self._progress["publication_complete"] = True
+                self._update_artifact_warning_locked()
+            elif event_type == "workflow_complete":
+                if self._trusted_attempt_event(event, required_key="workflow_complete"):
+                    self._progress["workflow_complete"] = True
+                    self._progress["artifact_seal_complete"] = bool(
+                        event.get("artifact_seal_complete", True)
+                    )
+                self._update_artifact_warning_locked()
+
+            if event_type == "tool_call" and tool_name:
+                args = event.get("args")
+                safe_args = _json_safe(args) if isinstance(args, dict) else {}
+                targets = self._event_targets.get(tool_name, [])
+                if targets:
+                    index = targets.pop(0)
+                    if 0 <= index < len(self._timeline):
+                        self._timeline[index]["args"] = safe_args
+                        self._timeline_revision += 1
+                else:
+                    self._pending_tool_args.setdefault(tool_name, []).append(safe_args)
+            self._events.append(safe_event)
+
+    def on_usage(self, *, inp: int, out: int, tool_calls: int) -> None:
+        with self._lock:
+            self._usage = {
+                "in": int(inp),
+                "out": int(out),
+                "tool_calls": int(tool_calls),
+            }
+
+    def on_tool_start(self, name: str, arguments: dict[str, Any]) -> int:
+        name = str(name)
+        if self._ignore_tool(name):
+            return -1
+        with self._lock:
+            pending = self._pending_tool_args.get(name, [])
+            event_args = pending.pop(0) if pending else None
+            args = event_args if event_args is not None else _json_safe(arguments)
+            timeline_id = self._next_timeline_id
+            self._next_timeline_id += 1
+            ordinal = len(self._timeline) + 1
+            item = {
+                "timeline_id": timeline_id,
+                "ordinal": ordinal,
+                "step": ordinal,
+                "env_step": None,
+                "action": name,
+                "args": args if isinstance(args, dict) else {},
+                "result": {},
+                "elapsed_s": 0.0,
+                "terminated": bool(
+                    self.environment == "behavior"
+                    and self._progress["official_task_success"]
+                ),
+                "has_action_video": False,
+                "status": "running",
+                "_started_at": time.monotonic(),
+            }
+            self._timeline.append(item)
+            if event_args is None:
+                self._event_targets.setdefault(name, []).append(len(self._timeline) - 1)
+            self._timeline_revision += 1
+            return timeline_id
+
+    def on_tool_progress(self, name: str, result: dict[str, Any]) -> None:
+        name = str(name)
+        if self._ignore_tool(name) or not isinstance(result, dict):
+            return
+        self._ingest_frames(result)
+        safe_result = _json_safe(result)
+        if not isinstance(safe_result, dict):
+            safe_result = {}
+        for frame_key in ("visual_review", "views", "images"):
+            safe_result.pop(frame_key, None)
+        event = {"type": "tool_progress", "tool": name, **safe_result}
+        with self._lock:
+            index = self._running_index_locked(name)
+            if index is None:
+                self.on_tool_start(name, {})
+                index = len(self._timeline) - 1
+            item = self._timeline[index]
+            env_step = self._env_step(result)
+            if env_step is not None:
+                item["env_step"] = env_step
+            item["result"] = safe_result
+            self._events.append(event)
+            self._update_progress_from_payload_locked(result)
+            self._timeline_revision += 1
+
+    def on_tool_result(self, name: str, result: Any) -> None:
+        name = str(name)
+        if self._ignore_tool(name) or not isinstance(result, dict):
+            return
+        self._ingest_frames(result)
+        log = result.get("log")
+        command = log.get("command") if isinstance(log, dict) else None
+        log_result = log.get("result") if isinstance(log, dict) else None
+        safe_result = _json_safe(log_result if log_result is not None else result)
+        if not isinstance(safe_result, dict):
+            safe_result = {}
+
+        with self._lock:
+            index = self._running_index_locked(name)
+            if index is None:
+                pending = self._pending_tool_args.get(name, [])
+                event_args = pending.pop(0) if pending else None
+                args = (
+                    event_args
+                    if event_args is not None
+                    else {
+                        key: _json_safe(value)
+                        for key, value in command.items()
+                        if key != "action"
+                    }
+                    if isinstance(command, dict) and command.get("action") == name
+                    else {}
+                )
+                timeline_id = self._next_timeline_id
+                self._next_timeline_id += 1
+                ordinal = len(self._timeline) + 1
+                item = {
+                    "timeline_id": timeline_id,
+                    "ordinal": ordinal,
+                    "step": ordinal,
+                    "env_step": None,
+                    "action": name,
+                    "args": args,
+                    "result": {},
+                    "elapsed_s": None,
+                    "terminated": False,
+                    "has_action_video": False,
+                    "status": "running",
+                    "_started_at": time.monotonic(),
+                }
+                self._timeline.append(item)
+                index = len(self._timeline) - 1
+                if event_args is None:
+                    self._event_targets.setdefault(name, []).append(index)
+
+            item = self._timeline[index]
+            env_step = self._env_step(result)
+            item["env_step"] = env_step
+            item["result"] = safe_result
+            reported_elapsed = log.get("elapsed_s") if isinstance(log, dict) else None
+            if reported_elapsed is None:
+                reported_elapsed = result.get("elapsed_s")
+            if isinstance(reported_elapsed, (int, float)) and not isinstance(
+                reported_elapsed, bool
+            ):
+                elapsed = max(0.0, float(reported_elapsed))
+            else:
+                elapsed = max(0.0, time.monotonic() - item["_started_at"])
+            item["elapsed_s"] = elapsed
+
+            if self.environment == "behavior":
+                terminated = bool(self._progress["official_task_success"])
+                safe_rejected = (
+                    terminated
+                    and result.get("stop_reason") == "precondition_rejected"
+                    and "official_success_latched"
+                    in (
+                        result.get("failed_preconditions")
+                        if isinstance(result.get("failed_preconditions"), list)
+                        else []
+                    )
+                )
+                item["status"] = (
+                    "safe_rejected"
+                    if safe_rejected
+                    else "failed"
+                    if self._tool_failed(result)
+                    else "completed"
+                )
+                item["terminated"] = terminated
+            else:
+                terminated = bool(result.get("libero_terminated"))
+                self._terminated = self._terminated or terminated
+                item["terminated"] = terminated
+                item["status"] = "failed" if self._tool_failed(result) else "completed"
+
+            item["has_action_video"] = self._action_video_path_locked(item).exists()
+            self._update_progress_from_payload_locked(result)
+            self._timeline_revision += 1
+
+    def on_job_progress(self, progress: dict[str, Any]) -> None:
+        if not isinstance(progress, dict):
+            return
+        mapping = {
+            "attempts": "attempts_completed",
+            "env_steps": "cumulative_env_steps",
+            "tool_calls": "cumulative_tool_calls",
+            "vla_chunks": "cumulative_vla_chunks",
+            "wall_clock_s": "elapsed_wall_clock_s",
+        }
+        with self._lock:
+            for source, target in mapping.items():
+                value = progress.get(source)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    self._progress[target] = value
+
+    def on_frame(self, kind: str, image: bytes, *, env_step: Any = None) -> None:
+        if not isinstance(image, bytes):
+            return
+        physical = self._physical_camera(kind, frame_id=None)
+        if not physical:
+            return
+        with self._lock:
+            if physical not in self._frames_png:
+                return
+            self._frames_png[physical] = bytes(image)
+            step = int(env_step) if _is_int(env_step) else -1
+            self._frame_indices[physical] = step
+            self._frame_idx += 1
+
+    def set_metadata(self, metadata: dict[str, Any]) -> None:
+        """Attach public run identity and budget metadata."""
+
+        if not isinstance(metadata, dict):
+            return
+        with self._lock:
+            for key, value in metadata.items():
+                if key not in _PUBLIC_RUN_METADATA or value in (None, ""):
+                    continue
+                self._metadata[key] = _json_safe(value)
+            budget_map = {
+                "max-episode-steps": "max_episode_steps",
+                "max-tool-calls": "max_tool_calls",
+                "max-wall-clock-s": "max_wall_clock_s",
+            }
+            for source, target in budget_map.items():
+                value = self._metadata.get(source)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    self._progress[target] = value
+
+    def set_budget_limits(
+        self,
+        *,
+        max_episode_steps: int | None | object = _UNSET,
+        max_tool_calls: int | None | object = _UNSET,
+        max_wall_clock_s: int | float | None | object = _UNSET,
+    ) -> None:
+        """Set explicit run budgets, including an intentional unlimited value."""
+
+        updates = {
+            "max_episode_steps": max_episode_steps,
+            "max_tool_calls": max_tool_calls,
+            "max_wall_clock_s": max_wall_clock_s,
+        }
+        with self._lock:
+            for key, value in updates.items():
+                if value is _UNSET:
+                    continue
+                if value is not None and (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or value < 0
+                ):
+                    raise ValueError(f"{key} must be non-negative or None")
+                self._progress[key] = value
+
+    # -- attempt and completion lifecycle ---------------------------------
+
+    def begin_attempt(
+        self,
+        *,
+        attempt_index: int,
+        output_dir: str | Path,
+        video_path: str | Path,
+    ) -> None:
+        with self._lock:
+            self.output_dir = Path(output_dir)
+            self.video_path = Path(video_path)
+            self._state = "running"
+            self._terminated = False
+            self._sealed_video_generation = None
+            self._video_generation += 1
+            for kind in self._frames_png:
+                self._frames_png[kind] = None
+                self._frame_indices[kind] = -1
+            self._frame_idx = -1
+            self._progress.update(
+                {
+                    "attempt_index": int(attempt_index),
+                    "attempt_outcome": None,
+                    "official_task_success": False,
+                    "workflow_complete": False,
+                    "publication_complete": False,
+                    "artifact_seal_complete": False,
+                    "artifact_seal_warning": False,
+                    "total_env_steps": 0,
+                    "global_tool_calls": 0,
+                    "global_vla_chunks": 0,
+                    "global_vla_invocations": 0,
+                    "elapsed_wall_clock_s": 0.0,
+                }
+            )
+            self._timeline_revision += 1
+
+    def end_attempt(self, *, attempt_index: int, outcome: str) -> None:
+        with self._lock:
+            if int(attempt_index) != int(self._progress["attempt_index"]):
+                return
+            self._progress["attempts_completed"] = max(
+                int(self._progress["attempts_completed"]),
+                int(attempt_index),
+            )
+            self._progress["attempt_outcome"] = str(outcome)
+            video_path = self._trusted_video_path_locked(self.video_path)
+            if (
+                video_path is not None
+                and self._video_generation not in self._sealed_episode_replays
+            ):
+                self._sealed_episode_replays[self._video_generation] = {
+                    "generation": self._video_generation,
+                    "attempt_index": int(attempt_index),
+                    "outcome": str(outcome),
+                    "path": video_path,
+                }
+
+    def mark_done(self, terminated: bool | None = None) -> None:
+        with self._lock:
+            now = time.monotonic()
+            for item in self._timeline:
+                if item["status"] == "running":
+                    item["status"] = "interrupted"
+                    item["elapsed_s"] = max(0.0, now - item["_started_at"])
+                    self._timeline_revision += 1
+            self._state = "done"
+            if self.environment == "behavior":
+                self._terminated = bool(self._progress["official_task_success"])
+            elif terminated is not None:
+                self._terminated = self._terminated or bool(terminated)
+            self._sealed_video_generation = (
+                self._video_generation
+                if self._trusted_video_path_locked(self.video_path) is not None
+                else None
+            )
+            self._update_artifact_warning_locked()
+
+    # -- public snapshots --------------------------------------------------
+
+    def events_since(self, since: int) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._events[max(0, int(since)) :])
+
+    def frame(self, kind: str) -> bytes | None:
+        with self._lock:
+            requested = str(kind)
+            if self.environment == "behavior" and requested in {"agent", "camera"}:
+                requested = "head"
+            return self._frames_png.get(requested)
+
+    def action_video_path(self, step: int) -> Path | None:
+        with self._lock:
+            for item in self._timeline:
+                if int(item.get("step", -1)) != int(step):
+                    continue
+                path = self._action_video_path_locked(item)
+                return path if path.exists() else None
+        return None
+
+    def video_path_for_generation(self, generation: int) -> Path | None:
+        with self._lock:
+            generation = int(generation)
+            replay = self._sealed_episode_replays.get(generation)
+            if replay is not None:
+                return self._trusted_video_path_locked(
+                    replay["path"], require_current_output=False
+                )
+            if generation != self._video_generation:
+                return None
+            if self._sealed_video_generation != self._video_generation:
+                return None
+            return self._trusted_video_path_locked(self.video_path)
+
+    def has_video(self) -> bool:
+        with self._lock:
+            return (
+                self._state == "done"
+                and self._sealed_video_generation == self._video_generation
+                and self._trusted_video_path_locked(self.video_path) is not None
+            )
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            self._refresh_publication_amendment_locked()
+            return {
+                "state": self._state,
+                "terminated": self._terminated,
+                "environment": self.environment,
+                "usage": dict(self._usage),
+                "has_video": self.has_video(),
+                "video_generation": self._video_generation,
+                "episode_replays": self._episode_replays_locked(),
+                "frame_idx": self._frame_idx,
+                "frame_indices": dict(self._frame_indices),
+                "frame_kinds": list(self._frames_png),
+                "n_steps": len(self._timeline),
+                "timeline_revision": self._timeline_revision,
+                "progress": dict(self._progress),
+            }
+
+    def run_info(self) -> dict[str, Any]:
+        with self._lock:
+            self._refresh_publication_amendment_locked()
+            return {
+                "id": self.run_id,
+                "name": self.name,
+                "environment": self.environment,
+                "suite": self.suite,
+                "task": self.task,
+                "seed": self.seed,
+                "identity": dict(self.identity),
+                "state": self._state,
+                "n_steps": len(self._timeline),
+                "timeline_revision": self._timeline_revision,
+                "video_generation": self._video_generation,
+                "progress": dict(self._progress),
+            }
+
+    def run_detail(self) -> dict[str, Any]:
+        with self._lock:
+            self._refresh_publication_amendment_locked()
+            timeline = [
+                self._public_timeline_item_locked(item) for item in self._timeline
+            ]
+            return {
+                "state": self._state,
+                "terminated": self._terminated,
+                "environment": self.environment,
+                "suite": self.suite,
+                "name": self.name,
+                "task": self.task,
+                "seed": self.seed,
+                "identity": dict(self.identity),
+                "usage": dict(self._usage),
+                "timeline": timeline,
+                "timeline_revision": self._timeline_revision,
+                "has_video": self.has_video(),
+                "video_generation": self._video_generation,
+                "episode_replays": self._episode_replays_locked(),
+                "frame_idx": self._frame_idx,
+                "frame_indices": dict(self._frame_indices),
+                "frame_kinds": list(self._frames_png),
+                "metadata": dict(self._metadata),
+                "progress": dict(self._progress),
+            }
+
+    # -- internals ---------------------------------------------------------
+
+    def _trusted_video_path_locked(
+        self,
+        path: str | Path,
+        *,
+        require_current_output: bool = True,
+    ) -> Path | None:
+        candidate = Path(path)
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                return None
+            resolved = candidate.resolve(strict=True)
+            job_root = self._job_output_dir
+            current_output = self.output_dir.resolve(strict=False)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if not (resolved == job_root or job_root in resolved.parents):
+            return None
+        if require_current_output and not (
+            resolved == current_output or current_output in resolved.parents
+        ):
+            return None
+        return resolved
+
+    def _episode_replays_locked(self) -> list[dict[str, Any]]:
+        replays: list[dict[str, Any]] = []
+        for generation in sorted(self._sealed_episode_replays):
+            replay = self._sealed_episode_replays[generation]
+            if (
+                self._trusted_video_path_locked(
+                    replay["path"], require_current_output=False
+                )
+                is None
+            ):
+                continue
+            replays.append(
+                {
+                    "generation": int(replay["generation"]),
+                    "attempt_index": int(replay["attempt_index"]),
+                    "outcome": str(replay["outcome"]),
+                }
+            )
+        return replays
+
+    def _ignore_tool(self, name: str) -> bool:
+        return (
+            self.environment == "behavior"
+            and bool(name)
+            and name not in _BEHAVIOR_TOOLS
+        )
+
+    def _trusted_attempt_event(
+        self, event: dict[str, Any], *, required_key: str
+    ) -> bool:
+        attempt = event.get("attempt_index")
+        return (
+            _is_int(attempt)
+            and int(attempt) == int(self._progress["attempt_index"])
+            and event.get(required_key) is True
+        )
+
+    def _running_index_locked(self, name: str) -> int | None:
+        for index, item in enumerate(self._timeline):
+            if item["action"] == name and item["status"] == "running":
+                return index
+        return None
+
+    @staticmethod
+    def _tool_failed(result: dict[str, Any]) -> bool:
+        if result.get("primitive_success") is False or result.get("success") is False:
+            return True
+        if result.get("error") not in (None, "", False):
+            return True
+        return str(result.get("stop_reason") or "") in {
+            "handoff_failed",
+            "precondition_rejected",
+            "isolation_failure",
+            "tool_error",
+        }
+
+    @staticmethod
+    def _env_step(result: dict[str, Any]) -> int | None:
+        for key in ("env_step", "total_env_steps", "step"):
+            value = result.get(key)
+            if _is_int(value):
+                return int(value)
+        return None
+
+    def _physical_camera(self, camera: Any, *, frame_id: Any) -> str | None:
+        candidate = str(camera or "")
+        if self.environment != "behavior":
+            return candidate if candidate in self._frames_png else None
+        if isinstance(frame_id, str):
+            prefix = frame_id.split(":", 1)[0]
+            if prefix in {"head", "left_wrist", "right_wrist"}:
+                return prefix
+        return _BEHAVIOR_CAMERA_ALIASES.get(candidate)
+
+    def _ingest_frames(self, result: dict[str, Any]) -> None:
+        env_step = self._env_step(result)
+        direct = (
+            result.get("_image_bytes")
+            if isinstance(result.get("_image_bytes"), bytes)
+            else _read_image(result.get("overlay_path") or result.get("image_path"))
+        )
+        if isinstance(direct, bytes):
+            camera = self._physical_camera(
+                result.get("resolved_camera") or result.get("camera") or "agent",
+                frame_id=result.get("frame_id"),
+            )
+            if camera:
+                self.on_frame(camera, direct, env_step=env_step)
+
+        camera_image = (
+            result.get("_image_cam_bytes")
+            if isinstance(result.get("_image_cam_bytes"), bytes)
+            else _read_image(result.get("image_cam_path"))
+        )
+        if isinstance(camera_image, bytes) and self.environment == "libero":
+            self.on_frame("camera", camera_image, env_step=env_step)
+
+        inline = result.get("_frames_bytes")
+        if isinstance(inline, dict):
+            for camera, image in inline.items():
+                if isinstance(image, bytes):
+                    physical = self._physical_camera(camera, frame_id=None)
+                    if physical:
+                        self.on_frame(physical, image, env_step=env_step)
+
+        containers: list[dict[str, Any]] = []
+        for key in ("views", "images"):
+            value = result.get(key)
+            if isinstance(value, dict):
+                containers.append(value)
+        visual_review = result.get("visual_review")
+        if isinstance(visual_review, dict):
+            for key in ("views", "images"):
+                value = visual_review.get(key)
+                if isinstance(value, dict):
+                    containers.append(value)
+        for views in containers:
+            for camera, view in views.items():
+                if not isinstance(view, dict):
+                    continue
+                image = (
+                    view.get("_image_bytes")
+                    if isinstance(view.get("_image_bytes"), bytes)
+                    else _read_image(
+                        view.get("rgb_path")
+                        or view.get("path")
+                        or view.get("image_path")
+                    )
+                )
+                if not isinstance(image, bytes):
+                    continue
+                physical = self._physical_camera(
+                    camera,
+                    frame_id=view.get("frame_id"),
+                )
+                if physical:
+                    self.on_frame(physical, image, env_step=env_step)
+
+    def _update_progress_from_payload_locked(self, payload: dict[str, Any]) -> None:
+        fields = {
+            "attempt_index": "attempt_index",
+            "total_env_steps": "total_env_steps",
+            "global_tool_calls": "global_tool_calls",
+            "global_vla_chunks": "global_vla_chunks",
+            "global_vla_invocations": "global_vla_invocations",
+            "global_elapsed_wall_clock_s": "elapsed_wall_clock_s",
+        }
+        for source, target in fields.items():
+            value = payload.get(source)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                self._progress[target] = value
+
+    def _action_video_path_locked(self, item: dict[str, Any]) -> Path:
+        return (
+            self.output_dir
+            / "action_videos"
+            / f"step_{int(item['step']):02d}_{item['action']}.mp4"
+        )
+
+    def _public_timeline_item_locked(self, item: dict[str, Any]) -> dict[str, Any]:
+        public = {key: value for key, value in item.items() if not key.startswith("_")}
+        if item["status"] == "running":
+            public["elapsed_s"] = max(0.0, time.monotonic() - item["_started_at"])
+        return public
+
+    def _update_artifact_warning_locked(self) -> None:
+        self._progress["artifact_seal_warning"] = bool(
+            self._progress["official_task_success"]
+            and not self._progress["workflow_complete"]
+        )
+
+    def _refresh_publication_amendment_locked(self) -> None:
+        if self.environment != "behavior":
+            return
+        amendment_path = self._job_root_locked() / "publication_amendment.json"
+        try:
+            amendment = json.loads(amendment_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(amendment, dict):
+            return
+        task_name = self._metadata.get("task-name")
+        public_seed = self._metadata.get("public-seed", self.seed)
+        expected_tag = (
+            f"{task_name}_s{public_seed}" if isinstance(task_name, str) else self.name
+        )
+        if (
+            amendment.get("job_id") != self._metadata.get("job-id")
+            or amendment.get("tag") != expected_tag
+            or amendment.get("public_seed") != public_seed
+            or amendment.get("attempt_index") != self._progress["attempt_index"]
+            or amendment.get("success_source") != 'info["done"]["success"]'
+            or amendment.get("task_success") is not True
+            or amendment.get("publication_complete") is not True
+        ):
+            return
+        recipe = self._job_root_locked() / f"recipe_{expected_tag}.jsonl"
+        memory = self._job_root_locked() / "memory" / f"{task_name}.md"
+        provenance = self._job_root_locked() / "memory" / f"{task_name}_provenance.json"
+        expected = {
+            recipe: amendment.get("recipe_sha256"),
+            memory: amendment.get("memory_sha256"),
+            provenance: amendment.get("provenance_sha256"),
+        }
+        for path, digest in expected.items():
+            if not isinstance(digest, str):
+                return
+            try:
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                return
+            if actual != digest:
+                return
+        attempt_dir = (
+            self._job_root_locked()
+            / "attempts"
+            / expected_tag
+            / f"attempt_{int(self._progress['attempt_index']):03d}"
+        )
+        receipt_path = attempt_dir / "official_success_receipt.json"
+        try:
+            receipt_bytes = receipt_path.read_bytes()
+            receipt = json.loads(receipt_bytes)
+            provenance_payload = json.loads(provenance.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(receipt, dict) or not isinstance(provenance_payload, dict):
+            return
+        receipt_digest = receipt.get("receipt_sha256")
+        unsigned_receipt = {
+            key: value for key, value in receipt.items() if key != "receipt_sha256"
+        }
+        canonical_receipt = json.dumps(
+            unsigned_receipt,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+        official_binding = provenance_payload.get("official_success_receipt")
+        if (
+            receipt.get("source") != 'info["done"]["success"]'
+            or not isinstance(receipt.get("raw_done"), dict)
+            or receipt["raw_done"].get("success") is not True
+            or receipt_digest != hashlib.sha256(canonical_receipt).hexdigest()
+            or provenance_payload.get("source") != "raw_official_success_v1"
+            or provenance_payload.get("success_source") != 'info["done"]["success"]'
+            or provenance_payload.get("source_tag") != expected_tag
+            or provenance_payload.get("job_id") != self._metadata.get("job-id")
+            or provenance_payload.get("attempt_index")
+            != self._progress["attempt_index"]
+            or provenance_payload.get("task_success") is not True
+            or not isinstance(official_binding, dict)
+            or official_binding.get("receipt_sha256") != receipt_digest
+            or official_binding.get("file_sha256")
+            != hashlib.sha256(receipt_bytes).hexdigest()
+        ):
+            return
+        self._progress["official_task_success"] = True
+        self._progress["publication_complete"] = True
+        self._progress["artifact_seal_complete"] = bool(
+            amendment.get("artifact_seal_complete")
+        )
+        self._terminated = True
+        self._update_artifact_warning_locked()
+
+    def _job_root_locked(self) -> Path:
+        job_id = self._metadata.get("job-id")
+        if isinstance(job_id, str) and self.run_id.endswith(f"/{job_id}"):
+            # Serial Explore points output_dir at the current attempt.
+            for candidate in (self.output_dir, *self.output_dir.parents):
+                if (candidate / "session_manifest.json").exists():
+                    return candidate
+        return self.output_dir
+
+
+__all__ = ["State"]

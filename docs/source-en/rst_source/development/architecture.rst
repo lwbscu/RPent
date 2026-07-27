@@ -1,4 +1,4 @@
-System internals
+System Internals
 ================
 
 This page is the implementation-level view of RPent. It walks through
@@ -24,14 +24,14 @@ around; the sections below then show how each is implemented.)*
   ``rotate_wrist``, ``back_project``, ``finish``, …). Each tool
   result is fed back as multimodal context (text + rendered images),
   so the model reasons over what it actually sees.
-- **Three-process architecture.** The **agent process** (LLM cerebrum
+- **Three-process architecture.** The **agent process** (LLM planner
   + toolkit, no ``torch``), the **env_server** (simulator + EGL
   rendering), and the **vla_server** (GPU policy weights) are
   separate processes wired by lightweight RPC. Either heavyweight
   process can be restarted, moved to another GPU, or pointed at a
   remote host independently.
-- **Pluggable reasoning brains (cerebrums).** Swap the decision brain
-  with one flag — ``--cerebrum {api, claude_code, codex}`` —
+- **Pluggable reasoning brains (planners).** Swap the decision brain
+  with one flag — ``--planner {api, claude_code, codex}`` —
   without touching the tools or prompts:
 
   - ``api`` — a provider-agnostic tool-calling loop built on
@@ -81,7 +81,7 @@ The code that implements the framework is split cleanly by concern:
 .. code-block:: text
 
    rpent/
-     cerebrum/       # Reasoning brains: api_loop, claude_code, codex, base.
+     planner/       # Reasoning brains: api_loop, claude_code, codex, base.
      cli/            # main.py entrypoint (no __init__.py — not a subpackage).
      context/        # Prompt bundles, prompt utils, shared prompt sections.
      dashboard/      # FastAPI monitor + SSE streams (optional).
@@ -91,39 +91,52 @@ The code that implements the framework is split cleanly by concern:
    robots/
      libero/         # LIBERO env_client / env_server / vla_server /
                      # toolkit / prompt_bundle. The reference env.
-     (robocasa/)     # RoboCasa driver (see scripts/run_robocasa.sh).
+     (robocasa/)     # RoboCasa driver — in progress.
      (franka/)       # Franka driver — in progress.
      (so101/)        # SO-101 driver — in progress.
-   scripts/          # Setup scripts (LIBERO PRO/PLUS, RoboCasa, codex proxy).
+   scripts/          # Setup scripts (LIBERO PRO/PLUS, codex proxy).
 
 The runner (``rpent/cli/main.py``)
 ----------------------------------
 
 ``rpent/cli/main.py`` is the choreographer. On each invocation it:
 
-1. Parses the CLI flags (:doc:`../quickstart` documents the ones you'll
-   use day-to-day).
-2. Creates the per-run scratch directory (``--output-dir`` or an
-   auto-generated one under ``runs/``).
-3. Spawns the **env_server** as a subprocess and waits for its
-   ``transport_ready`` JSON event on stdout. That event carries the
-   host/port the socket RPC is listening on; ``rpent/cli/main.py`` records
-   the endpoint under ``<output_dir>/`` so the client can find it.
-4. Spawns (or attaches to) the **vla_server** the same way, using
-   ``--vla-endpoint`` when reusing a running instance.
-5. Builds the **toolkit** for the chosen env via the env's
-   ``get_toolkit(primitives_kwargs=...)`` factory, wiring in the env
-   client and the VLA client.
-6. Builds the **cerebrum** via ``rpent.cerebrum.base.build_cerebrum``,
+1. Parses shared CLI flags (:doc:`../quickstart` documents the ones you'll
+   use day-to-day) with ``parse_known_args`` to grab ``--env`` and
+   ``--dashboard`` early.
+2. Resolves the env via ``get_env_spec(args.env_name)`` and calls
+   ``env_spec.add_cli_args(parser, use_dashboard=args.dashboard)`` — the env
+   registers its flags on the shared parser. ``use_dashboard=True`` makes
+   its otherwise-required flags optional so the dashboard can supply them.
+3. Runs ``parser.parse_args()`` once more against the now-complete parser —
+   a single argparse pass owns all validation and produces the final
+   ``args`` (with argparse's usual usage + error output on failure).
+4. If ``--dashboard`` is set, boots the launcher on ``args`` (whose
+   env-specific fields are populated from the CLI) and applies the user's
+   form choices back to it.
+5. Calls ``env_spec.parse_config(args)`` to derive a
+   :class:`~rpent.envs.RunConfig`
+   (``recipe_tag`` / ``output_dir`` / ``prompt_vars`` / ``dashboard_state``
+   / ``task_desc``). Under ``--dashboard``, this is where the env
+   enforces that its previously-optional flags were actually filled in.
+6. Calls ``init_output_dir`` to mkdir the per-run scratch dir and wire
+   ``run.log``.
+7. Calls ``env_spec.init_runtime(args, output_dir)`` — the env spawns its
+   own ``env_server`` + ``vla_server`` (or attaches to a running one via
+   ``--env-endpoint`` / ``--vla-endpoint``) and returns
+   ``(daemons, primitives_kwargs)``.
+8. Builds the **toolkit** via the env's ``get_toolkit(primitives_kwargs=...)``
+   factory.
+9. Builds the **planner** via ``rpent.planner.base.build_planner``,
    selecting one of ``api_loop.py`` / ``claude_code.py`` /
-   ``codex.py`` based on ``--cerebrum``.
-7. Runs the tool-calling loop, streams to the dashboard if
-   ``--dashboard`` is set, and on exit writes
-   ``<output_dir>/transcript_*.json`` plus ``<output_dir>/episode.mp4``.
+   ``codex.py`` based on ``--planner``.
+10. Runs the tool-calling loop, streams to the dashboard if
+    ``--dashboard`` is set, and on exit writes
+    ``<output_dir>/transcript_*.json`` plus ``<output_dir>/episode.mp4``.
 
 The runner is intentionally thin: everything env-specific lives under
 ``robots/<env>/``, and everything brain-specific lives under
-``rpent/cerebrum/``.
+``rpent/planner/``. main.py imports no env-specific class or script.
 
 Env-side registry
 -----------------
@@ -136,18 +149,29 @@ factories the package exposes:
 .. code-block:: python
 
    # robots/myenv/__init__.py
-   def get_env_spec() -> EnvSpec: ...
+   def get_env_spec() -> EnvSpec: ...           # identity + prompts + runner hooks
    def get_toolkit(*, primitives_kwargs, video_path=None): ...
+
+``EnvSpec`` carries five fields:
+
+- ``name`` / ``prompts`` — env identity and the :class:`PromptBundle`.
+- ``add_cli_args(parser, use_dashboard) -> None`` — register env flags on
+  the shared argparse parser. ``use_dashboard`` toggles whether flags that
+  are normally required stay optional (dashboard fills them).
+- ``parse_config(args) -> RunConfig`` — validates final ``args``
+  (post-dashboard) and returns the derived per-run identifiers.
+- ``init_runtime(args, output_dir) -> (daemons, primitives_kwargs)`` —
+  spawns env / VLA subprocesses and returns the toolkit inputs.
 
 There is **no central list** of envs. Dropping a package under
 ``robots/`` is enough. This is the mechanism you use to add a new
 robot (see :doc:`add_robot`).
 
-Cerebrum interface
-------------------
+Planner interface
+-----------------
 
-Every cerebrum implements the same tiny interface (see
-``rpent.cerebrum.base``):
+Every planner implements the same tiny interface (see
+``rpent.planner.base``):
 
 - Take the rendered ``prompt_bundle`` (system + user sections).
 - Take a ``toolkit`` (which exposes tool schemas + a ``dispatch``
@@ -156,10 +180,10 @@ Every cerebrum implements the same tiny interface (see
 - Feed each tool result back as multimodal context.
 - Terminate on ``finish`` or when caps are hit.
 
-That is the entire abstraction. The three built-in cerebrums differ
+That is the entire abstraction. The three built-in planners differ
 only in *how* they meet the contract — see
 :doc:`../usage/configure_planner` for the user-facing view and
-``rpent/cerebrum/api_loop.py`` / ``claude_code.py`` / ``codex.py``
+``rpent/planner/api_loop.py`` / ``claude_code.py`` / ``codex.py``
 for the code.
 
 Toolkit interface
@@ -184,19 +208,25 @@ class and registers whatever tools that env exposes.
 Transport substrate
 -------------------
 
-Two codecs are supported natively:
+Two codecs are supported natively, selected via the server's
+``--transport {http,socket}`` flag (default ``http``) and mirrored on
+the client side by ``--env-endpoint`` / ``--vla-endpoint`` protocol
+prefix:
 
-- **Pickle-framed socket RPC** (``rpent.utils.socket_rpc``) — used
-  by every env_server and by the RoboCasa vla_server. Chosen for
-  history-stacked nested numpy dicts (RLDX obs) and for the wide,
-  variable-shape state payloads env_servers exchange.
-- **HTTP** — used by the LIBERO vla_server for the flat
-  ``image+state → action`` payload of Pi0.5. Convenient for
-  standard load balancing and for ``--vla-endpoint``-style reuse.
+- **HTTP** (``rpent.utils.http_rpc``) — JSON body over ``POST /call``.
+  Convenient for standard load balancing and cross-language clients.
+  Numpy arrays cross the wire tagged as
+  ``{"__ndarray__": <base64>, "dtype": ..., "shape": [...]}``.
+- **Pickle-framed socket RPC** (``rpent.utils.socket_rpc``) — for
+  history-stacked nested numpy dicts and other wide, variable-shape
+  payloads where JSON re-encoding is wasteful.
 
-Adding a new transport is a matter of implementing the two-method
-``RpcClient`` interface (``call(method, args, kwargs, timeout_s)``);
-the toolkit and cerebrum stay unchanged.
+Server-side, subclass :class:`rpent.utils.rpc.RpcFacade` and implement
+``_dispatch(method, args, kwargs)``; the base provides shutdown, healthz,
+transport binding, parent-death watch, and clean teardown. Adding a new
+transport is a matter of implementing the two-method ``RpcClient``
+interface (``call(method, args, kwargs, timeout_s)``); the toolkit and
+planner stay unchanged.
 
 Dashboard (optional)
 --------------------

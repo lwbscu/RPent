@@ -1,3 +1,0 @@
-{"action": "reset"}
-{"action": "pi0_pick", "prompt": "Pick the akita black bowl in the top layer of the wooden cabinet and place it on the plate", "max_chunks": 20, "lift_thresh": 0.10, "gripper_closed_thresh": 0.06}
-{"action": "pi0_pick", "prompt": "Pick the akita black bowl in the top layer of the wooden cabinet and place it on the plate", "max_chunks": 25, "lift_thresh": 0.08, "gripper_closed_thresh": 0.06}

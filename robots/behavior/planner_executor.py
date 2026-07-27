@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import inspect
 import json
 import math
@@ -29,17 +30,28 @@ from robots.behavior.schemas import (
     ACTION_DIM,
     ENV_ACTION_SEGMENTS,
     validate_action_chunk,
+    validate_relative_navigation_motion,
 )
 
 LEFT_EEF_LINK = "left_eef_link"
 RIGHT_EEF_LINK = "right_eef_link"
 EEF_LINK_BY_HAND = {"left": LEFT_EEF_LINK, "right": RIGHT_EEF_LINK}
 GRIPPER_COMMAND_BY_OPENING = {"open": 1.0, "closed": -1.0}
-CUROBO_COLLISION_ACTIVATION_DISTANCE_M = 0.005
 LOCAL_GUARDED_IK_SEEDS = 16
-ARM_WAYPOINT_TOLERANCE_RAD = 0.015
-PICK_GUARDED_OVERTRAVEL_M = 0.001
-GUARDED_TARGET_NEIGHBORHOOD_M = 0.03
+ARM_WAYPOINT_TOLERANCE_RAD = 0.02
+WHOLE_BODY_BASE_XY_WAYPOINT_TOLERANCE_M = 0.02
+WHOLE_BODY_BASE_YAW_WAYPOINT_TOLERANCE_RAD = math.radians(1.0)
+WHOLE_BODY_ARTICULATION_WAYPOINT_TOLERANCE_RAD = 0.02
+WHOLE_BODY_DENSE_COLLISION_STEP = 0.0075
+WHOLE_BODY_EXECUTION_BASE_XY_STEP_M = 0.02
+WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD = math.radians(1.0)
+WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD = 0.02
+WHOLE_BODY_TOTAL_DEADLINE_S = 240.0
+WHOLE_BODY_PLANNING_DEADLINE_S = 60.0
+WHOLE_BODY_FAST_TRAJOPT_DEADLINE_S = 12.0
+WHOLE_BODY_EXECUTION_DEADLINE_S = 180.0
+WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M = 0.002
+WHOLE_BODY_REPLAN_TRACKING_IMPROVEMENT_RATIO = 0.05
 PRESS_EEF_TO_CONTACT_OFFSET_M = 0.026
 GRIPPER_CLOSE_COARSE_COMMAND_STEP = 0.05
 GRIPPER_CLOSE_FINE_COMMAND_STEP = 0.00625
@@ -49,12 +61,37 @@ LOCKED_BASE_Z_MAX_DRIFT_M = 0.01
 LOCKED_BASE_RPY_MAX_DRIFT_RAD = math.radians(1.0)
 LOCKED_ARTICULATION_MAX_DRIFT_RAD = 0.01
 LOCKED_GRIPPER_COMMAND_MAX_DRIFT = 1e-6
-PREPRESS_WARMUP_ENDPOINT_MAX_JOINT_DELTA_RAD = 0.05
-PREPRESS_WARMUP_PATH_MAX_JOINT_DELTA_RAD = 0.10
+TRUNK_ASSIST_MAX_STEP_RAD = 0.01
+TRUNK_ASSIST_MAX_TOTAL_RAD = 0.12
+_MOTION_SCOPES = frozenset({"arm_only", "arm_with_trunk", "whole_body", "gripper_only"})
+WHOLE_BODY_ACTIVE_JOINT_NAMES = (
+    "base_footprint_x_joint",
+    "base_footprint_y_joint",
+    "base_footprint_rz_joint",
+    "torso_joint1",
+    "torso_joint2",
+    "torso_joint3",
+    "torso_joint4",
+    *tuple(f"left_arm_joint{i}" for i in range(1, 8)),
+    *tuple(f"right_arm_joint{i}" for i in range(1, 8)),
+)
+WHOLE_BODY_LOCKED_JOINT_NAMES = (
+    "base_footprint_z_joint",
+    "base_footprint_rx_joint",
+    "base_footprint_ry_joint",
+    "left_gripper_finger_joint1",
+    "left_gripper_finger_joint2",
+    "right_gripper_finger_joint1",
+    "right_gripper_finger_joint2",
+)
 MAX_BASE_STATION_SHORTLIST = 9
 MAX_BASE_PLAN_CANDIDATES = 6
 BASE_PLAN_ATTEMPT_TIMEOUT_S = 8.0
 _ATTACHMENT_UNSET = object()
+
+
+class _WholeBodyCertificationError(RuntimeError):
+    """A shared cuRobo certification failure that invalidates the generator."""
 
 
 @contextmanager
@@ -104,24 +141,6 @@ def _wall_clock_deadline(timeout_s: float, operation: str):
                     raise TimeoutError("outer planner deadline exceeded")
             else:
                 signal.setitimer(signal.ITIMER_REAL, remaining, previous_interval)
-
-
-def _collision_margin_report_values(colliding: bool) -> dict[str, Any]:
-    """Expose the world-clearance lower bound certified by OG's checker.
-
-    OmniGibson's public ``check_collisions`` only returns whether any sphere is
-    inside cuRobo's activation zone.  A clear result therefore certifies a
-    lower bound equal to that configured zone; a violation is reported as zero
-    rather than inventing an unavailable penetration distance.
-    """
-
-    return {
-        "min_margin_m": (0.0 if colliding else CUROBO_COLLISION_ACTIVATION_DISTANCE_M),
-        "margin_available": True,
-        "margin_semantics": "curobo_world_activation_distance_lower_bound",
-        "margin_scope": "world_only",
-        "collision_activation_distance_m": CUROBO_COLLISION_ACTIVATION_DISTANCE_M,
-    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -181,8 +200,7 @@ def _terminally_smoothed_joint_trajectory(
     samples.  Replace only that final straight suffix with a triangular
     (linearly decreasing) command-spacing profile, then append exact endpoint
     repeats.  Every replacement sample lies on the original final joint-space
-    line segment, so the caller can run the usual full world+self collision
-    recheck on the returned samples.
+    line segment.
     """
 
     q = np.asarray(_jsonable(trajectory), dtype=np.float64)
@@ -196,7 +214,6 @@ def _terminally_smoothed_joint_trajectory(
         return result.astype(np.float32), {
             "method": "collinear_terminal_triangular_ease_out",
             "path_geometry": "original_joint_polyline",
-            "full_collision_recheck_required": True,
             "original_waypoints": 1,
             "smoothed_waypoints": int(len(result)),
             "collinear_tail_segments": 0,
@@ -212,7 +229,6 @@ def _terminally_smoothed_joint_trajectory(
         return result.astype(np.float32), {
             "method": "collinear_terminal_triangular_ease_out",
             "path_geometry": "original_joint_polyline",
-            "full_collision_recheck_required": True,
             "original_waypoints": int(len(q)),
             "smoothed_waypoints": int(len(result)),
             "collinear_tail_segments": 0,
@@ -261,7 +277,6 @@ def _terminally_smoothed_joint_trajectory(
     return result.astype(np.float32), {
         "method": "collinear_terminal_triangular_ease_out",
         "path_geometry": "original_joint_polyline",
-        "full_collision_recheck_required": True,
         "original_waypoints": original_waypoints,
         "smoothed_waypoints": int(len(result)),
         "collinear_tail_segments": int(tail_segments),
@@ -317,17 +332,49 @@ def _attachment_identity_status(
     }
 
 
+def _attachment_state_status(
+    actual: Any,
+    expected: Any,
+    *,
+    hand: str,
+) -> tuple[bool, dict[str, Any]]:
+    """Compare an attachment without exposing its private scene identity."""
+
+    if actual is None or expected is None:
+        matches = actual is None and expected is None
+        return matches, {
+            "expected_attached": expected is not None,
+            "actual_attached": actual is not None,
+            "matches": matches,
+        }
+    matches, _identity = _attachment_identity_status(
+        actual,
+        expected,
+        hand=hand,
+    )
+    return matches, {
+        "expected_attached": True,
+        "actual_attached": True,
+        "matches": matches,
+    }
+
+
 def _apply_fixed_trajectory_hold_segments(
     action: Any,
     hold_reference: Any,
     *,
     hand: str | None,
+    motion_scope: str = "arm_only",
 ) -> np.ndarray:
     """Freeze non-active 23D controller segments to one trajectory-start hold."""
 
     out = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM).copy()
     hold = np.asarray(hold_reference, dtype=np.float32).reshape(ACTION_DIM)
-    if hand is None:
+    if motion_scope not in _MOTION_SCOPES:
+        raise ValueError(f"unsupported analytic motion scope {motion_scope!r}")
+    if motion_scope == "whole_body":
+        locked_segments = ("left_gripper", "right_gripper")
+    elif hand is None:
         locked_segments = (
             "trunk",
             "left_arm",
@@ -339,14 +386,73 @@ def _apply_fixed_trajectory_hold_segments(
         active = _normalize_hand(hand)
         inactive = "right" if active == "left" else "left"
         locked_segments = (
-            "base",
-            f"{inactive}_arm",
-            "left_gripper",
-            "right_gripper",
+            ("base", f"{inactive}_arm", "left_gripper", "right_gripper")
+            if motion_scope == "arm_with_trunk"
+            else (
+                "base",
+                "trunk",
+                f"{inactive}_arm",
+                "left_gripper",
+                "right_gripper",
+            )
         )
     for segment_name in locked_segments:
         segment = ENV_ACTION_SEGMENTS[segment_name]
         out[segment] = hold[segment]
+    if hand is not None and motion_scope == "arm_with_trunk":
+        trunk = ENV_ACTION_SEGMENTS["trunk"]
+        out[trunk.stop - 1] = hold[trunk.stop - 1]
+    return out
+
+
+def _apply_single_arm_isolation_mask(
+    action: Any,
+    hold_reference: Any,
+    *,
+    hand: str,
+    gripper_only: bool,
+    motion_scope: str = "arm_only",
+) -> np.ndarray:
+    """Keep every controller outside the selected analytic scope at its hold."""
+
+    if motion_scope not in _MOTION_SCOPES:
+        raise ValueError(f"unsupported analytic motion scope {motion_scope!r}")
+    if motion_scope == "whole_body":
+        raise ValueError("whole-body motion must not use a single-arm isolation mask")
+    expected_scope = "gripper_only" if bool(gripper_only) else motion_scope
+    if bool(gripper_only) != (expected_scope == "gripper_only"):
+        raise ValueError("gripper_only and motion_scope disagree")
+    selected = _normalize_hand(hand)
+    inactive = "right" if selected == "left" else "left"
+    out = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM).copy()
+    hold = np.asarray(hold_reference, dtype=np.float32).reshape(ACTION_DIM)
+    locked_segments = (
+        (
+            "base",
+            "trunk",
+            "left_arm",
+            "right_arm",
+            f"{inactive}_gripper",
+        )
+        if bool(gripper_only)
+        else (
+            ("base", f"{inactive}_arm", "left_gripper", "right_gripper")
+            if motion_scope == "arm_with_trunk"
+            else (
+                "base",
+                "trunk",
+                f"{inactive}_arm",
+                "left_gripper",
+                "right_gripper",
+            )
+        )
+    )
+    for segment_name in locked_segments:
+        segment = ENV_ACTION_SEGMENTS[segment_name]
+        out[segment] = hold[segment]
+    if motion_scope == "arm_with_trunk":
+        trunk = ENV_ACTION_SEGMENTS["trunk"]
+        out[trunk.stop - 1] = hold[trunk.stop - 1]
     return out
 
 
@@ -355,7 +461,33 @@ def official_task_success(info: Any) -> bool:
     if not isinstance(info, dict):
         return False
     done = info.get("done")
-    return bool(done.get("success", False)) if isinstance(done, dict) else False
+    if not isinstance(done, dict):
+        return False
+    value = done.get("success", False)
+    return isinstance(value, (bool, np.bool_)) and bool(value)
+
+
+_TERMINAL_STEP_STOP_REASONS = frozenset(
+    {
+        "official_task_success",
+        "environment_terminated",
+        "environment_truncated",
+    }
+)
+
+
+def _terminal_step_outcome(
+    receipt: dict[str, bool | int],
+) -> tuple[bool, str] | None:
+    """Return the highest-priority terminal outcome from one executed env step."""
+
+    if receipt.get("raw_success") is True:
+        return True, "official_task_success"
+    if receipt.get("terminated") is True:
+        return False, "environment_terminated"
+    if receipt.get("truncated") is True:
+        return False, "environment_truncated"
+    return None
 
 
 def primitive_result(
@@ -372,13 +504,6 @@ def primitive_result(
     metric_values = _jsonable(metrics or {})
     diagnostic_values = _jsonable(diagnostics or {})
     joint_margin = metric_values.get("joint_margin")
-    collision_margin = metric_values.get("collision_margin")
-    if collision_margin is None:
-        collision_margin = metric_values.get("collision_margin_m")
-    if collision_margin is None and isinstance(
-        metric_values.get("collision_report"), dict
-    ):
-        collision_margin = metric_values["collision_report"].get("min_margin_m")
     return {
         "primitive_success": bool(primitive_success),
         "task_success": bool(task_success),
@@ -386,11 +511,9 @@ def primitive_result(
         "official_success_source": 'info["done"]["success"]',
         "stop_reason": str(stop_reason),
         "recoverable": bool(recoverable),
-        "suggested_next_tool": suggested_next_tool,
         "position_error_m": metric_values.get("final_position_error_m"),
         "orientation_error_rad": metric_values.get("final_orientation_error_rad"),
         "joint_margin": joint_margin,
-        "collision_margin_m": collision_margin,
         "elapsed_s": metric_values.get("elapsed_s"),
         "trace": diagnostic_values.get("trace", []),
         "trace_artifact": diagnostic_values.get("trace_artifact"),
@@ -399,11 +522,23 @@ def primitive_result(
     }
 
 
-def _planner_tool(
-    name: str,
-    *,
-    suggested_next_tool: str | None,
-):
+def _strip_public_flow_advice(value: Any) -> Any:
+    """Remove planner-prescribed ordering and phase structure from public output."""
+
+    if isinstance(value, dict):
+        return {
+            key: _strip_public_flow_advice(item)
+            for key, item in value.items()
+            if key != "suggested_next_tool" and "stage" not in key.lower()
+        }
+    if isinstance(value, list):
+        return [_strip_public_flow_advice(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_public_flow_advice(item) for item in value)
+    return value
+
+
+def _planner_tool(name: str):
     """Normalize every public planner call and persist its complete envelope."""
 
     def decorate(fn):
@@ -416,7 +551,16 @@ def _planner_tool(
                 if timeout_s is None:
                     result = fn(self, *args, **kwargs)
                 else:
-                    with _wall_clock_deadline(float(timeout_s), f"planner tool {name}"):
+                    public_deadline_s = float(timeout_s)
+                    if name == "move_to":
+                        public_deadline_s = min(
+                            public_deadline_s,
+                            WHOLE_BODY_TOTAL_DEADLINE_S,
+                        )
+                    with _wall_clock_deadline(
+                        public_deadline_s,
+                        f"planner tool {name}",
+                    ):
                         result = fn(self, *args, **kwargs)
                 if not isinstance(result, dict):
                     raise RuntimeError(
@@ -425,12 +569,13 @@ def _planner_tool(
             except Exception as exc:
                 result = self._exception_result(
                     exc,
-                    suggested_next_tool=suggested_next_tool,
+                    suggested_next_tool=None,
                 )
             metrics = result.setdefault("metrics", {})
             if isinstance(metrics, dict):
                 metrics.setdefault("elapsed_s", round(time.monotonic() - started, 3))
                 result["elapsed_s"] = metrics["elapsed_s"]
+            result = _strip_public_flow_advice(result)
             result["tool_artifact"] = self._persist_tool_artifact(
                 tool=name,
                 args=args,
@@ -551,21 +696,10 @@ class RealCuroboBackend:
         self._embodiment_cls: Any | None = None
         self._generators: dict[str, Any] = {}
         self._invalid_generators: set[str] = set()
-        self._recovering_generators: set[str] = set()
         self._config_paths: dict[str, Path] = {}
         self._base_workspace_limit_m: float | None = None
         self._last_base_candidate_summary: dict[str, Any] = {}
         self._attached_objects_by_hand: dict[str, Any] = {}
-        self._active_generator: Any | None = None
-        self._last_collision_step = -1
-        self._collision_check_interval_steps = 4
-        self._last_obstacle_update_step = -1
-        self._base_obstacle_world_step = -1
-        self._last_collision_report: dict[str, Any] = {
-            "available": False,
-            "reason": "not_checked",
-            "min_margin_m": None,
-        }
         self._last_actual_velocity: np.ndarray | None = None
         self._last_actual_velocity_step: int | None = None
         # Phase one has been the stable branch for the R1Pro contact corridor
@@ -574,19 +708,10 @@ class RealCuroboBackend:
         # independently retryable.
         self._guarded_seed_counter = 1
 
-    def on_simulator_state_restored(self) -> None:
-        """Invalidate live feedback caches after an acceptance-only restore."""
+    def on_runtime_state_changed(self) -> None:
+        """Invalidate live feedback caches after a controller or q-state change."""
 
         self._attached_objects_by_hand.clear()
-        self._active_generator = None
-        self._last_collision_step = -1
-        self._last_obstacle_update_step = -1
-        self._base_obstacle_world_step = -1
-        self._last_collision_report = {
-            "available": False,
-            "reason": "simulator_state_restored",
-            "min_margin_m": None,
-        }
         self._last_actual_velocity = None
         self._last_actual_velocity_step = None
         self._base_workspace_limit_m = None
@@ -594,7 +719,8 @@ class RealCuroboBackend:
 
     @staticmethod
     def _generator_key(*, kind: str, hand: str = "left") -> str:
-        return f"{kind}:{_normalize_hand(hand) if kind in {'arm', 'prepress_arm'} else 'left'}"
+        hand_kinds = {"arm", "attached_arm", "arm_with_trunk", "whole_body"}
+        return f"{kind}:{_normalize_hand(hand) if kind in hand_kinds else 'left'}"
 
     def _record_generator_recovery(self, event: dict[str, Any]) -> None:
         path = self.output_dir / "planner_generator_recovery.jsonl"
@@ -616,126 +742,39 @@ class RealCuroboBackend:
         hand: str = "left",
         reason: str,
     ) -> dict[str, Any]:
-        """Discard a generator whose temporary OG collision state is uncertain."""
+        """Discard a generator whose temporary planner state is uncertain."""
 
         key = self._generator_key(kind=kind, hand=hand)
         discarded = self._generators.pop(key, None)
-        if discarded is not None and self._active_generator is discarded:
-            self._active_generator = None
         self._invalid_generators.add(key)
-        if kind == "base":
-            self._base_obstacle_world_step = -1
         event = {
             "event": "generator_quarantined",
             "generator_key": key,
             "reason": str(reason),
             "monotonic_ns": time.monotonic_ns(),
-            "requires_rebuild_and_warmup": True,
+            "requires_fresh_rebuild": True,
         }
         self._record_generator_recovery(event)
         del discarded
         gc.collect()
         return event
 
-    def _warmup_rebuilt_generator(self, *, kind: str, hand: str) -> dict[str, Any]:
-        """Prove a fresh generator safe before returning it to movement RPCs."""
-
-        report: dict[str, Any] = {"kind": kind, "hand": hand, "checks": {}}
-        if kind == "base":
-            robot = self._find_robot()
-            current = self._base_xy_yaw(robot)
-            result = self._compute_base_plan(
-                target_xyyaw=current[:3],
-                timeout_s=120.0,
-            )
-        else:
-            generator = self._generators[self._generator_key(kind=kind, hand=hand)]
-            robot = self._find_robot()
-            current_q = np.asarray(
-                _jsonable(robot.get_joint_positions()), dtype=np.float32
-            ).reshape(1, -1)
-            collision = self._check_q_trajectory_collisions(
-                generator,
-                current_q,
-                skip_obstacle_update=False,
-            )
-            report["checks"]["current_q_combined_collision"] = collision
-            if not bool(collision.get("available", False)) or bool(
-                collision.get("colliding", True)
-            ):
-                raise RuntimeError("fresh ARM current-q collision warmup failed")
-            target_xyz, target_quat = self._curobo_eef_poses(generator, current_q)
-            report["checks"]["current_q_fk"] = {
-                "available": True,
-                "target_xyz": target_xyz[0].tolist(),
-                "target_quat_xyzw": target_quat[0].tolist(),
-            }
-            planner_checks = (
-                (
-                    "collision_ik",
-                    lambda: self._compute_arm_plan(
-                        hand=hand,
-                        target_xyz=target_xyz[0],
-                        target_quat_xyzw=target_quat[0],
-                        timeout_s=30.0,
-                        ik_only=True,
-                        generator_kind=kind,
-                    ),
-                ),
-                (
-                    "full_trajectory",
-                    lambda: self._compute_arm_plan(
-                        hand=hand,
-                        target_xyz=target_xyz[0],
-                        target_quat_xyzw=target_quat[0],
-                        timeout_s=120.0,
-                        ik_only=False,
-                        generator_kind=kind,
-                    ),
-                ),
-                (
-                    "guarded_ik",
-                    lambda: self._compute_arm_plan(
-                        hand=hand,
-                        target_xyz=target_xyz[0],
-                        target_quat_xyzw=target_quat[0],
-                        timeout_s=60.0,
-                        ik_only=True,
-                        ik_world_collision_check=False,
-                        return_ik_solution=True,
-                        guarded_contact_target_xyz=None,
-                        generator_kind=kind,
-                    ),
-                ),
-            )
-            result = {"ok": True}
-            for check_name, check in planner_checks:
-                result = check()
-                report["checks"][check_name] = _artifact_jsonable(result)
-                if not bool(result.get("ok", False)):
-                    break
-        if not bool(result.get("ok", False)):
-            raise RuntimeError(
-                f"fresh {kind}:{hand} generator warmup failed: "
-                f"{result.get('stop_reason', 'unknown')}"
-            )
-        report["ok"] = True
-        return report
-
     def warmup(self) -> dict[str, Any]:
-        """Compile planner kernels and freeze the post-reset obstacle world.
+        """Compile the whole-body planner kernels used by analytic primitives.
 
         This runs before any public planner-tool deadline starts.  It performs
-        real collision-checked queries at the current robot state, but never
-        executes an action or advances the simulator.
+        one collision-certified identity query per hand, but never executes an
+        action or advances the simulator.
         """
         started = time.monotonic()
-        robot = self._find_robot()
-        current_base = self._base_xy_yaw(robot)
         report: dict[str, Any] = {
             "status": "running",
-            "current_base_xyyaw": current_base[:3].tolist(),
             "stages": {},
+            "identity_warmup": {
+                "env_actions_sent": 0,
+                "simulator_advanced": False,
+                "hands": [],
+            },
         }
         path = self.output_dir / "planner_curobo_warmup.json"
 
@@ -764,120 +803,74 @@ class RealCuroboBackend:
             }
             return value
 
-        stage(
-            "base_collision_world_batch1",
-            lambda: self._candidate_base_collision_reports(
-                robot, [current_base[:3].copy()]
-            ),
-        )
-        base_plan = stage(
-            "base_full_trajectory",
-            lambda: self._compute_base_plan(
-                target_xyyaw=current_base[:3], timeout_s=60.0
-            ),
-        )
-        if not bool(base_plan.get("ok", False)):
-            report["status"] = "error"
-            report["elapsed_s"] = round(time.monotonic() - started, 3)
-            save()
-            raise RuntimeError(
-                "BASE cuRobo warmup failed closed: "
-                f"{base_plan.get('stop_reason', 'unknown')}"
-            )
-        current_q = np.asarray(
-            _jsonable(robot.get_joint_positions()), dtype=np.float32
-        ).reshape(-1)
-        stage(
-            "base_full_path_collision_batch16",
-            lambda: self._check_q_trajectory_collisions(
-                self._generator(kind="base"),
-                np.stack([current_q] * 16),
-                skip_obstacle_update=True,
-            ),
-        )
         for hand in ("left", "right"):
             eef_pose = self.get_eef_pose(hand)
             if eef_pose is None:
                 raise RuntimeError(f"R1Pro {hand} EEF pose unavailable during warmup")
-            arm_plan = stage(
-                f"arm_{hand}_collision_ik",
-                lambda hand=hand, eef_pose=eef_pose: self._compute_arm_plan(
+            whole_body_plan = stage(
+                f"whole_body_{hand}_identity_trajectory",
+                lambda hand=hand, eef_pose=eef_pose: self.plan_whole_body_trajectory(
                     hand=hand,
                     target_xyz=np.asarray(eef_pose[0], dtype=np.float64),
                     target_quat_xyzw=np.asarray(eef_pose[1], dtype=np.float64),
-                    timeout_s=30.0,
-                    ik_only=True,
+                    timeout_s=WHOLE_BODY_PLANNING_DEADLINE_S,
                 ),
             )
-            if not bool(arm_plan.get("ok", False)):
+            if not bool(whole_body_plan.get("ok", False)):
                 report["status"] = "error"
                 report["elapsed_s"] = round(time.monotonic() - started, 3)
                 save()
                 raise RuntimeError(
-                    f"{hand} ARM cuRobo warmup failed closed: "
-                    f"{arm_plan.get('stop_reason', 'unknown')}"
+                    f"{hand} whole-body cuRobo warmup failed closed: "
+                    f"{whole_body_plan.get('stop_reason', 'unknown')}"
                 )
-            arm_trajectory = stage(
-                f"arm_{hand}_full_trajectory",
-                lambda hand=hand, eef_pose=eef_pose: self._compute_arm_plan(
-                    hand=hand,
-                    target_xyz=np.asarray(eef_pose[0], dtype=np.float64),
-                    target_quat_xyzw=np.asarray(eef_pose[1], dtype=np.float64),
-                    timeout_s=120.0,
-                    ik_only=False,
-                ),
+            identity_metrics = (
+                whole_body_plan.get("metrics")
+                if isinstance(whole_body_plan.get("metrics"), dict)
+                else {}
             )
-            if not bool(arm_trajectory.get("ok", False)):
-                report["status"] = "error"
-                report["elapsed_s"] = round(time.monotonic() - started, 3)
-                save()
-                raise RuntimeError(
-                    f"{hand} ARM trajectory warmup failed closed: "
-                    f"{arm_trajectory.get('stop_reason', 'unknown')}"
-                )
-            guarded_plan = stage(
-                f"arm_{hand}_guarded_local_ik",
-                lambda hand=hand, eef_pose=eef_pose: self.plan_guarded_ik_step(
-                    hand=hand,
-                    target_xyz=np.asarray(eef_pose[0], dtype=np.float64),
-                    target_quat_xyzw=np.asarray(eef_pose[1], dtype=np.float64),
-                    timeout_s=60.0,
-                    contact_target_xyz=None,
-                ),
+            report["identity_warmup"]["hands"].append(
+                {
+                    "hand": hand,
+                    "query": "identity_trajectory",
+                    "ok": whole_body_plan.get("ok") is True,
+                    "stop_reason": whole_body_plan.get("stop_reason"),
+                    "trajectory_waypoints": identity_metrics.get("trajectory_waypoints"),
+                    "collision_admitted": (
+                        identity_metrics.get("collision_admission", {}).get("admitted")
+                        is True
+                    ),
+                    "active_dof_count": identity_metrics.get("active_dof_count"),
+                    "selected_eef_goal_count": identity_metrics.get(
+                        "selected_eef_goal_count"
+                    ),
+                }
             )
-            if not bool(guarded_plan.get("ok", False)):
-                report["status"] = "error"
-                report["elapsed_s"] = round(time.monotonic() - started, 3)
-                save()
-                raise RuntimeError(
-                    f"{hand} guarded local IK warmup failed closed: "
-                    f"{guarded_plan.get('stop_reason', 'unknown')}"
-                )
         report["status"] = "complete"
         report["elapsed_s"] = round(time.monotonic() - started, 3)
         save()
         report["artifact"] = str(path)
         return report
 
-    def warmup_prepress(
+    def warmup_attached_arm(
         self,
         *,
         hand: str,
         expected_attached_root: Any,
-        ignore_collision_checks: bool = False,
     ) -> dict[str, Any]:
-        """Warm only the attachment-aware held-arm planner used pre-press."""
+        """Warm the attachment-aware held-arm planner without executing motion."""
 
         hand = _normalize_hand(hand)
         started = time.monotonic()
-        path = self.output_dir / "planner_prepress_warmup.json"
+        path = self.output_dir / "planner_attached_arm_warmup.json"
         report: dict[str, Any] = {
             "status": "running",
-            "generator_kind": "prepress_arm",
+            "generator_kind": "attached_arm",
             "held_hand": hand,
             "base_generator_warmed": False,
             "unrelated_press_arm_generator_warmed": False,
             "stages": {},
+            "warnings": [],
         }
 
         def save() -> None:
@@ -892,7 +885,7 @@ class RealCuroboBackend:
             attached = self.get_attached_object(hand)
             if not isinstance(attached, dict) or not attached:
                 raise RuntimeError(
-                    f"{hand} pre-press warmup requires the held collision body"
+                    f"{hand} attached-arm warmup requires the held collision body"
                 )
             expected_path = str(
                 getattr(expected_attached_root, "prim_path", "")
@@ -908,132 +901,94 @@ class RealCuroboBackend:
             )
             if not root_matches_expected:
                 raise RuntimeError(
-                    f"{hand} pre-press attached body is not the selected radio"
+                    f"{hand} attached body does not match the selected object"
                 )
             report["attached_collision_body"] = {
                 "available": True,
-                "root_matches_expected_radio": True,
+                "root_matches_expected_object": True,
                 "eef_links": sorted(str(key) for key in attached),
                 "prim_paths": sorted(
                     str(getattr(value, "prim_path", "")) for value in attached.values()
                 ),
             }
-            if ignore_collision_checks:
-                skipped = {
-                    "ok": True,
-                    "collision_checks_skipped": True,
-                    "authorization": "stage3_post_press_debug_mirror_restore",
-                }
-                for stage_name in (
-                    "current_q_attached_combined_collision",
-                    "current_pose_attached_full_trajectory",
-                    "identity_neighborhood_connected_path",
-                ):
-                    report["stages"][stage_name] = dict(skipped)
-                report["robot_q_pose_jump_max"] = 0.0
-                report["status"] = "complete"
-                report["target_plan_validation"] = (
-                    "collision warmup skipped only for an explicitly restored "
-                    "stage-3 press mirror; direct stage-3 motion retains joint, "
-                    "dynamics, contact, and locked-segment guards"
-                )
-                report["elapsed_s"] = round(time.monotonic() - started, 3)
-                report["artifact"] = str(path)
-                save()
-                return report
-            generator = self._generator(kind="prepress_arm", hand=hand)
-            current_collision = self._check_q_trajectory_collisions(
-                generator,
-                pre_q.reshape(1, -1),
-                attached_obj=attached,
-                skip_obstacle_update=False,
-            )
-            report["stages"]["current_q_attached_combined_collision"] = {
-                "ok": bool(
-                    current_collision.get("available", False)
-                    and not current_collision.get("colliding", True)
-                ),
-                "result": _artifact_jsonable(current_collision),
-            }
-            if not bool(current_collision.get("available", False)) or bool(
-                current_collision.get("colliding", True)
-            ):
-                raise RuntimeError(
-                    f"{hand} pre-press current-q attached collision check failed"
-                )
-            eef_pose = self.get_eef_pose(hand)
-            if eef_pose is None:
-                raise RuntimeError(f"R1Pro {hand} EEF pose unavailable during warmup")
-            full_plan = self._compute_arm_plan(
-                hand=hand,
-                target_xyz=np.asarray(eef_pose[0], dtype=np.float64),
-                target_quat_xyzw=np.asarray(eef_pose[1], dtype=np.float64),
-                timeout_s=120.0,
-                ik_only=False,
-                attached_obj=attached,
-                generator_kind="prepress_arm",
-            )
-            report["stages"]["current_pose_attached_full_trajectory"] = {
-                "ok": bool(full_plan.get("ok", False)),
-                "stop_reason": full_plan.get("stop_reason"),
-                "metrics": _artifact_jsonable(full_plan.get("metrics", {})),
-            }
-            if not bool(full_plan.get("ok", False)):
-                raise RuntimeError(
-                    f"{hand} pre-press trajectory warmup failed: "
-                    f"{full_plan.get('stop_reason', 'unknown')}"
-                )
-            q_path = np.asarray(
-                _jsonable(full_plan.get("joint_trajectory")), dtype=np.float32
+            generator = self._generator(kind="attached_arm", hand=hand)
+            target_xyz, target_quat = self._curobo_eef_poses(
+                generator, pre_q.reshape(1, -1)
             )
             if (
-                q_path.ndim != 2
-                or q_path.shape[0] < 1
-                or q_path.shape[1] != pre_q.size
-                or not np.isfinite(q_path).all()
+                target_xyz.shape != (1, 3)
+                or target_quat.shape != (1, 4)
+                or not np.isfinite(target_xyz).all()
+                or not np.isfinite(target_quat).all()
             ):
-                raise RuntimeError("pre-press warmup trajectory q layout is invalid")
-            first_delta = float(np.max(np.abs(q_path[0] - pre_q)))
-            terminal_delta = float(np.max(np.abs(q_path[-1] - pre_q)))
-            path_delta = float(np.max(np.abs(q_path - pre_q.reshape(1, -1))))
-            connected_collision = self._check_q_trajectory_collisions(
-                generator,
-                np.vstack([pre_q.reshape(1, -1), q_path]),
-                attached_obj=attached,
-                skip_obstacle_update=False,
-            )
-            identity_ok = bool(
-                first_delta <= PREPRESS_WARMUP_ENDPOINT_MAX_JOINT_DELTA_RAD
-                and terminal_delta <= PREPRESS_WARMUP_ENDPOINT_MAX_JOINT_DELTA_RAD
-                and path_delta <= PREPRESS_WARMUP_PATH_MAX_JOINT_DELTA_RAD
-                and connected_collision.get("available", False)
-                and not connected_collision.get("colliding", True)
-            )
-            report["stages"]["identity_neighborhood_connected_path"] = {
-                "ok": identity_ok,
-                "trajectory_waypoints": int(q_path.shape[0]),
-                "first_max_joint_delta_rad": first_delta,
-                "terminal_max_joint_delta_rad": terminal_delta,
-                "path_max_joint_delta_rad": path_delta,
-                "endpoint_max_joint_delta_rad": (
-                    PREPRESS_WARMUP_ENDPOINT_MAX_JOINT_DELTA_RAD
-                ),
-                "path_max_joint_delta_limit_rad": (
-                    PREPRESS_WARMUP_PATH_MAX_JOINT_DELTA_RAD
-                ),
-                "connected_attached_collision": _artifact_jsonable(connected_collision),
+                raise RuntimeError(
+                    f"R1Pro {hand} CuRobo EEF pose unavailable during warmup"
+                )
+            report["stages"]["current_q_curobo_fk"] = {
+                "ok": True,
+                "target_xyz": target_xyz[0].tolist(),
+                "target_quat_xyzw": target_quat[0].tolist(),
             }
-            if not identity_ok:
-                raise RuntimeError(f"{hand} pre-press identity warmup path is unsafe")
+            identity_plan = self.plan_attached_arm_trajectory(
+                hand=hand,
+                target_xyz=target_xyz[0],
+                target_quat_xyzw=target_quat[0],
+                timeout_s=120.0,
+                attached_obj=attached,
+            )
+            report["stages"]["current_pose_attached_ik"] = {
+                "ok": bool(identity_plan.get("ok", False)),
+                "diagnostic_only": True,
+                "stop_reason": identity_plan.get("stop_reason"),
+                "metrics": _artifact_jsonable(identity_plan.get("metrics", {})),
+            }
+            if not bool(identity_plan.get("ok", False)):
+                report["warnings"].append(
+                    f"{hand} identity IK diagnostic did not return a solution: "
+                    f"{identity_plan.get('stop_reason', 'unknown')}"
+                )
+            q_path = np.asarray(
+                _jsonable(identity_plan.get("joint_trajectory")), dtype=np.float32
+            )
+            q_path_valid = bool(
+                q_path.ndim == 2
+                and q_path.shape[0] >= 1
+                and q_path.shape[1] == pre_q.size
+                and np.isfinite(q_path).all()
+            )
+            if not q_path_valid:
+                report["warnings"].append(
+                    "identity IK diagnostic returned no usable joint path"
+                )
             post_q = np.asarray(
                 _jsonable(robot.get_joint_positions()), dtype=np.float32
             ).reshape(-1)
             if post_q.shape != pre_q.shape or not np.isfinite(post_q).all():
-                raise RuntimeError("pre-press warmup changed the robot q layout")
+                raise RuntimeError("attached-arm warmup changed the robot q layout")
             pose_jump = float(np.max(np.abs(post_q - pre_q)))
             report["robot_q_pose_jump_max"] = pose_jump
             if pose_jump > 1e-6:
-                raise RuntimeError("pre-press warmup moved the robot")
+                raise RuntimeError("attached-arm warmup moved the robot")
+            if q_path_valid:
+                first_delta = float(np.max(np.abs(q_path[0] - pre_q)))
+                terminal_delta = float(np.max(np.abs(q_path[-1] - pre_q)))
+                path_delta = float(np.max(np.abs(q_path - pre_q.reshape(1, -1))))
+                report["stages"]["identity_ik_path"] = {
+                    "ok": True,
+                    "diagnostic_only": True,
+                    "trajectory_waypoints": int(q_path.shape[0]),
+                    "first_max_joint_delta_rad": first_delta,
+                    "terminal_max_joint_delta_rad": terminal_delta,
+                    "path_max_joint_delta_rad": path_delta,
+                    "robot_q_pose_jump_max": pose_jump,
+                }
+            else:
+                report["stages"]["identity_ik_path"] = {
+                    "ok": False,
+                    "diagnostic_only": True,
+                    "trajectory_waypoints": 0,
+                    "robot_q_pose_jump_max": pose_jump,
+                }
         except Exception as exc:
             report["status"] = "error"
             report["error"] = f"{type(exc).__name__}: {exc}"
@@ -1042,8 +997,8 @@ class RealCuroboBackend:
             raise
         report["status"] = "complete"
         report["target_plan_validation"] = (
-            "full attached-radio plan and collision recheck required again "
-            "by every move_to"
+            "warmup identity results are diagnostic only; public motion uses fresh "
+            "no-collision-admission IK"
         )
         report["elapsed_s"] = round(time.monotonic() - started, 3)
         report["artifact"] = str(path)
@@ -1143,9 +1098,21 @@ class RealCuroboBackend:
                     return candidate
         raise RuntimeError("could not locate R1Pro cuRobo YAML assets")
 
-    def _hand_config_path(self, hand: str, *, lock_trunk: bool = False) -> Path:
+    def _hand_config_path(
+        self,
+        hand: str,
+        *,
+        lock_trunk: bool = False,
+        motion_scope: str = "arm_only",
+    ) -> Path:
         hand = _normalize_hand(hand)
-        cache_key = f"{hand}:prepress" if lock_trunk else hand
+        if motion_scope not in {"arm_only", "arm_with_trunk"}:
+            raise ValueError(f"unsupported arm motion scope {motion_scope!r}")
+        cache_key = (
+            f"{hand}:arm_with_trunk"
+            if motion_scope == "arm_with_trunk"
+            else (f"{hand}:attached" if lock_trunk else hand)
+        )
         if cache_key in self._config_paths:
             return self._config_paths[cache_key]
         robot = self._find_robot()
@@ -1184,25 +1151,106 @@ class RealCuroboBackend:
         ):
             self._validate_joint_name(robot, joint)
             lock_joints.setdefault(joint, None)
-        if lock_trunk:
-            trunk_indices = _indices(getattr(robot, "trunk_control_idx", []))
-            joint_names = list((getattr(robot, "joints", {}) or {}).keys())
-            if len(trunk_indices) != 4 or max(trunk_indices, default=-1) >= len(
-                joint_names
-            ):
-                raise RuntimeError("R1Pro pre-press trunk joint indices unavailable")
-            for index in trunk_indices:
-                joint = joint_names[index]
-                self._validate_joint_name(robot, joint)
-                lock_joints.setdefault(joint, None)
+        trunk_indices = _indices(getattr(robot, "trunk_control_idx", []))
+        joint_names = list((getattr(robot, "joints", {}) or {}).keys())
+        if len(trunk_indices) != 4 or max(trunk_indices, default=-1) >= len(
+            joint_names
+        ):
+            raise RuntimeError("R1Pro arm trunk joint indices unavailable")
+        locked_trunk_indices = (
+            trunk_indices[-1:] if motion_scope == "arm_with_trunk" else trunk_indices
+        )
+        for index in locked_trunk_indices:
+            joint = joint_names[index]
+            self._validate_joint_name(robot, joint)
+            lock_joints.setdefault(joint, None)
         self._validate_lock_joint_names(robot, lock_joints)
         kinematics["lock_joints"] = dict(sorted(lock_joints.items()))
         out_dir = self.output_dir / "planner_curobo_configs"
         out_dir.mkdir(parents=True, exist_ok=True)
-        suffix = "_prepress" if lock_trunk else ""
+        suffix = (
+            "_arm_with_trunk"
+            if motion_scope == "arm_with_trunk"
+            else ("_attached" if lock_trunk else "")
+        )
         out = out_dir / f"r1pro_description_curobo_arm_{hand}{suffix}.yaml"
         with out.open("w", encoding="utf-8") as f:
             yaml.safe_dump(cfg, f, sort_keys=False)
+        self._config_paths[cache_key] = out
+        return out
+
+    def _whole_body_config_path(self, hand: str) -> Path:
+        """Generate a live-regularized 21-DOF R1Pro cuRobo configuration."""
+
+        hand = _normalize_hand(hand)
+        cache_key = f"{hand}:whole_body"
+        if cache_key in self._config_paths:
+            return self._config_paths[cache_key]
+        robot = self._find_robot()
+        source = self._asset_curobo_dir(robot) / "r1pro_description_curobo_default.yaml"
+        if not source.is_file():
+            raise RuntimeError(f"official R1Pro whole-body config is missing: {source}")
+        try:
+            import yaml
+        except Exception as exc:
+            raise RuntimeError(
+                "PyYAML is required to generate whole-body cuRobo config"
+            ) from exc
+
+        with source.open("r", encoding="utf-8") as stream:
+            cfg = yaml.safe_load(stream)
+        kinematics = cfg["robot_cfg"]["kinematics"]
+        cspace = kinematics["cspace"]
+        joint_names = [str(name) for name in cspace["joint_names"]]
+        if len(joint_names) != 28 or len(set(joint_names)) != 28:
+            raise RuntimeError(
+                "official R1Pro whole-body config must expose 28 unique joints"
+            )
+        for joint_name in joint_names:
+            self._validate_joint_name(robot, joint_name)
+        active = [name for name in joint_names if name in WHOLE_BODY_ACTIVE_JOINT_NAMES]
+        locked = [name for name in joint_names if name in WHOLE_BODY_LOCKED_JOINT_NAMES]
+        if (
+            len(active) != 21
+            or set(active) != set(WHOLE_BODY_ACTIVE_JOINT_NAMES)
+            or len(locked) != 7
+            or set(locked) != set(WHOLE_BODY_LOCKED_JOINT_NAMES)
+        ):
+            raise RuntimeError(
+                f"invalid R1Pro whole-body joint partition: active={active!r}, "
+                f"locked={locked!r}"
+            )
+
+        kinematics["ee_link"] = self._eef_link_name(robot, hand)
+        # The non-selected EEF is intentionally unconstrained.  Both arms stay
+        # in the 21-DOF optimization and both attachment bodies remain in the
+        # collision model, but no inactive-link world pose is submitted.
+        kinematics["link_names"] = []
+        kinematics["lock_joints"] = dict.fromkeys(WHOLE_BODY_LOCKED_JOINT_NAMES)
+        self._validate_lock_joint_names(robot, kinematics["lock_joints"])
+
+        q = np.asarray(
+            _jsonable(robot.get_joint_positions()), dtype=np.float64
+        ).reshape(-1)
+        robot_joint_names = list((getattr(robot, "joints", {}) or {}).keys())
+        if len(q) != len(robot_joint_names):
+            raise RuntimeError("R1Pro joint-position/name layout is inconsistent")
+        q_by_name = {
+            str(name): float(q[index]) for index, name in enumerate(robot_joint_names)
+        }
+        if any(name not in q_by_name for name in joint_names):
+            raise RuntimeError("R1Pro live retract configuration is incomplete")
+        cspace["retract_config"] = [q_by_name[name] for name in joint_names]
+
+        weights = [1.0] * len(joint_names)
+        cspace["cspace_distance_weight"] = weights
+        cspace["null_space_weight"] = weights
+
+        out_dir = self.output_dir / "planner_curobo_configs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"r1pro_description_curobo_whole_body_{hand}.yaml"
+        with out.open("w", encoding="utf-8") as stream:
+            yaml.safe_dump(cfg, stream, sort_keys=False)
         self._config_paths[cache_key] = out
         return out
 
@@ -1239,6 +1287,12 @@ class RealCuroboBackend:
             value = eef_names.get(hand)
             if value:
                 expected = str(value)
+        canonical = EEF_LINK_BY_HAND[_normalize_hand(hand)]
+        if expected != canonical:
+            raise RuntimeError(
+                f"R1Pro {hand} EEF link drifted from the BEHAVIOR collision "
+                f"contract: runtime={expected!r} expected={canonical!r}"
+            )
         links = getattr(robot, "links", {}) or {}
         if expected not in links:
             raise RuntimeError(
@@ -1257,83 +1311,33 @@ class RealCuroboBackend:
         for joint in lock_joints:
             self._validate_joint_name(robot, str(joint))
 
-    def _probe_generator_lock_resolution(
-        self,
-        generator: Any,
-        *,
-        kind: str,
-        hand: str,
-        emb_sel: Any | None = None,
-    ) -> None:
-        """Fail early if official null lock_joints were not resolved by OG/cuRobo."""
-        update = getattr(generator, "update_locked_joints", None)
-        if update is not None:
-            try:
-                from omnigibson import lazy
-
-                if emb_sel is None:
-                    emb_sel = (
-                        self._embodiment_cls.DEFAULT
-                        if self._embodiment_cls is not None
-                        else None
-                    )
-                robot = self._find_robot()
-                torch = self._torch
-                if torch is None:
-                    import torch as torch  # type: ignore[no-redef]
-                batch_size = int(getattr(generator, "batch_size", 1))
-                q_pos = torch.stack([robot.get_joint_positions()] * batch_size, dim=0)
-                zeros = torch.zeros_like(q_pos)
-                cu_joint_state = lazy.curobo.types.state.JointState(
-                    position=generator._tensor_args.to_device(q_pos),
-                    velocity=generator._tensor_args.to_device(zeros),
-                    acceleration=generator._tensor_args.to_device(zeros),
-                    jerk=generator._tensor_args.to_device(zeros),
-                    joint_names=generator.robot_joint_names,
-                )
-                update(cu_joint_state, emb_sel)
-                kc = generator.mg[emb_sel].kinematics.kinematics_config
-                positions = np.asarray(
-                    _jsonable(kc.lock_jointstate.position), dtype=np.float64
-                )
-                if not np.isfinite(positions).all():
-                    raise RuntimeError(
-                        "resolved lock joint positions contain NaN or infinity"
-                    )
-                return
-            except Exception as exc:
-                raise RuntimeError(
-                    f"failed to verify cuRobo {kind}:{hand} null lock_joints resolution"
-                ) from exc
-        lock_attrs = ("lock_joints", "_lock_joints", "locked_joints", "_locked_joints")
-        for attr in lock_attrs:
-            if not hasattr(generator, attr):
-                continue
-            value = getattr(generator, attr)
-            if value is None:
-                continue
-            flat = _jsonable(value)
-            if _contains_none(flat):
-                raise RuntimeError(
-                    f"cuRobo {kind}:{hand} lock_joints still contain null after runtime parsing"
-                )
-            return
-
     def _generator(self, *, kind: str, hand: str = "left") -> Any:
         self._lazy_imports()
         robot = self._find_robot()
         key = self._generator_key(kind=kind, hand=hand)
         if key in self._generators:
             return self._generators[key]
-        if kind in {"arm", "prepress_arm"}:
-            config_path = (
-                self._hand_config_path(hand, lock_trunk=True)
-                if kind == "prepress_arm"
-                else self._hand_config_path(hand)
-            )
+        if kind in {"arm", "attached_arm", "arm_with_trunk", "whole_body"}:
+            if kind == "whole_body":
+                config_path = self._whole_body_config_path(hand)
+            else:
+                motion_scope = (
+                    "arm_with_trunk" if kind == "arm_with_trunk" else "arm_only"
+                )
+                config_path = (
+                    self._hand_config_path(
+                        hand,
+                        lock_trunk=False,
+                        motion_scope=motion_scope,
+                    )
+                    if motion_scope == "arm_with_trunk"
+                    else self._hand_config_path(
+                        hand,
+                        lock_trunk=kind == "attached_arm",
+                    )
+                )
             robot_cfg_path: Any = str(config_path)
             use_default_embodiment_only = True
-            emb_sel = self._embodiment_cls.DEFAULT
         elif kind == "base":
             robot_cfg_path = dict(getattr(robot, "curobo_path", {}) or {})
             if not robot_cfg_path:
@@ -1347,7 +1351,7 @@ class RealCuroboBackend:
             raise ValueError(f"unknown cuRobo generator kind {kind!r}")
         assert self._curobo_cls is not None
         generator_cls = self._curobo_cls
-        if kind == "base":
+        if kind in {"base", "whole_body"}:
             workspace_limit_m = self._base_prismatic_workspace_limit(robot)
             parent_cls = generator_cls
 
@@ -1369,6 +1373,42 @@ class RealCuroboBackend:
                         joint_limits.position[0][index] = -workspace_limit_m
                         joint_limits.position[1][index] = workspace_limit_m
 
+                def plan_batch(
+                    inner_self,
+                    start_state,
+                    goal_pose,
+                    plan_config,
+                    link_poses=None,
+                    emb_sel=None,
+                ):
+                    """Apply one Behavior-owned per-query MotionGen policy."""
+
+                    override = getattr(inner_self, "_rpent_plan_override", None)
+                    if isinstance(override, dict):
+                        plan_config.enable_graph = bool(
+                            override.get("enable_graph", False)
+                        )
+                        plan_config.enable_graph_attempt = None
+                        plan_config.timeout = float(override["timeout_s"])
+                        if bool(override.get("position_only", False)):
+                            from curobo.rollout.cost.pose_cost import PoseCostMetric
+
+                            plan_config.pose_cost_metric = PoseCostMetric(
+                                reach_partial_pose=True,
+                                reach_vec_weight=inner_self._tensor_args.to_device(
+                                    [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+                                ),
+                            )
+                    kwargs = {"link_poses": link_poses}
+                    if emb_sel is not None:
+                        kwargs["emb_sel"] = emb_sel
+                    return super().plan_batch(
+                        start_state,
+                        goal_pose,
+                        plan_config,
+                        **kwargs,
+                    )
+
             generator_cls = _SceneWorkspaceCuroboMotionGenerator
         generator = generator_cls(
             robot,
@@ -1378,52 +1418,23 @@ class RealCuroboBackend:
                 "num_trajopt_seeds": 4,
                 "num_graph_seeds": 4,
                 "finetune_trajopt_iters": 100,
+                "self_collision_check": kind in {"arm_with_trunk", "whole_body"},
             },
             batch_size=2,
             use_cuda_graph=False,
             use_default_embodiment_only=use_default_embodiment_only,
-            collision_activation_distance=CUROBO_COLLISION_ACTIVATION_DISTANCE_M,
-        )
-        self._probe_generator_lock_resolution(
-            generator,
-            kind=kind,
-            hand=hand,
-            emb_sel=emb_sel,
         )
         self._generators[key] = generator
         if key in self._invalid_generators:
-            self._recovering_generators.add(key)
-            recovery_started = time.monotonic()
-            try:
-                recovery_report = self._warmup_rebuilt_generator(kind=kind, hand=hand)
-            except BaseException as exc:
-                self._generators.pop(key, None)
-                self._record_generator_recovery(
-                    {
-                        "event": "generator_recovery_failed",
-                        "generator_key": key,
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "elapsed_s": round(time.monotonic() - recovery_started, 3),
-                        "monotonic_ns": time.monotonic_ns(),
-                    }
-                )
-                raise RuntimeError(
-                    f"{key} generator recovery failed closed: {exc}"
-                ) from exc
-            else:
-                self._invalid_generators.remove(key)
-                self._record_generator_recovery(
-                    {
-                        "event": "generator_recovered",
-                        "generator_key": key,
-                        "elapsed_s": round(time.monotonic() - recovery_started, 3),
-                        "monotonic_ns": time.monotonic_ns(),
-                        "fresh_instance": True,
-                        "warmup": _artifact_jsonable(recovery_report),
-                    }
-                )
-            finally:
-                self._recovering_generators.discard(key)
+            self._invalid_generators.remove(key)
+            self._record_generator_recovery(
+                {
+                    "event": "generator_rebuilt",
+                    "generator_key": key,
+                    "monotonic_ns": time.monotonic_ns(),
+                    "fresh_instance": True,
+                }
+            )
         return generator
 
     def _base_prismatic_workspace_limit(self, robot: Any) -> float:
@@ -1434,7 +1445,7 @@ class RealCuroboBackend:
         that interval (instance 211 starts at x=5.213 m), which makes even the
         current BASE pose an impossible IK goal.  Only these two virtual
         workspace bounds are widened; all physical, velocity, acceleration,
-        collision, and locked-joint limits remain official.
+        and locked-joint limits remain official.
         """
 
         if self._base_workspace_limit_m is not None:
@@ -1590,6 +1601,7 @@ class RealCuroboBackend:
         skip_obstacle_update: bool = False,
         attached_obj: Any = _ATTACHMENT_UNSET,
     ) -> tuple[bool, str, dict[str, Any]]:
+        del skip_obstacle_update
         if float(timeout_s) <= 0.0:
             return False, "timeout", {"timeout_s": float(timeout_s)}
         try:
@@ -1605,7 +1617,6 @@ class RealCuroboBackend:
                     if attached_obj is _ATTACHMENT_UNSET
                     else attached_obj
                 ),
-                skip_obstacle_update=skip_obstacle_update,
             )
         except Exception as exc:
             quarantine = (
@@ -1651,12 +1662,12 @@ class RealCuroboBackend:
         timeout_s: float,
         skip_obstacle_update: bool = False,
     ) -> tuple[bool, str, dict[str, Any]]:
-        """Try a bounded, deterministic set of collision-free wrist poses.
+        """Try a bounded, deterministic set of wrist poses.
 
         A station is not rejected merely because the robot's reset wrist
         orientation cannot reach the point.  Every accepted pose is still an
-        official cuRobo world-collision IK result for the requested hand and
-        candidate BASE state.
+        official cuRobo IK result for the requested hand and candidate BASE
+        state.
         """
 
         started = time.monotonic()
@@ -1715,9 +1726,7 @@ class RealCuroboBackend:
                     True,
                     "reachable_candidate",
                     {
-                        "reachability_stage": (
-                            "candidate_world_collision_multi_orientation_ik"
-                        ),
+                        "reachability_stage": ("candidate_multi_orientation_ik"),
                         "selected_orientation": name,
                         "selected_target_quat_xyzw": quat.tolist(),
                         "attempts": attempts,
@@ -1729,10 +1738,733 @@ class RealCuroboBackend:
             False,
             "unreachable",
             {
-                "reachability_stage": "candidate_world_collision_multi_orientation_ik",
+                "reachability_stage": "candidate_multi_orientation_ik",
                 "attempts": attempts,
             },
         )
+
+    def _all_attached_objects(
+        self,
+        *,
+        selected_hand: str,
+        selected_expected: Any = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """Snapshot and merge both assisted-grasp collision bodies."""
+
+        selected_hand = _normalize_hand(selected_hand)
+        merged: dict[str, Any] = {}
+        by_hand: dict[str, Any] = {}
+        for side in ("left", "right"):
+            live = self.get_attached_object(side)
+            by_hand[side] = live
+            if isinstance(live, dict):
+                merged.update(live)
+        roots = list(merged.values())
+        root_paths = [str(getattr(root, "prim_path", "")).rstrip("/") for root in roots]
+        if len(roots) != len(
+            {path or f"object:{id(root)}" for path, root in zip(root_paths, roots)}
+        ):
+            raise RuntimeError(
+                "the same collision body cannot be attached to both R1Pro EEFs"
+            )
+        if selected_expected is not None:
+            matches, identity = _attachment_state_status(
+                by_hand[selected_hand],
+                selected_expected,
+                hand=selected_hand,
+            )
+            if not matches:
+                raise RuntimeError(
+                    "selected attachment changed before whole-body planning: "
+                    f"{identity!r}"
+                )
+        return (merged or None), by_hand
+
+    @contextmanager
+    def _whole_body_plan_policy(
+        self,
+        generator: Any,
+        *,
+        enable_graph: bool,
+        position_only: bool,
+        timeout_s: float,
+    ):
+        """Install and always clear one Behavior-owned MotionGen policy."""
+
+        if hasattr(generator, "_rpent_plan_override"):
+            raise RuntimeError("whole-body MotionGen policy is already active")
+        generator._rpent_plan_override = {
+            "enable_graph": bool(enable_graph),
+            "position_only": bool(position_only),
+            "timeout_s": float(timeout_s),
+        }
+        try:
+            yield
+        finally:
+            try:
+                delattr(generator, "_rpent_plan_override")
+            except AttributeError:
+                pass
+
+    def plan_whole_body_trajectory(
+        self,
+        *,
+        hand: str,
+        target_xyz: np.ndarray,
+        target_quat_xyzw: np.ndarray | None,
+        timeout_s: float,
+        attached_obj: Any = None,
+    ) -> dict[str, Any]:
+        """Plan and independently certify one selected-EEF 21-DOF trajectory."""
+
+        hand = _normalize_hand(hand)
+        started = time.monotonic()
+        hard_timeout_s = min(
+            float(timeout_s),
+            WHOLE_BODY_PLANNING_DEADLINE_S,
+        )
+        try:
+            with _wall_clock_deadline(
+                hard_timeout_s,
+                f"{hand} whole-body planning transaction",
+            ):
+                result = self._compute_whole_body_plan(
+                    hand=hand,
+                    target_xyz=target_xyz,
+                    target_quat_xyzw=target_quat_xyzw,
+                    timeout_s=hard_timeout_s,
+                    selected_expected_attachment=attached_obj,
+                )
+            metrics = (
+                dict(result.get("metrics"))
+                if isinstance(result.get("metrics"), dict)
+                else {}
+            )
+            metrics["planning_elapsed_s"] = round(
+                time.monotonic() - started, 3
+            )
+            result["metrics"] = metrics
+            return result
+        except Exception as exc:
+            quarantine = self._quarantine_generator(
+                kind="whole_body",
+                hand=hand,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+            return {
+                "ok": False,
+                "stop_reason": (
+                    "timeout"
+                    if isinstance(exc, TimeoutError)
+                    else "planner_unavailable"
+                ),
+                "metrics": {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "motion_scope": "whole_body",
+                    "generator_kind": "whole_body",
+                    "planning_elapsed_s": round(
+                        time.monotonic() - started, 3
+                    ),
+                    "generator_quarantine": quarantine,
+                    "collision_admission": {
+                        "available": False,
+                        "admitted": False,
+                        "reason": "whole-body trajectory unavailable",
+                    },
+                },
+            }
+
+    def _compute_whole_body_plan(
+        self,
+        *,
+        hand: str,
+        target_xyz: np.ndarray,
+        target_quat_xyzw: np.ndarray | None,
+        timeout_s: float,
+        selected_expected_attachment: Any = None,
+    ) -> dict[str, Any]:
+        hand = _normalize_hand(hand)
+        inactive = "right" if hand == "left" else "left"
+        generator = self._generator(kind="whole_body", hand=hand)
+        robot = self._find_robot()
+        embodiment = self._embodiment_cls.DEFAULT
+        planner_joint_names = tuple(
+            str(name) for name in generator.mg[embodiment].kinematics.joint_names
+        )
+        if len(planner_joint_names) != 21 or set(planner_joint_names) != set(
+            WHOLE_BODY_ACTIVE_JOINT_NAMES
+        ):
+            raise RuntimeError(
+                "whole-body generator active joints do not match the 21-DOF contract: "
+                f"{planner_joint_names!r}"
+            )
+        torch = self._torch
+        if torch is None:
+            import torch as torch  # type: ignore[no-redef]
+
+        selected_pose = self.get_eef_pose(hand)
+        if selected_pose is None:
+            raise RuntimeError(f"R1Pro {hand} EEF pose is unavailable")
+        selected_target = np.asarray(target_xyz, dtype=np.float64).reshape(3)
+        attachments, attachments_by_hand = self._all_attached_objects(
+            selected_hand=hand,
+            selected_expected=selected_expected_attachment,
+        )
+        selected_attachment_present = attachments_by_hand[hand] is not None
+        if target_quat_xyzw is not None:
+            selected_quat = np.asarray(target_quat_xyzw, dtype=np.float64).reshape(4)
+            orientation_mode = "explicit_hard_target"
+            position_only = False
+        elif selected_attachment_present:
+            selected_quat = np.asarray(selected_pose[1], dtype=np.float64).reshape(4)
+            orientation_mode = "preserve_call_start_world_orientation"
+            position_only = False
+        else:
+            selected_quat = np.asarray(selected_pose[1], dtype=np.float64).reshape(4)
+            orientation_mode = "position_only_orientation_free"
+            position_only = True
+        if not np.isfinite(selected_target).all() or not np.isfinite(
+            selected_quat
+        ).all():
+            raise RuntimeError("whole-body selected EEF target must be finite")
+
+        selected_link = self._eef_link_name(robot, hand)
+        batch_size = max(int(generator.batch_size), 1)
+        target_positions = {
+            selected_link: torch.as_tensor(selected_target, dtype=torch.float32)
+            .reshape(1, 3)
+            .repeat(batch_size, 1)
+        }
+        target_quaternions = {
+            selected_link: torch.as_tensor(selected_quat, dtype=torch.float32)
+            .reshape(1, 4)
+            .repeat(batch_size, 1)
+        }
+        start_q = np.asarray(
+            _jsonable(robot.get_joint_positions()), dtype=np.float32
+        ).reshape(-1)
+        initial_joint_pos = torch.as_tensor(start_q, dtype=torch.float32)
+        robot_joint_names = list((getattr(robot, "joints", {}) or {}).keys())
+        if len(robot_joint_names) != len(start_q):
+            raise RuntimeError(
+                "R1Pro live joint names do not match the whole-body start state"
+            )
+        start_by_name = {
+            str(name): float(start_q[index])
+            for index, name in enumerate(robot_joint_names)
+        }
+        active_retract = torch.as_tensor(
+            [start_by_name[name] for name in planner_joint_names],
+            dtype=torch.float32,
+        )
+        retract_tensors: dict[int, Any] = {}
+        for rollout in generator.mg[embodiment].get_all_rollout_instances():
+            dynamics = getattr(rollout, "dynamics_model", None)
+            retract = getattr(dynamics, "retract_config", None)
+            if retract is None:
+                continue
+            if tuple(retract.shape) != tuple(active_retract.shape):
+                raise RuntimeError(
+                    "whole-body rollout retract shape does not match 21 active joints"
+                )
+            retract.copy_(active_retract.to(device=retract.device, dtype=retract.dtype))
+            retract_tensors[id(retract)] = retract
+        kinematics_config = generator.mg[embodiment].kinematics.kinematics_config
+        cspace_retract = getattr(
+            getattr(kinematics_config, "cspace", None),
+            "retract_config",
+            None,
+        )
+        if cspace_retract is not None:
+            if tuple(cspace_retract.shape) != tuple(active_retract.shape):
+                raise RuntimeError(
+                    "whole-body kinematics retract shape does not match 21 active joints"
+                )
+            cspace_retract.copy_(
+                active_retract.to(
+                    device=cspace_retract.device,
+                    dtype=cspace_retract.dtype,
+                )
+            )
+            retract_tensors[id(cspace_retract)] = cspace_retract
+        if not retract_tensors:
+            raise RuntimeError("whole-body live retract synchronization is unavailable")
+        attachment_scales = (
+            {str(link): 1.0 for link in attachments}
+            if isinstance(attachments, dict)
+            else None
+        )
+        config_path = self._whole_body_config_path(hand)
+        metrics: dict[str, Any] = {
+            "motion_scope": "whole_body",
+            "generator_kind": "whole_body",
+            "active_dof_count": 21,
+            "active_joint_names": list(WHOLE_BODY_ACTIVE_JOINT_NAMES),
+            "locked_joint_names": list(WHOLE_BODY_LOCKED_JOINT_NAMES),
+            "curobo_config": str(config_path),
+            "curobo_config_sha256": hashlib.sha256(
+                config_path.read_bytes()
+            ).hexdigest(),
+            "eef_targets": {
+                hand: {
+                    "role": "requested_target",
+                    "link": selected_link,
+                    "xyz": selected_target.tolist(),
+                    "quat_xyzw": selected_quat.tolist(),
+                    "orientation_mode": orientation_mode,
+                    "orientation_constrained": not position_only,
+                },
+                inactive: {
+                    "role": "unconstrained",
+                    "target_submitted": False,
+                    "world_pose_gate": False,
+                },
+            },
+            "selected_eef_goal_count": 1,
+            "inactive_eef_goal_count": 0,
+            "attachment_hand_count": 2,
+            "attachments_by_hand": {
+                side: {"available": attachments_by_hand[side] is not None}
+                for side in ("left", "right")
+            },
+            "live_retract_synchronization": {
+                "available": True,
+                "active_dof_count": 21,
+                "updated_tensor_count": len(retract_tensors),
+                "source": "call_start_robot_joint_positions",
+            },
+            "collision_admission": {
+                "available": False,
+                "admitted": False,
+                "world_collision_check": True,
+                "self_collision_check": True,
+                "obstacle_update": True,
+                "full_trajectory": True,
+                "post_interpolation_check": False,
+                "source": "CuRoboMotionGenerator.compute_trajectories+check_collisions",
+            },
+            "planning_policy": {
+                "fast_trajopt_s": WHOLE_BODY_FAST_TRAJOPT_DEADLINE_S,
+                "graph_fallback": True,
+                "planning_hard_limit_s": WHOLE_BODY_PLANNING_DEADLINE_S,
+                "single_arm_fallback": False,
+                "probe_env_actions": 0,
+            },
+            "solver_stages": [],
+            "candidate_audit": [],
+        }
+
+        full_joint_names = tuple(str(name) for name in generator.robot_joint_names)
+        full_index = {name: index for index, name in enumerate(full_joint_names)}
+        active_indices = [full_index[name] for name in WHOLE_BODY_ACTIVE_JOINT_NAMES]
+        planning_deadline = time.monotonic() + min(
+            float(timeout_s), WHOLE_BODY_PLANNING_DEADLINE_S
+        )
+        safe_candidates: list[dict[str, Any]] = []
+        any_solver_success = False
+        for stage_name, enable_graph in (
+            ("fast_trajopt", False),
+            ("graph_trajopt", True),
+        ):
+            remaining = planning_deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            stage_budget = (
+                min(WHOLE_BODY_FAST_TRAJOPT_DEADLINE_S, remaining)
+                if not enable_graph
+                else remaining
+            )
+            stage_started = time.monotonic()
+            with self._whole_body_plan_policy(
+                generator,
+                enable_graph=enable_graph,
+                position_only=position_only,
+                timeout_s=stage_budget,
+            ):
+                successes, paths = generator.compute_trajectories(
+                    target_positions,
+                    target_quaternions,
+                    initial_joint_pos=initial_joint_pos,
+                    max_attempts=5,
+                    timeout=stage_budget,
+                    ik_fail_return=5,
+                    enable_finetune_trajopt=True,
+                    finetune_attempts=2,
+                    return_full_result=False,
+                    success_ratio=1.0 / batch_size,
+                    attached_obj=attachments,
+                    attached_obj_scale=attachment_scales,
+                    ik_only=False,
+                    is_local=False,
+                    skip_obstacle_update=False,
+                    ik_world_collision_check=True,
+                )
+            success_array = np.asarray(_jsonable(successes), dtype=bool).reshape(-1)
+            success_indices = np.flatnonzero(success_array)
+            any_solver_success = any_solver_success or bool(success_indices.size)
+            stage_report = {
+                "name": stage_name,
+                "enable_graph": enable_graph,
+                "timeout_s": float(stage_budget),
+                "elapsed_s": round(time.monotonic() - stage_started, 3),
+                "successes": success_array.tolist(),
+                "successful_candidate_indices": success_indices.tolist(),
+                "certified_candidate_indices": [],
+            }
+            for candidate_index in success_indices:
+                audit: dict[str, Any] = {
+                    "stage": stage_name,
+                    "candidate_index": int(candidate_index),
+                    "solver_success": True,
+                    "certified": False,
+                }
+                try:
+                    candidate_q, path_merge = (
+                        self._whole_body_path_to_full_joint_trajectory(
+                            generator,
+                            robot,
+                            paths[int(candidate_index)],
+                            start_q=start_q,
+                        )
+                    )
+                    if (
+                        candidate_q.ndim != 2
+                        or candidate_q.shape[1] != start_q.shape[0]
+                    ):
+                        raise RuntimeError(
+                            "whole-body candidate shape does not match R1Pro q"
+                        )
+                    candidate_with_start = (
+                        candidate_q
+                        if np.allclose(
+                            candidate_q[0],
+                            start_q,
+                            atol=1e-7,
+                            rtol=0.0,
+                        )
+                        else np.vstack([start_q.reshape(1, -1), candidate_q])
+                    )
+                    dense_q = _interpolate_joint_trajectory(
+                        candidate_with_start,
+                        max_inter_dist=WHOLE_BODY_DENSE_COLLISION_STEP,
+                    )
+                    execution_with_start = (
+                        _interpolate_whole_body_execution_trajectory(
+                            candidate_with_start,
+                            joint_names=full_joint_names,
+                        )
+                    )
+                    execution_q = (
+                        execution_with_start[1:]
+                        if len(execution_with_start) > 1
+                        and np.allclose(
+                            execution_with_start[0],
+                            start_q,
+                            atol=1e-7,
+                            rtol=0.0,
+                        )
+                        else execution_with_start
+                    )
+                    if len(execution_q) < 1:
+                        execution_q = execution_with_start
+                    if (
+                        len(dense_q) < 1
+                        or len(execution_q) < 1
+                        or not np.isfinite(dense_q).all()
+                        or not np.isfinite(execution_q).all()
+                    ):
+                        raise RuntimeError(
+                            "whole-body candidate interpolation is empty or non-finite"
+                        )
+                    try:
+                        collision_flags = generator.check_collisions(
+                            torch.as_tensor(dense_q, dtype=torch.float32),
+                            initial_joint_pos=torch.as_tensor(
+                                start_q, dtype=torch.float32
+                            ),
+                            self_collision_check=True,
+                            skip_obstacle_update=True,
+                            attached_obj=attachments,
+                            attached_obj_scale=attachment_scales,
+                        )
+                    except TimeoutError:
+                        raise
+                    except Exception as exc:
+                        raise _WholeBodyCertificationError(
+                            "whole-body collision certification backend failed"
+                        ) from exc
+                    collision_array = np.asarray(
+                        _jsonable(collision_flags), dtype=bool
+                    ).reshape(-1)
+                    if collision_array.shape != (len(dense_q),):
+                        raise _WholeBodyCertificationError(
+                            "whole-body collision checker returned an invalid "
+                            "waypoint count"
+                        )
+                    colliding_count = int(np.count_nonzero(collision_array))
+                    path_length = float(
+                        np.sum(
+                            np.linalg.norm(
+                                np.diff(
+                                    candidate_with_start[:, active_indices],
+                                    axis=0,
+                                ),
+                                axis=1,
+                            )
+                        )
+                    )
+                    audit.update(
+                        {
+                            "path_joint_merge": path_merge,
+                            "dense_collision_waypoints": int(len(dense_q)),
+                            "execution_waypoints": int(len(execution_q)),
+                            "full_21d_path_length": path_length,
+                            "colliding_waypoint_count": colliding_count,
+                        }
+                    )
+                    if colliding_count:
+                        audit["rejection_reason"] = "collision"
+                    else:
+                        audit["certified"] = True
+                        stage_report["certified_candidate_indices"].append(
+                            int(candidate_index)
+                        )
+                        safe_candidates.append(
+                            {
+                                "stage": stage_name,
+                                "candidate_index": int(candidate_index),
+                                "joint_trajectory": execution_q,
+                                "dense_collision_trajectory": dense_q,
+                                "path_joint_merge": path_merge,
+                                "full_21d_path_length": path_length,
+                            }
+                        )
+                except TimeoutError:
+                    raise
+                except _WholeBodyCertificationError:
+                    raise
+                except Exception as exc:
+                    audit["rejection_reason"] = f"{type(exc).__name__}: {exc}"
+                metrics["candidate_audit"].append(audit)
+            metrics["solver_stages"].append(stage_report)
+            if safe_candidates:
+                break
+
+        if not safe_candidates:
+            metrics["collision_admission"]["post_interpolation_check"] = bool(
+                any_solver_success
+            )
+            metrics["collision_admission"]["colliding_waypoint_count"] = sum(
+                int(candidate.get("colliding_waypoint_count", 0))
+                for candidate in metrics["candidate_audit"]
+            )
+            return {
+                "ok": False,
+                "stop_reason": (
+                    "collision_admission_failed"
+                    if any_solver_success
+                    else "unreachable"
+                ),
+                "metrics": metrics,
+            }
+
+        safe_candidates.sort(
+            key=lambda item: (
+                len(item["joint_trajectory"]),
+                item["full_21d_path_length"],
+                item["candidate_index"],
+            )
+        )
+        selected = safe_candidates[0]
+        q_traj = np.asarray(selected["joint_trajectory"], dtype=np.float32)
+        dense_q = np.asarray(
+            selected["dense_collision_trajectory"], dtype=np.float32
+        )
+        metrics["path_joint_merge"] = selected["path_joint_merge"]
+
+        post_attachments, post_by_hand = self._all_attached_objects(
+            selected_hand=hand,
+            selected_expected=selected_expected_attachment,
+        )
+        del post_attachments
+        for side in ("left", "right"):
+            matches, identity = _attachment_state_status(
+                post_by_hand[side], attachments_by_hand[side], hand=side
+            )
+            if not matches:
+                metrics["attachment_identity_changed"] = {
+                    "hand": side,
+                    **identity,
+                }
+                return {
+                    "ok": False,
+                    "stop_reason": "attachment_identity_mismatch",
+                    "metrics": metrics,
+                }
+
+        trajectory_bytes = np.ascontiguousarray(q_traj, dtype=np.float32).tobytes()
+        certificate = {
+            "schema_version": 1,
+            "trajectory_sha256": hashlib.sha256(trajectory_bytes).hexdigest(),
+            "start_q_sha256": hashlib.sha256(
+                np.ascontiguousarray(start_q, dtype=np.float32).tobytes()
+            ).hexdigest(),
+            "waypoint_count": int(len(q_traj)),
+            "q_dimension": int(q_traj.shape[1]),
+            "active_dof_count": 21,
+            "selected_eef_goal_count": 1,
+            "inactive_eef_goal_count": 0,
+            "attachment_hand_count": 2,
+            "world_collision_check": True,
+            "self_collision_check": True,
+            "post_interpolation_check": True,
+            "collision_free_waypoints": int(len(dense_q)),
+            "dense_collision_trajectory_sha256": hashlib.sha256(
+                np.ascontiguousarray(dense_q, dtype=np.float32).tobytes()
+            ).hexdigest(),
+        }
+        metrics["selected_solver_stage"] = selected["stage"]
+        metrics["selected_full_trajectory_candidate"] = selected["candidate_index"]
+        metrics["full_trajectory_selection"] = (
+            "fewest_execution_waypoints_then_shortest_full_21d_path"
+        )
+        metrics["selected_full_21d_path_length"] = selected[
+            "full_21d_path_length"
+        ]
+        metrics["trajectory_waypoints"] = int(len(q_traj))
+        metrics["execution_mode"] = "online_robot_q_to_action"
+        metrics["collision_admission"].update(
+            {
+                "available": True,
+                "admitted": True,
+                "post_interpolation_check": True,
+                "colliding_waypoint_count": 0,
+                "collision_free_waypoints": int(len(dense_q)),
+            }
+        )
+        metrics["whole_body_certificate"] = certificate
+        return {
+            "ok": True,
+            "joint_trajectory": q_traj,
+            "metrics": metrics,
+            "whole_body_certificate": certificate,
+            "expected_attachments_by_hand": attachments_by_hand,
+        }
+
+    def _whole_body_path_to_full_joint_trajectory(
+        self,
+        generator: Any,
+        robot: Any,
+        path: Any,
+        *,
+        start_q: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Merge active or already-augmented cuRobo paths into full R1Pro q.
+
+        OmniGibson's ``path_to_joint_trajectory(get_full_js=True)`` delegates
+        to cuRobo ``get_full_js``.  Some supported cuRobo builds already
+        return locked joints in a trajectory; asking them to append locks a
+        second time raises ``lock_joints is also listed in self.joint_names``.
+        Name-based merging accepts either backend representation while never
+        allowing a planned value to change the seven locked R1Pro joints.
+        """
+
+        full_names = tuple(str(name) for name in generator.robot_joint_names)
+        robot_names = tuple(str(name) for name in (getattr(robot, "joints", {}) or {}))
+        start = np.asarray(start_q, dtype=np.float32).reshape(-1)
+        if (
+            len(full_names) != len(set(full_names))
+            or full_names != robot_names
+            or start.size != len(full_names)
+        ):
+            raise RuntimeError(
+                "R1Pro whole-body path merge requires the exact full joint layout"
+            )
+
+        path_names = tuple(
+            str(name) for name in (getattr(path, "joint_names", None) or ())
+        )
+        if not path_names or len(path_names) != len(set(path_names)):
+            raise RuntimeError(
+                "whole-body cuRobo path has missing or duplicate joint names"
+            )
+        unknown = sorted(set(path_names) - set(full_names))
+        if unknown:
+            raise RuntimeError(
+                f"whole-body cuRobo path contains unknown joints: {unknown}"
+            )
+
+        values = np.asarray(
+            _jsonable(getattr(path, "position", None)), dtype=np.float32
+        )
+        if values.size == 0 or values.shape[-1] != len(path_names):
+            raise RuntimeError(
+                "whole-body cuRobo path width does not match its joint names: "
+                f"shape={values.shape}, names={len(path_names)}"
+            )
+        values = values.reshape(-1, len(path_names))
+        if not np.isfinite(values).all():
+            raise RuntimeError("whole-body cuRobo path contains non-finite values")
+
+        active_names = tuple(
+            str(name)
+            for name in generator.mg[
+                self._embodiment_cls.DEFAULT
+            ].kinematics.joint_names
+        )
+        if (
+            len(active_names) != 21
+            or set(active_names) != set(WHOLE_BODY_ACTIVE_JOINT_NAMES)
+        ):
+            raise RuntimeError(
+                "whole-body cuRobo path active names violate the 21-DOF contract"
+            )
+        missing_active = sorted(set(active_names) - set(path_names))
+        if missing_active:
+            raise RuntimeError(
+                f"whole-body cuRobo path is missing active joints: {missing_active}"
+            )
+
+        full_index = {name: index for index, name in enumerate(full_names)}
+        merged = np.broadcast_to(start, (len(values), len(start))).copy()
+        locked_entries_ignored: list[str] = []
+        active_entries_written: list[str] = []
+        for source_index, name in enumerate(path_names):
+            if name in WHOLE_BODY_LOCKED_JOINT_NAMES:
+                locked_entries_ignored.append(name)
+                continue
+            if name not in WHOLE_BODY_ACTIVE_JOINT_NAMES:
+                raise RuntimeError(
+                    f"whole-body cuRobo path contains unclassified joint {name!r}"
+                )
+            merged[:, full_index[name]] = values[:, source_index]
+            active_entries_written.append(name)
+
+        if set(active_entries_written) != set(WHOLE_BODY_ACTIVE_JOINT_NAMES):
+            raise RuntimeError(
+                "whole-body cuRobo path did not write all 21 active joints"
+            )
+        locked_indices = [
+            full_index[name] for name in WHOLE_BODY_LOCKED_JOINT_NAMES
+        ]
+        expected_locked = np.broadcast_to(
+            start[locked_indices], (len(merged), len(locked_indices))
+        )
+        if not np.array_equal(merged[:, locked_indices], expected_locked):
+            raise RuntimeError("whole-body path merge changed a locked joint")
+        return merged, {
+            "method": "joint_name_merge_preserving_call_start_locked_joints",
+            "source_joint_count": len(path_names),
+            "waypoint_count": len(values),
+            "active_joint_count": len(active_entries_written),
+            "locked_joint_count": len(WHOLE_BODY_LOCKED_JOINT_NAMES),
+            "locked_source_entries_ignored": len(locked_entries_ignored),
+            "source_representation": (
+                "active_only"
+                if not locked_entries_ignored
+                else "already_augmented_full"
+            ),
+        }
 
     def plan_arm_trajectory(
         self,
@@ -1743,14 +2475,17 @@ class RealCuroboBackend:
         timeout_s: float,
         attached_obj: Any = None,
     ) -> dict[str, Any]:
+        """Solve an arm IK target and interpolate it without safety admission."""
+
         try:
             return self._compute_arm_plan(
                 hand=hand,
                 target_xyz=target_xyz,
                 target_quat_xyzw=target_quat_xyzw,
                 timeout_s=timeout_s,
-                ik_only=False,
+                ik_only=True,
                 attached_obj=attached_obj,
+                return_ik_solution=True,
             )
         except Exception as exc:
             quarantine = (
@@ -1777,31 +2512,34 @@ class RealCuroboBackend:
                 },
             }
 
-    def plan_prepress_arm_trajectory(
+    def plan_arm_with_trunk_trajectory(
         self,
         *,
         hand: str,
         target_xyz: np.ndarray,
-        target_quat_xyzw: np.ndarray,
+        target_quat_xyzw: np.ndarray | None,
         timeout_s: float,
-        attached_obj: Any,
+        attached_obj: Any = None,
     ) -> dict[str, Any]:
-        """Plan held-arm-only motion with base, trunk and press arm locked."""
+        """Plan one collision-admitted selected-arm plus trunk1-3 trajectory."""
 
         try:
-            return self._compute_arm_plan(
+            result = self._compute_arm_plan(
                 hand=hand,
                 target_xyz=target_xyz,
                 target_quat_xyzw=target_quat_xyzw,
                 timeout_s=timeout_s,
                 ik_only=False,
                 attached_obj=attached_obj,
-                generator_kind="prepress_arm",
+                generator_kind="arm_with_trunk",
             )
+            if not result.get("ok"):
+                return result
+            return self._certify_arm_with_trunk_trajectory(result, hand=hand)
         except Exception as exc:
             quarantine = (
                 self._quarantine_generator(
-                    kind="prepress_arm",
+                    kind="arm_with_trunk",
                     hand=hand,
                     reason=f"{type(exc).__name__}: {exc}",
                 )
@@ -1817,7 +2555,143 @@ class RealCuroboBackend:
                 ),
                 "metrics": {
                     "error": f"{type(exc).__name__}: {exc}",
-                    "generator_kind": "prepress_arm",
+                    "motion_scope": "arm_with_trunk",
+                    "generator_kind": "arm_with_trunk",
+                    "generator_quarantine": quarantine,
+                    "collision_admission": {
+                        "available": False,
+                        "admitted": False,
+                        "reason": "collision-admitted trajectory unavailable",
+                    },
+                },
+            }
+
+    def _certify_arm_with_trunk_trajectory(
+        self,
+        result: dict[str, Any],
+        *,
+        hand: str,
+    ) -> dict[str, Any]:
+        """Fail closed unless collision admission and bounded trunk motion exist."""
+
+        metrics = result.get("metrics")
+        if not isinstance(metrics, dict):
+            raise RuntimeError("arm-with-trunk planner metrics are unavailable")
+        collision = metrics.get("collision_admission")
+        if (
+            not isinstance(collision, dict)
+            or collision.get("available") is not True
+            or collision.get("admitted") is not True
+            or collision.get("world_collision_check") is not True
+            or collision.get("self_collision_check") is not True
+            or collision.get("obstacle_update") is not True
+            or collision.get("full_trajectory") is not True
+        ):
+            raise RuntimeError(
+                "arm-with-trunk collision admission certificate is unavailable"
+            )
+        trajectory = np.asarray(
+            _jsonable(result.get("joint_trajectory")), dtype=np.float64
+        )
+        robot = self._find_robot()
+        current = np.asarray(
+            _jsonable(robot.get_joint_positions()), dtype=np.float64
+        ).reshape(-1)
+        trunk_indices = _indices(getattr(robot, "trunk_control_idx", []))
+        if (
+            trajectory.ndim != 2
+            or trajectory.shape[0] < 1
+            or trajectory.shape[1] != current.size
+            or len(trunk_indices) != 4
+            or max(trunk_indices, default=-1) >= current.size
+            or not np.isfinite(trajectory).all()
+            or not np.isfinite(current).all()
+        ):
+            raise RuntimeError("arm-with-trunk joint trajectory is invalid")
+        active_trunk = trunk_indices[:3]
+        locked_trunk = trunk_indices[3]
+        with_start = np.vstack([current.reshape(1, -1), trajectory])
+        adjacent = np.abs(np.diff(with_start[:, active_trunk], axis=0))
+        total = np.max(
+            np.abs(trajectory[:, active_trunk] - current[active_trunk]), axis=0
+        )
+        locked_delta = float(
+            np.max(np.abs(trajectory[:, locked_trunk] - current[locked_trunk]))
+        )
+        max_adjacent = float(np.max(adjacent))
+        if max_adjacent > TRUNK_ASSIST_MAX_STEP_RAD + 1e-9:
+            raise RuntimeError("arm-with-trunk trajectory exceeds per-step trunk limit")
+        if np.any(total > TRUNK_ASSIST_MAX_TOTAL_RAD + 1e-9):
+            raise RuntimeError("arm-with-trunk trajectory exceeds total trunk limit")
+        if locked_delta > 1e-6 + 1e-12:
+            raise RuntimeError("arm-with-trunk trajectory changed locked trunk4")
+        certified = dict(result)
+        certified_metrics = dict(metrics)
+        certified_metrics.update(
+            {
+                "motion_scope": "arm_with_trunk",
+                "active_controller_segments": [
+                    "trunk[0:3]",
+                    f"{_normalize_hand(hand)}_arm",
+                ],
+                "trunk_motion_limits": {
+                    "available": True,
+                    "ok": True,
+                    "active_trunk_joint_count": 3,
+                    "locked_trunk_joint_count": 1,
+                    "max_adjacent_delta_rad": max_adjacent,
+                    "max_adjacent_delta_limit_rad": TRUNK_ASSIST_MAX_STEP_RAD,
+                    "max_total_delta_rad_by_joint": total.tolist(),
+                    "max_total_delta_limit_rad": TRUNK_ASSIST_MAX_TOTAL_RAD,
+                    "locked_trunk4_delta_rad": locked_delta,
+                },
+            }
+        )
+        certified["metrics"] = certified_metrics
+        return certified
+
+    def plan_attached_arm_trajectory(
+        self,
+        *,
+        hand: str,
+        target_xyz: np.ndarray,
+        target_quat_xyzw: np.ndarray,
+        timeout_s: float,
+        attached_obj: Any,
+    ) -> dict[str, Any]:
+        """Solve held-arm IK with base, trunk and press arm locked."""
+
+        try:
+            return self._compute_arm_plan(
+                hand=hand,
+                target_xyz=target_xyz,
+                target_quat_xyzw=target_quat_xyzw,
+                timeout_s=timeout_s,
+                ik_only=True,
+                attached_obj=attached_obj,
+                return_ik_solution=True,
+                generator_kind="attached_arm",
+            )
+        except Exception as exc:
+            quarantine = (
+                self._quarantine_generator(
+                    kind="attached_arm",
+                    hand=hand,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+                if isinstance(exc, TimeoutError)
+                else None
+            )
+            return {
+                "ok": False,
+                "stop_reason": (
+                    "timeout"
+                    if isinstance(exc, TimeoutError)
+                    else "planner_unavailable"
+                ),
+                "metrics": {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "generator_kind": "attached_arm",
                     "generator_quarantine": quarantine,
                 },
             }
@@ -1831,17 +2705,12 @@ class RealCuroboBackend:
         timeout_s: float,
         attached_obj: Any = None,
         contact_target_xyz: np.ndarray | None = None,
-        ignore_collision_checks: bool = False,
+        lock_trunk: bool = False,
         full_solution: bool = False,
     ) -> dict[str, Any]:
-        """Solve one bounded Cartesian contact step with collision-free IK.
+        """Solve one bounded Cartesian contact step without safety admission."""
 
-        World collision is deliberately deferred to the 2 mm online guarded
-        controller, where actual contacts can be classified against the target
-        neighborhood. Self-collision remains mandatory in the IK solution and
-        large joint-branch jumps are rejected.
-        """
-
+        generator_kind = "attached_arm" if lock_trunk else "arm"
         try:
             return self._compute_arm_plan(
                 hand=hand,
@@ -1850,23 +2719,15 @@ class RealCuroboBackend:
                 timeout_s=timeout_s,
                 ik_only=True,
                 attached_obj=attached_obj,
-                ik_world_collision_check=False,
                 return_ik_solution=True,
                 guarded_contact_target_xyz=contact_target_xyz,
                 guarded_full_solution=bool(full_solution),
-                # Direct stage-3 presses must move the press arm relative to
-                # the held object.  The normal arm generator may recruit the
-                # trunk, which moves both hands together and leaves the
-                # fingertip-to-button error unchanged.  The prepress variant
-                # locks the trunk so each receding-horizon step is press-arm
-                # motion only.
-                generator_kind=("prepress_arm" if ignore_collision_checks else "arm"),
-                ignore_collision_checks=bool(ignore_collision_checks),
+                generator_kind=generator_kind,
             )
         except Exception as exc:
             quarantine = (
                 self._quarantine_generator(
-                    kind="arm",
+                    kind=generator_kind,
                     hand=hand,
                     reason=f"{type(exc).__name__}: {exc}",
                 )
@@ -1899,12 +2760,11 @@ class RealCuroboBackend:
         attached_obj: Any = None,
         contact_target_xyz: np.ndarray | None = None,
     ) -> dict[str, Any]:
-        """Plan one Cartesian-certified guarded path to a contact target.
+        """Plan one Cartesian-consistent guarded path to a contact target.
 
         The terminal pose is solved by cuRobo IK once.  The resulting joint
         path is then densified until forward kinematics proves every EEF step
-        is at most roughly 2 mm, follows the requested approach corridor, and
-        is collision-free with only the resolved contact body exempted.
+        is at most roughly 2 mm and follows the requested approach corridor.
         """
 
         try:
@@ -1942,51 +2802,6 @@ class RealCuroboBackend:
                 },
             }
 
-    def certify_attached_joint_trajectory(
-        self,
-        *,
-        hand: str,
-        joint_trajectory: Any,
-        attached_obj: Any,
-        timeout_s: float,
-    ) -> dict[str, Any]:
-        """Fail-closed full-path certification with the held body attached."""
-
-        hand = _normalize_hand(hand)
-        generator = self._generator(kind="arm", hand=hand)
-        self._active_generator = generator
-        with _wall_clock_deadline(
-            float(timeout_s), f"{hand} attached retreat certification"
-        ):
-            report = self._check_q_trajectory_collisions(
-                generator,
-                joint_trajectory,
-                attached_obj=attached_obj,
-                skip_obstacle_update=False,
-            )
-        available = bool(report.get("available", False))
-        colliding = bool(report.get("colliding", True))
-        return {
-            "ok": available and not colliding,
-            "stop_reason": (
-                "certified"
-                if available and not colliding
-                else (
-                    "attached_retreat_collision"
-                    if available
-                    else "collision_check_unavailable"
-                )
-            ),
-            "metrics": {
-                "method": "reverse_guarded_path_full_world+self_recheck",
-                "checked_waypoints": int(
-                    np.asarray(_jsonable(joint_trajectory)).shape[0]
-                ),
-                "attached_collision_body": {"available": attached_obj is not None},
-                "collision_report": report,
-            },
-        }
-
     def _compute_guarded_waypoint_path(
         self,
         *,
@@ -2004,7 +2819,6 @@ class RealCuroboBackend:
             raise RuntimeError("guarded contact path requires a resolved target point")
         hand = _normalize_hand(hand)
         generator = self._generator(kind="arm", hand=hand)
-        self._active_generator = generator
         robot = self._find_robot()
         current_pose = self.get_eef_pose(hand)
         if current_pose is None:
@@ -2047,7 +2861,6 @@ class RealCuroboBackend:
         self._guarded_seed_counter += 1
         guarded_selection_state: dict[str, Any] = {
             "previous": None,
-            "attached_obj": attached_obj,
             "graph_independent_seeds": True,
             "seed_phase": seed_phase,
         }
@@ -2108,14 +2921,10 @@ class RealCuroboBackend:
             "planner_seed_count_per_target": LOCAL_GUARDED_IK_SEEDS,
             "guarded_seed_phase": seed_phase,
             "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
-            "curobo_config": str(self._hand_config_path(hand)),
-            "collision_semantics": (
-                "guarded_online_world_contact+self_collision_checked_path"
-            ),
+            "curobo_config": str(self._hand_config_path(hand, lock_trunk=True)),
+            "collision_semantics": "not_used_for_admission",
+            "collision_admission_enabled": False,
             "attached_collision_body": {"available": attached_obj is not None},
-            "candidate_self_collision_reports": guarded_selection_state.get(
-                "candidate_self_collision_reports", []
-            ),
         }
         if len(success_array) != len(positions) or not bool(success_array.all()):
             return {"ok": False, "stop_reason": "unreachable", "metrics": metrics}
@@ -2135,33 +2944,23 @@ class RealCuroboBackend:
                 candidate_selectable_masks=guarded_selection_state.get(
                     "candidate_selectable_masks", []
                 )[: len(positions)],
-                attached_obj=attached_obj,
             )
-        graph_report["method"] = (
-            "sequential_seeded_candidates+final_state_collision_graph"
-        )
+        graph_report["method"] = "sequential_seeded_candidates+cartesian_graph"
         metrics["guarded_candidate_graph"] = graph_report
         if raw_q_waypoints is None:
             return {
                 "ok": False,
-                "stop_reason": "guarded_self_collision_path_unreachable",
+                "stop_reason": "guarded_cartesian_path_unreachable",
                 "metrics": metrics,
             }
         raw_adjacent = np.diff(np.vstack([current_q, raw_q_waypoints]), axis=0)
         raw_max_joint_delta = float(np.max(np.abs(raw_adjacent)))
         q_waypoints = raw_q_waypoints
         metrics["guarded_raw_max_adjacent_joint_delta"] = raw_max_joint_delta
-        metrics["guarded_edge_collision_sample_steps_rad"] = [
-            0.01,
-            0.005,
-            0.0025,
-            0.00125,
-        ]
         trajectory = None
         cartesian_attempts: list[dict[str, Any]] = []
-        collision_report: dict[str, Any] | None = None
         safe_guarded_candidates: list[
-            tuple[int, float, str, np.ndarray, dict[str, Any], dict[str, Any]]
+            tuple[int, float, str, np.ndarray, dict[str, Any]]
         ] = []
         for waypoint_mode, candidate_goals in (
             ("direct_terminal_ik", q_waypoints[-1:]),
@@ -2193,25 +2992,6 @@ class RealCuroboBackend:
                 attempt["reason"] = "cartesian_path_invalid"
                 cartesian_attempts.append(attempt)
                 continue
-            collision_report = self._check_q_target_excluded_collisions(
-                generator,
-                candidate_trajectory,
-                target_xyz=np.asarray(contact_target_xyz, dtype=np.float64),
-                attached_obj=attached_obj,
-            )
-            attempt["collision_report"] = collision_report
-            if not bool(collision_report.get("available", False)):
-                metrics["guarded_cartesian_attempts"] = cartesian_attempts + [attempt]
-                return {
-                    "ok": False,
-                    "stop_reason": "collision_check_unavailable",
-                    "metrics": metrics,
-                }
-            if bool(collision_report.get("colliding", False)):
-                attempt["accepted"] = False
-                attempt["reason"] = "guarded_trajectory_collision"
-                cartesian_attempts.append(attempt)
-                continue
             attempt["accepted"] = True
             joint_path_length = float(
                 np.linalg.norm(
@@ -2229,22 +3009,13 @@ class RealCuroboBackend:
                     waypoint_mode,
                     candidate_trajectory,
                     cartesian_report,
-                    collision_report,
                 )
             )
         metrics["guarded_cartesian_attempts"] = cartesian_attempts
         if not safe_guarded_candidates:
-            metrics["guarded_target_excluded_collision_report"] = collision_report
             return {
                 "ok": False,
-                "stop_reason": (
-                    "guarded_trajectory_collision"
-                    if any(
-                        attempt.get("reason") == "guarded_trajectory_collision"
-                        for attempt in cartesian_attempts
-                    )
-                    else "guarded_cartesian_path_invalid"
-                ),
+                "stop_reason": "guarded_cartesian_path_invalid",
                 "metrics": metrics,
             }
         (
@@ -2253,7 +3024,6 @@ class RealCuroboBackend:
             selected_mode,
             trajectory,
             selected_cartesian_report,
-            selected_collision_report,
         ) = min(
             safe_guarded_candidates,
             key=lambda candidate: (candidate[0], candidate[1], candidate[2]),
@@ -2261,17 +3031,13 @@ class RealCuroboBackend:
         metrics["guarded_cartesian_path_report"] = selected_cartesian_report
         metrics["guarded_selected_waypoint_mode"] = selected_mode
         metrics["guarded_path_selection"] = (
-            "minimum_execution_waypoints_then_joint_path_length_after_full_recheck"
+            "minimum_execution_waypoints_then_joint_path_length"
         )
-        metrics["guarded_target_excluded_collision_report"] = selected_collision_report
         metrics["guarded_interpolated_waypoints"] = int(len(trajectory))
         metrics["execution_mode"] = "online_robot_q_to_action"
         return {
             "ok": True,
             "joint_trajectory": trajectory,
-            # The descent was certified from current_q through trajectory.
-            # A pick may reverse it only after a second full-path check with
-            # the newly held object added to the collision model.
             "reverse_joint_trajectory": np.vstack(
                 [current_q.reshape(1, -1), trajectory]
             )[::-1].copy(),
@@ -2288,19 +3054,18 @@ class RealCuroboBackend:
         ik_only: bool,
         base_xyyaw: np.ndarray | None = None,
         attached_obj: Any = None,
-        skip_obstacle_update: bool = False,
-        ik_world_collision_check: bool = True,
         return_ik_solution: bool = False,
         guarded_contact_target_xyz: np.ndarray | None = None,
         guarded_full_solution: bool = False,
         generator_kind: str = "arm",
-        ignore_collision_checks: bool = False,
     ) -> dict[str, Any]:
         hand = _normalize_hand(hand)
-        if generator_kind not in {"arm", "prepress_arm"}:
+        if generator_kind not in {"arm", "attached_arm", "arm_with_trunk"}:
             raise ValueError(f"invalid arm generator kind {generator_kind!r}")
+        trunk_assist = generator_kind == "arm_with_trunk"
+        if trunk_assist and bool(ik_only):
+            raise ValueError("arm-with-trunk planning requires a full trajectory")
         generator = self._generator(kind=generator_kind, hand=hand)
-        self._active_generator = generator
         torch = self._torch
         if torch is None:
             import torch as torch  # type: ignore[no-redef]
@@ -2334,13 +3099,7 @@ class RealCuroboBackend:
         )
         if initial_joint_pos is not None:
             initial_joint_pos = torch.as_tensor(initial_joint_pos, dtype=torch.float32)
-        reachability_stage = (
-            "candidate_world_collision_ik_with_initial_base"
-            if base_xyyaw is not None and ik_only
-            else (
-                "world_collision_ik" if ik_only else "world_collision_full_trajectory"
-            )
-        )
+        reachability_stage = "ik_exists"
         batch_size = max(int(generator.batch_size), 1)
         planner_targets = (
             torch.as_tensor(
@@ -2358,58 +3117,33 @@ class RealCuroboBackend:
             .reshape(1, 4)
             .repeat(batch_size, 1)
         )
-        original_solve_ik_batch = None
-        if return_ik_solution:
-            original_solve_ik_batch = generator.solve_ik_batch
-            guarded_selection_state: dict[str, Any] = {
-                "previous": None,
-                "attached_obj": attached_obj,
-                "ignore_collision_checks": bool(ignore_collision_checks),
-            }
-
-            def local_seeded_solve_ik_batch(
-                curobo_generator: Any,
-                start_state: Any,
-                goal_pose: Any,
-                plan_config: Any,
-                link_poses: Any = None,
-                emb_sel: Any = self._embodiment_cls.DEFAULT,
-            ) -> tuple[Any, Any, list[Any]]:
-                return self._solve_local_seeded_ik_batch(
-                    curobo_generator,
-                    start_state,
-                    goal_pose,
-                    plan_config,
-                    link_poses=link_poses,
-                    emb_sel=emb_sel,
-                    selection_state=guarded_selection_state,
-                )
-
-            generator.solve_ik_batch = types.MethodType(
-                local_seeded_solve_ik_batch, generator
+        attachment_world_refreshed = attached_obj is not None
+        with _wall_clock_deadline(float(timeout_s), f"{hand} ARM cuRobo"):
+            if attachment_world_refreshed and not trunk_assist:
+                # CuRobo resolves attached collision-mesh names through its
+                # world registry even when collision costs are not used for
+                # admission. A fresh generator has no world model until this
+                # registry is populated. Refresh it only for attachment
+                # bookkeeping; the solver call below still disables collision
+                # admission and skips its own obstacle update.
+                generator.update_obstacles()
+            successes, paths = generator.compute_trajectories(
+                planner_targets,
+                planner_quats,
+                initial_joint_pos=initial_joint_pos,
+                max_attempts=5,
+                timeout=min(float(timeout_s), 8.0),
+                ik_fail_return=5,
+                enable_finetune_trajopt=not bool(ik_only),
+                finetune_attempts=0 if ik_only else 2,
+                return_full_result=False,
+                success_ratio=1.0 / batch_size,
+                attached_obj=attached_obj,
+                ik_only=bool(ik_only),
+                is_local=False,
+                skip_obstacle_update=not trunk_assist,
+                ik_world_collision_check=trunk_assist,
             )
-        try:
-            with _wall_clock_deadline(float(timeout_s), f"{hand} ARM cuRobo"):
-                successes, paths = generator.compute_trajectories(
-                    planner_targets,
-                    planner_quats,
-                    initial_joint_pos=initial_joint_pos,
-                    max_attempts=5,
-                    timeout=min(float(timeout_s), 8.0),
-                    ik_fail_return=5,
-                    enable_finetune_trajopt=not bool(ik_only),
-                    finetune_attempts=0 if ik_only else 2,
-                    return_full_result=False,
-                    success_ratio=1.0 / batch_size,
-                    attached_obj=attached_obj,
-                    ik_only=bool(ik_only),
-                    is_local=False,
-                    skip_obstacle_update=bool(skip_obstacle_update),
-                    ik_world_collision_check=bool(ik_world_collision_check),
-                )
-        finally:
-            if original_solve_ik_batch is not None:
-                generator.solve_ik_batch = original_solve_ik_batch
         success_array = np.asarray(_jsonable(successes), dtype=bool).reshape(-1)
         success_indices = np.flatnonzero(success_array)
         metrics = {
@@ -2421,18 +3155,21 @@ class RealCuroboBackend:
             if base_xyyaw is not None
             else None,
             "collision_semantics": (
-                "guarded_online_world_contact+self_collision_checked_ik"
-                if ik_only and not ik_world_collision_check
-                else (
-                    "candidate_world_collision_checked"
-                    if base_xyyaw is not None and ik_only
-                    else "world_collision_checked"
-                )
+                "curobo_world_and_self_collision_admitted"
+                if trunk_assist
+                else "not_used_for_admission"
             ),
             "curobo_config": str(
-                self._hand_config_path(hand, lock_trunk=True)
-                if generator_kind == "prepress_arm"
-                else self._hand_config_path(hand)
+                self._hand_config_path(
+                    hand,
+                    lock_trunk=False,
+                    motion_scope="arm_with_trunk",
+                )
+                if trunk_assist
+                else self._hand_config_path(
+                    hand,
+                    lock_trunk=generator_kind == "attached_arm",
+                )
             ),
             "generator_kind": generator_kind,
             "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
@@ -2440,7 +3177,19 @@ class RealCuroboBackend:
             "success_ratio": 1.0 / batch_size,
             "planner_seed_count": batch_size,
             "orientation_mode": orientation_mode,
-            "obstacle_update": not bool(skip_obstacle_update),
+            "world_mesh_registry_refreshed": attachment_world_refreshed,
+            "collision_admission_enabled": trunk_assist,
+            "obstacle_update": trunk_assist or attachment_world_refreshed,
+            "motion_scope": "arm_with_trunk" if trunk_assist else "arm_only",
+            "collision_admission": {
+                "available": bool(trunk_assist),
+                "admitted": bool(trunk_assist and success_indices.size > 0),
+                "world_collision_check": bool(trunk_assist),
+                "self_collision_check": bool(trunk_assist),
+                "obstacle_update": bool(trunk_assist),
+                "full_trajectory": bool(trunk_assist and not ik_only),
+                "source": "CuRoboMotionGenerator.compute_trajectories",
+            },
         }
         if success_indices.size == 0:
             return {
@@ -2449,10 +3198,7 @@ class RealCuroboBackend:
                 "metrics": metrics,
             }
         if ik_only:
-            metrics["reachable_by_collision_free_ik"] = bool(ik_world_collision_check)
-            metrics["reachable_by_candidate_world_collision_ik"] = (
-                base_xyyaw is not None
-            )
+            metrics["reachable_by_ik"] = True
             if return_ik_solution:
                 path = paths[int(success_indices[0])]
                 q_goal, merge_report = self._merge_ik_solution_into_full_q(
@@ -2465,273 +3211,31 @@ class RealCuroboBackend:
                     _jsonable(robot.get_joint_positions()), dtype=np.float32
                 ).reshape(1, -1)
                 max_joint_delta = float(np.max(np.abs(q_goal - current_q)))
-                metrics["guarded_max_joint_delta"] = max_joint_delta
-                metrics["guarded_max_joint_delta_limit"] = 0.35
-                if max_joint_delta > 0.35:
-                    return {
-                        "ok": False,
-                        "stop_reason": "guarded_ik_branch_jump",
-                        "metrics": metrics,
-                    }
-                if guarded_full_solution:
-                    guarded_start_pose = self.get_eef_pose(hand)
-                    if guarded_start_pose is None:
-                        raise RuntimeError(
-                            f"R1Pro {hand} EEF pose unavailable for guarded path"
-                        )
-                    guarded_trajectory, cartesian_report = (
-                        self._cartesian_certified_guarded_trajectory(
-                            generator,
-                            current_q=current_q,
-                            q_goal=q_goal,
-                            expected_distance_m=float(
-                                np.linalg.norm(planner_target - guarded_start_pose[0])
-                            ),
-                        )
-                    )
-                    metrics["guarded_cartesian_path_report"] = cartesian_report
-                    if guarded_trajectory is None:
-                        return {
-                            "ok": False,
-                            "stop_reason": "guarded_cartesian_path_invalid",
-                            "metrics": metrics,
-                        }
-                    collision_report = (
-                        {
-                            "available": True,
-                            "colliding": False,
-                            "collision_checks_skipped": True,
-                            "authorization": "explicit_stage3_direct_press",
-                        }
-                        if ignore_collision_checks
-                        else self._check_q_target_excluded_collisions(
-                            generator,
-                            guarded_trajectory,
-                            target_xyz=np.asarray(
-                                guarded_contact_target_xyz, dtype=np.float64
-                            ),
-                            attached_obj=attached_obj,
-                        )
-                    )
-                    metrics["guarded_target_excluded_collision_report"] = (
-                        collision_report
-                    )
-                    if not bool(collision_report.get("available", False)):
-                        return {
-                            "ok": False,
-                            "stop_reason": "collision_check_unavailable",
-                            "metrics": metrics,
-                        }
-                    if bool(collision_report.get("colliding", False)):
-                        return {
-                            "ok": False,
-                            "stop_reason": "guarded_trajectory_collision",
-                            "metrics": metrics,
-                        }
-                    metrics["guarded_contact_step"] = True
-                    metrics["guarded_cartesian_path"] = True
-                    metrics["guarded_interpolated_waypoints"] = int(
-                        len(guarded_trajectory)
-                    )
-                    metrics["execution_mode"] = "online_robot_q_to_action"
-                    return {
-                        "ok": True,
-                        "joint_trajectory": guarded_trajectory,
-                        "metrics": metrics,
-                    }
-                current_eef = self.get_eef_pose(hand)
-                cartesian_step_m = (
-                    float(np.linalg.norm(planner_target - current_eef[0]))
-                    if current_eef is not None
-                    else 0.002
-                )
-                requested_trust_region_rad = min(
-                    0.04,
-                    max(0.01, 0.02 * cartesian_step_m / 0.004),
-                )
-                metrics["guarded_cartesian_requested_step_m"] = cartesian_step_m
-                collision_attempts = []
-                trust_region_rad = requested_trust_region_rad
-                guarded_trajectory = None
-                collision_report = None
-                while True:
-                    trust_scale = min(
-                        1.0,
-                        trust_region_rad / max(max_joint_delta, 1e-9),
-                    )
-                    trusted_goal = current_q + (q_goal - current_q) * trust_scale
-                    candidate_trajectory = _interpolate_joint_trajectory(
-                        np.vstack([current_q, trusted_goal]),
-                        max_inter_dist=0.004,
-                    )[1:]
-                    if ignore_collision_checks:
-                        candidate_report = {
-                            "available": True,
-                            "colliding": False,
-                            "collision_checks_skipped": True,
-                            "authorization": "explicit_stage3_direct_press",
-                        }
-                    elif guarded_contact_target_xyz is not None:
-                        candidate_report = self._check_q_target_excluded_collisions(
-                            generator,
-                            candidate_trajectory,
-                            target_xyz=guarded_contact_target_xyz,
-                            attached_obj=attached_obj,
-                        )
-                    else:
-                        candidate_report = self._check_q_combined_collisions(
-                            generator,
-                            candidate_trajectory,
-                            attached_obj=attached_obj,
-                        )
-                    collision_attempts.append(
-                        {
-                            "trust_region_rad": trust_region_rad,
-                            "trust_scale": trust_scale,
-                            "waypoints": int(len(candidate_trajectory)),
-                            "collision_report": candidate_report,
-                        }
-                    )
-                    if not bool(candidate_report.get("available", False)):
-                        metrics["guarded_collision_backoff_attempts"] = (
-                            collision_attempts
-                        )
-                        return {
-                            "ok": False,
-                            "stop_reason": "collision_check_unavailable",
-                            "metrics": metrics,
-                        }
-                    if not bool(candidate_report.get("colliding", False)):
-                        guarded_trajectory = candidate_trajectory
-                        collision_report = candidate_report
-                        break
-                    if trust_region_rad <= 0.0100001:
-                        break
-                    trust_region_rad = max(0.01, trust_region_rad * 0.5)
-                metrics["guarded_collision_backoff_attempts"] = collision_attempts
-                metrics["guarded_interpolated_waypoints"] = int(
-                    len(guarded_trajectory) if guarded_trajectory is not None else 0
-                )
-                metrics["guarded_max_joint_step"] = 0.004
-                metrics["guarded_joint_trust_region_requested_rad"] = (
-                    requested_trust_region_rad
-                )
-                metrics["guarded_joint_trust_region_rad"] = trust_region_rad
-                metrics["guarded_joint_trust_scale"] = min(
-                    1.0,
-                    trust_region_rad / max(max_joint_delta, 1e-9),
-                )
-                if guarded_contact_target_xyz is not None:
-                    metrics["guarded_target_excluded_collision_report"] = (
-                        collision_report or collision_attempts[-1]["collision_report"]
-                    )
-                else:
-                    metrics["combined_collision_report"] = (
-                        collision_report or collision_attempts[-1]["collision_report"]
-                    )
-                if guarded_trajectory is None or collision_report is None:
-                    return {
-                        "ok": False,
-                        "stop_reason": (
-                            "guarded_trajectory_collision"
-                            if guarded_contact_target_xyz is not None
-                            else "self_collision"
-                        ),
-                        "metrics": metrics,
-                    }
-                metrics["guarded_contact_step"] = True
+                joint_step = 0.004 if guarded_contact_target_xyz is not None else 0.0075
+                trajectory = _interpolate_joint_trajectory(
+                    np.vstack([current_q, q_goal]),
+                    max_inter_dist=joint_step,
+                )[1:]
+                metrics["maximum_ik_joint_delta_rad"] = max_joint_delta
+                metrics["interpolated_waypoints"] = int(len(trajectory))
+                metrics["interpolation_joint_step_rad"] = joint_step
+                metrics["guarded_contact_step"] = guarded_contact_target_xyz is not None
+                metrics["guarded_full_solution_requested"] = bool(guarded_full_solution)
                 metrics["execution_mode"] = "online_robot_q_to_action"
                 return {
                     "ok": True,
-                    "joint_trajectory": guarded_trajectory,
+                    "joint_trajectory": trajectory,
                     "metrics": metrics,
                 }
             return {"ok": True, "metrics": metrics}
-        current_q = np.asarray(
-            _jsonable(robot.get_joint_positions()), dtype=np.float32
-        ).reshape(-1)
-        candidate_reports = []
-        safe_candidates: list[
-            tuple[float, int, np.ndarray, dict[str, Any], dict[str, Any]]
-        ] = []
-        for success_index in success_indices:
-            candidate_index = int(success_index)
-            try:
-                candidate_q = generator.path_to_joint_trajectory(
-                    paths[candidate_index], get_full_js=True
-                )
-                candidate_q = _interpolate_joint_trajectory(
-                    candidate_q, max_inter_dist=0.0075
-                )
-                candidate_q, retime_report = _retime_joint_trajectory(
-                    candidate_q,
-                    sample_dt_s=1.0 / 60.0,
-                    max_command_velocity=3.0,
-                    max_command_acceleration=7.5,
-                )
-                candidate_collision = self._check_q_trajectory_collisions(
-                    generator,
-                    candidate_q,
-                    attached_obj=attached_obj,
-                    skip_obstacle_update=True,
-                )
-            except Exception as exc:
-                candidate_reports.append(
-                    {
-                        "candidate_index": candidate_index,
-                        "available": False,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-                continue
-            terminal_l2 = float(
-                np.linalg.norm(
-                    np.asarray(candidate_q[-1], dtype=np.float32).reshape(-1)
-                    - current_q
-                )
-            )
-            candidate_reports.append(
-                {
-                    "candidate_index": candidate_index,
-                    "available": bool(candidate_collision.get("available", False)),
-                    "colliding": bool(candidate_collision.get("colliding", True)),
-                    "terminal_joint_l2": terminal_l2,
-                    "trajectory_waypoints": int(len(candidate_q)),
-                    "execution_retime": retime_report,
-                    "collision_report": candidate_collision,
-                }
-            )
-            if bool(candidate_collision.get("available", False)) and not bool(
-                candidate_collision.get("colliding", True)
-            ):
-                safe_candidates.append(
-                    (
-                        terminal_l2,
-                        candidate_index,
-                        np.asarray(candidate_q, dtype=np.float32),
-                        candidate_collision,
-                        retime_report,
-                    )
-                )
-        metrics["full_trajectory_candidate_reports"] = candidate_reports
-        if not safe_candidates:
-            return {
-                "ok": False,
-                "stop_reason": "trajectory_collision"
-                if any(report.get("available") for report in candidate_reports)
-                else "collision_check_unavailable",
-                "metrics": metrics,
-            }
-        _cost, selected_index, q_traj, collision_report, retime_report = min(
-            safe_candidates, key=lambda item: (item[0], item[1])
+        selected_index = int(success_indices[0])
+        q_traj = generator.path_to_joint_trajectory(
+            paths[selected_index], get_full_js=True
         )
+        q_traj = _interpolate_joint_trajectory(q_traj, max_inter_dist=0.0075)
         metrics["selected_full_trajectory_candidate"] = selected_index
-        metrics["full_trajectory_selection"] = (
-            "minimum_terminal_joint_l2_after_full_collision_recheck"
-        )
-        metrics["collision_report"] = collision_report
+        metrics["full_trajectory_selection"] = "first_solver_success"
         metrics["trajectory_waypoints"] = int(len(q_traj))
-        metrics["execution_retime"] = retime_report
         metrics["execution_mode"] = "online_robot_q_to_action"
         return {
             "ok": True,
@@ -2833,25 +3337,8 @@ class RealCuroboBackend:
                 solution_position = solution_position[..., solution_index]
             solution_position = solution_position.reshape(-1, previous.shape[-1])
             selectable = seed_success.clone()
-            graph_selectable = seed_success.clone()
             candidate_full: list[np.ndarray] = []
             if selection_state is not None:
-                edge_segments = []
-                edge_offsets = []
-                offset = 0
-                assert previous_full is not None
-                preliminary_delta = np.asarray(
-                    _jsonable((solution_position - previous[0]).abs().amax(dim=-1)),
-                    dtype=np.float64,
-                ).reshape(-1)
-                preliminary_success = np.asarray(
-                    _jsonable(seed_success), dtype=bool
-                ).reshape(-1)
-                checked_indices = [
-                    int(candidate_index)
-                    for candidate_index in np.argsort(preliminary_delta)
-                    if preliminary_success[candidate_index]
-                ][:8]
                 for seed_index in range(int(seed_success.shape[0])):
                     q_candidate, _merge_report = self._merge_ik_solution_into_full_q(
                         generator,
@@ -2860,113 +3347,11 @@ class RealCuroboBackend:
                     )
                     candidate = q_candidate.reshape(-1)
                     candidate_full.append(candidate)
-                    if seed_index not in checked_indices:
-                        edge_offsets.append((-1, -1))
-                        continue
-                    segment = np.concatenate(
-                        [
-                            _interpolate_joint_trajectory(
-                                np.vstack([previous_full, candidate]),
-                                max_inter_dist=sample_step,
-                            )[1:]
-                            for sample_step in (0.01, 0.005, 0.0025, 0.00125)
-                        ],
-                        axis=0,
-                    )
-                    edge_segments.append(segment)
-                    edge_offsets.append((offset, offset + len(segment)))
-                    offset += len(segment)
-                ignore_collisions = bool(
-                    selection_state.get("ignore_collision_checks", False)
-                )
-                edge_report = (
-                    {
-                        "available": True,
-                        "colliding": False,
-                        "colliding_mask": [False] * int(offset),
-                        "collision_waypoints": 0,
-                        "checked_waypoints": 0,
-                        "collision_checks_skipped": True,
-                        "authorization": "explicit_stage3_direct_press",
-                    }
-                    if ignore_collisions
-                    else (
-                        self._check_q_self_collisions(
-                            generator,
-                            np.concatenate(edge_segments, axis=0),
-                            attached_obj=selection_state.get("attached_obj"),
-                        )
-                        if edge_segments
-                        else {
-                            "available": True,
-                            "colliding": False,
-                            "colliding_mask": [],
-                            "collision_waypoints": 0,
-                            "checked_waypoints": 0,
-                            "reason": "no_successful_ik_candidates",
-                        }
-                    )
-                )
-                if not bool(edge_report.get("available", False)):
-                    raise RuntimeError(
-                        "guarded IK edge self-collision check unavailable: "
-                        f"{edge_report.get('reason', 'unknown')}"
-                    )
-                edge_mask = np.asarray(
-                    edge_report.get("colliding_mask"), dtype=bool
-                ).reshape(-1)
-                collision_candidates = (
-                    np.zeros(len(edge_offsets), dtype=bool)
-                    if ignore_collisions
-                    else np.asarray(
-                        [
-                            True if start < 0 else edge_mask[start:end].any()
-                            for start, end in edge_offsets
-                        ],
-                        dtype=bool,
-                    )
-                )
-                collision_tensor = selectable.new_tensor(
-                    collision_candidates, dtype=selectable.dtype
-                )
-                selectable &= ~collision_tensor
                 selection_state.setdefault("candidate_q_sets", []).append(
                     np.asarray(candidate_full, dtype=np.float32).tolist()
                 )
                 selection_state.setdefault("candidate_selectable_masks", []).append(
-                    np.asarray(_jsonable(graph_selectable), dtype=bool).tolist()
-                )
-                selection_state.setdefault(
-                    "candidate_self_collision_reports", []
-                ).append(
-                    {
-                        "candidate_count": int(len(collision_candidates)),
-                        "ik_seed_strategy": (
-                            "current_q_plus_15_deterministic_local_seeds"
-                        ),
-                        "ik_seed_max_perturbation_rad": 0.02,
-                        "ik_successful_candidates": int(
-                            np.asarray(_jsonable(graph_selectable), dtype=bool).sum()
-                        ),
-                        "densely_checked_candidates": len(checked_indices),
-                        "pruned_far_candidates": int(
-                            len(collision_candidates) - len(checked_indices)
-                        ),
-                        "edge_joint_sample_steps_rad": [
-                            0.01,
-                            0.005,
-                            0.0025,
-                            0.00125,
-                        ],
-                        "self_colliding_candidates": int(collision_candidates.sum()),
-                        "targets_without_self_free_solution": int(
-                            not bool(selectable.any())
-                        ),
-                        "graph_candidate_semantics": (
-                            "all_ik_successes; final_state_graph_rechecks_each_edge"
-                        ),
-                        "checked_edge_waypoints": int(len(edge_mask)),
-                    }
+                    np.asarray(_jsonable(selectable), dtype=bool).tolist()
                 )
             joint_delta = (solution_position - previous[0]).abs().amax(dim=-1)
             joint_delta[~selectable].fill_(float("inf"))
@@ -2974,12 +3359,12 @@ class RealCuroboBackend:
                 selection_state is not None
                 and selection_state.get("graph_independent_seeds", False)
             )
-            effective_success = graph_selectable if graph_independent else selectable
+            effective_success = selectable
             success = bool(effective_success.any())
             minimum_error_index = int(joint_delta.argmin().item())
             if graph_independent:
                 graph_delta = (solution_position - previous[0]).abs().amax(dim=-1)
-                graph_delta[~graph_selectable].fill_(float("inf"))
+                graph_delta[~selectable].fill_(float("inf"))
                 minimum_error_index = int(graph_delta.argmin().item())
             paths.append(result.js_solution[0, minimum_error_index])
             success_flags.append(effective_success.any())
@@ -3227,9 +3612,8 @@ class RealCuroboBackend:
         current_q: np.ndarray,
         candidate_q_sets: Any,
         candidate_selectable_masks: Any,
-        attached_obj: Any = None,
     ) -> tuple[np.ndarray | None, dict[str, Any]]:
-        """Find a minimum-motion layered IK path with collision-free edges."""
+        """Find a minimum-motion layered IK path with Cartesian-consistent edges."""
 
         candidates = np.asarray(candidate_q_sets, dtype=np.float32)
         selectable = np.asarray(candidate_selectable_masks, dtype=bool)
@@ -3283,25 +3667,12 @@ class RealCuroboBackend:
                     "failed_layer": layer,
                     "layers": layer_reports,
                 }
-            collision = self._check_q_self_collisions(
-                generator,
-                np.concatenate(edge_waypoints, axis=0),
-                attached_obj=attached_obj,
-            )
-            if not bool(collision.get("available", False)):
-                raise RuntimeError(
-                    "guarded candidate edge collision check unavailable: "
-                    f"{collision.get('reason', 'unknown')}"
-                )
-            collision_mask = np.asarray(
-                collision.get("colliding_mask"), dtype=bool
-            ).reshape(-1)
             eef_positions = self._curobo_eef_positions(
                 generator, np.concatenate(edge_waypoints, axis=0)
             )
             next_costs = np.full(candidate_count, np.inf, dtype=np.float64)
             next_backpointer = np.full(candidate_count, -1, dtype=np.int64)
-            clear_edges = 0
+            accepted_edges = 0
             cartesian_rejected_edges = 0
             for (
                 previous_index,
@@ -3310,8 +3681,6 @@ class RealCuroboBackend:
                 end_offset,
                 edge_cost,
             ) in edges:
-                if bool(collision_mask[start_offset:end_offset].any()):
-                    continue
                 edge_positions = eef_positions[start_offset:end_offset]
                 chord = edge_positions[-1] - edge_positions[0]
                 chord_length = float(np.linalg.norm(chord))
@@ -3328,7 +3697,7 @@ class RealCuroboBackend:
                 if max_lateral > 0.002 or min_progress < -0.0005:
                     cartesian_rejected_edges += 1
                     continue
-                clear_edges += 1
+                accepted_edges += 1
                 cost = previous_costs[previous_index] + edge_cost
                 if cost < next_costs[candidate_index]:
                     next_costs[candidate_index] = cost
@@ -3339,17 +3708,16 @@ class RealCuroboBackend:
                     "candidate_count": int(selectable[layer].sum()),
                     "tested_edges": len(edges),
                     "branch_rejected_edges": branch_rejected_edges,
-                    "collision_free_edges": clear_edges,
+                    "accepted_edges": accepted_edges,
                     "cartesian_rejected_edges": cartesian_rejected_edges,
                     "reachable_candidates": int(np.isfinite(next_costs).sum()),
-                    "checked_edge_waypoints": int(len(collision_mask)),
                 }
             )
             if not bool(np.isfinite(next_costs).any()):
                 return None, {
                     "available": True,
                     "selected": False,
-                    "reason": "no_self_collision_free_path",
+                    "reason": "no_cartesian_consistent_path",
                     "failed_layer": layer,
                     "layers": layer_reports,
                 }
@@ -3396,29 +3764,12 @@ class RealCuroboBackend:
             candidate_selection_elapsed_s = round(time.monotonic() - started, 3)
             if not candidates:
                 summary = dict(self._last_base_candidate_summary)
-                collision_only = bool(
-                    summary.get("traversable_count", 0) > 0
-                    and summary.get("collision_colliding_count", 0)
-                    == summary.get("traversable_count", 0)
-                )
-                collision_unavailable = bool(
-                    summary.get("collision_unavailable_count", 0) > 0
-                    and summary.get("collision_free_count", 0) == 0
-                )
                 return {
                     "ok": False,
-                    "stop_reason": (
-                        "navigation_collision"
-                        if collision_only
-                        else (
-                            "planner_unavailable"
-                            if collision_unavailable
-                            else "navigation_unreachable"
-                        )
-                    ),
+                    "stop_reason": "navigation_unreachable",
                     "metrics": {
                         "candidate_count": 0,
-                        "reason": "no traversable collision-free reachable station",
+                        "reason": "no traversable IK-reachable station",
                         "candidate_summary": summary,
                     },
                 }
@@ -3433,7 +3784,6 @@ class RealCuroboBackend:
                     "reachability_target_quat_xyzw": (
                         item.get("reachability", {}).get("selected_target_quat_xyzw")
                     ),
-                    "base_collision_report": item.get("base_collision_report"),
                 }
                 for item in candidates[:8]
             ]
@@ -3526,6 +3876,397 @@ class RealCuroboBackend:
                 },
             }
 
+    def plan_navigation_trajectory(
+        self,
+        *,
+        target_xyz: Any,
+        standoff_m: float,
+        max_travel_m: float,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        """Plan one bounded BASE-only stage along OG's robot-eroded A* path."""
+
+        started = time.monotonic()
+        target = _as_xyz(target_xyz)
+        standoff = float(standoff_m)
+        max_travel = float(max_travel_m)
+        timeout = float(timeout_s)
+        if not math.isfinite(standoff) or standoff <= 0.0:
+            raise ValueError("standoff_m must be finite and positive")
+        if not math.isfinite(max_travel) or max_travel <= 0.0:
+            raise ValueError("max_travel_m must be finite and positive")
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("timeout_s must be finite and positive")
+        deadline = started + timeout
+
+        robot = self._find_robot()
+        scene = self._scene(robot)
+        trav_map = getattr(scene, "trav_map", None)
+        if trav_map is None or not callable(
+            getattr(trav_map, "get_shortest_path", None)
+        ):
+            return {
+                "ok": False,
+                "stop_reason": "navigation_planner_unavailable",
+                "metrics": {
+                    "navigation_path": {
+                        "source": "official_robot_eroded_traversability",
+                        "entire_path_requested": True,
+                        "full_path_used": False,
+                        "dynamic_world_collision_admission": False,
+                    }
+                },
+            }
+        current = self._base_xy_yaw(robot)
+        floor = self._current_floor(scene, current)
+        candidates = [
+            candidate
+            for candidate in _base_candidates(target, standoff_m=standoff)
+            if self._candidate_is_traversable(trav_map, candidate, floor=floor)
+        ]
+        path_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("navigation candidate search timed out")
+            path_value, geodesic_value = trav_map.get_shortest_path(
+                floor,
+                current[:2],
+                candidate[:2],
+                entire_path=True,
+                robot=robot,
+            )
+            if path_value is None or geodesic_value is None:
+                continue
+            path = np.asarray(_jsonable(path_value), dtype=np.float64)
+            if (
+                path.ndim != 2
+                or path.shape[1] != 2
+                or len(path) < 1
+                or not np.isfinite(path).all()
+            ):
+                continue
+            if float(np.linalg.norm(path[0] - current[:2])) > 1e-9:
+                path = np.vstack([current[:2], path])
+            if float(np.linalg.norm(path[-1] - candidate[:2])) > 1e-9:
+                path = np.vstack([path, candidate[:2]])
+            geodesic = float(geodesic_value)
+            if not math.isfinite(geodesic) or geodesic < 0.0:
+                continue
+            path_candidates.append(
+                {
+                    "station": candidate,
+                    "path": path,
+                    "geodesic_distance_m": geodesic,
+                }
+            )
+        if not path_candidates:
+            return {
+                "ok": False,
+                "stop_reason": "navigation_unreachable",
+                "metrics": {
+                    "candidate_count": len(candidates),
+                    "navigation_path": {
+                        "source": "official_robot_eroded_traversability",
+                        "entire_path_requested": True,
+                        "full_path_used": False,
+                        "dynamic_world_collision_admission": False,
+                    },
+                    "elapsed_s": round(time.monotonic() - started, 3),
+                },
+            }
+        path_candidates.sort(
+            key=lambda item: (
+                float(item["geodesic_distance_m"]),
+                float(np.linalg.norm(item["station"][:2] - current[:2])),
+            )
+        )
+        selected = path_candidates[0]
+        bounded_path, planned_travel, full_length, truncated = _bounded_polyline_prefix(
+            selected["path"],
+            max_travel_m=max_travel,
+        )
+
+        start_q = np.asarray(
+            _jsonable(robot.get_joint_positions()), dtype=np.float64
+        ).reshape(-1)
+        if start_q.size < 1 or not np.isfinite(start_q).all():
+            raise RuntimeError("R1Pro joint feedback is unavailable for navigation")
+        base_indices = _indices(getattr(robot, "base_idx", []))
+        if len(base_indices) != 6:
+            raise RuntimeError("R1Pro six-axis virtual base indices are unavailable")
+        q_waypoints = [start_q.copy()]
+        prior_yaw = float(start_q[base_indices[5]])
+        for point in bounded_path[1:]:
+            toward_target = target[:2] - point
+            desired_yaw = (
+                prior_yaw
+                if float(np.linalg.norm(toward_target)) <= 1e-9
+                else math.atan2(float(toward_target[1]), float(toward_target[0]))
+            )
+            desired_yaw = prior_yaw + _wrap_angle(desired_yaw - prior_yaw)
+            q = start_q.copy()
+            q[base_indices[0]] = float(point[0])
+            q[base_indices[1]] = float(point[1])
+            q[base_indices[5]] = desired_yaw
+            q_waypoints.append(q)
+            prior_yaw = desired_yaw
+        if len(q_waypoints) == 1:
+            q = start_q.copy()
+            desired_yaw = math.atan2(
+                float(target[1] - current[1]),
+                float(target[0] - current[0]),
+            )
+            q[base_indices[5]] = prior_yaw + _wrap_angle(desired_yaw - prior_yaw)
+            q_waypoints.append(q)
+        q_path = _interpolate_joint_trajectory(
+            np.asarray(q_waypoints, dtype=np.float64),
+            max_inter_dist=0.01,
+        )[1:].astype(np.float32)
+        if q_path.ndim != 2 or len(q_path) < 1 or not np.isfinite(q_path).all():
+            raise RuntimeError("navigation q trajectory is unavailable")
+        base_goal = np.asarray(
+            [
+                q_path[-1, base_indices[0]],
+                q_path[-1, base_indices[1]],
+                _wrap_angle(float(q_path[-1, base_indices[5]])),
+            ],
+            dtype=np.float64,
+        )
+        metrics = {
+            "candidate_count": len(candidates),
+            "reachable_candidate_count": len(path_candidates),
+            "selected_geodesic_distance_m": float(selected["geodesic_distance_m"]),
+            "base_goal": base_goal.tolist(),
+            "navigation_path": {
+                "source": "official_robot_eroded_traversability",
+                "entire_path_requested": True,
+                "full_path_used": not truncated,
+                "dynamic_world_collision_admission": False,
+                "returned_waypoint_count": int(len(selected["path"])),
+                "bounded_waypoint_count": int(len(bounded_path)),
+                "execution_waypoint_count": int(len(q_path)),
+                "full_path_length_m": full_length,
+                "bounded_stage": {
+                    "max_travel_m": max_travel,
+                    "planned_travel_m": planned_travel,
+                    "truncated": bool(truncated),
+                },
+            },
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+        self._record_base_phase(
+            {
+                "phase": "navigation_path_selected",
+                "metrics": metrics,
+            }
+        )
+        return {
+            "ok": True,
+            "joint_trajectory": q_path,
+            "base_goal": base_goal,
+            "metrics": metrics,
+        }
+
+    def plan_relative_navigation_trajectory(
+        self,
+        *,
+        relative_motion: Any,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        """Plan one exact straight translation or in-place BASE rotation."""
+
+        started = time.monotonic()
+        motion = validate_relative_navigation_motion(relative_motion)
+        timeout = float(timeout_s)
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("timeout_s must be finite and positive")
+        robot = self._find_robot()
+        scene = self._scene(robot)
+        trav_map = getattr(scene, "trav_map", None)
+        floor_maps = getattr(trav_map, "floor_map", None)
+        erode = getattr(trav_map, "_erode_trav_map", None)
+        world_to_map = getattr(trav_map, "world_to_map", None)
+        if floor_maps is None or not callable(erode) or not callable(world_to_map):
+            return {
+                "ok": False,
+                "stop_reason": "relative_navigation_traversability_unavailable",
+                "metrics": {"elapsed_s": round(time.monotonic() - started, 3)},
+            }
+
+        current = self._base_xy_yaw(robot)
+        floor = self._current_floor(scene, current)
+        if floor < 0 or floor >= len(floor_maps):
+            return {
+                "ok": False,
+                "stop_reason": "relative_navigation_traversability_unavailable",
+                "metrics": {"elapsed_s": round(time.monotonic() - started, 3)},
+            }
+        try:
+            import torch
+
+            source_map = floor_maps[floor]
+            source_tensor = (
+                torch.clone(source_map)
+                if torch.is_tensor(source_map)
+                else torch.as_tensor(np.asarray(_jsonable(source_map))).clone()
+            )
+            eroded_map = np.asarray(
+                _jsonable(erode(source_tensor, robot=robot)),
+                dtype=np.float64,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "stop_reason": "relative_navigation_traversability_unavailable",
+                "metrics": {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "elapsed_s": round(time.monotonic() - started, 3),
+                },
+            }
+        if (
+            eroded_map.ndim != 2
+            or eroded_map.size < 1
+            or not np.isfinite(eroded_map).all()
+        ):
+            return {
+                "ok": False,
+                "stop_reason": "relative_navigation_traversability_unavailable",
+                "metrics": {"elapsed_s": round(time.monotonic() - started, 3)},
+            }
+
+        start_q = np.asarray(
+            _jsonable(robot.get_joint_positions()), dtype=np.float64
+        ).reshape(-1)
+        base_indices = _indices(getattr(robot, "base_idx", []))
+        if (
+            start_q.size < 1
+            or not np.isfinite(start_q).all()
+            or len(base_indices) != 6
+        ):
+            raise RuntimeError("R1Pro base joint feedback is unavailable")
+        q_pose = np.asarray(
+            [
+                start_q[base_indices[0]],
+                start_q[base_indices[1]],
+                start_q[base_indices[5]],
+            ],
+            dtype=np.float64,
+        )
+        if (
+            float(np.linalg.norm(q_pose[:2] - current[:2])) > 0.02 + 1e-9
+            or abs(_wrap_angle(float(q_pose[2] - current[2])))
+            > math.radians(1.0) + 1e-9
+        ):
+            return {
+                "ok": False,
+                "stop_reason": "relative_navigation_pose_inconsistent",
+                "metrics": {"elapsed_s": round(time.monotonic() - started, 3)},
+            }
+
+        base_goal = q_pose.copy()
+        if motion["kind"] == "translation":
+            signed_distance = float(motion["distance_m"]) * (
+                1.0 if motion["direction"] == "forward" else -1.0
+            )
+            heading = np.asarray(
+                [math.cos(float(current[2])), math.sin(float(current[2]))],
+                dtype=np.float64,
+            )
+            base_goal[:2] = current[:2] + signed_distance * heading
+            start_cell = np.asarray(
+                _jsonable(world_to_map(current[:2])), dtype=np.int64
+            ).reshape(-1)
+            end_cell = np.asarray(
+                _jsonable(world_to_map(base_goal[:2])), dtype=np.int64
+            ).reshape(-1)
+            if start_cell.shape != (2,) or end_cell.shape != (2,):
+                return {
+                    "ok": False,
+                    "stop_reason": "relative_navigation_traversability_unavailable",
+                    "metrics": {"elapsed_s": round(time.monotonic() - started, 3)},
+                }
+            checked_cells = _supercover_grid_cells(start_cell, end_cell)
+            segments = max(1, int(math.ceil(abs(signed_distance) / 0.01)))
+        else:
+            signed_angle = math.radians(float(motion["angle_deg"])) * (
+                1.0 if motion["direction"] == "left" else -1.0
+            )
+            base_goal[2] = float(q_pose[2]) + signed_angle
+            start_cell = np.asarray(
+                _jsonable(world_to_map(current[:2])), dtype=np.int64
+            ).reshape(-1)
+            if start_cell.shape != (2,):
+                return {
+                    "ok": False,
+                    "stop_reason": "relative_navigation_traversability_unavailable",
+                    "metrics": {"elapsed_s": round(time.monotonic() - started, 3)},
+                }
+            checked_cells = [(int(start_cell[0]), int(start_cell[1]))]
+            segments = max(
+                1,
+                int(math.ceil(abs(signed_angle) / math.radians(1.0))),
+            )
+
+        if any(
+            row < 0
+            or column < 0
+            or row >= eroded_map.shape[0]
+            or column >= eroded_map.shape[1]
+            or eroded_map[row, column] <= 0.0
+            for row, column in checked_cells
+        ):
+            return {
+                "ok": False,
+                "stop_reason": "relative_navigation_untraversable",
+                "metrics": {
+                    "checked_cell_count": len(checked_cells),
+                    "elapsed_s": round(time.monotonic() - started, 3),
+                },
+            }
+
+        fractions = np.linspace(0.0, 1.0, segments + 1, dtype=np.float64)[1:]
+        q_path = np.repeat(start_q.reshape(1, -1), len(fractions), axis=0)
+        q_path[:, base_indices[0]] = (
+            q_pose[0] + fractions * (base_goal[0] - q_pose[0])
+        )
+        q_path[:, base_indices[1]] = (
+            q_pose[1] + fractions * (base_goal[1] - q_pose[1])
+        )
+        q_path[:, base_indices[5]] = (
+            q_pose[2] + fractions * (base_goal[2] - q_pose[2])
+        )
+        metrics = {
+            "relative_motion": dict(motion),
+            "base_goal": [
+                float(base_goal[0]),
+                float(base_goal[1]),
+                _wrap_angle(float(base_goal[2])),
+            ],
+            "navigation_path": {
+                "source": "official_robot_eroded_traversability",
+                "straight_relative_motion": True,
+                "dynamic_world_collision_admission": False,
+                "checked_cell_count": len(checked_cells),
+                "execution_waypoint_count": int(len(q_path)),
+            },
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+        self._record_base_phase(
+            {
+                "phase": "relative_navigation_admitted",
+                "metrics": metrics,
+            }
+        )
+        return {
+            "ok": True,
+            "joint_trajectory": q_path.astype(np.float32),
+            "base_goal": np.asarray(
+                [base_goal[0], base_goal[1], _wrap_angle(float(base_goal[2]))],
+                dtype=np.float64,
+            ),
+            "metrics": metrics,
+        }
+
     def _ranked_base_candidates(
         self,
         robot: Any,
@@ -3559,9 +4300,6 @@ class RealCuroboBackend:
             "generated_count": len(generated),
             "pixel_traversable_count": len(pixel_traversable),
             "traversable_count": 0,
-            "collision_free_count": 0,
-            "collision_colliding_count": 0,
-            "collision_unavailable_count": 0,
             "reachability_checked_count": 0,
             "reachable_count": 0,
             "shortlisted_count": len(shortlisted),
@@ -3605,40 +4343,10 @@ class RealCuroboBackend:
                 "remaining_s": float(deadline) - time.monotonic(),
             }
         )
-        collision_started = time.monotonic()
-        collision_reports = self._candidate_base_collision_reports(
-            robot,
-            [item["xyyaw"] for item in connected],
-        )
-        self._last_base_candidate_summary["collision_free_count"] = sum(
-            bool(report.get("available", False))
-            and not bool(report.get("colliding", False))
-            for report in collision_reports
-        )
-        self._last_base_candidate_summary["collision_colliding_count"] = sum(
-            bool(report.get("available", False))
-            and bool(report.get("colliding", False))
-            for report in collision_reports
-        )
-        self._last_base_candidate_summary["collision_unavailable_count"] = sum(
-            not bool(report.get("available", False)) for report in collision_reports
-        )
-        self._record_base_phase(
-            {
-                "phase": "candidate_collision_complete",
-                "elapsed_s": round(time.monotonic() - collision_started, 3),
-                "summary": dict(self._last_base_candidate_summary),
-                "remaining_s": float(deadline) - time.monotonic(),
-            }
-        )
         ranked: list[dict[str, Any]] = []
-        for item, base_collision in zip(connected, collision_reports):
+        for item in connected:
             if len(ranked) >= MAX_BASE_PLAN_CANDIDATES:
                 break
-            if not bool(base_collision.get("available", False)) or bool(
-                base_collision.get("colliding", False)
-            ):
-                continue
             remaining_s = float(deadline) - time.monotonic()
             if remaining_s <= 0.0:
                 raise TimeoutError("BASE candidate reachability deadline exceeded")
@@ -3679,7 +4387,6 @@ class RealCuroboBackend:
                     "reachability_reason": reason,
                     "reachability": reach_metrics,
                     "reachability_stage": reach_metrics.get("reachability_stage"),
-                    "base_collision_report": base_collision,
                 }
             )
             self._last_base_candidate_summary["reachable_count"] = len(ranked)
@@ -3771,7 +4478,7 @@ class RealCuroboBackend:
         *,
         clearance_m: float = 0.15,
     ) -> np.ndarray:
-        """Return a collision-free precontact target between base and surface."""
+        """Return a precontact target between base and surface."""
 
         target = np.asarray(surface_target_xyz, dtype=np.float64).reshape(3)
         toward_surface = target[:2] - np.asarray(candidate_xyyaw, dtype=np.float64)[:2]
@@ -3781,78 +4488,6 @@ class RealCuroboBackend:
         result = target.copy()
         result[:2] -= toward_surface / norm * float(clearance_m)
         return result
-
-    def _candidate_base_collision_reports(
-        self,
-        robot: Any,
-        candidates: list[np.ndarray],
-    ) -> list[dict[str, Any]]:
-        """Validate all traversable BASE stations in one official OG query."""
-
-        if not candidates:
-            return []
-        try:
-            generator = self._generator(kind="base")
-            step = int(getattr(self.env_facade, "_env_steps", -1))
-            refresh_obstacles = step < 0 or self._base_obstacle_world_step != step
-            q = np.stack(
-                [
-                    self._initial_joint_pos_for_base_candidate(robot, candidate)
-                    for candidate in candidates
-                ],
-                axis=0,
-            )
-            colliding = generator.check_collisions(
-                q,
-                self_collision_check=False,
-                skip_obstacle_update=not refresh_obstacles,
-                attached_obj=None,
-            )
-            if refresh_obstacles:
-                self._base_obstacle_world_step = step
-            collision_array = np.asarray(_jsonable(colliding), dtype=bool).reshape(-1)
-            if collision_array.size != len(candidates):
-                raise RuntimeError(
-                    "BASE collision result count does not match candidate count"
-                )
-        except TimeoutError:
-            # An interrupted CUDA collision-world update invalidates the
-            # generator.  Propagate so the owning BASE plan quarantines it;
-            # never downgrade a hard timeout to an ordinary unavailable
-            # candidate and reuse uncertain planner state.
-            raise
-        except Exception as exc:
-            return [
-                {
-                    "available": False,
-                    "colliding": None,
-                    "reason": f"{type(exc).__name__}: {exc}",
-                    "checked_waypoints": 0,
-                    "candidate_xyyaw": candidate.tolist(),
-                }
-                for candidate in candidates
-            ]
-        return [
-            {
-                "available": True,
-                "colliding": bool(is_colliding),
-                "collision_waypoints": int(bool(is_colliding)),
-                "checked_waypoints": 1,
-                **_collision_margin_report_values(bool(is_colliding)),
-                "self_collision_check": False,
-                "obstacle_world_refreshed": bool(refresh_obstacles),
-                "candidate_xyyaw": candidate.tolist(),
-            }
-            for candidate, is_colliding in zip(candidates, collision_array)
-        ]
-
-    def _candidate_base_collision_report(
-        self,
-        robot: Any,
-        candidate: np.ndarray,
-    ) -> dict[str, Any]:
-        """Check the full robot at a candidate base state, failing closed."""
-        return self._candidate_base_collision_reports(robot, [candidate])[0]
 
     def _scene(self, robot: Any) -> Any:
         scene = getattr(robot, "scene", None)
@@ -3922,8 +4557,8 @@ class RealCuroboBackend:
         timeout_s: float,
         skip_obstacle_update: bool = False,
     ) -> dict[str, Any]:
+        del skip_obstacle_update
         generator = self._generator(kind="base")
-        self._active_generator = generator
         emb_sel = self._embodiment_cls.BASE
         torch = self._torch
         if torch is None:
@@ -3950,49 +4585,26 @@ class RealCuroboBackend:
         hard_attempt_timeout_s = min(float(timeout_s), BASE_PLAN_ATTEMPT_TIMEOUT_S)
         attempt_timeout_s = max(0.1, hard_attempt_timeout_s - 2.0)
         with _wall_clock_deadline(hard_attempt_timeout_s, "BASE cuRobo candidate"):
-            full_results = generator.compute_trajectories(
+            successes, paths = generator.compute_trajectories(
                 planner_targets,
                 planner_quats,
                 max_attempts=5,
                 timeout=attempt_timeout_s,
                 ik_fail_return=5,
-                enable_finetune_trajopt=True,
-                finetune_attempts=1,
-                return_full_result=True,
+                enable_finetune_trajopt=False,
+                finetune_attempts=0,
+                return_full_result=False,
                 success_ratio=1.0 / batch_size,
-                ik_only=False,
-                skip_obstacle_update=bool(skip_obstacle_update),
+                ik_only=True,
+                skip_obstacle_update=True,
+                ik_world_collision_check=False,
                 emb_sel=emb_sel,
             )
-        success_chunks = []
-        paths = []
-        result_statuses = []
-        for result in full_results:
-            result_success = np.asarray(
-                _jsonable(result.success),
-                dtype=bool,
-            ).reshape(-1)
-            success_chunks.append(result_success)
-            if result_success.any():
-                result_paths = result.get_paths()
-                if result_paths is not None:
-                    paths.extend(list(result_paths))
-            result_statuses.append(
-                {
-                    "success": result_success.tolist(),
-                    "status": str(getattr(result, "status", "unavailable")),
-                    "valid_query": str(getattr(result, "valid_query", "unavailable")),
-                }
-            )
-        success_array = (
-            np.concatenate(success_chunks)
-            if success_chunks
-            else np.zeros((0,), dtype=bool)
-        )
+        success_array = np.asarray(_jsonable(successes), dtype=bool).reshape(-1)
         success_indices = np.flatnonzero(success_array)
         metrics = {
             "successes": success_array.tolist(),
-            "ik_only": False,
+            "ik_only": True,
             "curobo_config": str(self._base_config_path()),
             "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
             "success_ratio": 1.0 / batch_size,
@@ -4001,59 +4613,51 @@ class RealCuroboBackend:
             "ik_fail_return": 5,
             "attempt_timeout_s": attempt_timeout_s,
             "hard_attempt_timeout_s": hard_attempt_timeout_s,
-            "motion_gen_results": result_statuses,
             "base_prismatic_workspace_limit_m": self._base_workspace_limit_m,
             "base_prismatic_workspace_limit_source": "scene_envelope_plus_2m",
-            "obstacle_update": not bool(skip_obstacle_update),
+            "collision_admission_enabled": False,
+            "obstacle_update": False,
         }
         if success_indices.size == 0:
             return {"ok": False, "stop_reason": "base_plan_failed", "metrics": metrics}
         path = paths[int(success_indices[0])]
-        q_traj = generator.path_to_joint_trajectory(
-            path,
-            get_full_js=True,
-            emb_sel=emb_sel,
+        q_goal = np.asarray(
+            _jsonable(
+                generator.path_to_joint_trajectory(
+                    path,
+                    get_full_js=True,
+                    emb_sel=emb_sel,
+                )
+            ),
+            dtype=np.float32,
         )
-        dense_q_traj = _interpolate_joint_trajectory(q_traj, max_inter_dist=0.01)
-        collision_report = self._check_q_trajectory_collisions(
-            generator,
-            dense_q_traj,
-            skip_obstacle_update=True,
-        )
-        # CuRobo already time-parameterizes against the simulator step.  Do not
-        # decimate this path: position-drive setpoint jumps reintroduce unsafe
-        # acceleration even though the dense path itself passed collision and
-        # dynamics validation.
-        execution_q_traj = dense_q_traj.copy()
+        if q_goal.ndim == 1:
+            q_goal = q_goal.reshape(1, -1)
+        current_q = np.asarray(
+            _jsonable(robot.get_joint_positions()), dtype=np.float32
+        ).reshape(1, -1)
+        if q_goal.ndim != 2 or q_goal.shape[1] != current_q.shape[1]:
+            raise RuntimeError(
+                "BASE IK goal does not match the live robot joint layout: "
+                f"goal={q_goal.shape} current={current_q.shape}"
+            )
+        execution_q_traj = _interpolate_joint_trajectory(
+            np.vstack([current_q, q_goal[-1:]]),
+            max_inter_dist=0.01,
+        )[1:]
         metrics.update(
             {
-                "trajectory_waypoints": int(len(dense_q_traj)),
-                "dense_collision_check_waypoints": int(len(dense_q_traj)),
+                "trajectory_waypoints": int(len(execution_q_traj)),
                 "execution_waypoints": int(len(execution_q_traj)),
                 "execution_resampling": {
-                    "source": "dense_curobo_path",
-                    "dense_max_joint_step": 0.01,
+                    "source": "base_ik_linear_joint_interpolation",
                     "execution_max_joint_step": 0.01,
-                    "stride": 1,
                     "controller": "official_position_holonomic_base",
                     "planner_base_isaac_kp": 2_000_000.0,
                     "planner_base_isaac_kd": 100_000.0,
                 },
-                "collision_report": collision_report,
             }
         )
-        if not bool(collision_report.get("available", False)):
-            return {
-                "ok": False,
-                "stop_reason": "collision_check_unavailable",
-                "metrics": metrics,
-            }
-        if bool(collision_report.get("colliding", False)):
-            return {
-                "ok": False,
-                "stop_reason": "trajectory_collision",
-                "metrics": metrics,
-            }
         return {
             "ok": True,
             "joint_trajectory": execution_q_traj,
@@ -4121,6 +4725,12 @@ class RealCuroboBackend:
     def get_base_pose(self) -> np.ndarray:
         return self._base_xy_yaw(self._find_robot())[:3]
 
+    def get_joint_positions(self) -> np.ndarray:
+        return np.asarray(
+            _jsonable(self._find_robot().get_joint_positions()),
+            dtype=np.float32,
+        ).reshape(-1)
+
     def joint_tracking_report(
         self, target_q: Any, *, hand: str | None
     ) -> dict[str, Any]:
@@ -4136,14 +4746,36 @@ class RealCuroboBackend:
                 "reason": f"joint shape mismatch target={target.shape} current={current.shape}",
                 "reached": False,
             }
+        if not np.isfinite(target).all() or not np.isfinite(current).all():
+            return {
+                "available": False,
+                "reason": "joint tracking state contains NaN or infinity",
+                "reached": False,
+            }
         base_idx = _indices(getattr(robot, "base_control_idx", []))
-        articulation_idx = _indices(getattr(robot, "trunk_control_idx", []))
+        trunk_idx = _indices(getattr(robot, "trunk_control_idx", []))
         arm_control_idx = getattr(robot, "arm_control_idx", {}) or {}
         if hand is None:
-            for side in ("left", "right"):
-                articulation_idx.extend(_indices(arm_control_idx.get(side, [])))
+            left_idx = _indices(arm_control_idx.get("left", []))
+            right_idx = _indices(arm_control_idx.get("right", []))
+            active_idx = base_idx[:3] + trunk_idx + left_idx + right_idx
+            if (
+                len(base_idx) < 3
+                or len(trunk_idx) != 4
+                or len(left_idx) != 7
+                or len(right_idx) != 7
+                or len(active_idx) != 21
+                or len(set(active_idx)) != 21
+            ):
+                return {
+                    "available": False,
+                    "reason": "R1Pro 21-DOF controlled joint indices unavailable",
+                    "reached": False,
+                }
+            articulation_idx = trunk_idx + left_idx + right_idx
         else:
-            articulation_idx.extend(_indices(arm_control_idx.get(hand, [])))
+            selected_idx = _indices(arm_control_idx.get(hand, []))
+            articulation_idx = trunk_idx + selected_idx
         if len(base_idx) < 3 or not articulation_idx:
             return {
                 "available": False,
@@ -4155,8 +4787,33 @@ class RealCuroboBackend:
         base_yaw_error = abs(_wrap_angle(float(diff[base_idx[2]])))
         articulation_error = float(np.max(np.abs(diff[sorted(set(articulation_idx))])))
         if hand is None:
-            reached = base_xy_error <= 0.01 and base_yaw_error <= math.radians(1.0)
+            normalized_components = np.concatenate(
+                [
+                    diff[base_idx[:2]]
+                    / WHOLE_BODY_BASE_XY_WAYPOINT_TOLERANCE_M,
+                    np.asarray(
+                        [
+                            _wrap_angle(float(diff[base_idx[2]]))
+                            / WHOLE_BODY_BASE_YAW_WAYPOINT_TOLERANCE_RAD
+                        ],
+                        dtype=np.float64,
+                    ),
+                    diff[articulation_idx]
+                    / WHOLE_BODY_ARTICULATION_WAYPOINT_TOLERANCE_RAD,
+                ]
+            )
+            reached = bool(
+                base_xy_error <= WHOLE_BODY_BASE_XY_WAYPOINT_TOLERANCE_M
+                and base_yaw_error
+                <= WHOLE_BODY_BASE_YAW_WAYPOINT_TOLERANCE_RAD
+                and articulation_error
+                <= WHOLE_BODY_ARTICULATION_WAYPOINT_TOLERANCE_RAD
+            )
         else:
+            normalized_components = np.asarray(
+                diff[sorted(set(articulation_idx))] / ARM_WAYPOINT_TOLERANCE_RAD,
+                dtype=np.float64,
+            )
             reached = articulation_error <= ARM_WAYPOINT_TOLERANCE_RAD
         return {
             "available": True,
@@ -4165,11 +4822,31 @@ class RealCuroboBackend:
             "articulation_waypoint_tolerance_rad": ARM_WAYPOINT_TOLERANCE_RAD,
             "max_base_xy_error_m": base_xy_error,
             "base_yaw_error_rad": base_yaw_error,
-            "base_waypoint_xy_tolerance_m": 0.01,
-            "base_waypoint_yaw_tolerance_rad": math.radians(1.0),
+            "base_waypoint_xy_tolerance_m": (
+                WHOLE_BODY_BASE_XY_WAYPOINT_TOLERANCE_M
+                if hand is None
+                else 0.01
+            ),
+            "base_waypoint_yaw_tolerance_rad": (
+                WHOLE_BODY_BASE_YAW_WAYPOINT_TOLERANCE_RAD
+            ),
+            "active_dof_count": 21 if hand is None else len(articulation_idx),
+            "normalized_21d_tracking_error": (
+                float(np.max(np.abs(normalized_components)))
+                if hand is None
+                else None
+            ),
+            "active_joint_l2_error": float(
+                np.linalg.norm(diff[active_idx if hand is None else articulation_idx])
+            ),
         }
 
-    def capture_trajectory_hold_reference(self, *, hand: str | None) -> dict[str, Any]:
+    def capture_trajectory_hold_reference(
+        self,
+        *,
+        hand: str | None,
+        motion_scope: str = "arm_only",
+    ) -> dict[str, Any]:
         """Capture fixed world/joint targets and gripper commands once.
 
         The reference intentionally contains q-space values, not a packed 23D
@@ -4178,6 +4855,8 @@ class RealCuroboBackend:
         at every control step as the robot root frame changes.
         """
 
+        if motion_scope not in _MOTION_SCOPES:
+            raise ValueError(f"unsupported analytic motion scope {motion_scope!r}")
         robot = self._find_robot()
         q = np.asarray(
             _jsonable(robot.get_joint_positions()), dtype=np.float64
@@ -4185,7 +4864,27 @@ class RealCuroboBackend:
         arm_control_idx = getattr(robot, "arm_control_idx", {}) or {}
         base_indices: list[int] = []
         articulation_indices: list[int] = []
-        if hand is None:
+        if motion_scope == "whole_body":
+            if hand is not None:
+                raise RuntimeError(
+                    "whole-body trajectory hold reference requires hand=None"
+                )
+            base_all = _indices(getattr(robot, "base_idx", []))
+            gripper_control_idx = getattr(robot, "gripper_control_idx", {}) or {}
+            if len(base_all) != 6:
+                raise RuntimeError(
+                    "R1Pro whole-body trajectory requires six virtual base joints"
+                )
+            base_indices = base_all[2:5]
+            for side in ("left", "right"):
+                indices = _indices(gripper_control_idx.get(side, []))
+                if len(indices) != 2:
+                    raise RuntimeError(
+                        f"R1Pro {side} gripper joint indices are unavailable"
+                    )
+                articulation_indices.extend(indices)
+            scope = "whole_body_21dof_locks_base_z_roll_pitch_and_both_finger_pairs"
+        elif hand is None:
             scope = "base_trajectory_locks_trunk_and_both_arms"
             articulation_indices.extend(
                 _indices(getattr(robot, "trunk_control_idx", []))
@@ -4195,12 +4894,25 @@ class RealCuroboBackend:
         else:
             hand = _normalize_hand(hand)
             inactive = "right" if hand == "left" else "left"
-            scope = f"{hand}_arm_trajectory_locks_full_base_and_{inactive}_arm"
+            scope = (
+                f"{hand}_arm_with_trunk_trajectory_locks_full_base_trunk4_and_"
+                f"{inactive}_arm"
+                if motion_scope == "arm_with_trunk"
+                else (f"{hand}_arm_trajectory_locks_full_base_trunk_and_{inactive}_arm")
+            )
             base_indices = _indices(getattr(robot, "base_idx", []))
             if len(base_indices) != 6:
                 raise RuntimeError(
                     "R1Pro ARM trajectory requires all six virtual base joint indices"
                 )
+            trunk_indices = _indices(getattr(robot, "trunk_control_idx", []))
+            if len(trunk_indices) != 4:
+                raise RuntimeError("R1Pro trajectory requires four trunk joints")
+            articulation_indices.extend(
+                trunk_indices[-1:]
+                if motion_scope == "arm_with_trunk"
+                else trunk_indices
+            )
             articulation_indices.extend(_indices(arm_control_idx.get(inactive, [])))
         base_indices = list(dict.fromkeys(base_indices))
         articulation_indices = sorted(set(articulation_indices))
@@ -4234,7 +4946,219 @@ class RealCuroboBackend:
             },
             "locked_joint_reference": locked_joint_reference,
             "scope": scope,
+            "motion_scope": motion_scope,
         }
+
+    def capture_navigation_isolation_reference(self) -> dict[str, Any]:
+        """Capture immutable non-BASE and attachment state for one navigation call."""
+
+        robot = self._find_robot()
+        q = np.asarray(
+            _jsonable(robot.get_joint_positions()), dtype=np.float64
+        ).reshape(-1)
+        base_indices = _indices(getattr(robot, "base_idx", []))
+        trunk_indices = _indices(getattr(robot, "trunk_control_idx", []))
+        arm_control_idx = getattr(robot, "arm_control_idx", {}) or {}
+        arm_indices = {
+            hand: _indices(arm_control_idx.get(hand, [])) for hand in ("left", "right")
+        }
+        if (
+            len(base_indices) != 6
+            or len(trunk_indices) != 4
+            or any(len(arm_indices[hand]) != 7 for hand in ("left", "right"))
+        ):
+            raise RuntimeError(
+                "R1Pro navigation isolation joint indices are unavailable"
+            )
+        selected_indices = (
+            base_indices[2:5]
+            + trunk_indices
+            + arm_indices["left"]
+            + arm_indices["right"]
+        )
+        if (
+            min(selected_indices) < 0
+            or max(selected_indices) >= len(q)
+            or not np.isfinite(q[selected_indices]).all()
+        ):
+            raise RuntimeError(
+                "R1Pro navigation isolation joint feedback is unavailable"
+            )
+        return {
+            "mode": "base_only",
+            "base_z_index": base_indices[2],
+            "base_roll_pitch_indices": base_indices[3:5],
+            "trunk_indices": trunk_indices,
+            "arm_indices": arm_indices,
+            "q_reference": q.copy(),
+            "gripper_commands": {
+                hand: self._gripper_latch(hand) for hand in ("left", "right")
+            },
+            "attachments": {
+                hand: self.get_attached_object(hand) for hand in ("left", "right")
+            },
+        }
+
+    def navigation_isolation_report(
+        self,
+        *,
+        action: Any,
+        reference: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Verify actual BASE-only isolation after one admitted action."""
+
+        thresholds = {
+            "base_z_m": LOCKED_BASE_Z_MAX_DRIFT_M,
+            "base_roll_pitch_rad": LOCKED_BASE_RPY_MAX_DRIFT_RAD,
+            "articulation_rad": LOCKED_ARTICULATION_MAX_DRIFT_RAD,
+            "gripper_command": LOCKED_GRIPPER_COMMAND_MAX_DRIFT,
+        }
+        try:
+            if not isinstance(reference, dict) or reference.get("mode") != "base_only":
+                raise RuntimeError("navigation isolation reference is invalid")
+            robot = self._find_robot()
+            current_q = np.asarray(
+                _jsonable(robot.get_joint_positions()), dtype=np.float64
+            ).reshape(-1)
+            expected_q = np.asarray(
+                _jsonable(reference.get("q_reference")), dtype=np.float64
+            ).reshape(-1)
+            if (
+                current_q.shape != expected_q.shape
+                or current_q.size < 1
+                or not np.isfinite(current_q).all()
+                or not np.isfinite(expected_q).all()
+            ):
+                raise RuntimeError("navigation joint feedback is unavailable")
+            base_z_index = int(reference["base_z_index"])
+            base_roll_pitch_indices = _indices(reference["base_roll_pitch_indices"])
+            trunk_indices = _indices(reference["trunk_indices"])
+            raw_arm_indices = reference.get("arm_indices")
+            if not isinstance(raw_arm_indices, dict):
+                raise RuntimeError("navigation arm indices are unavailable")
+            arm_indices = {
+                hand: _indices(raw_arm_indices.get(hand)) for hand in ("left", "right")
+            }
+            all_indices = (
+                [base_z_index]
+                + base_roll_pitch_indices
+                + trunk_indices
+                + arm_indices["left"]
+                + arm_indices["right"]
+            )
+            if (
+                len(base_roll_pitch_indices) != 2
+                or len(trunk_indices) != 4
+                or any(len(arm_indices[hand]) != 7 for hand in ("left", "right"))
+                or min(all_indices) < 0
+                or max(all_indices) >= len(current_q)
+            ):
+                raise RuntimeError("navigation isolation indices are invalid")
+            packed = validate_action_chunk(
+                np.asarray(action, dtype=np.float32).reshape(1, ACTION_DIM)
+            )[0]
+            gripper_commands = reference.get("gripper_commands")
+            if not isinstance(gripper_commands, dict) or any(
+                hand not in gripper_commands
+                or not math.isfinite(float(gripper_commands[hand]))
+                for hand in ("left", "right")
+            ):
+                raise RuntimeError(
+                    "navigation gripper command reference is unavailable"
+                )
+            attachments = reference.get("attachments")
+            if not isinstance(attachments, dict):
+                raise RuntimeError("navigation attachment reference is unavailable")
+
+            base_z_drift = abs(
+                float(current_q[base_z_index] - expected_q[base_z_index])
+            )
+            base_roll_pitch_drift = float(
+                np.max(
+                    np.abs(
+                        current_q[base_roll_pitch_indices]
+                        - expected_q[base_roll_pitch_indices]
+                    )
+                )
+            )
+            trunk_drift = float(
+                np.max(np.abs(current_q[trunk_indices] - expected_q[trunk_indices]))
+            )
+            arm_drifts = {
+                hand: float(
+                    np.max(
+                        np.abs(
+                            current_q[arm_indices[hand]] - expected_q[arm_indices[hand]]
+                        )
+                    )
+                )
+                for hand in ("left", "right")
+            }
+            gripper_drifts = {
+                hand: abs(
+                    float(packed[ENV_ACTION_SEGMENTS[f"{hand}_gripper"]][0])
+                    - float(gripper_commands[hand])
+                )
+                for hand in ("left", "right")
+            }
+            attachment_checks: dict[str, bool] = {}
+            for hand in ("left", "right"):
+                actual = self.get_attached_object(hand)
+                matches, _identity = _attachment_state_status(
+                    actual,
+                    attachments.get(hand),
+                    hand=hand,
+                )
+                attachment_checks[hand] = bool(matches)
+            checks = {
+                "base_z_locked": (base_z_drift <= LOCKED_BASE_Z_MAX_DRIFT_M + 1e-9),
+                "base_roll_pitch_locked": (
+                    base_roll_pitch_drift <= LOCKED_BASE_RPY_MAX_DRIFT_RAD + 1e-9
+                ),
+                "trunk_locked": (
+                    trunk_drift <= LOCKED_ARTICULATION_MAX_DRIFT_RAD + 1e-9
+                ),
+                "left_arm_locked": (
+                    arm_drifts["left"] <= LOCKED_ARTICULATION_MAX_DRIFT_RAD + 1e-9
+                ),
+                "right_arm_locked": (
+                    arm_drifts["right"] <= LOCKED_ARTICULATION_MAX_DRIFT_RAD + 1e-9
+                ),
+                "left_gripper_command_locked": (
+                    gripper_drifts["left"] <= LOCKED_GRIPPER_COMMAND_MAX_DRIFT + 1e-12
+                ),
+                "right_gripper_command_locked": (
+                    gripper_drifts["right"] <= LOCKED_GRIPPER_COMMAND_MAX_DRIFT + 1e-12
+                ),
+                "left_attachment_identity_unchanged": attachment_checks["left"],
+                "right_attachment_identity_unchanged": attachment_checks["right"],
+            }
+            return {
+                "available": True,
+                "ok": all(checks.values()),
+                "mode": "base_only",
+                "checks": checks,
+                "max_observed": {
+                    "base_z_drift_m": base_z_drift,
+                    "base_roll_pitch_drift_rad": base_roll_pitch_drift,
+                    "trunk_drift_rad": trunk_drift,
+                    "left_arm_drift_rad": arm_drifts["left"],
+                    "right_arm_drift_rad": arm_drifts["right"],
+                    "left_gripper_command_drift": gripper_drifts["left"],
+                    "right_gripper_command_drift": gripper_drifts["right"],
+                },
+                "thresholds": thresholds,
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "ok": False,
+                "mode": "base_only",
+                "checks": {},
+                "max_observed": {},
+                "thresholds": thresholds,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
 
     def capture_locked_joint_reference(self, *, hand: str | None) -> dict[str, Any]:
         """Compatibility entry point for callers that only monitor drift."""
@@ -4379,6 +5303,454 @@ class RealCuroboBackend:
             "command_drift_threshold": LOCKED_GRIPPER_COMMAND_MAX_DRIFT,
             "semantics": "fixed_controller_command_not_physical_joint_pose",
         }
+
+    def capture_single_arm_isolation_reference(
+        self,
+        *,
+        hand: str,
+        gripper_only: bool,
+        motion_scope: str = "arm_only",
+    ) -> dict[str, Any]:
+        """Capture one immutable reference for a complete analytic primitive."""
+
+        if motion_scope not in _MOTION_SCOPES:
+            raise ValueError(f"unsupported analytic motion scope {motion_scope!r}")
+        expected_scope = "gripper_only" if bool(gripper_only) else motion_scope
+        if bool(gripper_only) != (expected_scope == "gripper_only"):
+            raise ValueError("gripper_only and motion_scope disagree")
+        mode = (
+            "gripper_only"
+            if bool(gripper_only)
+            else ("arm_motion" if motion_scope == "arm_only" else motion_scope)
+        )
+        selected = _normalize_hand(hand)
+        inactive = "right" if selected == "left" else "left"
+        robot = self._find_robot()
+        q = np.asarray(
+            _jsonable(robot.get_joint_positions()), dtype=np.float64
+        ).reshape(-1)
+        base_indices = _indices(getattr(robot, "base_idx", []))
+        trunk_indices = _indices(getattr(robot, "trunk_control_idx", []))
+        arm_control_idx = getattr(robot, "arm_control_idx", {}) or {}
+        locked_arm_sides = ("left", "right") if bool(gripper_only) else (inactive,)
+        arm_indices = {
+            side: _indices(arm_control_idx.get(side, [])) for side in locked_arm_sides
+        }
+        locked_trunk_indices = (
+            trunk_indices[-1:] if motion_scope == "arm_with_trunk" else trunk_indices
+        )
+        all_indices = [
+            *base_indices,
+            *locked_trunk_indices,
+            *(index for side in locked_arm_sides for index in arm_indices[side]),
+        ]
+        if (
+            len(base_indices) != 6
+            or len(trunk_indices) != 4
+            or any(len(arm_indices[side]) != 7 for side in locked_arm_sides)
+            or not all_indices
+            or min(all_indices) < 0
+            or max(all_indices) >= len(q)
+            or not np.isfinite(q[all_indices]).all()
+        ):
+            raise RuntimeError(
+                "R1Pro single-arm isolation joint feedback is unavailable"
+            )
+        eef_sides = (
+            ()
+            if motion_scope == "arm_with_trunk"
+            else (("left", "right") if bool(gripper_only) else (inactive,))
+        )
+        eef_poses: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for side in eef_sides:
+            pose = self.get_eef_pose(side)
+            if pose is None:
+                raise RuntimeError(
+                    f"R1Pro {side} EEF feedback is unavailable for isolation"
+                )
+            position = np.asarray(_jsonable(pose[0]), dtype=np.float64).reshape(-1)
+            orientation = _quat_xyzw(pose[1])
+            if position.shape != (3,) or not np.isfinite(position).all():
+                raise RuntimeError(
+                    f"R1Pro {side} EEF feedback is invalid for isolation"
+                )
+            assert orientation is not None
+            eef_poses[side] = (position.copy(), orientation.copy())
+        locked_gripper_sides = (
+            ("left", "right") if not bool(gripper_only) else (inactive,)
+        )
+        gripper_commands = {
+            side: self._gripper_latch(side) for side in locked_gripper_sides
+        }
+        if any(not math.isfinite(float(value)) for value in gripper_commands.values()):
+            raise RuntimeError("R1Pro gripper command latch is unavailable")
+        return {
+            "selected_hand": selected,
+            "mode": mode,
+            "motion_scope": expected_scope,
+            "base_indices": base_indices,
+            "base_values": q[base_indices].copy(),
+            "trunk_indices": trunk_indices,
+            "trunk_values": q[trunk_indices].copy(),
+            "locked_trunk_indices": locked_trunk_indices,
+            "locked_trunk_values": q[locked_trunk_indices].copy(),
+            "arm_indices": arm_indices,
+            "arm_values": {
+                side: q[arm_indices[side]].copy() for side in locked_arm_sides
+            },
+            "eef_poses": eef_poses,
+            "locked_gripper_sides": locked_gripper_sides,
+            "gripper_commands": gripper_commands,
+            "inactive_hand": inactive,
+            "inactive_attachment": self.get_attached_object(inactive),
+            "selected_attachment": (
+                None if bool(gripper_only) else self.get_attached_object(selected)
+            ),
+            "reference_origin": "primitive_call_start",
+            "inactive_eef_check": (
+                "not_applicable_shared_trunk"
+                if motion_scope == "arm_with_trunk"
+                else "initial_world_pose"
+            ),
+        }
+
+    def single_arm_isolation_report(
+        self,
+        *,
+        hand: str,
+        action: Any,
+        reference: dict[str, Any],
+        gripper_only: bool,
+        motion_scope: str = "arm_only",
+    ) -> dict[str, Any]:
+        """Validate actual locked feedback after one analytic action step."""
+
+        if motion_scope not in _MOTION_SCOPES:
+            raise ValueError(f"unsupported analytic motion scope {motion_scope!r}")
+        selected = _normalize_hand(hand)
+        mode = (
+            "gripper_only"
+            if bool(gripper_only)
+            else ("arm_motion" if motion_scope == "arm_only" else motion_scope)
+        )
+        expected_scope = "gripper_only" if bool(gripper_only) else motion_scope
+        unavailable = {
+            "available": False,
+            "ok": False,
+            "selected_hand": selected,
+            "mode": mode,
+            "context_id": reference.get("context_id")
+            if isinstance(reference, dict)
+            else None,
+            "reference_origin": reference.get(
+                "reference_origin", "primitive_call_start"
+            )
+            if isinstance(reference, dict)
+            else "primitive_call_start",
+            "checks": {},
+            "max_observed": {},
+            "thresholds": {
+                "base_xy_m": LOCKED_BASE_XY_MAX_DRIFT_M,
+                "base_z_m": LOCKED_BASE_Z_MAX_DRIFT_M,
+                "base_rpy_rad": LOCKED_BASE_RPY_MAX_DRIFT_RAD,
+                "articulation_rad": LOCKED_ARTICULATION_MAX_DRIFT_RAD,
+                "inactive_eef_position_m": 0.01,
+                "inactive_eef_orientation_rad": math.radians(1.0),
+                "gripper_command": LOCKED_GRIPPER_COMMAND_MAX_DRIFT,
+            },
+        }
+        if (
+            not isinstance(reference, dict)
+            or reference.get("selected_hand") != selected
+            or reference.get("mode") != mode
+            or reference.get("motion_scope") != expected_scope
+            or "inactive_attachment" not in reference
+            or (not bool(gripper_only) and "selected_attachment" not in reference)
+        ):
+            unavailable["reason"] = "isolation reference does not match action scope"
+            return unavailable
+        try:
+            robot = self._find_robot()
+            current_q = np.asarray(
+                _jsonable(robot.get_joint_positions()), dtype=np.float64
+            ).reshape(-1)
+            base_indices = _indices(reference.get("base_indices"))
+            base_expected = np.asarray(
+                _jsonable(reference.get("base_values", [])), dtype=np.float64
+            ).reshape(-1)
+            trunk_indices = _indices(reference.get("locked_trunk_indices"))
+            trunk_expected = np.asarray(
+                _jsonable(reference.get("locked_trunk_values", [])), dtype=np.float64
+            ).reshape(-1)
+            arm_indices = reference.get("arm_indices")
+            arm_values = reference.get("arm_values")
+            if (
+                len(base_indices) != 6
+                or base_expected.shape != (6,)
+                or len(trunk_indices) != (1 if motion_scope == "arm_with_trunk" else 4)
+                or trunk_expected.shape
+                != ((1,) if motion_scope == "arm_with_trunk" else (4,))
+                or not isinstance(arm_indices, dict)
+                or not isinstance(arm_values, dict)
+            ):
+                raise RuntimeError("locked joint reference is incomplete")
+            locked_arm_sides = tuple(str(side) for side in arm_indices)
+            if not locked_arm_sides:
+                raise RuntimeError("locked arm reference is empty")
+            locked_indices = [*base_indices, *trunk_indices]
+            arm_drifts: dict[str, float] = {}
+            for side in locked_arm_sides:
+                indices = _indices(arm_indices.get(side))
+                expected = np.asarray(
+                    _jsonable(arm_values.get(side, [])), dtype=np.float64
+                ).reshape(-1)
+                if len(indices) != 7 or expected.shape != (7,):
+                    raise RuntimeError(f"{side} locked arm reference is incomplete")
+                locked_indices.extend(indices)
+                arm_drifts[side] = float(np.max(np.abs(current_q[indices] - expected)))
+            if (
+                min(locked_indices) < 0
+                or max(locked_indices) >= len(current_q)
+                or not np.isfinite(current_q[locked_indices]).all()
+                or not np.isfinite(base_expected).all()
+                or not np.isfinite(trunk_expected).all()
+            ):
+                raise RuntimeError("locked joint feedback is invalid")
+            base_xy_drift = float(
+                np.max(np.abs(current_q[base_indices[:2]] - base_expected[:2]))
+            )
+            base_z_drift = abs(float(current_q[base_indices[2]] - base_expected[2]))
+            base_rpy_drift = max(
+                abs(_wrap_angle(float(current_q[index] - base_expected[offset])))
+                for offset, index in enumerate(base_indices[3:6], start=3)
+            )
+            trunk_drift = float(
+                np.max(np.abs(current_q[trunk_indices] - trunk_expected))
+            )
+            joints_ok = bool(
+                base_xy_drift <= LOCKED_BASE_XY_MAX_DRIFT_M + 1e-9
+                and base_z_drift <= LOCKED_BASE_Z_MAX_DRIFT_M + 1e-9
+                and base_rpy_drift <= LOCKED_BASE_RPY_MAX_DRIFT_RAD + 1e-9
+                and trunk_drift <= LOCKED_ARTICULATION_MAX_DRIFT_RAD + 1e-9
+                and all(
+                    drift <= LOCKED_ARTICULATION_MAX_DRIFT_RAD + 1e-9
+                    for drift in arm_drifts.values()
+                )
+            )
+
+            eef_reports: dict[str, dict[str, Any]] = {}
+            eef_poses = reference.get("eef_poses")
+            if motion_scope != "arm_with_trunk":
+                if not isinstance(eef_poses, dict) or not eef_poses:
+                    raise RuntimeError("inactive EEF reference is unavailable")
+                for side, expected_pose in eef_poses.items():
+                    live_pose = self.get_eef_pose(str(side))
+                    if live_pose is None:
+                        raise RuntimeError(
+                            f"{side} inactive EEF feedback is unavailable"
+                        )
+                    expected_position = np.asarray(
+                        _jsonable(expected_pose[0]), dtype=np.float64
+                    ).reshape(3)
+                    position_drift = float(
+                        np.linalg.norm(
+                            np.asarray(
+                                _jsonable(live_pose[0]), dtype=np.float64
+                            ).reshape(3)
+                            - expected_position
+                        )
+                    )
+                    orientation_drift = _quat_angle_error_rad(
+                        live_pose[1],
+                        expected_pose[1],
+                    )
+                    if orientation_drift is None:
+                        raise RuntimeError(
+                            f"{side} inactive EEF orientation is unavailable"
+                        )
+                    eef_reports[str(side)] = {
+                        "position_drift_m": position_drift,
+                        "orientation_drift_rad": orientation_drift,
+                        "ok": bool(
+                            position_drift <= 0.01 + 1e-9
+                            and orientation_drift <= math.radians(1.0) + 1e-9
+                        ),
+                    }
+
+            packed = np.asarray(_jsonable(action), dtype=np.float64).reshape(-1)
+            locked_gripper_sides = tuple(reference.get("locked_gripper_sides", ()))
+            commands = reference.get("gripper_commands")
+            if (
+                packed.shape != (ACTION_DIM,)
+                or not locked_gripper_sides
+                or not isinstance(commands, dict)
+            ):
+                raise RuntimeError("locked gripper command feedback is unavailable")
+            gripper_drifts = {
+                str(side): abs(
+                    float(packed[ENV_ACTION_SEGMENTS[f"{side}_gripper"]][0])
+                    - float(commands[side])
+                )
+                for side in locked_gripper_sides
+            }
+            grippers_ok = all(
+                drift <= LOCKED_GRIPPER_COMMAND_MAX_DRIFT + 1e-12
+                for drift in gripper_drifts.values()
+            )
+            inactive = str(reference.get("inactive_hand"))
+            attachment_ok, attachment_report = _attachment_state_status(
+                self.get_attached_object(inactive),
+                reference.get("inactive_attachment"),
+                hand=inactive,
+            )
+            selected_attachment_ok = True
+            selected_attachment_report: dict[str, Any] | None = None
+            if not bool(gripper_only):
+                selected_attachment_ok, selected_attachment_report = (
+                    _attachment_state_status(
+                        self.get_attached_object(selected),
+                        reference.get("selected_attachment"),
+                        hand=selected,
+                    )
+                )
+        except Exception as exc:
+            unavailable["reason"] = f"{type(exc).__name__}: {exc}"
+            return unavailable
+
+        checks = {
+            "locked_joints": {
+                "ok": joints_ok,
+                "base_xy_drift_m": base_xy_drift,
+                "base_z_drift_m": base_z_drift,
+                "base_rpy_drift_rad": base_rpy_drift,
+                "trunk_drift_rad": trunk_drift,
+                "locked_arm_drift_rad": arm_drifts,
+            },
+            "locked_gripper_commands": {
+                "ok": grippers_ok,
+                "command_drift": gripper_drifts,
+            },
+            "inactive_attachment": {
+                "ok": attachment_ok,
+                "hand": inactive,
+                **attachment_report,
+            },
+        }
+        if motion_scope != "arm_with_trunk":
+            checks["inactive_eef"] = {
+                "ok": all(bool(report["ok"]) for report in eef_reports.values()),
+                "hands": eef_reports,
+            }
+        if not bool(gripper_only):
+            assert selected_attachment_report is not None
+            checks["selected_attachment"] = {
+                "ok": selected_attachment_ok,
+                "hand": selected,
+                **selected_attachment_report,
+            }
+        return {
+            "available": True,
+            "ok": all(bool(check["ok"]) for check in checks.values()),
+            "selected_hand": selected,
+            "mode": mode,
+            "motion_scope": expected_scope,
+            "context_id": reference.get("context_id"),
+            "reference_origin": reference.get(
+                "reference_origin", "primitive_call_start"
+            ),
+            "checks": checks,
+            "max_observed": {
+                "base_xy_m": base_xy_drift,
+                "base_z_m": base_z_drift,
+                "base_rpy_rad": base_rpy_drift,
+                "trunk_rad": trunk_drift,
+                "inactive_arm_rad": max(arm_drifts.values()),
+                "inactive_eef_position_m": (
+                    max(
+                        float(report["position_drift_m"])
+                        for report in eef_reports.values()
+                    )
+                    if eef_reports
+                    else None
+                ),
+                "inactive_eef_orientation_rad": (
+                    max(
+                        float(report["orientation_drift_rad"])
+                        for report in eef_reports.values()
+                    )
+                    if eef_reports
+                    else None
+                ),
+                "gripper_command": max(gripper_drifts.values()),
+            },
+            "thresholds": unavailable["thresholds"],
+            "inactive_eef_check": (
+                "not_applicable_shared_trunk"
+                if motion_scope == "arm_with_trunk"
+                else "initial_world_pose"
+            ),
+        }
+
+    def single_arm_isolation_hold_action(
+        self,
+        *,
+        reference: dict[str, Any],
+    ) -> np.ndarray:
+        """Repack the original locked q targets in the current robot root frame."""
+
+        robot = self._find_robot()
+        target_q = np.asarray(
+            _jsonable(robot.get_joint_positions()), dtype=np.float32
+        ).reshape(-1)
+        groups: list[tuple[list[int], np.ndarray]] = [
+            (
+                _indices(reference.get("base_indices")),
+                np.asarray(
+                    _jsonable(reference.get("base_values", [])), dtype=np.float32
+                ).reshape(-1),
+            ),
+        ]
+        groups.append(
+            (
+                _indices(reference.get("locked_trunk_indices")),
+                np.asarray(
+                    _jsonable(reference.get("locked_trunk_values", [])),
+                    dtype=np.float32,
+                ).reshape(-1),
+            )
+        )
+        arm_indices = reference.get("arm_indices")
+        arm_values = reference.get("arm_values")
+        if not isinstance(arm_indices, dict) or not isinstance(arm_values, dict):
+            raise RuntimeError("single-arm isolation arm reference is unavailable")
+        for side, raw_indices in arm_indices.items():
+            groups.append(
+                (
+                    _indices(raw_indices),
+                    np.asarray(
+                        _jsonable(arm_values.get(side, [])), dtype=np.float32
+                    ).reshape(-1),
+                )
+            )
+        for indices, values in groups:
+            if (
+                not indices
+                or len(indices) != len(values)
+                or min(indices) < 0
+                or max(indices) >= len(target_q)
+                or not np.isfinite(values).all()
+            ):
+                raise RuntimeError("single-arm isolation q reference is invalid")
+            target_q[indices] = values
+        action = self.joint_target_to_action(target_q, hand=None)
+        commands = reference.get("gripper_commands")
+        if not isinstance(commands, dict):
+            raise RuntimeError("single-arm isolation gripper reference is unavailable")
+        for side, command in commands.items():
+            action[ENV_ACTION_SEGMENTS[f"{side}_gripper"]] = float(command)
+        return validate_action_chunk(
+            np.asarray(action, dtype=np.float32).reshape(1, ACTION_DIM)
+        )[0]
 
     def q_trajectory_to_actions(self, q_traj: Any, *, hand: str | None) -> np.ndarray:
         robot = self._find_robot()
@@ -4779,442 +6151,6 @@ class RealCuroboBackend:
                 "ok": None,
             }
 
-    def _check_q_trajectory_collisions(
-        self,
-        generator: Any,
-        q_traj: Any,
-        *,
-        attached_obj: Any = None,
-        skip_obstacle_update: bool = False,
-    ) -> dict[str, Any]:
-        if not hasattr(generator, "check_collisions"):
-            report = {
-                "available": False,
-                "reason": "check_collisions_unavailable",
-                "min_margin_m": None,
-            }
-            self._last_collision_report = report
-            return report
-        try:
-            torch = self._torch
-            if torch is None:
-                import torch as torch  # type: ignore[no-redef]
-            q_tensor = torch.as_tensor(
-                np.asarray(_jsonable(q_traj), dtype=np.float32),
-                dtype=torch.float32,
-            )
-            world_collision_chunks = []
-            waypoint_count = int(q_tensor.shape[0])
-            for start in range(0, waypoint_count, 16):
-                world_collision_chunks.append(
-                    generator.check_collisions(
-                        q_tensor[start : start + 16],
-                        self_collision_check=False,
-                        skip_obstacle_update=bool(skip_obstacle_update) or start > 0,
-                        attached_obj=attached_obj,
-                    )
-                )
-            world_colliding = np.concatenate(
-                [
-                    np.asarray(_jsonable(chunk), dtype=bool).reshape(-1)
-                    for chunk in world_collision_chunks
-                ]
-            )
-            self_report = self._check_q_self_collisions(
-                generator,
-                q_tensor,
-                attached_obj=attached_obj,
-            )
-            if not bool(self_report.get("available", False)):
-                raise RuntimeError(
-                    f"self collision check unavailable: {self_report.get('reason')}"
-                )
-        except TimeoutError:
-            raise
-        except Exception as exc:
-            report = {
-                "available": False,
-                "reason": f"{type(exc).__name__}: {exc}",
-                "min_margin_m": None,
-            }
-            self._last_collision_report = report
-            return report
-        world_array = np.asarray(_jsonable(world_colliding), dtype=bool)
-        world_hit = bool(world_array.any())
-        self_hit = bool(self_report.get("colliding", False))
-        combined_hit = world_hit or self_hit
-        world_report = {
-            "available": True,
-            "colliding": world_hit,
-            "collision_waypoints": int(world_array.sum()),
-            "checked_waypoints": int(world_array.size),
-            **_collision_margin_report_values(world_hit),
-        }
-        report = {
-            "available": True,
-            "colliding": combined_hit,
-            "world_colliding": world_hit,
-            "self_colliding": self_hit,
-            "collision_waypoints": max(
-                int(world_array.sum()),
-                int(self_report.get("collision_waypoints", 0)),
-            ),
-            "checked_waypoints": int(world_array.size),
-            **_collision_margin_report_values(world_hit),
-            "min_margin_m": (
-                0.0 if combined_hit else CUROBO_COLLISION_ACTIVATION_DISTANCE_M
-            ),
-            "margin_semantics": (
-                "world_activation_lower_bound_with_self_collision_boolean"
-            ),
-            "collision_margin_scope": "world_activation_lower_bound_only",
-            "combined_clearance_certified": False,
-            "world_collision_report": world_report,
-            "self_collision_report": self_report,
-            "attached_collision_body": {"available": attached_obj is not None},
-            "obstacle_world_refreshed": not bool(skip_obstacle_update),
-        }
-        self._last_collision_report = report
-        step = int(getattr(self.env_facade, "_env_steps", -1))
-        self._last_collision_step = step
-        if not bool(skip_obstacle_update):
-            self._last_obstacle_update_step = step
-        return report
-
-    def _check_q_self_collisions(
-        self,
-        generator: Any,
-        q_traj: Any,
-        *,
-        attached_obj: Any = None,
-    ) -> dict[str, Any]:
-        """Run OG/cuRobo's robot-sphere self-collision constraint only."""
-
-        attached_info = None
-        try:
-            torch = self._torch
-            if torch is None:
-                import torch as torch  # type: ignore[no-redef]
-
-            emb_sel = self._embodiment_cls.DEFAULT
-            robot = self._find_robot()
-            q_tensor = generator._tensor_args.to_device(
-                torch.as_tensor(
-                    np.asarray(_jsonable(q_traj), dtype=np.float32),
-                    dtype=torch.float32,
-                )
-            )
-            current_q = robot.get_joint_positions().unsqueeze(0)
-            current_state = generator._tensor_args.to_device(current_q)
-            from omnigibson import lazy
-
-            zeros = torch.zeros_like(current_state)
-            cu_current = lazy.curobo.types.state.JointState(
-                position=current_state,
-                velocity=generator._tensor_args.to_device(zeros),
-                acceleration=generator._tensor_args.to_device(zeros),
-                jerk=generator._tensor_args.to_device(zeros),
-                joint_names=generator.robot_joint_names,
-            )
-            generator.update_locked_joints(cu_current, emb_sel)
-            cu_js = lazy.curobo.types.state.JointState(
-                position=q_tensor,
-                joint_names=generator.robot_joint_names,
-            ).get_ordered_joint_state(generator.mg[emb_sel].kinematics.joint_names)
-            attached_info = generator._attach_objects_to_robot(
-                attached_obj=attached_obj,
-                attached_obj_scale=None,
-                cu_js_batch=cu_js,
-                emb_sel=emb_sel,
-            )
-            spheres = generator.mg[emb_sel].compute_kinematics(cu_js).robot_spheres
-            spheres = spheres.unsqueeze(dim=1)
-            with torch.no_grad():
-                distances = (
-                    generator.mg[emb_sel]
-                    .rollout_fn.robot_self_collision_constraint.forward(spheres)
-                    .squeeze(1)
-                )
-                colliding = distances > 0.0
-            array = np.asarray(_jsonable(colliding), dtype=bool).reshape(-1)
-            return {
-                "available": True,
-                "colliding": bool(array.any()),
-                "colliding_mask": array.tolist(),
-                "collision_waypoints": int(array.sum()),
-                "checked_waypoints": int(array.size),
-                "min_margin_m": None,
-                "margin_available": False,
-                "margin_semantics": "self_collision_boolean_only",
-                "collision_scope": "self_only",
-                "attached_collision_body": {"available": attached_obj is not None},
-            }
-        except TimeoutError:
-            raise
-        except Exception as exc:
-            return {
-                "available": False,
-                "reason": f"{type(exc).__name__}: {exc}",
-                "min_margin_m": None,
-                "collision_scope": "self_only",
-            }
-        finally:
-            if attached_info is not None:
-                try:
-                    generator._detach_objects_from_robot(attached_info, emb_sel)
-                except Exception:
-                    pass
-
-    def _check_q_target_excluded_collisions(
-        self,
-        generator: Any,
-        q_traj: Any,
-        *,
-        target_xyz: np.ndarray,
-        attached_obj: Any = None,
-    ) -> dict[str, Any]:
-        """Check a guarded configuration with only its resolved target removed.
-
-        World collision and self collision are queried independently with the
-        official OG/cuRobo constraints, then combined explicitly.  This avoids
-        losing attribution in OG's mixed ``self_collision_check=True`` result.
-        The normal world is restored before this method returns, including all
-        fail-closed error paths.
-        """
-
-        target_object = self._target_object_for_point(target_xyz)
-        if target_object is None:
-            return {
-                "available": False,
-                "reason": "target_collision_body_unresolved",
-                "target_object_resolved": False,
-                "normal_world_restored": True,
-            }
-        torch = self._torch
-        if torch is None:
-            import torch as torch  # type: ignore[no-redef]
-        q_tensor = torch.as_tensor(
-            np.asarray(_jsonable(q_traj), dtype=np.float32),
-            dtype=torch.float32,
-        )
-        self_report = self._check_q_self_collisions(
-            generator,
-            q_tensor,
-            attached_obj=attached_obj,
-        )
-        if not bool(self_report.get("available", False)):
-            return {
-                "available": False,
-                "reason": self_report.get("reason", "self_collision_check_unavailable"),
-                "target_object_resolved": True,
-                "normal_world_restored": True,
-                "self_collision_report": self_report,
-            }
-        self_array = np.asarray(self_report.get("colliding_mask"), dtype=bool).reshape(
-            -1
-        )
-        if self_array.shape != (int(q_tensor.shape[0]),):
-            return {
-                "available": False,
-                "reason": "self_collision_mask_shape_mismatch",
-                "target_object_resolved": True,
-                "normal_world_restored": True,
-                "self_collision_report": self_report,
-            }
-        query_error: Exception | None = None
-        restore_error: Exception | None = None
-        world_array = np.ones((int(q_tensor.shape[0]),), dtype=bool)
-        try:
-            generator.update_obstacles(ignore_objects=[target_object])
-            world_array = np.asarray(
-                _jsonable(
-                    generator.check_collisions(
-                        q_tensor,
-                        self_collision_check=False,
-                        skip_obstacle_update=True,
-                        attached_obj=attached_obj,
-                    )
-                ),
-                dtype=bool,
-            ).reshape(-1)
-        except TimeoutError:
-            raise
-        except Exception as exc:
-            query_error = exc
-        finally:
-            try:
-                generator.update_obstacles()
-            except Exception as exc:
-                restore_error = exc
-        if query_error is not None or restore_error is not None:
-            error = restore_error or query_error
-            assert error is not None
-            return {
-                "available": False,
-                "reason": f"{type(error).__name__}: {error}",
-                "target_object_resolved": True,
-                "normal_world_restored": restore_error is None,
-            }
-        world_hit = bool(world_array.any())
-        combined_array = world_array | self_array
-        combined_hit = bool(combined_array.any())
-        return {
-            "available": True,
-            "colliding": combined_hit,
-            "target_object_resolved": True,
-            "world_without_target_colliding": world_hit,
-            "self_or_unrelated_world_colliding": combined_hit,
-            "self_colliding": bool(self_array.any()),
-            "collision_waypoints": int(combined_array.sum()),
-            "checked_waypoints": int(combined_array.size),
-            "normal_world_restored": True,
-            "target_only_activation_verified": not combined_hit,
-            "self_collision_report": self_report,
-            "world_without_target_report": {
-                "available": True,
-                "colliding": world_hit,
-                "collision_waypoints": int(world_array.sum()),
-                "checked_waypoints": int(world_array.size),
-                **_collision_margin_report_values(world_hit),
-            },
-            "combined_target_excluded_report": {
-                "available": True,
-                "colliding": combined_hit,
-                "collision_waypoints": int(combined_array.sum()),
-                "checked_waypoints": int(combined_array.size),
-                "margin_available": False,
-                "margin_semantics": (
-                    "combined_self_and_unrelated_world_collision_boolean"
-                ),
-            },
-        }
-
-    def _check_q_combined_collisions(
-        self,
-        generator: Any,
-        q_traj: Any,
-        *,
-        attached_obj: Any = None,
-        skip_obstacle_update: bool = False,
-    ) -> dict[str, Any]:
-        """Use OG's public combined world+self collision query."""
-
-        try:
-            torch = self._torch
-            if torch is None:
-                import torch as torch  # type: ignore[no-redef]
-            q_tensor = torch.as_tensor(
-                np.asarray(_jsonable(q_traj), dtype=np.float32),
-                dtype=torch.float32,
-            )
-            collision = generator.check_collisions(
-                q_tensor,
-                self_collision_check=True,
-                skip_obstacle_update=bool(skip_obstacle_update),
-                attached_obj=attached_obj,
-            )
-            array = np.asarray(_jsonable(collision), dtype=bool).reshape(-1)
-            hit = bool(array.any())
-            return {
-                "available": True,
-                "colliding": hit,
-                "collision_waypoints": int(array.sum()),
-                "checked_waypoints": int(array.size),
-                "collision_scope": "combined_world_and_self",
-                "min_margin_m": (
-                    0.0 if hit else CUROBO_COLLISION_ACTIVATION_DISTANCE_M
-                ),
-                "margin_available": True,
-                "margin_semantics": (
-                    "combined_boolean_with_world_activation_lower_bound"
-                ),
-                "collision_activation_distance_m": (
-                    CUROBO_COLLISION_ACTIVATION_DISTANCE_M
-                ),
-                "obstacle_world_refreshed": not bool(skip_obstacle_update),
-            }
-        except TimeoutError:
-            raise
-        except Exception as exc:
-            return {
-                "available": False,
-                "reason": f"{type(exc).__name__}: {exc}",
-                "collision_scope": "combined_world_and_self",
-                "min_margin_m": None,
-            }
-
-    def collision_report(self, *, force: bool = False) -> dict[str, Any]:
-        step = int(getattr(self.env_facade, "_env_steps", -1))
-        if (
-            not force
-            and self._last_collision_report.get("available")
-            and step >= 0
-            and self._last_collision_step >= 0
-            and step - self._last_collision_step < self._collision_check_interval_steps
-        ):
-            return dict(self._last_collision_report)
-        try:
-            generator = self._active_generator or self._generator(
-                kind="arm", hand="left"
-            )
-            robot = self._find_robot()
-            q = robot.get_joint_positions().reshape(1, -1)
-            attached: dict[str, Any] = {}
-            for side in ("left", "right"):
-                item = self.get_attached_object(side)
-                if item:
-                    attached.update(item)
-            refresh_obstacles = (
-                self._last_obstacle_update_step < 0
-                or step - self._last_obstacle_update_step
-                >= self._collision_check_interval_steps
-            )
-            combined = self._check_q_combined_collisions(
-                generator,
-                q,
-                attached_obj=attached or None,
-                skip_obstacle_update=not refresh_obstacles,
-            )
-            if not bool(combined.get("available", False)):
-                self._last_collision_report = combined
-            elif bool(combined.get("colliding", False)):
-                # Keep the common clear-state query to one official combined
-                # world+self kernel per waypoint.  Only a hit pays for the
-                # separate world/self attribution needed by guarded target
-                # contact handling; both paths remain fail closed.
-                self._check_q_trajectory_collisions(
-                    generator,
-                    q,
-                    attached_obj=attached or None,
-                    skip_obstacle_update=not refresh_obstacles,
-                )
-            else:
-                self._last_collision_report = {
-                    **combined,
-                    "world_colliding": False,
-                    "self_colliding": False,
-                    "combined_clearance_certified": False,
-                    "attached_collision_body": {
-                        "available": bool(attached),
-                    },
-                }
-                self._last_collision_step = step
-                if refresh_obstacles:
-                    self._last_obstacle_update_step = step
-        except TimeoutError:
-            raise
-        except Exception as exc:
-            self._last_collision_report = {
-                "available": False,
-                "reason": f"{type(exc).__name__}: {exc}",
-                "min_margin_m": None,
-            }
-            self._last_collision_step = step
-        return dict(self._last_collision_report)
-
-    def collision_margin(self) -> float | None:
-        return self._last_collision_report.get("min_margin_m")
-
     def dynamics_report(self) -> dict[str, Any]:
         """Measure actual controlled-joint velocity and acceleration limits."""
         try:
@@ -5448,6 +6384,112 @@ class RealCuroboBackend:
             "expected_contact": expected,
         }
 
+    @staticmethod
+    def _canonical_contact_pairs(contacts: Any) -> set[tuple[str, str]]:
+        pairs: set[tuple[str, str]] = set()
+        for contact in contacts or ():
+            body0 = str(getattr(contact, "body0", "")).rstrip("/")
+            body1 = str(getattr(contact, "body1", "")).rstrip("/")
+            if not body0 or not body1:
+                raise RuntimeError("contact feedback omitted a body path")
+            pairs.add(tuple(sorted((body0, body1))))
+        return pairs
+
+    def _whole_body_contact_pairs(
+        self,
+        expected_attachments_by_hand: dict[str, Any],
+    ) -> set[tuple[str, str]]:
+        robot = self._find_robot()
+        contact_list = getattr(robot, "contact_list", None)
+        if not callable(contact_list):
+            raise RuntimeError("R1Pro whole-body contact API is unavailable")
+        contacts = list(contact_list())
+        seen_roots: set[int] = set()
+        for side in ("left", "right"):
+            attachment = expected_attachments_by_hand.get(side)
+            if not isinstance(attachment, dict):
+                continue
+            for root in attachment.values():
+                if id(root) in seen_roots:
+                    continue
+                seen_roots.add(id(root))
+                root_contacts = getattr(root, "contact_list", None)
+                if not callable(root_contacts):
+                    raise RuntimeError(
+                        f"{side} attachment contact API is unavailable"
+                    )
+                contacts.extend(root_contacts())
+        return self._canonical_contact_pairs(contacts)
+
+    def capture_whole_body_contact_baseline(
+        self,
+        *,
+        expected_attachments_by_hand: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Capture existing contacts without advancing the simulator."""
+
+        try:
+            pairs = self._whole_body_contact_pairs(expected_attachments_by_hand)
+            return {
+                "available": True,
+                "pairs": [list(pair) for pair in sorted(pairs)],
+                "continuous_pairs": [list(pair) for pair in sorted(pairs)],
+                "pair_count": len(pairs),
+                "policy": "new_or_reappearing_contact_pair_is_unexpected",
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+
+    def whole_body_contact_report(
+        self,
+        *,
+        baseline: dict[str, Any],
+        expected_attachments_by_hand: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Reject any contact pair not present at trajectory start."""
+
+        if not isinstance(baseline, dict) or baseline.get("available") is not True:
+            return {
+                "available": False,
+                "reason": "whole-body contact baseline unavailable",
+                "unexpected_contact": False,
+            }
+        try:
+            baseline_pairs = {
+                tuple(str(value) for value in pair)
+                for pair in baseline.get(
+                    "continuous_pairs",
+                    baseline.get("pairs", ()),
+                )
+                if isinstance(pair, (list, tuple)) and len(pair) == 2
+            }
+            current_pairs = self._whole_body_contact_pairs(
+                expected_attachments_by_hand
+            )
+            unexpected = sorted(current_pairs - baseline_pairs)
+            continuous_pairs = baseline_pairs & current_pairs
+            baseline["continuous_pairs"] = [
+                list(pair) for pair in sorted(continuous_pairs)
+            ]
+            return {
+                "available": True,
+                "unexpected_contact": bool(unexpected),
+                "unexpected_pairs": [list(pair) for pair in unexpected],
+                "current_pair_count": len(current_pairs),
+                "baseline_pair_count": len(baseline_pairs),
+                "continuous_baseline_pair_count": len(continuous_pairs),
+                "policy": "new_or_reappearing_contact_pair_is_unexpected",
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "unexpected_contact": False,
+            }
+
     def _target_object_for_point(
         self,
         target_xyz: np.ndarray | None,
@@ -5502,92 +6544,6 @@ class RealCuroboBackend:
             return None
         return candidates[0][2]
 
-    def guarded_contact_safety_report(
-        self,
-        *,
-        hand: str,
-        target_xyz: np.ndarray,
-        allowed_contact_distance_m: float = 0.025,
-    ) -> dict[str, Any]:
-        """Verify a guarded collision is attributable only to its target body.
-
-        The target is removed only for this diagnostic world query. The normal
-        cuRobo world is restored before returning; self collision is checked
-        independently and can never be exempted.
-        """
-
-        target_object = self._target_object_for_point(target_xyz)
-        if target_object is None:
-            return {
-                "available": False,
-                "reason": "target_collision_body_unresolved",
-                "target_object_resolved": False,
-            }
-        generator = self._active_generator or self._generator(kind="arm", hand=hand)
-        robot = self._find_robot()
-        q = robot.get_joint_positions().reshape(1, -1)
-        attached: dict[str, Any] = {}
-        for side in ("left", "right"):
-            item = self.get_attached_object(side)
-            if item:
-                attached.update(item)
-        collision_report = self._check_q_target_excluded_collisions(
-            generator,
-            q,
-            target_xyz=target_xyz,
-            attached_obj=attached or None,
-        )
-        if not bool(collision_report.get("available", False)):
-            return {
-                "available": False,
-                "reason": collision_report.get(
-                    "reason", "target_excluded_collision_check_unavailable"
-                ),
-                "target_object_resolved": True,
-                "target_excluded_collision_report": collision_report,
-                "normal_world_restored": collision_report.get(
-                    "normal_world_restored", False
-                ),
-            }
-        contact = self.contact_report(
-            hand=hand,
-            target_xyz=target_xyz,
-            allowed_contact_distance_m=allowed_contact_distance_m,
-        )
-        return {
-            "available": bool(contact.get("available", False)),
-            "target_object_resolved": True,
-            "self_colliding": bool(collision_report.get("colliding", True)),
-            "world_without_target_colliding": bool(
-                collision_report.get("world_without_target_colliding", True)
-            ),
-            "target_excluded_collision_report": collision_report,
-            "world_without_target_report": collision_report.get(
-                "world_without_target_report"
-            ),
-            "contact_report": contact,
-            "target_only_activation_verified": bool(
-                collision_report.get("target_only_activation_verified", False)
-            ),
-        }
-
-    def resolve_target_attachment(
-        self,
-        *,
-        hand: str,
-        target_xyz: np.ndarray,
-    ) -> Any:
-        """Lock the RGB-D target's exact root collision body before grasping."""
-
-        hand = _normalize_hand(hand)
-        target_object = self._target_object_for_point(target_xyz)
-        if target_object is None:
-            return None
-        root_link = getattr(target_object, "root_link", None)
-        if root_link is None:
-            raise RuntimeError("pick target has no root_link collision body")
-        return {EEF_LINK_BY_HAND[hand]: root_link}
-
     def get_attached_object(self, hand: str) -> Any:
         hand = _normalize_hand(hand)
         robot = self._find_robot()
@@ -5620,16 +6576,6 @@ def _indices(value: Any) -> list[int]:
         return []
 
 
-def _contains_none(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, dict):
-        return any(_contains_none(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_contains_none(item) for item in value)
-    return False
-
-
 def _verify_env_action_segments() -> None:
     covered = []
     for segment in ENV_ACTION_SEGMENTS.values():
@@ -5642,6 +6588,51 @@ def _verify_env_action_segments() -> None:
 
 def _wrap_angle(angle: float) -> float:
     return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _supercover_grid_cells(
+    start_row_col: Any,
+    end_row_col: Any,
+) -> list[tuple[int, int]]:
+    """Return every grid cell touched by a segment between two map cells."""
+
+    start = np.asarray(start_row_col, dtype=np.int64).reshape(2)
+    end = np.asarray(end_row_col, dtype=np.int64).reshape(2)
+    row, column = int(start[0]), int(start[1])
+    end_row, end_column = int(end[0]), int(end[1])
+    delta_column = end_column - column
+    delta_row = end_row - row
+    count_column = abs(delta_column)
+    count_row = abs(delta_row)
+    step_column = 0 if delta_column == 0 else (1 if delta_column > 0 else -1)
+    step_row = 0 if delta_row == 0 else (1 if delta_row > 0 else -1)
+    advanced_column = 0
+    advanced_row = 0
+    cells: list[tuple[int, int]] = [(row, column)]
+    while advanced_column < count_column or advanced_row < count_row:
+        decision = (
+            (1 + 2 * advanced_column) * count_row
+            - (1 + 2 * advanced_row) * count_column
+        )
+        if decision == 0:
+            next_column = column + step_column
+            next_row = row + step_row
+            # A corner crossing touches both orthogonal neighbours as well as
+            # the diagonal destination; checking all three is conservative.
+            cells.append((row, next_column))
+            cells.append((next_row, column))
+            column = next_column
+            row = next_row
+            advanced_column += 1
+            advanced_row += 1
+        elif decision < 0:
+            column += step_column
+            advanced_column += 1
+        else:
+            row += step_row
+            advanced_row += 1
+        cells.append((row, column))
+    return list(dict.fromkeys(cells))
 
 
 def _yaw_from_quat_xyzw(quat: Any) -> float:
@@ -5690,6 +6681,57 @@ def _base_candidates(target_xyz: np.ndarray, *, standoff_m: float) -> list[np.nd
     return candidates
 
 
+def _bounded_polyline_prefix(
+    points_xy: Any,
+    *,
+    max_travel_m: float,
+) -> tuple[np.ndarray, float, float, bool]:
+    """Return an exact bounded prefix of a finite world-XY polyline."""
+
+    points = np.asarray(_jsonable(points_xy), dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 1:
+        raise ValueError(f"navigation path must be finite [N,2], got {points.shape}")
+    if not np.isfinite(points).all():
+        raise ValueError("navigation path contains NaN or infinity")
+    limit = float(max_travel_m)
+    if not math.isfinite(limit) or limit <= 0.0:
+        raise ValueError("max_travel_m must be finite and positive")
+
+    compact = [points[0].copy()]
+    for point in points[1:]:
+        if float(np.linalg.norm(point - compact[-1])) > 1e-9:
+            compact.append(point.copy())
+    path = np.asarray(compact, dtype=np.float64)
+    if len(path) == 1:
+        return path, 0.0, 0.0, False
+
+    segment_lengths = np.linalg.norm(np.diff(path, axis=0), axis=1)
+    full_length = float(np.sum(segment_lengths))
+    if full_length <= limit + 1e-9:
+        return path, full_length, full_length, False
+
+    prefix = [path[0].copy()]
+    travelled = 0.0
+    for start, end, segment_length in zip(
+        path[:-1],
+        path[1:],
+        segment_lengths,
+        strict=True,
+    ):
+        remaining = limit - travelled
+        if remaining <= 1e-9:
+            break
+        if segment_length <= remaining + 1e-9:
+            prefix.append(end.copy())
+            travelled += float(segment_length)
+            continue
+        fraction = remaining / float(segment_length)
+        prefix.append(start + fraction * (end - start))
+        travelled = limit
+        break
+    return np.asarray(prefix, dtype=np.float64), travelled, full_length, True
+
+
 class PlannerExecutor:
     """Executes planner tool requests inside the BEHAVIOR env process."""
 
@@ -5717,16 +6759,19 @@ class PlannerExecutor:
         self.max_stall_steps = int(max_stall_steps)
         self.last_info: Any = None
         self._trace_counter = 0
+        self._isolation_context_counter = 0
+        self._active_isolation_report: dict[str, Any] | None = None
         self._last_guarded_retreat_paths: dict[str, np.ndarray] = {}
 
-    def on_simulator_state_restored(self) -> None:
-        """Reset executor-local state without exposing restore over planner RPC."""
+    def on_runtime_state_changed(self) -> None:
+        """Reset executor-local state after a controller or q-state change."""
 
         self.last_info = None
+        self._active_isolation_report = None
         self._last_guarded_retreat_paths.clear()
-        restored = getattr(self.backend, "on_simulator_state_restored", None)
-        if callable(restored):
-            restored()
+        changed = getattr(self.backend, "on_runtime_state_changed", None)
+        if callable(changed):
+            changed()
 
     def warmup(self) -> dict[str, Any]:
         warmup = getattr(self.backend, "warmup", None)
@@ -5734,27 +6779,79 @@ class PlannerExecutor:
             raise RuntimeError("planner backend does not implement safety warmup")
         return dict(warmup())
 
-    def warmup_prepress(
+    def warmup_attached_arm(
         self,
         *,
         hand: str,
         expected_attached_root: Any,
-        ignore_collision_checks: bool = False,
     ) -> dict[str, Any]:
-        warmup = getattr(self.backend, "warmup_prepress", None)
+        warmup = getattr(self.backend, "warmup_attached_arm", None)
         if not callable(warmup):
             raise RuntimeError(
-                "planner backend does not implement pre-press safety warmup"
+                "planner backend does not implement attached-arm safety warmup"
             )
-        kwargs = {
-            "hand": hand,
-            "expected_attached_root": expected_attached_root,
-        }
-        if ignore_collision_checks:
-            kwargs["ignore_collision_checks"] = True
-        return dict(warmup(**kwargs))
+        return dict(warmup(hand=hand, expected_attached_root=expected_attached_root))
 
-    @_planner_tool("observe", suggested_next_tool="observe")
+    def _capture_single_arm_isolation(
+        self,
+        *,
+        hand: str,
+        gripper_only: bool,
+        reference_origin: str,
+        motion_scope: str = "arm_only",
+    ) -> dict[str, Any] | None:
+        capture = getattr(
+            self.backend,
+            "capture_single_arm_isolation_reference",
+            None,
+        )
+        if not callable(capture):
+            return None
+        try:
+            kwargs = {
+                "hand": _normalize_hand(hand),
+                "gripper_only": bool(gripper_only),
+            }
+            if motion_scope == "arm_with_trunk":
+                kwargs["motion_scope"] = motion_scope
+            reference = capture(**kwargs)
+        except Exception:
+            return None
+        if not isinstance(reference, dict):
+            return None
+        self._isolation_context_counter += 1
+        result = dict(reference)
+        result["context_id"] = (
+            f"single-arm-isolation-{self._isolation_context_counter:06d}"
+        )
+        result["reference_origin"] = str(reference_origin)
+        return result
+
+    @staticmethod
+    def _merge_isolation_report(
+        aggregate: dict[str, Any] | None,
+        report: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Retain the latest checks and maximum privacy-safe drift metrics."""
+
+        merged = dict(report)
+        if not isinstance(aggregate, dict):
+            merged["checks_performed"] = 1
+            return merged
+        maxima = dict(aggregate.get("max_observed", {}))
+        for key, value in dict(report.get("max_observed", {})).items():
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                prior = maxima.get(key)
+                maxima[key] = (
+                    float(value)
+                    if not isinstance(prior, (int, float))
+                    else max(float(prior), float(value))
+                )
+        merged["max_observed"] = maxima
+        merged["checks_performed"] = int(aggregate.get("checks_performed", 0)) + 1
+        return merged
+
+    @_planner_tool("observe")
     def observe(self, camera: str) -> dict[str, Any]:
         payload = self.frame_cache.observe_payload(canonical_camera(camera))
         payload.update(
@@ -5773,7 +6870,7 @@ class PlannerExecutor:
         )
         return payload
 
-    @_planner_tool("pixel_to_world", suggested_next_tool="observe")
+    @_planner_tool("pixel_to_world")
     def pixel_to_world(
         self,
         *,
@@ -5828,101 +6925,657 @@ class PlannerExecutor:
                 diagnostics={"error": f"{type(exc).__name__}: {exc}"},
             )
 
-    @_planner_tool("navigate_to", suggested_next_tool="observe")
+    @_planner_tool("navigate_to")
     def navigate_to(
+        self,
+        *,
+        target_xyz: Any | None = None,
+        relative_motion: Any = None,
+        standoff_m: float | None = None,
+        max_travel_m: float | None = None,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        """Move only BASE toward a target or by one explicit relative motion."""
+
+        started = time.monotonic()
+        timeout = self._validated_timeout(timeout_s)
+        if self._task_success():
+            return primitive_result(
+                primitive_success=True,
+                task_success=True,
+                stop_reason="task_success",
+                recoverable=False,
+                suggested_next_tool=None,
+                metrics={"env_actions_sent": 0},
+            )
+        relative_mode = relative_motion is not None
+        if relative_mode:
+            if any(
+                value is not None
+                for value in (target_xyz, standoff_m, max_travel_m)
+            ):
+                raise ValueError(
+                    "relative_motion is mutually exclusive with target navigation"
+                )
+            motion = validate_relative_navigation_motion(relative_motion)
+            plan_navigation = getattr(
+                self.backend,
+                "plan_relative_navigation_trajectory",
+                None,
+            )
+            planner_kwargs = {
+                "relative_motion": motion,
+                "timeout_s": timeout,
+            }
+            unavailable_reason = "relative_navigation_planner_unavailable"
+        else:
+            if target_xyz is None:
+                raise ValueError("target_xyz is required for projection navigation")
+            target = _as_xyz(target_xyz)
+            standoff = float(0.85 if standoff_m is None else standoff_m)
+            max_travel = float(1.0 if max_travel_m is None else max_travel_m)
+            if not math.isfinite(standoff) or standoff <= 0.0:
+                raise ValueError("standoff_m must be finite and positive")
+            if not math.isfinite(max_travel) or max_travel <= 0.0:
+                raise ValueError("max_travel_m must be finite and positive")
+            plan_navigation = getattr(
+                self.backend,
+                "plan_navigation_trajectory",
+                None,
+            )
+            planner_kwargs = {
+                "target_xyz": target,
+                "standoff_m": standoff,
+                "max_travel_m": max_travel,
+                "timeout_s": timeout,
+            }
+            unavailable_reason = "navigation_planner_unavailable"
+        if not callable(plan_navigation):
+            return primitive_result(
+                primitive_success=False,
+                task_success=self._task_success(),
+                stop_reason=unavailable_reason,
+                recoverable=True,
+                suggested_next_tool="observe",
+                metrics={
+                    "navigation_isolation": {
+                        "available": True,
+                        "ok": True,
+                        "mode": "base_only",
+                        "checks": {},
+                        "max_observed": {},
+                        "checks_performed": 0,
+                        "reason": "no navigation action was admitted",
+                    }
+                },
+            )
+        plan = plan_navigation(**planner_kwargs)
+        if not isinstance(plan, dict):
+            raise RuntimeError("navigation planner returned a non-mapping result")
+        plan_metrics = (
+            dict(plan.get("metrics")) if isinstance(plan.get("metrics"), dict) else {}
+        )
+        planning_elapsed = plan_metrics.pop("elapsed_s", None)
+        if isinstance(planning_elapsed, (int, float)):
+            plan_metrics["planning_elapsed_s"] = float(planning_elapsed)
+        if plan.get("ok") is not True:
+            stop_reason = str(plan.get("stop_reason", "navigation_unreachable"))
+            return primitive_result(
+                primitive_success=False,
+                task_success=self._task_success(),
+                stop_reason=stop_reason,
+                recoverable=stop_reason
+                not in {"navigation_planner_unavailable", "planner_unavailable"},
+                suggested_next_tool="observe",
+                metrics={
+                    **plan_metrics,
+                    "navigation_isolation": {
+                        "available": True,
+                        "ok": True,
+                        "mode": "base_only",
+                        "checks": {},
+                        "max_observed": {},
+                        "checks_performed": 0,
+                        "reason": "no navigation action was admitted",
+                    },
+                    "elapsed_s": round(time.monotonic() - started, 3),
+                },
+            )
+        trajectory = np.asarray(
+            _jsonable(plan.get("joint_trajectory")), dtype=np.float32
+        )
+        base_goal = np.asarray(
+            _jsonable(plan.get("base_goal")), dtype=np.float64
+        ).reshape(-1)
+        if (
+            trajectory.ndim != 2
+            or len(trajectory) < 1
+            or not np.isfinite(trajectory).all()
+        ):
+            raise RuntimeError("navigation planner omitted a finite q trajectory")
+        if base_goal.shape != (3,) or not np.isfinite(base_goal).all():
+            raise RuntimeError("navigation planner omitted a finite BASE goal")
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0.0:
+            raise TimeoutError("navigation planning consumed the tool deadline")
+        return self._execute_navigation_trajectory(
+            trajectory,
+            base_goal_xyyaw=base_goal,
+            timeout_s=remaining,
+            plan_metrics=plan_metrics,
+        )
+
+    def _move_to_whole_body_impl(
         self,
         *,
         hand: str,
         target_xyz: Any,
-        frame: str = "world",
-        standoff_m: float = 0.85,
-        timeout_s: float = 90.0,
+        frame: str,
+        target_quat_xyzw: Any | None,
+        plan_only: bool,
+        position_tolerance_m: float,
+        orientation_tolerance_rad: float,
+        timeout_s: float,
     ) -> dict[str, Any]:
         started = time.monotonic()
-        try:
-            deadline = started + self._validated_timeout(timeout_s)
-            hand = _normalize_hand(hand)
-            target = self._world_target(target_xyz, frame=frame)
-            plan = self.backend.plan_base_trajectory(
-                hand=hand,
-                target_xyz=target,
-                standoff_m=float(standoff_m),
-                timeout_s=self._remaining_s(deadline),
-            )
-            if not plan.get("ok"):
+        total_budget = min(
+            self._validated_timeout(timeout_s), WHOLE_BODY_TOTAL_DEADLINE_S
+        )
+        deadline = started + total_budget
+        hand = _normalize_hand(hand)
+        target = self._world_target(target_xyz, frame=frame)
+        explicit_quat = _quat_xyzw(target_quat_xyzw)
+        expected_attachments = {
+            side: _call_optional_arg(self.backend, "get_attached_object", side)
+            for side in ("left", "right")
+        }
+        effective_quat = explicit_quat
+        if effective_quat is None and expected_attachments[hand] is not None:
+            call_start_pose = _call_optional_arg(self.backend, "get_eef_pose", hand)
+            if call_start_pose is None:
                 return primitive_result(
                     primitive_success=False,
                     task_success=self._task_success(),
-                    stop_reason=str(plan.get("stop_reason", "base_plan_failed")),
-                    recoverable=True,
+                    stop_reason="pose_feedback_unavailable",
+                    recoverable=False,
                     suggested_next_tool="observe",
-                    metrics=plan.get("metrics", {}),
+                    metrics={"env_actions_sent": 0},
+                )
+            effective_quat = _quat_xyzw(call_start_pose[1])
+
+        if self._task_success():
+            return primitive_result(
+                primitive_success=True,
+                task_success=True,
+                stop_reason="official_task_success",
+                recoverable=False,
+                suggested_next_tool=None,
+                metrics={
+                    "motion_scope": "whole_body",
+                    "env_actions_sent": 0,
+                    "planning_attempts": 0,
+                    "post_success_env_actions": 0,
+                },
+            )
+
+        plan_whole_body = getattr(self.backend, "plan_whole_body_trajectory", None)
+        if not callable(plan_whole_body):
+            return primitive_result(
+                primitive_success=False,
+                task_success=self._task_success(),
+                stop_reason="whole_body_planner_unavailable",
+                recoverable=True,
+                suggested_next_tool=None,
+                metrics={
+                    "motion_scope": "whole_body",
+                    "active_dof_count": 21,
+                },
+            )
+
+        current_pose = _call_optional_arg(self.backend, "get_eef_pose", hand)
+        if current_pose is not None and not plan_only:
+            initial_position_error = float(
+                np.linalg.norm(
+                    np.asarray(current_pose[0], dtype=np.float64).reshape(3) - target
+                )
+            )
+            initial_orientation_error = (
+                _quat_angle_error_rad(current_pose[1], effective_quat)
+                if effective_quat is not None
+                else None
+            )
+            if (
+                initial_position_error <= float(position_tolerance_m)
+                and (
+                    initial_orientation_error is None
+                    or initial_orientation_error <= float(orientation_tolerance_rad)
+                )
+            ):
+                return primitive_result(
+                    primitive_success=True,
+                    task_success=self._task_success(),
+                    stop_reason="reached",
+                    recoverable=True,
+                    suggested_next_tool=None,
+                    metrics={
+                        "motion_scope": "whole_body",
+                        "active_dof_count": 21,
+                        "env_actions_sent": 0,
+                        "planning_attempts": 0,
+                        "final_position_error_m": initial_position_error,
+                        "final_orientation_error_rad": initial_orientation_error,
+                        "local_target_already_satisfied": True,
+                    },
+                )
+
+        planning_spent_s = 0.0
+        execution_spent_s = 0.0
+        previous_eligible_failure: dict[str, float | None] | None = None
+        rounds: list[dict[str, Any]] = []
+        last_plan_metrics: dict[str, Any] = {}
+        while True:
+            if self._task_success():
+                return primitive_result(
+                    primitive_success=True,
+                    task_success=True,
+                    stop_reason="official_task_success",
+                    recoverable=False,
+                    suggested_next_tool=None,
+                    metrics={
+                        **last_plan_metrics,
+                        "motion_scope": "whole_body",
+                        "planning_spent_s": planning_spent_s,
+                        "execution_spent_s": execution_spent_s,
+                        "replan_rounds": rounds,
+                        "post_success_env_actions": 0,
+                    },
+                )
+            for side in ("left", "right"):
+                live = _call_optional_arg(self.backend, "get_attached_object", side)
+                matches, identity = _attachment_state_status(
+                    live, expected_attachments[side], hand=side
+                )
+                if not matches:
+                    return primitive_result(
+                        primitive_success=False,
+                        task_success=self._task_success(),
+                        stop_reason="attachment_identity_mismatch",
+                        recoverable=False,
+                        suggested_next_tool="observe",
+                        metrics={
+                            **last_plan_metrics,
+                            "attachment_identity": {"hand": side, **identity},
+                            "planning_spent_s": planning_spent_s,
+                            "execution_spent_s": execution_spent_s,
+                            "replan_rounds": rounds,
+                        },
+                    )
+
+            total_remaining = deadline - time.monotonic()
+            plan_allowance = min(
+                WHOLE_BODY_PLANNING_DEADLINE_S - planning_spent_s,
+                total_remaining,
+            )
+            if plan_allowance <= 0.0:
+                return primitive_result(
+                    primitive_success=False,
+                    task_success=self._task_success(),
+                    stop_reason="planning_budget_exhausted",
+                    recoverable=True,
+                    suggested_next_tool=None,
+                    metrics={
+                        **last_plan_metrics,
+                        "planning_spent_s": planning_spent_s,
+                        "execution_spent_s": execution_spent_s,
+                        "replan_rounds": rounds,
+                        "total_deadline_s": total_budget,
+                    },
+                )
+
+            plan_started = time.monotonic()
+            try:
+                with _wall_clock_deadline(
+                    plan_allowance,
+                    "whole-body planning transaction",
+                ):
+                    plan = plan_whole_body(
+                        hand=hand,
+                        target_xyz=target,
+                        target_quat_xyzw=effective_quat,
+                        timeout_s=plan_allowance,
+                        attached_obj=expected_attachments[hand],
+                    )
+            except TimeoutError as exc:
+                planning_spent_s += time.monotonic() - plan_started
+                return primitive_result(
+                    primitive_success=False,
+                    task_success=self._task_success(),
+                    stop_reason="planning_budget_exhausted",
+                    recoverable=True,
+                    suggested_next_tool=None,
+                    metrics={
+                        **last_plan_metrics,
+                        "planning_spent_s": planning_spent_s,
+                        "execution_spent_s": execution_spent_s,
+                        "replan_rounds": rounds,
+                        "total_deadline_s": total_budget,
+                        "planning_hard_limit_s": WHOLE_BODY_PLANNING_DEADLINE_S,
+                    },
+                    diagnostics={"error": f"{type(exc).__name__}: {exc}"},
+                )
+            planning_elapsed = time.monotonic() - plan_started
+            planning_spent_s += planning_elapsed
+            plan_metrics = (
+                dict(plan.get("metrics"))
+                if isinstance(plan.get("metrics"), dict)
+                else {}
+            )
+            last_plan_metrics = plan_metrics
+            round_report: dict[str, Any] = {
+                "round": len(rounds) + 1,
+                "planning_allowance_s": plan_allowance,
+                "planning_elapsed_s": planning_elapsed,
+                "plan_ok": plan.get("ok") is True,
+                "plan_stop_reason": plan.get("stop_reason"),
+            }
+            rounds.append(round_report)
+            if not plan.get("ok"):
+                stop_reason = str(plan.get("stop_reason", "whole_body_plan_failed"))
+                return primitive_result(
+                    primitive_success=False,
+                    task_success=self._task_success(),
+                    stop_reason=stop_reason,
+                    recoverable=stop_reason
+                    in {
+                        "unreachable",
+                        "timeout",
+                        "planner_unavailable",
+                        "collision_admission_failed",
+                    },
+                    suggested_next_tool=None,
+                    metrics={
+                        **plan_metrics,
+                        "planning_spent_s": planning_spent_s,
+                        "execution_spent_s": execution_spent_s,
+                        "replan_rounds": rounds,
+                    },
                     diagnostics=plan,
                 )
-            actions = plan.get("actions")
-            execution = self._execute_actions(
-                validate_action_chunk(actions) if actions is not None else None,
-                hand=hand,
-                target_xyz=None,
-                target_quat_xyzw=None,
-                position_tolerance_m=0.05,
-                orientation_tolerance_rad=math.radians(5.0),
-                timeout_s=self._remaining_s(deadline),
-                require_pose=False,
-                base_goal_xyyaw=np.asarray(plan.get("base_goal"), dtype=np.float64),
-                joint_trajectory=plan.get("joint_trajectory"),
+
+            metrics = plan.get("metrics")
+            collision = (
+                metrics.get("collision_admission")
+                if isinstance(metrics, dict)
+                else None
             )
-            if not bool(execution.get("primitive_success", False)):
-                metrics = {
-                    **plan.get("metrics", {}),
-                    **execution.get("metrics", {}),
-                }
-                metrics["elapsed_s"] = round(time.monotonic() - started, 3)
+            certificate = plan.get("whole_body_certificate")
+            if (
+                not isinstance(collision, dict)
+                or collision.get("available") is not True
+                or collision.get("admitted") is not True
+                or collision.get("world_collision_check") is not True
+                or collision.get("self_collision_check") is not True
+                or collision.get("obstacle_update") is not True
+                or collision.get("full_trajectory") is not True
+                or collision.get("post_interpolation_check") is not True
+                or not isinstance(certificate, dict)
+            ):
                 return primitive_result(
                     primitive_success=False,
                     task_success=self._task_success(),
-                    stop_reason=str(execution.get("stop_reason", "execution_failed")),
-                    recoverable=bool(execution.get("recoverable", True)),
-                    suggested_next_tool=execution.get("suggested_next_tool", "observe"),
-                    metrics=metrics,
-                    diagnostics=execution.get("diagnostics", {}),
+                    stop_reason="collision_admission_unavailable",
+                    recoverable=False,
+                    suggested_next_tool=None,
+                    metrics={
+                        **dict(metrics or {}),
+                        "planning_spent_s": planning_spent_s,
+                        "execution_spent_s": execution_spent_s,
+                        "replan_rounds": rounds,
+                    },
+                    diagnostics=plan,
                 )
-            reachability_target = np.asarray(
-                plan.get("reachability_target_xyz", target),
-                dtype=np.float64,
-            ).reshape(3)
-            reachability_quat = _quat_xyzw(plan.get("reachability_target_quat_xyzw"))
-            reachable, reason, reach_metrics = self._check_arm_reachability(
-                hand=hand,
-                target_xyz=reachability_target,
-                target_quat_xyzw=reachability_quat,
-                timeout_s=self._remaining_s(deadline),
-            )
-            self._remaining_s(deadline)
-            metrics = {
-                **plan.get("metrics", {}),
-                **execution["metrics"],
-                **reach_metrics,
-            }
-            metrics["elapsed_s"] = round(time.monotonic() - started, 3)
-            metrics["post_base_reachability_stage"] = reach_metrics.get(
-                "reachability_stage"
-            )
-            metrics["post_base_reachability_target_xyz"] = reachability_target.tolist()
-            success = bool(execution["primitive_success"] and reachable)
-            return primitive_result(
-                primitive_success=success,
-                task_success=self._task_success(),
-                stop_reason="arrived" if success else reason,
-                recoverable=True,
-                suggested_next_tool="observe",
-                metrics=metrics,
-                diagnostics=execution["diagnostics"],
-            )
-        except Exception as exc:
-            return self._exception_result(exc, suggested_next_tool="observe")
+            for side in ("left", "right"):
+                live = _call_optional_arg(self.backend, "get_attached_object", side)
+                matches, identity = _attachment_state_status(
+                    live, expected_attachments[side], hand=side
+                )
+                if not matches:
+                    return primitive_result(
+                        primitive_success=False,
+                        task_success=self._task_success(),
+                        stop_reason="attachment_identity_mismatch",
+                        recoverable=False,
+                        suggested_next_tool="observe",
+                        metrics={
+                            **dict(metrics or {}),
+                            "attachment_identity": {"hand": side, **identity},
+                            "planning_spent_s": planning_spent_s,
+                            "execution_spent_s": execution_spent_s,
+                            "replan_rounds": rounds,
+                        },
+                    )
+            if plan_only:
+                return primitive_result(
+                    primitive_success=True,
+                    task_success=self._task_success(),
+                    stop_reason="plan_ready",
+                    recoverable=True,
+                    metrics={
+                        **dict(metrics or {}),
+                        "planning_spent_s": planning_spent_s,
+                        "execution_spent_s": 0.0,
+                        "replan_rounds": rounds,
+                        "elapsed_s": round(time.monotonic() - started, 3),
+                    },
+                )
+            trajectory = plan.get("joint_trajectory")
+            if trajectory is None:
+                return primitive_result(
+                    primitive_success=False,
+                    task_success=self._task_success(),
+                    stop_reason="whole_body_trajectory_unavailable",
+                    recoverable=False,
+                    metrics={
+                        **dict(metrics or {}),
+                        "planning_spent_s": planning_spent_s,
+                        "execution_spent_s": execution_spent_s,
+                        "replan_rounds": rounds,
+                    },
+                )
 
-    @_planner_tool("move_to", suggested_next_tool="navigate_to")
+            total_remaining = deadline - time.monotonic()
+            execution_allowance = min(
+                WHOLE_BODY_EXECUTION_DEADLINE_S - execution_spent_s,
+                total_remaining,
+            )
+            if execution_allowance <= 0.0:
+                return primitive_result(
+                    primitive_success=False,
+                    task_success=self._task_success(),
+                    stop_reason="execution_budget_exhausted",
+                    recoverable=True,
+                    suggested_next_tool=None,
+                    metrics={
+                        **dict(metrics or {}),
+                        "planning_spent_s": planning_spent_s,
+                        "execution_spent_s": execution_spent_s,
+                        "replan_rounds": rounds,
+                    },
+                )
+
+            execution_started = time.monotonic()
+            try:
+                with _wall_clock_deadline(
+                    execution_allowance,
+                    "whole-body execution transaction",
+                ):
+                    execution = self._execute_actions(
+                        None,
+                        hand=hand,
+                        target_xyz=target,
+                        target_quat_xyzw=effective_quat,
+                        position_tolerance_m=float(position_tolerance_m),
+                        orientation_tolerance_rad=float(
+                            orientation_tolerance_rad
+                        ),
+                        timeout_s=execution_allowance,
+                        require_pose=True,
+                        hold_steps_required=1,
+                        joint_trajectory=trajectory,
+                        expected_attachments_by_hand=expected_attachments,
+                        motion_scope="whole_body",
+                        whole_body_certificate=certificate,
+                    )
+            except TimeoutError as exc:
+                execution_elapsed = time.monotonic() - execution_started
+                execution_spent_s += execution_elapsed
+                return primitive_result(
+                    primitive_success=False,
+                    task_success=self._task_success(),
+                    stop_reason="execution_budget_exhausted",
+                    recoverable=False,
+                    suggested_next_tool=None,
+                    metrics={
+                        **dict(metrics or {}),
+                        "planning_spent_s": planning_spent_s,
+                        "execution_spent_s": execution_spent_s,
+                        "replan_rounds": rounds,
+                        "total_deadline_s": total_budget,
+                        "execution_hard_limit_s": (
+                            WHOLE_BODY_EXECUTION_DEADLINE_S
+                        ),
+                    },
+                    diagnostics={"error": f"{type(exc).__name__}: {exc}"},
+                )
+            execution_elapsed = time.monotonic() - execution_started
+            execution_spent_s += execution_elapsed
+            execution_metrics = (
+                dict(execution.get("metrics"))
+                if isinstance(execution.get("metrics"), dict)
+                else {}
+            )
+            round_report.update(
+                {
+                    "execution_allowance_s": execution_allowance,
+                    "execution_elapsed_s": execution_elapsed,
+                    "execution_stop_reason": execution.get("stop_reason"),
+                    "primitive_success": execution.get("primitive_success"),
+                    "task_success": execution.get("task_success"),
+                }
+            )
+            combined_metrics = {
+                **dict(metrics or {}),
+                **execution_metrics,
+                "motion_scope": "whole_body",
+                "planning_spent_s": planning_spent_s,
+                "execution_spent_s": execution_spent_s,
+                "total_deadline_s": total_budget,
+                "planning_hard_limit_s": WHOLE_BODY_PLANNING_DEADLINE_S,
+                "execution_hard_limit_s": WHOLE_BODY_EXECUTION_DEADLINE_S,
+                "replan_rounds": rounds,
+                "whole_body_execution": {
+                    "available": True,
+                    "ok": bool(execution.get("primitive_success")),
+                    "collision_certificate_verified_before_first_action": True,
+                    "dual_attachment_checked_each_nonterminal_step": True,
+                    "unexpected_contact_checked_each_nonterminal_step": True,
+                    "raw_success_checked_after_each_action": True,
+                    "raw_success_preempts_post_step_safety_checks": True,
+                    "feedback_gated_waypoints": True,
+                },
+                "elapsed_s": round(time.monotonic() - started, 3),
+            }
+            if execution.get("primitive_success") is True or execution.get(
+                "task_success"
+            ) is True:
+                return primitive_result(
+                    primitive_success=bool(execution["primitive_success"]),
+                    task_success=self._task_success(),
+                    stop_reason=str(execution["stop_reason"]),
+                    recoverable=bool(execution["recoverable"]),
+                    suggested_next_tool=execution.get("suggested_next_tool"),
+                    metrics=combined_metrics,
+                    diagnostics=execution.get("diagnostics"),
+                )
+
+            stop_reason = str(execution.get("stop_reason", "execution_failed"))
+            eligible = stop_reason in {"stalled_tracking", "waypoint_tracking_lag"}
+            if (
+                stop_reason == "target_tolerance_not_met"
+                and execution_metrics.get("trajectory_complete") is True
+            ):
+                eligible = True
+            if not eligible:
+                return primitive_result(
+                    primitive_success=False,
+                    task_success=self._task_success(),
+                    stop_reason=stop_reason,
+                    recoverable=bool(execution.get("recoverable", False)),
+                    suggested_next_tool=execution.get("suggested_next_tool"),
+                    metrics=combined_metrics,
+                    diagnostics=execution.get("diagnostics"),
+                )
+
+            position_error = execution_metrics.get("final_position_error_m")
+            tracking = execution_metrics.get("final_joint_tracking")
+            tracking_error = (
+                tracking.get("normalized_21d_tracking_error")
+                if isinstance(tracking, dict)
+                else None
+            )
+            current_failure = {
+                "position_error_m": (
+                    float(position_error)
+                    if isinstance(position_error, (int, float))
+                    and math.isfinite(float(position_error))
+                    else None
+                ),
+                "tracking_error_21d": (
+                    float(tracking_error)
+                    if isinstance(tracking_error, (int, float))
+                    and math.isfinite(float(tracking_error))
+                    else None
+                ),
+            }
+            round_report["eligible_replan_failure"] = current_failure
+            if previous_eligible_failure is not None:
+                previous_position = previous_eligible_failure["position_error_m"]
+                previous_tracking = previous_eligible_failure["tracking_error_21d"]
+                position_improved = bool(
+                    previous_position is not None
+                    and current_failure["position_error_m"] is not None
+                    and previous_position - current_failure["position_error_m"]
+                    >= WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M
+                )
+                tracking_improved = bool(
+                    previous_tracking is not None
+                    and previous_tracking > 0.0
+                    and current_failure["tracking_error_21d"] is not None
+                    and current_failure["tracking_error_21d"]
+                    <= previous_tracking
+                    * (1.0 - WHOLE_BODY_REPLAN_TRACKING_IMPROVEMENT_RATIO)
+                )
+                round_report["replan_progress"] = {
+                    "position_improved_at_least_2mm": position_improved,
+                    "tracking_improved_at_least_5pct": tracking_improved,
+                }
+                if not (position_improved or tracking_improved):
+                    return primitive_result(
+                        primitive_success=False,
+                        task_success=self._task_success(),
+                        stop_reason="replan_no_progress",
+                        recoverable=True,
+                        suggested_next_tool=None,
+                        metrics={
+                            **combined_metrics,
+                            "post_stop_action_policy": "no_additional_env_action",
+                            "post_stop_env_actions": 0,
+                        },
+                        diagnostics=execution.get("diagnostics"),
+                    )
+            previous_eligible_failure = current_failure
+
+    @_planner_tool("move_to")
     def move_to(
         self,
         *,
@@ -5932,118 +7585,22 @@ class PlannerExecutor:
         target_quat_xyzw: Any | None = None,
         plan_only: bool = False,
         position_tolerance_m: float = 0.02,
-        orientation_tolerance_rad: float = 0.087,
-        timeout_s: float = 45.0,
+        orientation_tolerance_rad: float = math.radians(5.0),
+        timeout_s: float = WHOLE_BODY_TOTAL_DEADLINE_S,
     ) -> dict[str, Any]:
-        started = time.monotonic()
         try:
-            deadline = started + self._validated_timeout(timeout_s)
-            hand = _normalize_hand(hand)
-            # Lock the assisted-grasp collision body exactly once. Reachability,
-            # full planning, and execution must reason about the same object;
-            # later reads are identity checks, never silent reference updates.
-            attached_obj = _call_optional_arg(self.backend, "get_attached_object", hand)
-            expected_attachment = attached_obj
-            require_attachment = attached_obj is not None
-            attached_collision_body_metrics = {
-                "attached_collision_body": {
-                    "available": require_attachment,
-                    "identity_locked_at_call_start": require_attachment,
-                    "used_for_reachability": require_attachment,
-                    "used_for_full_trajectory_plan": require_attachment,
-                    "required_during_execution": require_attachment,
-                }
-            }
-            target = self._world_target(target_xyz, frame=frame)
-            quat = _quat_xyzw(target_quat_xyzw)
-            reachable, reason, reach_metrics = self._check_arm_reachability(
+            return self._move_to_whole_body_impl(
                 hand=hand,
-                target_xyz=target,
-                target_quat_xyzw=quat,
-                timeout_s=self._remaining_s(deadline),
-                attached_obj=attached_obj,
-            )
-            self._remaining_s(deadline)
-            if not reachable:
-                suggested = "navigate_to" if reason == "navigation_required" else None
-                return primitive_result(
-                    primitive_success=False,
-                    task_success=self._task_success(),
-                    stop_reason=reason,
-                    recoverable=True,
-                    suggested_next_tool=suggested,
-                    metrics={**reach_metrics, **attached_collision_body_metrics},
-                )
-            plan = self.backend.plan_arm_trajectory(
-                hand=hand,
-                target_xyz=target,
-                target_quat_xyzw=quat,
-                timeout_s=self._remaining_s(deadline),
-                attached_obj=attached_obj,
-            )
-            if not plan.get("ok"):
-                stop_reason = str(plan.get("stop_reason", "arm_plan_failed"))
-                return primitive_result(
-                    primitive_success=False,
-                    task_success=self._task_success(),
-                    stop_reason=stop_reason,
-                    recoverable=stop_reason in {"unreachable", "planner_unavailable"},
-                    suggested_next_tool="navigate_to"
-                    if stop_reason == "unreachable"
-                    else None,
-                    metrics={
-                        **reach_metrics,
-                        **plan.get("metrics", {}),
-                        **attached_collision_body_metrics,
-                    },
-                    diagnostics=plan,
-                )
-            if plan_only:
-                return primitive_result(
-                    primitive_success=True,
-                    task_success=self._task_success(),
-                    stop_reason="plan_ready",
-                    recoverable=True,
-                    metrics={
-                        **reach_metrics,
-                        **plan.get("metrics", {}),
-                        **attached_collision_body_metrics,
-                        "elapsed_s": round(time.monotonic() - started, 3),
-                    },
-                )
-            execution = self._execute_actions(
-                validate_action_chunk(plan["actions"])
-                if plan.get("actions") is not None
-                else None,
-                hand=hand,
-                target_xyz=target,
-                target_quat_xyzw=quat,
-                position_tolerance_m=float(position_tolerance_m),
-                orientation_tolerance_rad=float(orientation_tolerance_rad),
-                timeout_s=self._remaining_s(deadline),
-                require_pose=True,
-                joint_trajectory=plan.get("joint_trajectory"),
-                expected_attachment=expected_attachment,
-                require_attachment=require_attachment,
-            )
-            metrics = {
-                **reach_metrics,
-                **plan.get("metrics", {}),
-                **execution["metrics"],
-                **attached_collision_body_metrics,
-            }
-            metrics["elapsed_s"] = round(time.monotonic() - started, 3)
-            return primitive_result(
-                primitive_success=execution["primitive_success"],
-                task_success=self._task_success(),
-                stop_reason=execution["stop_reason"],
-                recoverable=execution["recoverable"],
-                suggested_next_tool=execution["suggested_next_tool"],
-                metrics=metrics,
-                diagnostics=execution["diagnostics"],
+                target_xyz=target_xyz,
+                frame=frame,
+                target_quat_xyzw=target_quat_xyzw,
+                plan_only=plan_only,
+                position_tolerance_m=position_tolerance_m,
+                orientation_tolerance_rad=orientation_tolerance_rad,
+                timeout_s=timeout_s,
             )
         except Exception as exc:
-            return self._exception_result(exc, suggested_next_tool="navigate_to")
+            return self._exception_result(exc, suggested_next_tool=None)
 
     def _move_to_composite_stage(
         self,
@@ -6056,37 +7613,46 @@ class PlannerExecutor:
         timeout_s: float,
         hold_steps_required: int,
         contact_target_xyz: np.ndarray | None = None,
-        allow_target_activation: bool = False,
         expected_attachment: Any = None,
         require_attachment: bool = False,
+        isolation_reference: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run a collision-checked intermediate move inside a composite tool."""
+        """Run a collision-certified whole-body stage inside a composite tool."""
 
         started = time.monotonic()
         try:
+            del isolation_reference
             deadline = started + self._validated_timeout(timeout_s)
             hand = _normalize_hand(hand)
             target = _as_xyz(target_xyz)
             quat = _quat_xyzw(target_quat_xyzw)
-            # Composite stages immediately request a full collision-checked
-            # trajectory.  A separate IK reachability probe here duplicated
-            # cuRobo work without adding a safety check; the full planner
-            # already performs IK, trajopt, interpolation, and complete path
-            # collision certification under the same hard deadline.
             reach_metrics: dict[str, Any] = {
-                "reachability_stage": "full_trajectory_direct",
+                "reachability_stage": "whole_body_full_trajectory",
                 "redundant_ik_probe_skipped": True,
             }
-            plan = self.backend.plan_arm_trajectory(
+            expected_attachments = {
+                side: _call_optional_arg(self.backend, "get_attached_object", side)
+                for side in ("left", "right")
+            }
+            if require_attachment:
+                selected_matches, _identity = _attachment_state_status(
+                    expected_attachments[hand],
+                    expected_attachment,
+                    hand=hand,
+                )
+                if not selected_matches:
+                    raise RuntimeError(
+                        "selected attachment changed before composite whole-body stage"
+                    )
+            plan_whole_body = getattr(self.backend, "plan_whole_body_trajectory", None)
+            if not callable(plan_whole_body):
+                raise RuntimeError("whole-body cuRobo planner is unavailable")
+            plan = plan_whole_body(
                 hand=hand,
                 target_xyz=target,
                 target_quat_xyzw=quat,
                 timeout_s=self._remaining_s(deadline),
-                attached_obj=(
-                    expected_attachment
-                    if require_attachment
-                    else _call_optional_arg(self.backend, "get_attached_object", hand)
-                ),
+                attached_obj=expected_attachments[hand],
             )
             if not plan.get("ok"):
                 stop_reason = str(plan.get("stop_reason", "arm_plan_failed"))
@@ -6095,9 +7661,7 @@ class PlannerExecutor:
                     task_success=self._task_success(),
                     stop_reason=stop_reason,
                     recoverable=stop_reason in {"unreachable", "planner_unavailable"},
-                    suggested_next_tool=(
-                        "navigate_to" if stop_reason == "unreachable" else None
-                    ),
+                    suggested_next_tool=None,
                     metrics={**reach_metrics, **plan.get("metrics", {})},
                     diagnostics=plan,
                 )
@@ -6114,11 +7678,12 @@ class PlannerExecutor:
                 require_pose=True,
                 hold_steps_required=max(1, int(hold_steps_required)),
                 contact_target_xyz=contact_target_xyz,
-                allow_expected_contact=False,
-                allow_guarded_goal_world_collision=allow_target_activation,
                 joint_trajectory=plan.get("joint_trajectory"),
                 expected_attachment=expected_attachment,
                 require_attachment=require_attachment,
+                expected_attachments_by_hand=expected_attachments,
+                motion_scope="whole_body",
+                whole_body_certificate=plan.get("whole_body_certificate"),
             )
             metrics = {
                 **reach_metrics,
@@ -6132,325 +7697,14 @@ class PlannerExecutor:
                 task_success=self._task_success(),
                 stop_reason=execution["stop_reason"],
                 recoverable=execution["recoverable"],
-                suggested_next_tool=execution["suggested_next_tool"],
+                suggested_next_tool=execution.get("suggested_next_tool"),
                 metrics=metrics,
                 diagnostics=execution["diagnostics"],
             )
         except Exception as exc:
-            return self._exception_result(exc, suggested_next_tool="navigate_to")
+            return self._exception_result(exc, suggested_next_tool=None)
 
-    @_planner_tool("pick", suggested_next_tool="observe")
-    def pick(
-        self,
-        *,
-        hand: str,
-        target_xyz: Any,
-        approach_vector: Any | None = None,
-        grasp_quat_xyzw: Any | None = None,
-        pregrasp_offset_m: float = 0.08,
-        lift_m: float = 0.08,
-        timeout_s: float = 90.0,
-    ) -> dict[str, Any]:
-        started = time.monotonic()
-        try:
-            deadline = started + self._validated_timeout(timeout_s)
-            hand = _normalize_hand(hand)
-            self._last_guarded_retreat_paths.pop(hand, None)
-            target = _as_xyz(target_xyz)
-            resolve_target_attachment = getattr(
-                self.backend, "resolve_target_attachment", None
-            )
-            expected_attachment = (
-                resolve_target_attachment(hand=hand, target_xyz=target)
-                if callable(resolve_target_attachment)
-                else None
-            )
-            if expected_attachment is None:
-                return primitive_result(
-                    primitive_success=False,
-                    task_success=self._task_success(),
-                    stop_reason="target_attachment_unresolved",
-                    recoverable=True,
-                    suggested_next_tool="observe",
-                    metrics={
-                        "elapsed_s": round(time.monotonic() - started, 3),
-                        "target_root_identity_locked": False,
-                    },
-                )
-            approach = _approach_vector(approach_vector)
-            effective_grasp_quat = _quat_xyzw(grasp_quat_xyzw)
-            if effective_grasp_quat is None:
-                current_pose = self.backend.get_eef_pose(hand)
-                if current_pose is None:
-                    raise RuntimeError("cannot validate pick approach without EEF pose")
-                effective_grasp_quat = _quat_xyzw(current_pose[1])
-            assert effective_grasp_quat is not None
-            finger_axis_world = _quat_rotate_vector_xyzw(
-                effective_grasp_quat, [0.0, 0.0, 1.0]
-            )
-            axis_alignment = float(np.dot(finger_axis_world, approach))
-            if axis_alignment < math.cos(math.radians(5.0)):
-                raise ValueError(
-                    "pick approach_vector must align with grasp EEF local +Z"
-                )
-            fingertip_offset_value = _call_optional_arg(
-                self.backend, "get_eef_to_fingertip_length", hand
-            )
-            fingertip_offset_m = (
-                0.0 if fingertip_offset_value is None else float(fingertip_offset_value)
-            )
-            if not np.isfinite(fingertip_offset_m) or fingertip_offset_m < 0:
-                raise RuntimeError("invalid EEF-to-fingertip offset")
-            ray_geometry = _call_optional_arg(
-                self.backend,
-                "get_assisted_grasp_outward_ray_geometry",
-                hand,
-            )
-            if not isinstance(ray_geometry, dict) or not bool(
-                ray_geometry.get("available", False)
-            ):
-                return primitive_result(
-                    primitive_success=False,
-                    task_success=self._task_success(),
-                    stop_reason="assisted_grasp_ray_geometry_unavailable",
-                    recoverable=True,
-                    suggested_next_tool="observe",
-                    metrics={
-                        "elapsed_s": round(time.monotonic() - started, 3),
-                        "target_root_identity_locked": True,
-                    },
-                )
-            guarded_overtravel_m = PICK_GUARDED_OVERTRAVEL_M
-            start_ray_offset_m = float(
-                ray_geometry.get("start_outward_offset_m", float("nan"))
-            )
-            end_ray_offset_m = float(
-                ray_geometry.get("end_outward_offset_m", float("nan"))
-            )
-            assisted_grasp_ray_offset_m = max(
-                start_ray_offset_m,
-                end_ray_offset_m,
-            )
-            if (
-                not np.isfinite(
-                    [
-                        assisted_grasp_ray_offset_m,
-                        start_ray_offset_m,
-                        end_ray_offset_m,
-                    ]
-                ).all()
-                or assisted_grasp_ray_offset_m <= guarded_overtravel_m
-            ):
-                return primitive_result(
-                    primitive_success=False,
-                    task_success=self._task_success(),
-                    stop_reason="assisted_grasp_ray_geometry_unavailable",
-                    recoverable=True,
-                    suggested_next_tool="observe",
-                    metrics={
-                        "elapsed_s": round(time.monotonic() - started, 3),
-                        "target_root_identity_locked": True,
-                    },
-                )
-            # target_xyz is the public RGB-D surface point. Place OG's actual
-            # outward (+Z) assisted-grasp ray plane one millimetre through that
-            # surface. The fingertip tip is diagnostic only and does not define
-            # the attachment ray's longitudinal plane.
-            eef_to_contact_vector = finger_axis_world * (
-                assisted_grasp_ray_offset_m - guarded_overtravel_m
-            )
-            grasp_eef_target = target - eef_to_contact_vector
-            guarded_transition_m = float(pregrasp_offset_m)
-            if not np.isfinite(guarded_transition_m) or guarded_transition_m <= 0:
-                raise ValueError("pregrasp_offset_m must be finite and positive")
-            pregrasp = grasp_eef_target - approach * guarded_transition_m
-            move = self._move_to_composite_stage(
-                hand=hand,
-                target_xyz=pregrasp,
-                target_quat_xyzw=effective_grasp_quat,
-                position_tolerance_m=0.002,
-                orientation_tolerance_rad=0.087,
-                timeout_s=self._remaining_s(deadline),
-                hold_steps_required=1,
-            )
-            if not move["primitive_success"]:
-                move["suggested_next_tool"] = (
-                    move.get("suggested_next_tool") or "move_to"
-                )
-                return move
-            guarded = self._guarded_incremental_move(
-                hand=hand,
-                target_xyz=grasp_eef_target,
-                target_quat_xyzw=effective_grasp_quat,
-                direction=approach,
-                allow_expected_contact=True,
-                position_tolerance_m=0.015,
-                timeout_s=self._remaining_s(deadline),
-                terminal_hold_steps_required=1,
-                contact_target_xyz=target,
-                eef_to_contact_vector=eef_to_contact_vector,
-            )
-            if not guarded["primitive_success"]:
-                return primitive_result(
-                    primitive_success=False,
-                    task_success=self._task_success(),
-                    stop_reason=guarded["stop_reason"],
-                    recoverable=guarded["recoverable"],
-                    suggested_next_tool="observe",
-                    metrics={
-                        **guarded["metrics"],
-                        "pick_stages": {
-                            "pregrasp_move": move.get("metrics", {}),
-                        },
-                    },
-                    diagnostics=guarded["diagnostics"],
-                )
-            close = self._gripper_command(
-                hand,
-                opening=0.0,
-                timeout_s=self._remaining_s(deadline),
-                contact_target_xyz=target,
-                allow_expected_contact=True,
-                hold_steps_required=10,
-                stop_on_attachment=True,
-                eef_to_contact_vector=eef_to_contact_vector,
-                expected_attachment=expected_attachment,
-            )
-            close.setdefault("metrics", {})["pick_stages"] = {
-                "pregrasp_move": move.get("metrics", {}),
-                "guarded_approach": guarded.get("metrics", {}),
-            }
-            if not close["primitive_success"]:
-                return close
-            attached_obj = _call_optional_arg(self.backend, "get_attached_object", hand)
-            attachment_matches, attachment_identity = _attachment_identity_status(
-                attached_obj,
-                expected_attachment,
-                hand=hand,
-            )
-            if not attachment_matches:
-                return primitive_result(
-                    primitive_success=False,
-                    task_success=self._task_success(),
-                    stop_reason=(
-                        "attachment_identity_mismatch"
-                        if attached_obj is not None
-                        else "grasp_not_confirmed"
-                    ),
-                    recoverable=True,
-                    suggested_next_tool="observe",
-                    metrics={
-                        **close.get("metrics", {}),
-                        "elapsed_s": round(time.monotonic() - started, 3),
-                        "attached_collision_body": {"available": False},
-                        "attachment_identity": attachment_identity,
-                    },
-                    diagnostics=close.get("diagnostics", {}),
-                )
-            lift_target = grasp_eef_target + np.array(
-                [0.0, 0.0, float(lift_m)], dtype=np.float64
-            )
-            reverse_path = self._last_guarded_retreat_paths.pop(hand, None)
-            reverse_path_available = reverse_path is not None
-            reverse_endpoint_matches_lift = bool(
-                np.linalg.norm(pregrasp - lift_target) <= 0.01
-            )
-            if not reverse_endpoint_matches_lift:
-                reverse_path = None
-            certify_retreat = getattr(
-                self.backend, "certify_attached_joint_trajectory", None
-            )
-            retreat_certification: dict[str, Any] | None = None
-            if reverse_path is not None and callable(certify_retreat):
-                retreat_certification = certify_retreat(
-                    hand=hand,
-                    joint_trajectory=reverse_path,
-                    attached_obj=attached_obj,
-                    timeout_s=min(self._remaining_s(deadline), 8.0),
-                )
-            if retreat_certification is not None and retreat_certification.get("ok"):
-                current_pose = self.backend.get_eef_pose(hand)
-                lift_quat = None if current_pose is None else current_pose[1]
-                lift = self._execute_actions(
-                    None,
-                    hand=hand,
-                    target_xyz=lift_target,
-                    target_quat_xyzw=lift_quat,
-                    position_tolerance_m=0.02,
-                    orientation_tolerance_rad=0.087,
-                    timeout_s=self._remaining_s(deadline),
-                    require_pose=True,
-                    hold_steps_required=10,
-                    runtime_collision_interval_steps=1,
-                    joint_trajectory=reverse_path,
-                    expected_attachment=expected_attachment,
-                    require_attachment=True,
-                )
-                lift.setdefault("metrics", {})["lift_execution"] = {
-                    "method": "reverse_guarded_path",
-                    "full_attached_path_rechecked": True,
-                    "runtime_collision_interval_steps": 1,
-                    "physical_contact_query_interval_steps": 1,
-                    "certification": retreat_certification.get("metrics", {}),
-                }
-            else:
-                lift = self._move_to_composite_stage(
-                    hand=hand,
-                    target_xyz=lift_target,
-                    target_quat_xyzw=None,
-                    position_tolerance_m=0.02,
-                    orientation_tolerance_rad=0.087,
-                    timeout_s=min(self._remaining_s(deadline), 30.0),
-                    hold_steps_required=10,
-                    expected_attachment=expected_attachment,
-                    require_attachment=True,
-                )
-                lift.setdefault("metrics", {})["lift_execution"] = {
-                    "method": "fresh_curobo_trajectory",
-                    "reverse_guarded_path_available": reverse_path_available,
-                    "reverse_endpoint_matches_lift": reverse_endpoint_matches_lift,
-                    "reverse_guarded_path_certification": retreat_certification,
-                }
-            lift["stop_reason"] = (
-                "picked" if lift["primitive_success"] else lift["stop_reason"]
-            )
-            lift["metrics"]["attached_collision_body"] = {
-                "available": attached_obj is not None
-            }
-            lift["metrics"]["attachment_identity"] = attachment_identity
-            lift["metrics"]["target_root_identity_locked"] = True
-            lift["metrics"]["pick_stages"] = {
-                "pregrasp_move": move.get("metrics", {}),
-                "guarded_approach": guarded.get("metrics", {}),
-                "gripper_close": close.get("metrics", {}),
-            }
-            lift["metrics"]["pick_contact_geometry"] = {
-                "target_xyz": target.tolist(),
-                "grasp_eef_target_xyz": grasp_eef_target.tolist(),
-                "eef_to_fingertip_offset_m": fingertip_offset_m,
-                "assisted_grasp_outward_ray_offset_m": (assisted_grasp_ray_offset_m),
-                "assisted_grasp_ray_geometry": ray_geometry,
-                "assisted_grasp_ray_endpoint_penetration_m": {
-                    "start": guarded_overtravel_m
-                    - (assisted_grasp_ray_offset_m - start_ray_offset_m),
-                    "end": guarded_overtravel_m
-                    - (assisted_grasp_ray_offset_m - end_ray_offset_m),
-                },
-                "maximum_ray_endpoint_penetration_m": guarded_overtravel_m,
-                "outward_ray_to_fingertip_delta_m": (
-                    assisted_grasp_ray_offset_m - fingertip_offset_m
-                ),
-                "guarded_overtravel_m": guarded_overtravel_m,
-                "approach_vector": approach.tolist(),
-                "finger_axis_world": finger_axis_world.tolist(),
-                "axis_alignment_cosine": axis_alignment,
-                "reverse_endpoint_matches_lift": reverse_endpoint_matches_lift,
-            }
-            return lift
-        except Exception as exc:
-            return self._exception_result(exc, suggested_next_tool="observe")
-
-    @_planner_tool("rotate_wrist", suggested_next_tool="observe")
+    @_planner_tool("rotate_wrist")
     def rotate_wrist(
         self,
         *,
@@ -6489,15 +7743,14 @@ class PlannerExecutor:
         except Exception as exc:
             return self._exception_result(exc, suggested_next_tool="move_to")
 
-    @_planner_tool("press", suggested_next_tool="observe")
+    @_planner_tool("press")
     def press(
         self,
         *,
         hand: str,
         target_xyz: Any,
         press_direction: Any | None = None,
-        approach_distance_m: float = 0.04,
-        press_depth_m: float = 0.012,
+        travel_m: float,
         timeout_s: float = 60.0,
     ) -> dict[str, Any]:
         started = time.monotonic()
@@ -6508,20 +7761,14 @@ class PlannerExecutor:
             direction = _approach_vector(
                 press_direction if press_direction is not None else [0, 0, -1]
             )
+            travel = float(travel_m)
+            if not np.isfinite(travel) or travel <= 0.0:
+                raise ValueError("travel_m must be finite and positive")
+            isolation_reference = None
             contact = (
-                target
-                - direction * PRESS_EEF_TO_CONTACT_OFFSET_M
-                + direction * float(press_depth_m)
+                target - direction * PRESS_EEF_TO_CONTACT_OFFSET_M + direction * travel
             )
-            guarded_transition_m = min(
-                float(approach_distance_m) + float(press_depth_m),
-                max(
-                    0.012,
-                    float(press_depth_m)
-                    + CUROBO_COLLISION_ACTIVATION_DISTANCE_M
-                    + 0.001,
-                ),
-            )
+            guarded_transition_m = travel + 0.001
             pre = contact - direction * guarded_transition_m
             move = self._move_to_composite_stage(
                 hand=hand,
@@ -6532,37 +7779,50 @@ class PlannerExecutor:
                 timeout_s=min(self._remaining_s(deadline), 40.0),
                 hold_steps_required=1,
                 contact_target_xyz=target,
-                allow_target_activation=True,
+                isolation_reference=isolation_reference,
             )
-            if not move["primitive_success"]:
-                move.setdefault("metrics", {})["press_stages"] = {}
+            if move.get("stop_reason") in _TERMINAL_STEP_STOP_REASONS:
+                move.setdefault("metrics", {}).update(
+                    {
+                        "motion_scope": "whole_body",
+                        "whole_body_execution": {
+                            "available": True,
+                            "ok": True,
+                            "raw_success_checked_after_each_action": True,
+                        },
+                    }
+                )
                 return move
-            # Configure the fingertip only after reaching the certified
-            # pre-contact pose.  Closing at the previous tool's terminal pose
-            # can itself enter the newly activated press target's collision
-            # zone before guarded motion begins.
-            close = self._gripper_command(
-                hand,
-                opening=0.0,
-                timeout_s=min(self._remaining_s(deadline), 10.0),
-            )
-            if not close["primitive_success"]:
-                close.setdefault("metrics", {})["press_stages"] = {
-                    "precontact_move": move.get("metrics", {}),
-                }
-                return close
+            if not move["primitive_success"]:
+                return move
             guarded_press = self._guarded_incremental_move(
                 hand=hand,
                 target_xyz=contact,
                 target_quat_xyzw=None,
                 direction=direction,
-                allow_expected_contact=True,
                 position_tolerance_m=0.012,
                 timeout_s=self._remaining_s(deadline),
                 require_expected_contact=True,
                 contact_target_xyz=target,
                 stop_on_expected_contact=True,
-                eef_to_contact_vector=direction * PRESS_EEF_TO_CONTACT_OFFSET_M,
+                isolation_reference=isolation_reference,
+            )
+            if guarded_press.get("stop_reason") in _TERMINAL_STEP_STOP_REASONS:
+                guarded_press.setdefault("metrics", {}).update(
+                    {
+                        "motion_scope": "whole_body",
+                        "whole_body_execution": {
+                            "available": True,
+                            "ok": True,
+                            "raw_success_checked_after_each_action": True,
+                        },
+                    }
+                )
+                return guarded_press
+            guarded_metrics = dict(guarded_press["metrics"])
+            guarded_metrics.setdefault(
+                "single_arm_isolation",
+                move.get("metrics", {}).get("single_arm_isolation"),
             )
             return primitive_result(
                 primitive_success=guarded_press["primitive_success"],
@@ -6575,84 +7835,23 @@ class PlannerExecutor:
                 if guarded_press["primitive_success"]
                 else "observe",
                 metrics={
-                    **guarded_press["metrics"],
-                    "press_stages": {
-                        "gripper_close": close.get("metrics", {}),
-                        "precontact_move": move.get("metrics", {}),
+                    **guarded_metrics,
+                    "motion_scope": "whole_body",
+                    "whole_body_execution": {
+                        "available": True,
+                        "ok": True,
+                        "collision_certificate_verified_before_each_guarded_action": True,
+                        "dual_attachment_checked_each_nonterminal_step": True,
+                        "raw_success_checked_after_each_action": True,
+                        "raw_success_preempts_post_step_safety_checks": True,
                     },
+                    "precontact_motion": move.get("metrics", {}),
+                    "requested_travel_m": travel,
                 },
                 diagnostics=guarded_press["diagnostics"],
             )
         except Exception as exc:
             return self._exception_result(exc, suggested_next_tool="observe")
-
-    @_planner_tool("release", suggested_next_tool="observe")
-    def release(
-        self,
-        *,
-        hand: str,
-        opening: float = 1.0,
-        retreat_vector: Any | None = None,
-        retreat_m: float = 0.03,
-        timeout_s: float = 30.0,
-    ) -> dict[str, Any]:
-        started = time.monotonic()
-        try:
-            deadline = started + self._validated_timeout(timeout_s)
-            hand = _normalize_hand(hand)
-            attached_before_release = _call_optional_arg(
-                self.backend, "get_attached_object", hand
-            )
-            release_pose = self.backend.get_eef_pose(hand)
-            release = self._gripper_command(
-                hand,
-                opening=float(opening),
-                timeout_s=min(self._remaining_s(deadline), 15.0),
-                contact_target_xyz=(
-                    np.asarray(release_pose[0], dtype=np.float64)
-                    if attached_before_release is not None and release_pose is not None
-                    else None
-                ),
-                allow_expected_contact=attached_before_release is not None,
-            )
-            if not release["primitive_success"]:
-                return release
-            if (
-                _call_optional_arg(self.backend, "get_attached_object", hand)
-                is not None
-            ):
-                return primitive_result(
-                    primitive_success=False,
-                    task_success=self._task_success(),
-                    stop_reason="release_not_confirmed",
-                    recoverable=True,
-                    suggested_next_tool="release",
-                    metrics={
-                        **release.get("metrics", {}),
-                        "elapsed_s": round(time.monotonic() - started, 3),
-                        "attached_collision_body": {"available": True},
-                    },
-                    diagnostics=release.get("diagnostics", {}),
-                )
-            if retreat_vector is None or float(retreat_m) <= 0:
-                release["stop_reason"] = "released"
-                return release
-            current = self.backend.get_eef_pose(hand)
-            if current is None:
-                return release
-            direction = _approach_vector(retreat_vector)
-            target = current[0] + direction * float(retreat_m)
-            retreat = self.move_to(
-                hand=hand,
-                target_xyz=target,
-                timeout_s=min(self._remaining_s(deadline), 20.0),
-            )
-            retreat["stop_reason"] = (
-                "released" if retreat["primitive_success"] else retreat["stop_reason"]
-            )
-            return retreat
-        except Exception as exc:
-            return self._exception_result(exc, suggested_next_tool="move_to")
 
     def _guarded_incremental_move(
         self,
@@ -6661,19 +7860,23 @@ class PlannerExecutor:
         target_xyz: np.ndarray,
         target_quat_xyzw: Any | None,
         direction: np.ndarray,
-        allow_expected_contact: bool,
+        allow_expected_contact: bool | None = None,
         position_tolerance_m: float,
         timeout_s: float,
         require_expected_contact: bool = False,
         contact_target_xyz: np.ndarray | None = None,
-        terminal_hold_steps_required: int = 10,
         stop_on_expected_contact: bool = False,
         eef_to_contact_vector: np.ndarray | None = None,
-        ignore_collision_checks: bool = False,
         allowed_contact_distance_m: float = 0.025,
+        isolation_reference: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        del allow_expected_contact, eef_to_contact_vector, isolation_reference
         started = time.monotonic()
         quat = _quat_xyzw(target_quat_xyzw)
+        expected_attachments = {
+            side: _call_optional_arg(self.backend, "get_attached_object", side)
+            for side in ("left", "right")
+        }
         current = self.backend.get_eef_pose(hand)
         if current is None:
             return self._execution_result(
@@ -6696,17 +7899,13 @@ class PlannerExecutor:
             else np.asarray(contact_target_xyz, dtype=np.float64).reshape(3)
         )
         allowed_contact_distance = float(allowed_contact_distance_m)
-        if not 0.025 <= allowed_contact_distance <= 0.05:
-            raise ValueError("allowed_contact_distance_m must lie within [0.025, 0.05]")
+        if not np.isfinite(allowed_contact_distance) or allowed_contact_distance <= 0.0:
+            raise ValueError("allowed_contact_distance_m must be finite and positive")
         total = float(np.linalg.norm(target - start))
-        guarded_path_planner = getattr(self.backend, "plan_guarded_ik_path", None)
-        use_certified_path = callable(guarded_path_planner) and not bool(
-            ignore_collision_checks
-        )
         nominal_waypoint_distances = _guarded_waypoint_distances(total)
         nominal_steps = len(nominal_waypoint_distances)
-        steps = 1 if use_certified_path else nominal_steps
-        max_guarded_iterations = 1 if use_certified_path else max(steps * 4, steps + 8)
+        steps = nominal_steps
+        max_guarded_iterations = max(steps * 4, steps + 8)
         guard_metrics = {
             "guarded_step_m": 0.002,
             "guarded_coarse_step_m": 0.002,
@@ -6714,19 +7913,8 @@ class PlannerExecutor:
             "guarded_total_distance_m": total,
             "guarded_waypoints": steps,
             "guarded_max_feedback_iterations": max_guarded_iterations,
-            "guarded_execution_mode": (
-                "single_batch_curobo_cartesian_fk_certified_path"
-                if use_certified_path
-                else "receding_horizon_cartesian_ik"
-            ),
-            "guarded_preexecution_collision_recheck": (
-                "every_dense_joint_waypoint_world+self_target_excluded"
-                if use_certified_path
-                else "per_step_online"
-            ),
-            "guarded_runtime_collision_query_interval_steps": 1,
+            "guarded_execution_mode": "receding_horizon_cartesian_ik",
             "guarded_physical_contact_query_interval_steps": 1,
-            "collision_checks_skipped": bool(ignore_collision_checks),
         }
         if steps > max(1, int(float(timeout_s) * 120)):
             return self._execution_result(
@@ -6770,18 +7958,15 @@ class PlannerExecutor:
                         "contact_report": contact,
                     },
                 )
-            if self._contact_is_abort(
-                contact,
-                hand=hand,
-                target_xyz=contact_target,
-                allow_expected_contact=allow_expected_contact,
-                eef_to_contact_vector=eef_to_contact_vector,
-            ):
+            expected_contact_seen = expected_contact_seen or bool(
+                contact.get("expected_contact", False)
+            )
+            if stop_on_expected_contact and expected_contact_seen:
                 return self._execution_result(
-                    primitive_success=False,
-                    stop_reason="unexpected_contact",
+                    primitive_success=True,
+                    stop_reason="guarded_reached",
                     recoverable=True,
-                    suggested_next_tool="observe",
+                    suggested_next_tool=None,
                     executed=executed,
                     trace=trace,
                     final_pos_err=final_pos_err,
@@ -6790,12 +7975,12 @@ class PlannerExecutor:
                     started=started,
                     extra_metrics={
                         **guard_metrics,
+                        "guarded_direction": direction.tolist(),
+                        "guarded_feedback_iterations": index,
+                        "expected_contact_seen": True,
                         "contact_report": contact,
                     },
                 )
-            expected_contact_seen = expected_contact_seen or bool(
-                contact.get("expected_contact", False)
-            )
             live_pose = self.backend.get_eef_pose(hand)
             live_target_error = (
                 float(
@@ -6805,8 +7990,8 @@ class PlannerExecutor:
                 else float("inf")
             )
             terminal_tolerance_m = max(0.0015, min(float(position_tolerance_m), 0.003))
-            terminal_hold = bool(live_target_error <= terminal_tolerance_m)
-            if time.monotonic() - started > float(timeout_s) and not terminal_hold:
+            terminal_reached = bool(live_target_error <= terminal_tolerance_m)
+            if time.monotonic() - started > float(timeout_s) and not terminal_reached:
                 return self._execution_result(
                     primitive_success=False,
                     stop_reason="timeout",
@@ -6820,12 +8005,30 @@ class PlannerExecutor:
                     started=started,
                     extra_metrics=guard_metrics,
                 )
-            if terminal_hold:
-                hold = _call_optional_arg(self.backend, "hold_action", hand)
-                if hold is None:
+            if terminal_reached:
+                final_pos_err = live_target_error
+                trace.append(
+                    {
+                        "event": "terminal_target_reached",
+                        "env_action_sent": False,
+                        "post_stop_action_policy": "no_additional_env_action",
+                        "position_error_m": live_target_error,
+                    }
+                )
+                break
+            else:
+                assert live_pose is not None
+                live_position = np.asarray(live_pose[0], dtype=np.float64)
+                remaining_vector = target - live_position
+                remaining_distance = float(np.linalg.norm(remaining_vector))
+                waypoint = live_position + remaining_vector * min(
+                    1.0, 0.002 / max(remaining_distance, 1e-9)
+                )
+                guarded_plan = getattr(self.backend, "plan_whole_body_trajectory", None)
+                if not callable(guarded_plan):
                     return self._execution_result(
                         primitive_success=False,
-                        stop_reason="hold_action_unavailable",
+                        stop_reason="whole_body_planner_unavailable",
                         recoverable=True,
                         suggested_next_tool="observe",
                         executed=executed,
@@ -6834,65 +8037,21 @@ class PlannerExecutor:
                         final_ori_err=final_ori_err,
                         held_steps=0,
                         started=started,
+                        extra_metrics=guard_metrics,
                     )
-                plan = {
-                    "ok": True,
-                    "actions": np.repeat(
-                        np.asarray(hold, dtype=np.float32).reshape(1, ACTION_DIM),
-                        10,
-                        axis=0,
-                    ),
-                    "metrics": {"terminal_hold_without_replanning": True},
-                }
-                waypoint = target
-            else:
-                assert live_pose is not None
-                live_position = np.asarray(live_pose[0], dtype=np.float64)
-                remaining_vector = target - live_position
-                remaining_distance = float(np.linalg.norm(remaining_vector))
-                waypoint = (
-                    target
-                    if use_certified_path
-                    else live_position
-                    + remaining_vector * min(1.0, 0.002 / max(remaining_distance, 1e-9))
-                )
-                guarded_plan = (
-                    guarded_path_planner
-                    if use_certified_path
-                    else getattr(
-                        self.backend,
-                        "plan_guarded_ik_step",
-                        self.backend.plan_arm_trajectory,
-                    )
-                )
                 guarded_plan_kwargs = {
                     "hand": hand,
                     "target_xyz": waypoint,
                     "target_quat_xyzw": quat,
                     "timeout_s": min(
-                        (
-                            30.0
-                            if use_certified_path
-                            else (15.0 if ignore_collision_checks else 2.0)
-                        ),
+                        2.0,
                         max(
                             0.25,
                             float(timeout_s) - (time.monotonic() - started),
                         ),
                     ),
-                    "attached_obj": _call_optional_arg(
-                        self.backend, "get_attached_object", hand
-                    ),
+                    "attached_obj": expected_attachments[hand],
                 }
-                if "contact_target_xyz" in inspect.signature(guarded_plan).parameters:
-                    guarded_plan_kwargs["contact_target_xyz"] = contact_target
-                if (
-                    "ignore_collision_checks"
-                    in inspect.signature(guarded_plan).parameters
-                ):
-                    guarded_plan_kwargs["ignore_collision_checks"] = bool(
-                        ignore_collision_checks
-                    )
                 plan = guarded_plan(**guarded_plan_kwargs)
                 reverse_path = plan.get("reverse_joint_trajectory")
                 if reverse_path is not None:
@@ -6907,36 +8066,6 @@ class PlannerExecutor:
                         "stop_reason": plan.get("stop_reason"),
                     }
                 ]
-                retryable_guarded_failures = {
-                    "unreachable",
-                    "guarded_self_collision_path_unreachable",
-                    "guarded_trajectory_collision",
-                    "guarded_cartesian_path_invalid",
-                }
-                while (
-                    use_certified_path
-                    and len(guarded_plan_attempts) < 4
-                    and not plan.get("ok")
-                    and plan.get("stop_reason") in retryable_guarded_failures
-                ):
-                    retry_remaining_s = float(timeout_s) - (time.monotonic() - started)
-                    if retry_remaining_s <= 1.0:
-                        break
-                    guarded_plan_kwargs["timeout_s"] = min(30.0, retry_remaining_s)
-                    plan = guarded_plan(**guarded_plan_kwargs)
-                    reverse_path = plan.get("reverse_joint_trajectory")
-                    if reverse_path is not None:
-                        self._last_guarded_retreat_paths[hand] = np.asarray(
-                            _jsonable(reverse_path), dtype=np.float32
-                        )
-                    guard_metrics["guarded_plan_metrics"] = plan.get("metrics", {})
-                    guarded_plan_attempts.append(
-                        {
-                            "attempt": len(guarded_plan_attempts) + 1,
-                            "ok": bool(plan.get("ok", False)),
-                            "stop_reason": plan.get("stop_reason"),
-                        }
-                    )
                 guard_metrics["guarded_plan_attempts"] = guarded_plan_attempts
                 cartesian_report = plan.get("metrics", {}).get(
                     "guarded_cartesian_path_report"
@@ -6973,11 +8102,6 @@ class PlannerExecutor:
                         **plan.get("metrics", {}),
                     },
                 )
-            hold_required = (
-                max(1, int(terminal_hold_steps_required))
-                if terminal_hold or use_certified_path
-                else 5
-            )
             execution = self._execute_actions(
                 validate_action_chunk(plan["actions"])
                 if plan.get("actions") is not None
@@ -6987,16 +8111,11 @@ class PlannerExecutor:
                 target_quat_xyzw=quat,
                 position_tolerance_m=max(
                     0.0015,
-                    min(
-                        float(position_tolerance_m),
-                        0.003 if terminal_hold or use_certified_path else 0.0015,
-                    ),
+                    min(float(position_tolerance_m), 0.0015),
                 ),
                 orientation_tolerance_rad=0.087,
                 timeout_s=(
-                    max(0.5, float(timeout_s) - (time.monotonic() - started))
-                    if use_certified_path
-                    else min(
+                    min(
                         16.0,
                         max(
                             0.5,
@@ -7005,17 +8124,29 @@ class PlannerExecutor:
                     )
                 ),
                 require_pose=True,
-                hold_steps_required=hold_required,
+                hold_steps_required=5,
                 contact_target_xyz=contact_target,
-                allow_expected_contact=allow_expected_contact,
-                allow_guarded_goal_world_collision=allow_expected_contact,
-                eef_to_contact_vector=eef_to_contact_vector,
                 stop_on_expected_contact=stop_on_expected_contact,
-                runtime_collision_interval_steps=1,
                 joint_trajectory=plan.get("joint_trajectory"),
-                ignore_collision_checks=bool(ignore_collision_checks),
                 allowed_contact_distance_m=allowed_contact_distance,
+                expected_attachments_by_hand=(
+                    expected_attachments
+                    if plan.get("joint_trajectory") is not None
+                    else None
+                ),
+                motion_scope=(
+                    "whole_body"
+                    if plan.get("joint_trajectory") is not None
+                    else "arm_only"
+                ),
+                whole_body_certificate=(
+                    plan.get("whole_body_certificate")
+                    if plan.get("joint_trajectory") is not None
+                    else None
+                ),
             )
+            if execution.get("stop_reason") in _TERMINAL_STEP_STOP_REASONS:
+                return execution
             executed += int(execution["metrics"].get("executed_waypoints", 0))
             trace.extend(execution["diagnostics"].get("trace", []))
             final_pos_err = execution["metrics"].get("final_position_error_m")
@@ -7047,7 +8178,7 @@ class PlannerExecutor:
             expected_contact_seen = expected_contact_seen or bool(
                 after_contact.get("expected_contact", False)
             )
-            if terminal_hold or use_certified_path:
+            if stop_on_expected_contact and expected_contact_seen:
                 break
         else:
             live_pose = self.backend.get_eef_pose(hand)
@@ -7084,7 +8215,7 @@ class PlannerExecutor:
                 trace=trace,
                 final_pos_err=final_pos_err,
                 final_ori_err=final_ori_err,
-                held_steps=max(1, int(terminal_hold_steps_required)),
+                held_steps=0,
                 started=started,
                 extra_metrics={
                     **guard_metrics,
@@ -7100,7 +8231,7 @@ class PlannerExecutor:
             trace=trace,
             final_pos_err=final_pos_err,
             final_ori_err=final_ori_err,
-            held_steps=max(1, int(terminal_hold_steps_required)),
+            held_steps=0,
             started=started,
             extra_metrics={
                 **guard_metrics,
@@ -7117,12 +8248,14 @@ class PlannerExecutor:
         opening: float,
         timeout_s: float,
         contact_target_xyz: np.ndarray | None = None,
-        allow_expected_contact: bool = False,
+        allow_expected_contact: bool | None = None,
         hold_steps_required: int = 1,
         stop_on_attachment: bool = False,
         eef_to_contact_vector: np.ndarray | None = None,
         expected_attachment: Any = None,
+        require_attachment: bool = False,
     ) -> dict[str, Any]:
+        del allow_expected_contact, eef_to_contact_vector
         command = 1.0 if float(opening) >= 0.5 else -1.0
         latch = getattr(self.env, "_gripper_latch", None)
         current_command = (
@@ -7193,17 +8326,17 @@ class PlannerExecutor:
             timeout_s=timeout_s,
             require_pose=False,
             contact_target_xyz=contact_target_xyz,
-            allow_expected_contact=allow_expected_contact,
-            allow_guarded_goal_world_collision=allow_expected_contact,
             hold_steps_required=max(1, int(hold_steps_required)),
             stop_on_attachment=stop_on_attachment,
             static_gripper_only=True,
-            eef_to_contact_vector=eef_to_contact_vector,
             expected_attachment=expected_attachment,
+            require_attachment=require_attachment,
             gripper_contact_settle_steps=(
                 GRIPPER_CONTACT_SETTLE_STEPS if command < current_command else 0
             ),
         )
+        if execution.get("stop_reason") in _TERMINAL_STEP_STOP_REASONS:
+            return execution
         execution.setdefault("metrics", {})["gripper_command_profile"] = {
             "start": current_command,
             "target": command,
@@ -7232,6 +8365,311 @@ class PlannerExecutor:
             diagnostics=execution["diagnostics"],
         )
 
+    def _execute_navigation_trajectory(
+        self,
+        joint_trajectory: Any,
+        *,
+        base_goal_xyyaw: np.ndarray,
+        timeout_s: float,
+        plan_metrics: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute a BASE-only q path with fail-closed per-step isolation."""
+
+        started = time.monotonic()
+        q_path = np.asarray(_jsonable(joint_trajectory), dtype=np.float32)
+        if q_path.ndim != 2 or len(q_path) < 1 or not np.isfinite(q_path).all():
+            raise ValueError(
+                f"navigation joint trajectory must be finite [T,D], got {q_path.shape}"
+            )
+        base_goal = np.asarray(base_goal_xyyaw, dtype=np.float64).reshape(-1)
+        if base_goal.shape != (3,) or not np.isfinite(base_goal).all():
+            raise ValueError("base_goal_xyyaw must contain three finite values")
+        deadline = time.monotonic() + self._validated_timeout(timeout_s)
+        capture_hold = getattr(
+            self.backend,
+            "capture_trajectory_hold_reference",
+            None,
+        )
+        capture_isolation = getattr(
+            self.backend,
+            "capture_navigation_isolation_reference",
+            None,
+        )
+        report_isolation = getattr(
+            self.backend,
+            "navigation_isolation_report",
+            None,
+        )
+        if not all(
+            callable(fn) for fn in (capture_hold, capture_isolation, report_isolation)
+        ):
+            return self._execution_result(
+                primitive_success=False,
+                stop_reason="navigation_isolation_feedback_unavailable",
+                recoverable=True,
+                suggested_next_tool="observe",
+                executed=0,
+                trace=[],
+                final_pos_err=None,
+                final_ori_err=None,
+                started=started,
+                extra_metrics={
+                    **plan_metrics,
+                    "navigation_isolation": {
+                        "available": False,
+                        "ok": False,
+                        "mode": "base_only",
+                        "checks": {},
+                        "max_observed": {},
+                        "checks_performed": 0,
+                        "reason": "navigation isolation backend is unavailable",
+                    },
+                },
+            )
+        try:
+            hold_reference = capture_hold(hand=None)
+            isolation_reference = capture_isolation()
+        except Exception as exc:
+            return self._execution_result(
+                primitive_success=False,
+                stop_reason="navigation_isolation_feedback_unavailable",
+                recoverable=True,
+                suggested_next_tool="observe",
+                executed=0,
+                trace=[],
+                final_pos_err=None,
+                final_ori_err=None,
+                started=started,
+                extra_metrics={
+                    **plan_metrics,
+                    "navigation_isolation": {
+                        "available": False,
+                        "ok": False,
+                        "mode": "base_only",
+                        "checks": {},
+                        "max_observed": {},
+                        "checks_performed": 0,
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    },
+                },
+            )
+        if not isinstance(hold_reference, dict) or not isinstance(
+            isolation_reference, dict
+        ):
+            raise RuntimeError("navigation isolation references are invalid")
+
+        trace: list[dict[str, Any]] = []
+        aggregate_isolation: dict[str, Any] | None = None
+        executed = 0
+        waypoint_index = 0
+        stalled_steps = 0
+        best_error = float("inf")
+        final_pos_err: float | None = None
+        final_ori_err: float | None = None
+
+        def finish(
+            *,
+            primitive_success: bool,
+            stop_reason: str,
+            recoverable: bool,
+            terminal_step_receipt: dict[str, bool | int] | None = None,
+        ) -> dict[str, Any]:
+            isolation = (
+                aggregate_isolation
+                if isinstance(aggregate_isolation, dict)
+                else {
+                    "available": False,
+                    "ok": False,
+                    "mode": "base_only",
+                    "checks": {},
+                    "max_observed": {},
+                    "checks_performed": 0,
+                    "reason": "no navigation action was verified",
+                }
+            )
+            return self._execution_result(
+                primitive_success=primitive_success,
+                stop_reason=stop_reason,
+                recoverable=recoverable,
+                suggested_next_tool=(
+                    None if primitive_success or not recoverable else "observe"
+                ),
+                executed=executed,
+                trace=trace,
+                final_pos_err=final_pos_err,
+                final_ori_err=final_ori_err,
+                started=started,
+                extra_metrics={
+                    **plan_metrics,
+                    "final_yaw_error_rad": final_ori_err,
+                    "navigation_isolation": isolation,
+                    **(
+                        {"terminal_step_receipt": dict(terminal_step_receipt)}
+                        if terminal_step_receipt is not None
+                        else {}
+                    ),
+                },
+            )
+
+        max_steps = len(q_path) * (self.max_stall_steps + 1)
+        while executed < max_steps:
+            if time.monotonic() >= deadline:
+                return finish(
+                    primitive_success=False,
+                    stop_reason="timeout",
+                    recoverable=True,
+                )
+            target_q = q_path[min(waypoint_index, len(q_path) - 1)]
+            try:
+                action = self.backend.joint_target_to_action(
+                    target_q,
+                    hand=None,
+                    fixed_reference=hold_reference,
+                )
+                action = validate_action_chunk(
+                    np.asarray(action, dtype=np.float32).reshape(1, ACTION_DIM)
+                )[0]
+            except Exception as exc:
+                trace.append(
+                    {
+                        "step": executed,
+                        "waypoint_index": waypoint_index,
+                        "action_conversion_error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                return finish(
+                    primitive_success=False,
+                    stop_reason="navigation_isolation_feedback_unavailable",
+                    recoverable=True,
+                )
+
+            step_receipt = self._step_env_action(action)
+            executed += 1
+            terminal_outcome = _terminal_step_outcome(step_receipt)
+            if terminal_outcome is not None:
+                primitive_success, stop_reason = terminal_outcome
+                trace.append(
+                    {
+                        "step": executed,
+                        "waypoint_index": waypoint_index,
+                        "step_receipt": dict(step_receipt),
+                    }
+                )
+                return finish(
+                    primitive_success=primitive_success,
+                    stop_reason=stop_reason,
+                    recoverable=False,
+                    terminal_step_receipt=step_receipt,
+                )
+            isolation_report = report_isolation(
+                action=action,
+                reference=isolation_reference,
+            )
+            if not isinstance(isolation_report, dict):
+                isolation_report = {
+                    "available": False,
+                    "ok": False,
+                    "mode": "base_only",
+                    "checks": {},
+                    "max_observed": {},
+                    "reason": "navigation isolation reporter returned no mapping",
+                }
+            aggregate_isolation = self._merge_isolation_report(
+                aggregate_isolation,
+                isolation_report,
+            )
+            trace_entry: dict[str, Any] = {
+                "step": executed,
+                "waypoint_index": waypoint_index,
+                "navigation_isolation": isolation_report,
+            }
+            if isolation_report.get("available") is not True:
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="navigation_isolation_feedback_unavailable",
+                    recoverable=True,
+                )
+            if isolation_report.get("ok") is not True:
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="navigation_isolation_violation",
+                    recoverable=True,
+                )
+
+            tracking = _call_optional_kw(
+                self.backend,
+                "joint_tracking_report",
+                target_q=target_q,
+                hand=None,
+            )
+            if not isinstance(tracking, dict) or tracking.get("available") is not True:
+                trace_entry["joint_tracking"] = tracking
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="joint_tracking_feedback_unavailable",
+                    recoverable=True,
+                )
+            trace_entry["joint_tracking"] = tracking
+            base_pose = _call_optional(self.backend, "get_base_pose")
+            if base_pose is None:
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="pose_feedback_unavailable",
+                    recoverable=True,
+                )
+            base_pose = np.asarray(base_pose, dtype=np.float64).reshape(-1)
+            if base_pose.shape != (3,) or not np.isfinite(base_pose).all():
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="pose_feedback_unavailable",
+                    recoverable=True,
+                )
+            final_pos_err = float(np.linalg.norm(base_pose[:2] - base_goal[:2]))
+            final_ori_err = abs(_wrap_angle(float(base_pose[2]) - float(base_goal[2])))
+            trace.append(trace_entry)
+
+            if bool(tracking.get("reached", False)):
+                waypoint_index += 1
+                stalled_steps = 0
+                best_error = float("inf")
+                if waypoint_index >= len(q_path):
+                    if (
+                        final_pos_err <= 0.01 + 1e-9
+                        and final_ori_err <= math.radians(1.0) + 1e-9
+                    ):
+                        return finish(
+                            primitive_success=True,
+                            stop_reason="reached",
+                            recoverable=True,
+                        )
+                    waypoint_index = len(q_path) - 1
+                continue
+
+            tracking_error = float(tracking.get("max_base_xy_error_m", 0.0)) + float(
+                tracking.get("base_yaw_error_rad", 0.0)
+            )
+            if tracking_error + 1e-9 < best_error:
+                best_error = tracking_error
+                stalled_steps = 0
+            else:
+                stalled_steps += 1
+            if stalled_steps >= self.max_stall_steps:
+                return finish(
+                    primitive_success=False,
+                    stop_reason="stalled_tracking",
+                    recoverable=True,
+                )
+        return finish(
+            primitive_success=False,
+            stop_reason="target_tolerance_not_met",
+            recoverable=True,
+        )
+
     def _execute_actions(
         self,
         actions: np.ndarray | None,
@@ -7246,23 +8684,97 @@ class PlannerExecutor:
         base_goal_xyyaw: np.ndarray | None = None,
         hold_steps_required: int = 10,
         contact_target_xyz: np.ndarray | None = None,
-        allow_expected_contact: bool = False,
-        allow_guarded_goal_world_collision: bool = False,
+        allow_expected_contact: bool | None = None,
         stop_on_expected_contact: bool = False,
         stop_on_attachment: bool = False,
         static_gripper_only: bool = False,
-        runtime_collision_interval_steps: int = 1,
         joint_trajectory: Any | None = None,
         eef_to_contact_vector: np.ndarray | None = None,
         expected_attachment: Any = None,
+        expected_attachments_by_hand: dict[str, Any] | None = None,
         require_attachment: bool = False,
         gripper_contact_settle_steps: int = 0,
-        ignore_collision_checks: bool = False,
         allowed_contact_distance_m: float = 0.025,
+        isolation_reference: dict[str, Any] | None = None,
+        motion_scope: str = "arm_only",
+        whole_body_certificate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        del allow_expected_contact, eef_to_contact_vector
         started = time.monotonic()
+        if motion_scope not in _MOTION_SCOPES:
+            raise ValueError(f"unsupported analytic motion scope {motion_scope!r}")
+        if bool(static_gripper_only) != (motion_scope == "gripper_only"):
+            if bool(static_gripper_only):
+                motion_scope = "gripper_only"
+            elif motion_scope == "gripper_only":
+                raise ValueError("gripper-only scope requires static gripper motion")
         if (actions is None) == (joint_trajectory is None):
             raise ValueError("provide exactly one of actions or joint_trajectory")
+        isolation_required = base_goal_xyyaw is None and motion_scope != "whole_body"
+        isolation_gripper_only = bool(static_gripper_only)
+        if isolation_required and isolation_reference is None:
+            isolation_reference = self._capture_single_arm_isolation(
+                hand=hand,
+                gripper_only=isolation_gripper_only,
+                reference_origin="primitive_call_start",
+                motion_scope=motion_scope,
+            )
+        if isolation_required:
+            expected_mode = (
+                "gripper_only"
+                if isolation_gripper_only
+                else ("arm_motion" if motion_scope == "arm_only" else motion_scope)
+            )
+            if (
+                not isinstance(isolation_reference, dict)
+                or isolation_reference.get("selected_hand") != _normalize_hand(hand)
+                or isolation_reference.get("mode") != expected_mode
+            ):
+                self._active_isolation_report = {
+                    "available": False,
+                    "ok": False,
+                    "selected_hand": _normalize_hand(hand),
+                    "mode": expected_mode,
+                    "context_id": isolation_reference.get("context_id")
+                    if isinstance(isolation_reference, dict)
+                    else None,
+                    "reference_origin": isolation_reference.get(
+                        "reference_origin", "primitive_call_start"
+                    )
+                    if isinstance(isolation_reference, dict)
+                    else "primitive_call_start",
+                    "reason": "isolation reference unavailable or mismatched",
+                    "checks": {},
+                    "max_observed": {},
+                    "checks_performed": 0,
+                }
+                return self._execution_result(
+                    primitive_success=False,
+                    stop_reason="single_arm_isolation_feedback_unavailable",
+                    recoverable=True,
+                    suggested_next_tool="observe",
+                    executed=0,
+                    trace=[],
+                    final_pos_err=None,
+                    final_ori_err=None,
+                    held_steps=0,
+                    started=started,
+                )
+            self._active_isolation_report = {
+                "available": True,
+                "ok": True,
+                "selected_hand": _normalize_hand(hand),
+                "mode": expected_mode,
+                "context_id": isolation_reference.get("context_id"),
+                "reference_origin": isolation_reference.get(
+                    "reference_origin", "primitive_call_start"
+                ),
+                "checks": {},
+                "max_observed": {},
+                "checks_performed": 0,
+            }
+        else:
+            self._active_isolation_report = None
         if (stop_on_attachment or require_attachment) and expected_attachment is None:
             raise ValueError(
                 "attachment monitoring requires a locked expected attachment root"
@@ -7301,6 +8813,66 @@ class PlannerExecutor:
                         },
                     },
                 )
+        whole_body_contact_baseline: dict[str, Any] | None = None
+        if motion_scope == "whole_body":
+            if not isinstance(expected_attachments_by_hand, dict) or set(
+                expected_attachments_by_hand
+            ) != {"left", "right"}:
+                raise ValueError(
+                    "whole-body execution requires a two-hand attachment snapshot"
+                )
+            for side in ("left", "right"):
+                live = _call_optional_arg(self.backend, "get_attached_object", side)
+                matches, identity = _attachment_state_status(
+                    live,
+                    expected_attachments_by_hand[side],
+                    hand=side,
+                )
+                if not matches:
+                    return self._execution_result(
+                        primitive_success=False,
+                        stop_reason="attachment_identity_mismatch",
+                        recoverable=True,
+                        suggested_next_tool="observe",
+                        executed=0,
+                        trace=[],
+                        final_pos_err=None,
+                        final_ori_err=None,
+                        held_steps=0,
+                        started=started,
+                        extra_metrics={
+                            "whole_body_attachment_preflight": {
+                                "hand": side,
+                                **identity,
+                            }
+                        },
+                    )
+            whole_body_contact_baseline = _call_optional_kw(
+                self.backend,
+                "capture_whole_body_contact_baseline",
+                expected_attachments_by_hand=expected_attachments_by_hand,
+            )
+            if (
+                not isinstance(whole_body_contact_baseline, dict)
+                or whole_body_contact_baseline.get("available") is not True
+            ):
+                return self._execution_result(
+                    primitive_success=False,
+                    stop_reason="contact_feedback_unavailable",
+                    recoverable=False,
+                    suggested_next_tool="observe",
+                    executed=0,
+                    trace=[],
+                    final_pos_err=None,
+                    final_ori_err=None,
+                    held_steps=0,
+                    started=started,
+                    extra_metrics={
+                        "whole_body_contact_baseline": (
+                            whole_body_contact_baseline
+                        )
+                    },
+                )
         action_chunk = validate_action_chunk(actions) if actions is not None else None
         q_chunk = (
             np.asarray(_jsonable(joint_trajectory), dtype=np.float32)
@@ -7309,24 +8881,71 @@ class PlannerExecutor:
         )
         if q_chunk is not None and (q_chunk.ndim != 2 or q_chunk.shape[0] < 1):
             raise ValueError(f"joint trajectory must be [T,D], got {q_chunk.shape}")
+        if motion_scope == "whole_body":
+            if not isinstance(whole_body_certificate, dict):
+                raise ValueError(
+                    "whole-body execution requires a collision certificate"
+                )
+            digest = hashlib.sha256(
+                np.ascontiguousarray(q_chunk, dtype=np.float32).tobytes()
+            ).hexdigest()
+            current_q = _call_optional(self.backend, "get_joint_positions")
+            current_q_digest = (
+                hashlib.sha256(
+                    np.ascontiguousarray(
+                        np.asarray(current_q, dtype=np.float32).reshape(-1),
+                        dtype=np.float32,
+                    ).tobytes()
+                ).hexdigest()
+                if current_q is not None
+                else None
+            )
+            if current_q is not None and int(q_chunk.shape[1]) != int(
+                np.asarray(current_q).reshape(-1).shape[0]
+            ):
+                raise ValueError(
+                    "whole-body joint trajectory dimension "
+                    f"{q_chunk.shape[1]} does not match live robot dimension "
+                    f"{np.asarray(current_q).reshape(-1).shape[0]}"
+                )
+            if (
+                whole_body_certificate.get("trajectory_sha256") != digest
+                or current_q_digest is None
+                or whole_body_certificate.get("start_q_sha256") != current_q_digest
+                or whole_body_certificate.get("waypoint_count") != int(len(q_chunk))
+                or whole_body_certificate.get("q_dimension") != int(q_chunk.shape[1])
+                or whole_body_certificate.get("active_dof_count") != 21
+                or whole_body_certificate.get("selected_eef_goal_count") != 1
+                or whole_body_certificate.get("inactive_eef_goal_count") != 0
+                or whole_body_certificate.get("attachment_hand_count") != 2
+                or whole_body_certificate.get("world_collision_check") is not True
+                or whole_body_certificate.get("self_collision_check") is not True
+                or whole_body_certificate.get("post_interpolation_check") is not True
+            ):
+                raise RuntimeError(
+                    "whole-body trajectory does not match its collision certificate"
+                )
         planned_steps = (
             action_chunk.shape[0] if action_chunk is not None else q_chunk.shape[0]
         )
         trajectory_hold_reference: np.ndarray | None = None
         trajectory_fixed_reference: dict[str, Any] | None = None
         trajectory_uses_fixed_reference = False
-        locked_joint_reference: dict[str, Any] | None = None
-        trajectory_hand = None if base_goal_xyyaw is not None else hand
+        trajectory_hand = (
+            None
+            if base_goal_xyyaw is not None or motion_scope == "whole_body"
+            else hand
+        )
         if q_chunk is not None:
             trajectory_fixed_reference = _call_optional_kw(
                 self.backend,
                 "capture_trajectory_hold_reference",
                 hand=trajectory_hand,
+                **(
+                    {"motion_scope": motion_scope} if motion_scope != "arm_only" else {}
+                ),
             )
             if isinstance(trajectory_fixed_reference, dict):
-                locked_joint_reference = trajectory_fixed_reference.get(
-                    "locked_joint_reference"
-                )
                 try:
                     converter_parameters = inspect.signature(
                         self.backend.joint_target_to_action
@@ -7351,76 +8970,6 @@ class PlannerExecutor:
                         )[0]
                     except Exception:
                         trajectory_hold_reference = None
-                locked_joint_reference = _call_optional_kw(
-                    self.backend,
-                    "capture_locked_joint_reference",
-                    hand=trajectory_hand,
-                )
-            if (
-                not isinstance(locked_joint_reference, dict)
-                or (
-                    trajectory_fixed_reference is not None
-                    and not trajectory_uses_fixed_reference
-                )
-                or (
-                    trajectory_fixed_reference is None
-                    and trajectory_hold_reference is None
-                )
-            ):
-                return self._execution_result(
-                    primitive_success=False,
-                    stop_reason="locked_joint_feedback_unavailable",
-                    recoverable=True,
-                    suggested_next_tool="move_to",
-                    executed=0,
-                    trace=[],
-                    final_pos_err=None,
-                    final_ori_err=None,
-                    held_steps=0,
-                    started=started,
-                    extra_metrics={
-                        "trajectory_hold_reference_available": (
-                            trajectory_fixed_reference is not None
-                            or trajectory_hold_reference is not None
-                        ),
-                        "q_space_hold_reference": (
-                            trajectory_fixed_reference is not None
-                        ),
-                        "online_fixed_reference_conversion": (
-                            trajectory_uses_fixed_reference
-                        ),
-                        "locked_joint_reference_available": isinstance(
-                            locked_joint_reference, dict
-                        ),
-                    },
-                )
-        runtime_collision_interval_steps = max(1, int(runtime_collision_interval_steps))
-        dynamics = (
-            _action_dynamics_report(action_chunk)
-            if action_chunk is not None
-            else {
-                "ok": True,
-                "mode": "online_controller_commands",
-                "max_velocity_command_delta": 0.0,
-                "max_acceleration_command_delta": 0.0,
-                "velocity_limit": 5.0,
-                "acceleration_limit": 10.0,
-            }
-        )
-        if not dynamics["ok"]:
-            return self._execution_result(
-                primitive_success=False,
-                stop_reason=str(dynamics["stop_reason"]),
-                recoverable=True,
-                suggested_next_tool="move_to",
-                executed=0,
-                trace=[],
-                final_pos_err=None,
-                final_ori_err=None,
-                held_steps=0,
-                started=started,
-                extra_metrics={"dynamics": dynamics},
-            )
         deadline = time.monotonic() + float(timeout_s)
         best_error = float("inf")
         stalled_steps = 0
@@ -7431,26 +8980,18 @@ class PlannerExecutor:
         final_ori_err: float | None = None
         hold_action: np.ndarray | None = None
         previous_action: np.ndarray | None = None
-        previous_delta: np.ndarray | None = None
         contact_stop_active = False
         attachment_seen = False
         attachment_confirmation_steps = 0
         attachment_endpoint_held_steps = 0
         attachment_identity: dict[str, Any] | None = None
-        locked_joint_report: dict[str, Any] | None = None
-        locked_joint_peaks: dict[str, float | None] = {
-            "base_xy_drift_m": None,
-            "base_z_drift_m": None,
-            "base_rpy_drift_rad": None,
-            "articulation_drift_rad": None,
-        }
-        locked_gripper_command_report: dict[str, Any] | None = None
         gripper_contact_settle_remaining = 0
         gripper_contact_settle_executed = 0
         gripper_contact_settle_started = False
         gripper_contact_hold_action: np.ndarray | None = None
-        static_guarded_collision_cache: tuple[bool, dict[str, Any]] | None = None
         index = 0
+        waypoint_attempts = 0
+        final_waypoint_tracking: dict[str, Any] | None = None
         max_steps = (
             planned_steps * (self.max_stall_steps + 1)
             + int(hold_steps_required)
@@ -7470,6 +9011,10 @@ class PlannerExecutor:
                     final_ori_err=final_ori_err,
                     held_steps=held_steps,
                     started=started,
+                    extra_metrics={
+                        "final_joint_tracking": final_waypoint_tracking,
+                        "trajectory_complete": index >= planned_steps,
+                    },
                 )
             if gripper_contact_settle_remaining > 0:
                 assert gripper_contact_hold_action is not None
@@ -7509,11 +9054,18 @@ class PlannerExecutor:
                         )
                 else:
                     if hold_action is None:
-                        hold_action = _call_optional_arg(
-                            self.backend, "hold_action", hand
-                        )
-                        if hold_action is None:
-                            hold_action = np.zeros((ACTION_DIM,), dtype=np.float32)
+                        if static_gripper_only and previous_action is not None:
+                            # A gripper confirmation window must preserve the
+                            # exact accepted endpoint command. A generic robot
+                            # hold can contain a stale gripper value and would
+                            # otherwise reopen the fingers during validation.
+                            hold_action = previous_action.copy()
+                        else:
+                            hold_action = _call_optional_arg(
+                                self.backend, "hold_action", hand
+                            )
+                            if hold_action is None:
+                                hold_action = np.zeros((ACTION_DIM,), dtype=np.float32)
                     action = hold_action
             action = validate_action_chunk(
                 np.asarray(action, dtype=np.float32).reshape(1, ACTION_DIM)
@@ -7524,183 +9076,73 @@ class PlannerExecutor:
                     action,
                     trajectory_hold_reference,
                     hand=trajectory_hand,
+                    motion_scope=motion_scope,
                 )
-            if trajectory_uses_fixed_reference:
-                locked_gripper_command_report = _call_optional_kw(
+            if isolation_required:
+                assert isolation_reference is not None
+                isolation_hold = _call_optional_kw(
                     self.backend,
-                    "locked_gripper_command_report",
-                    action=action,
-                    reference=trajectory_fixed_reference,
+                    "single_arm_isolation_hold_action",
+                    reference=isolation_reference,
                 )
-                if not isinstance(locked_gripper_command_report, dict) or not bool(
-                    locked_gripper_command_report.get("available", False)
-                ):
-                    return self._execution_result(
-                        primitive_success=False,
-                        stop_reason="locked_gripper_command_feedback_unavailable",
-                        recoverable=True,
-                        suggested_next_tool="move_to",
-                        executed=executed,
-                        trace=trace,
-                        final_pos_err=final_pos_err,
-                        final_ori_err=final_ori_err,
-                        held_steps=held_steps,
-                        started=started,
-                        extra_metrics={
-                            "locked_gripper_command_report": (
-                                locked_gripper_command_report
-                            )
-                        },
+                if isolation_hold is None:
+                    isolation_hold = _call_optional_arg(
+                        self.backend,
+                        "hold_action",
+                        hand,
                     )
-                if locked_gripper_command_report.get("ok") is False:
-                    return self._execution_result(
-                        primitive_success=False,
-                        stop_reason="locked_gripper_command_drift",
-                        recoverable=True,
-                        suggested_next_tool="move_to",
-                        executed=executed,
-                        trace=trace,
-                        final_pos_err=final_pos_err,
-                        final_ori_err=final_ori_err,
-                        held_steps=held_steps,
-                        started=started,
-                        extra_metrics={
-                            "locked_gripper_command_report": (
-                                locked_gripper_command_report
-                            )
-                        },
-                    )
-            if static_gripper_only:
-                latch = getattr(self.env, "_gripper_latch", None)
-                if isinstance(latch, dict):
-                    gripper_segment = ENV_ACTION_SEGMENTS[f"{hand}_gripper"]
-                    latch[hand] = float(action[gripper_segment][0])
-            if previous_action is not None:
-                delta = action - previous_action
-                max_velocity = float(np.max(np.abs(delta)))
-                dynamics["max_velocity_command_delta"] = max(
-                    float(dynamics["max_velocity_command_delta"]),
-                    max_velocity,
-                )
-                if previous_delta is not None:
-                    max_acceleration = float(np.max(np.abs(delta - previous_delta)))
-                    dynamics["max_acceleration_command_delta"] = max(
-                        float(dynamics["max_acceleration_command_delta"]),
-                        max_acceleration,
-                    )
-                    if max_acceleration > float(dynamics["acceleration_limit"]):
-                        return self._execution_result(
-                            primitive_success=False,
-                            stop_reason="acceleration_limit",
-                            recoverable=True,
-                            suggested_next_tool="move_to",
-                            executed=executed,
-                            trace=trace,
-                            final_pos_err=final_pos_err,
-                            final_ori_err=final_ori_err,
-                            held_steps=held_steps,
-                            started=started,
-                            extra_metrics={"dynamics": dynamics},
+                try:
+                    isolation_hold = validate_action_chunk(
+                        np.asarray(isolation_hold, dtype=np.float32).reshape(
+                            1, ACTION_DIM
                         )
-                previous_delta = delta
-                if max_velocity > float(dynamics["velocity_limit"]):
+                    )[0]
+                except Exception:
+                    assert self._active_isolation_report is not None
+                    self._active_isolation_report.update(
+                        {
+                            "available": False,
+                            "ok": False,
+                            "reason": "single-arm isolation hold action unavailable",
+                        }
+                    )
                     return self._execution_result(
                         primitive_success=False,
-                        stop_reason="velocity_limit",
+                        stop_reason="single_arm_isolation_feedback_unavailable",
                         recoverable=True,
-                        suggested_next_tool="move_to",
+                        suggested_next_tool="observe",
                         executed=executed,
                         trace=trace,
                         final_pos_err=final_pos_err,
                         final_ori_err=final_ori_err,
                         held_steps=held_steps,
                         started=started,
-                        extra_metrics={"dynamics": dynamics},
                     )
+                action = _apply_single_arm_isolation_mask(
+                    action,
+                    isolation_hold,
+                    hand=hand,
+                    gripper_only=isolation_gripper_only,
+                    motion_scope=motion_scope,
+                )
+                action = validate_action_chunk(action.reshape(1, ACTION_DIM))[0]
             previous_action = action.copy()
-            joint_report = self._joint_margin_report()
-            if not bool(joint_report.get("available", False)):
+            step_receipt = self._step_env_action(action)
+            executed += 1
+            terminal_outcome = _terminal_step_outcome(step_receipt)
+            if terminal_outcome is not None:
+                primitive_success, stop_reason = terminal_outcome
+                trace.append(
+                    {
+                        "step": executed,
+                        "step_receipt": dict(step_receipt),
+                    }
+                )
                 return self._execution_result(
-                    primitive_success=False,
-                    stop_reason="joint_limit_feedback_unavailable",
-                    recoverable=True,
-                    suggested_next_tool="move_to",
-                    executed=executed,
-                    trace=trace,
-                    final_pos_err=final_pos_err,
-                    final_ori_err=final_ori_err,
-                    held_steps=held_steps,
-                    started=started,
-                    extra_metrics={"joint_margin": joint_report},
-                )
-            if joint_report.get("ok") is False:
-                return self._execution_result(
-                    primitive_success=False,
-                    stop_reason="joint_limit_margin",
-                    recoverable=True,
-                    suggested_next_tool="move_to",
-                    executed=executed,
-                    trace=trace,
-                    final_pos_err=final_pos_err,
-                    final_ori_err=final_ori_err,
-                    held_steps=held_steps,
-                    started=started,
-                    extra_metrics={"joint_margin": joint_report},
-                )
-            collision_report = (
-                {
-                    "available": True,
-                    "colliding": False,
-                    "collision_checks_skipped": True,
-                    "authorization": "explicit_stage3_direct_press",
-                }
-                if ignore_collision_checks
-                else self._collision_report()
-            )
-            if not bool(collision_report.get("available", False)):
-                return self._execution_result(
-                    primitive_success=False,
-                    stop_reason="collision_feedback_unavailable",
-                    recoverable=True,
-                    suggested_next_tool="move_to",
-                    executed=executed,
-                    trace=trace,
-                    final_pos_err=final_pos_err,
-                    final_ori_err=final_ori_err,
-                    held_steps=held_steps,
-                    started=started,
-                    extra_metrics={"collision_report": collision_report},
-                )
-            collision_margin = collision_report.get("min_margin_m")
-            collision_detected = bool(collision_report.get("colliding", False)) or (
-                collision_margin is not None and float(collision_margin) < 0.0
-            )
-            if static_gripper_only and static_guarded_collision_cache is not None:
-                guarded_collision_allowed, guarded_collision_contact = (
-                    static_guarded_collision_cache
-                )
-            else:
-                guarded_collision_allowed, guarded_collision_contact = (
-                    self._guarded_target_collision_allowed(
-                        hand=hand,
-                        target_xyz=contact_target_xyz,
-                        enabled=(
-                            collision_detected and allow_guarded_goal_world_collision
-                        ),
-                        eef_to_contact_vector=eef_to_contact_vector,
-                    )
-                )
-                if static_gripper_only and guarded_collision_allowed:
-                    static_guarded_collision_cache = (
-                        guarded_collision_allowed,
-                        guarded_collision_contact,
-                    )
-            if collision_detected and not guarded_collision_allowed:
-                return self._execution_result(
-                    primitive_success=False,
-                    stop_reason="unexpected_collision",
-                    recoverable=True,
-                    suggested_next_tool="move_to",
+                    primitive_success=primitive_success,
+                    stop_reason=stop_reason,
+                    recoverable=False,
+                    suggested_next_tool=None,
                     executed=executed,
                     trace=trace,
                     final_pos_err=final_pos_err,
@@ -7708,58 +9150,150 @@ class PlannerExecutor:
                     held_steps=held_steps,
                     started=started,
                     extra_metrics={
-                        "collision_report": collision_report,
-                        "guarded_collision_contact": guarded_collision_contact,
+                        "terminal_step_receipt": dict(step_receipt),
                     },
                 )
-            self._step_env_action(action)
-            executed += 1
-            # Validate the state produced by this command. A pre-step margin
-            # cannot authorize success after a waypoint enters the soft-limit
-            # guard band.
-            joint_report = self._joint_margin_report()
-            if not bool(joint_report.get("available", False)):
-                return self._execution_result(
-                    primitive_success=False,
-                    stop_reason="joint_limit_feedback_unavailable",
-                    recoverable=True,
-                    suggested_next_tool="move_to",
-                    executed=executed,
-                    trace=trace,
-                    final_pos_err=final_pos_err,
-                    final_ori_err=final_ori_err,
-                    held_steps=held_steps,
-                    started=started,
-                    extra_metrics={"joint_margin": joint_report},
-                )
-            if joint_report.get("ok") is False:
-                return self._execution_result(
-                    primitive_success=False,
-                    stop_reason="joint_limit_margin",
-                    recoverable=True,
-                    suggested_next_tool="move_to",
-                    executed=executed,
-                    trace=trace,
-                    final_pos_err=final_pos_err,
-                    final_ori_err=final_ori_err,
-                    held_steps=held_steps,
-                    started=started,
-                    extra_metrics={"joint_margin": joint_report},
-                )
-            if locked_joint_reference is not None:
-                locked_joint_report = _call_optional_kw(
+            if static_gripper_only:
+                latch = getattr(self.env, "_gripper_latch", None)
+                if isinstance(latch, dict):
+                    gripper_segment = ENV_ACTION_SEGMENTS[f"{hand}_gripper"]
+                    latch[hand] = float(action[gripper_segment][0])
+            if isolation_required:
+                assert isolation_reference is not None
+                isolation_kwargs = {
+                    "hand": hand,
+                    "action": action,
+                    "reference": isolation_reference,
+                    "gripper_only": isolation_gripper_only,
+                }
+                if motion_scope == "arm_with_trunk":
+                    isolation_kwargs["motion_scope"] = motion_scope
+                isolation_report = _call_optional_kw(
                     self.backend,
-                    "locked_joint_drift_report",
-                    reference=locked_joint_reference,
+                    "single_arm_isolation_report",
+                    **isolation_kwargs,
                 )
-                if not isinstance(locked_joint_report, dict) or not bool(
-                    locked_joint_report.get("available", False)
-                ):
+                if not isinstance(isolation_report, dict):
+                    isolation_report = {
+                        "available": False,
+                        "ok": False,
+                        "selected_hand": _normalize_hand(hand),
+                        "mode": (
+                            "gripper_only"
+                            if isolation_gripper_only
+                            else (
+                                "arm_motion"
+                                if motion_scope == "arm_only"
+                                else motion_scope
+                            )
+                        ),
+                        "context_id": isolation_reference.get("context_id"),
+                        "reference_origin": isolation_reference.get(
+                            "reference_origin", "primitive_call_start"
+                        ),
+                        "reason": "single-arm isolation report unavailable",
+                        "checks": {},
+                        "max_observed": {},
+                    }
+                self._active_isolation_report = self._merge_isolation_report(
+                    self._active_isolation_report,
+                    isolation_report,
+                )
+                if not bool(isolation_report.get("available", False)):
+                    trace.append(
+                        {
+                            "step": executed,
+                            "single_arm_isolation": isolation_report,
+                        }
+                    )
                     return self._execution_result(
                         primitive_success=False,
-                        stop_reason="locked_joint_feedback_unavailable",
+                        stop_reason="single_arm_isolation_feedback_unavailable",
                         recoverable=True,
-                        suggested_next_tool="move_to",
+                        suggested_next_tool="observe",
+                        executed=executed,
+                        trace=trace,
+                        final_pos_err=final_pos_err,
+                        final_ori_err=final_ori_err,
+                        held_steps=held_steps,
+                        started=started,
+                    )
+                if not bool(isolation_report.get("ok", False)):
+                    trace.append(
+                        {
+                            "step": executed,
+                            "single_arm_isolation": isolation_report,
+                        }
+                    )
+                    return self._execution_result(
+                        primitive_success=False,
+                        stop_reason="single_arm_isolation_violation",
+                        recoverable=True,
+                        suggested_next_tool="observe",
+                        executed=executed,
+                        trace=trace,
+                        final_pos_err=final_pos_err,
+                        final_ori_err=final_ori_err,
+                        held_steps=held_steps,
+                        started=started,
+                    )
+            if motion_scope == "whole_body":
+                assert expected_attachments_by_hand is not None
+                for side in ("left", "right"):
+                    live = _call_optional_arg(self.backend, "get_attached_object", side)
+                    matches, identity = _attachment_state_status(
+                        live,
+                        expected_attachments_by_hand[side],
+                        hand=side,
+                    )
+                    if not matches:
+                        trace.append(
+                            {
+                                "step": executed,
+                                "whole_body_attachment": {
+                                    "hand": side,
+                                    **identity,
+                                },
+                            }
+                        )
+                        return self._execution_result(
+                            primitive_success=False,
+                            stop_reason="attachment_identity_mismatch",
+                            recoverable=True,
+                            suggested_next_tool="observe",
+                            executed=executed,
+                            trace=trace,
+                            final_pos_err=final_pos_err,
+                            final_ori_err=final_ori_err,
+                            held_steps=held_steps,
+                            started=started,
+                            extra_metrics={
+                                "whole_body_attachment": {
+                                    "hand": side,
+                                    **identity,
+                                }
+                            },
+                        )
+                whole_body_contact = _call_optional_kw(
+                    self.backend,
+                    "whole_body_contact_report",
+                    baseline=whole_body_contact_baseline,
+                    expected_attachments_by_hand=expected_attachments_by_hand,
+                )
+                if not isinstance(whole_body_contact, dict) or not bool(
+                    whole_body_contact.get("available", False)
+                ):
+                    trace.append(
+                        {
+                            "step": executed,
+                            "whole_body_contact": whole_body_contact,
+                        }
+                    )
+                    return self._execution_result(
+                        primitive_success=False,
+                        stop_reason="contact_feedback_unavailable",
+                        recoverable=False,
+                        suggested_next_tool="observe",
                         executed=executed,
                         trace=trace,
                         final_pos_err=final_pos_err,
@@ -7767,25 +9301,21 @@ class PlannerExecutor:
                         held_steps=held_steps,
                         started=started,
                         extra_metrics={
-                            "locked_joint_report": locked_joint_report,
-                            "locked_joint_peaks": locked_joint_peaks,
+                            "whole_body_contact": whole_body_contact,
                         },
                     )
-                for field in locked_joint_peaks:
-                    value = locked_joint_report.get(field)
-                    if value is not None:
-                        previous_peak = locked_joint_peaks[field]
-                        locked_joint_peaks[field] = (
-                            float(value)
-                            if previous_peak is None
-                            else max(previous_peak, float(value))
-                        )
-                if locked_joint_report.get("ok") is False:
+                if bool(whole_body_contact.get("unexpected_contact", False)):
+                    trace.append(
+                        {
+                            "step": executed,
+                            "whole_body_contact": whole_body_contact,
+                        }
+                    )
                     return self._execution_result(
                         primitive_success=False,
-                        stop_reason="locked_joint_drift",
-                        recoverable=True,
-                        suggested_next_tool="move_to",
+                        stop_reason="unexpected_contact",
+                        recoverable=False,
+                        suggested_next_tool="observe",
                         executed=executed,
                         trace=trace,
                         final_pos_err=final_pos_err,
@@ -7793,8 +9323,7 @@ class PlannerExecutor:
                         held_steps=held_steps,
                         started=started,
                         extra_metrics={
-                            "locked_joint_report": locked_joint_report,
-                            "locked_joint_peaks": locked_joint_peaks,
+                            "whole_body_contact": whole_body_contact,
                         },
                     )
             if stop_on_attachment or require_attachment:
@@ -7878,170 +9407,20 @@ class PlannerExecutor:
                 elif require_attachment:
                     attachment_seen = True
                     attachment_confirmation_steps += 1
-            # Validate the state produced by this waypoint, not only the state
-            # that preceded it. Force a new world/self-collision query so the
-            # final waypoint cannot succeed on a cached pre-action report.
-            collision_report = (
-                {
-                    "available": True,
-                    "colliding": False,
-                    "collision_checks_skipped": True,
-                    "authorization": "explicit_stage3_direct_press",
-                }
-                if ignore_collision_checks
-                else self._collision_report(
-                    force=(
-                        q_chunk is not None
-                        or (
-                            not static_gripper_only
-                            and runtime_collision_interval_steps == 1
-                        )
-                        or executed == 1
-                        or (
-                            not static_gripper_only
-                            and executed % runtime_collision_interval_steps == 0
-                        )
-                        or (q_chunk is not None and index >= planned_steps - 1)
-                        or (static_gripper_only and executed == planned_steps)
-                    )
-                )
-            )
-            if not bool(collision_report.get("available", False)):
-                return self._execution_result(
-                    primitive_success=False,
-                    stop_reason="collision_feedback_unavailable",
-                    recoverable=True,
-                    suggested_next_tool="move_to",
-                    executed=executed,
-                    trace=trace,
-                    final_pos_err=final_pos_err,
-                    final_ori_err=final_ori_err,
-                    held_steps=held_steps,
-                    started=started,
-                    extra_metrics={"collision_report": collision_report},
-                )
-            if static_gripper_only and static_guarded_collision_cache is not None:
-                guarded_collision_allowed, guarded_collision_contact = (
-                    static_guarded_collision_cache
-                )
-            else:
-                guarded_collision_allowed, guarded_collision_contact = (
-                    self._guarded_target_collision_allowed(
-                        hand=hand,
-                        target_xyz=contact_target_xyz,
-                        enabled=(
-                            bool(collision_report.get("colliding", False))
-                            and allow_guarded_goal_world_collision
-                        ),
-                        eef_to_contact_vector=eef_to_contact_vector,
-                    )
-                )
-                if static_gripper_only and guarded_collision_allowed:
-                    static_guarded_collision_cache = (
-                        guarded_collision_allowed,
-                        guarded_collision_contact,
-                    )
-            if (
-                bool(collision_report.get("colliding", False))
-                and not guarded_collision_allowed
-            ):
-                return self._execution_result(
-                    primitive_success=False,
-                    stop_reason="unexpected_collision",
-                    recoverable=True,
-                    suggested_next_tool="move_to",
-                    executed=executed,
-                    trace=trace,
-                    final_pos_err=final_pos_err,
-                    final_ori_err=final_ori_err,
-                    held_steps=held_steps,
-                    started=started,
-                    extra_metrics={
-                        "collision_report": collision_report,
-                        "guarded_collision_contact": guarded_collision_contact,
-                    },
-                )
-            actual_dynamics = self._actual_dynamics_report()
-            if actual_dynamics is not None:
-                dynamics["actual"] = actual_dynamics
-                dynamics["actual_peak"] = _accumulate_actual_dynamics_peak(
-                    dynamics.get("actual_peak"),
-                    actual_dynamics,
-                )
-                if not bool(actual_dynamics.get("available", False)):
-                    return self._execution_result(
-                        primitive_success=False,
-                        stop_reason="dynamics_feedback_unavailable",
-                        recoverable=True,
-                        suggested_next_tool="move_to",
-                        executed=executed,
-                        trace=trace,
-                        final_pos_err=final_pos_err,
-                        final_ori_err=final_ori_err,
-                        held_steps=held_steps,
-                        started=started,
-                        extra_metrics={"dynamics": dynamics},
-                    )
-                if actual_dynamics.get("ok") is False:
-                    terminal_guarded_oscillation = bool(
-                        q_chunk is not None
-                        and index >= planned_steps
-                        and contact_target_xyz is not None
-                    )
-                    gripper_contact_impact = bool(
-                        static_gripper_only and contact_target_xyz is not None
-                    )
-                    terminal_contact = (
-                        self._contact_report(
-                            hand=hand,
-                            target_xyz=contact_target_xyz,
-                            allowed_contact_distance_m=max(
-                                float(allowed_contact_distance_m),
-                                float(position_tolerance_m) * 2.0,
-                            ),
-                        )
-                        if terminal_guarded_oscillation or gripper_contact_impact
-                        else None
-                    )
-                    return self._execution_result(
-                        primitive_success=False,
-                        stop_reason=(
-                            "guarded_terminal_oscillation"
-                            if terminal_guarded_oscillation
-                            else (
-                                "gripper_contact_dynamics_limit"
-                                if gripper_contact_impact
-                                else "actual_dynamics_limit"
-                            )
-                        ),
-                        recoverable=True,
-                        suggested_next_tool="move_to",
-                        executed=executed,
-                        trace=trace,
-                        final_pos_err=final_pos_err,
-                        final_ori_err=final_ori_err,
-                        held_steps=held_steps,
-                        started=started,
-                        extra_metrics={
-                            "dynamics": dynamics,
-                            "terminal_hold_actual_dynamics_violation": (
-                                terminal_guarded_oscillation
-                            ),
-                            "gripper_contact_actual_dynamics_violation": (
-                                gripper_contact_impact
-                            ),
-                            "terminal_contact_report": terminal_contact,
-                            "actual_acceleration_limit_rad_s2": 15.0,
-                        },
-                    )
             waypoint_tracking: dict[str, Any] | None = None
             waypoint_advanced = False
+            waypoint_stalled = False
             if q_chunk is not None and index < planned_steps:
+                waypoint_attempts += 1
                 waypoint_tracking = _call_optional_kw(
                     self.backend,
                     "joint_tracking_report",
                     target_q=q_chunk[index],
-                    hand=None if base_goal_xyyaw is not None else hand,
+                    hand=(
+                        None
+                        if base_goal_xyyaw is not None or motion_scope == "whole_body"
+                        else hand
+                    ),
                 )
                 if not isinstance(waypoint_tracking, dict) or not bool(
                     waypoint_tracking.get("available", False)
@@ -8059,9 +9438,13 @@ class PlannerExecutor:
                         started=started,
                         extra_metrics={"joint_tracking": waypoint_tracking},
                     )
+                final_waypoint_tracking = waypoint_tracking
                 if bool(waypoint_tracking.get("reached", False)):
                     index += 1
                     waypoint_advanced = True
+                    waypoint_attempts = 0
+                elif waypoint_attempts >= self.max_stall_steps:
+                    waypoint_stalled = True
             if base_goal_xyyaw is not None:
                 base_pose = _call_optional(self.backend, "get_base_pose")
                 if base_pose is None:
@@ -8112,7 +9495,10 @@ class PlannerExecutor:
                         final_pos_err = float(np.linalg.norm(pos - target_xyz))
                     if target_quat_xyzw is not None:
                         final_ori_err = _quat_angle_error_rad(quat, target_quat_xyzw)
-            if contact_target_xyz is not None:
+            contact: dict[str, Any] | None = None
+            if contact_target_xyz is not None and (
+                stop_on_expected_contact or stop_on_attachment
+            ):
                 contact = self._contact_report(
                     hand=hand,
                     target_xyz=contact_target_xyz,
@@ -8135,41 +9521,7 @@ class PlannerExecutor:
                         started=started,
                         extra_metrics={"contact_report": contact},
                     )
-                if self._contact_is_abort(
-                    contact,
-                    hand=hand,
-                    target_xyz=contact_target_xyz,
-                    allow_expected_contact=allow_expected_contact,
-                    eef_to_contact_vector=eef_to_contact_vector,
-                ):
-                    return self._execution_result(
-                        primitive_success=False,
-                        stop_reason="unexpected_contact",
-                        recoverable=True,
-                        suggested_next_tool="observe",
-                        executed=executed,
-                        trace=trace,
-                        final_pos_err=final_pos_err,
-                        final_ori_err=final_ori_err,
-                        held_steps=held_steps,
-                        started=started,
-                        extra_metrics={"contact_report": contact},
-                    )
                 expected_contact = bool(contact.get("expected_contact", False))
-                if contact_stop_active and not expected_contact:
-                    return self._execution_result(
-                        primitive_success=False,
-                        stop_reason="expected_contact_lost",
-                        recoverable=True,
-                        suggested_next_tool="observe",
-                        executed=executed,
-                        trace=trace,
-                        final_pos_err=final_pos_err,
-                        final_ori_err=final_ori_err,
-                        held_steps=held_steps,
-                        started=started,
-                        extra_metrics={"contact_report": contact},
-                    )
                 if stop_on_expected_contact and expected_contact:
                     contact_stop_active = True
                     index = planned_steps
@@ -8179,8 +9531,8 @@ class PlannerExecutor:
                     and not gripper_contact_settle_started
                     and bool(contact.get("target_two_finger_contact", False))
                 ):
-                    # Hold this exact two-finger+raycast candidate for at least
-                    # ten 60 Hz steps while normal per-step safety checks continue.
+                    # Hold the exact two-finger+raycast candidate for a bounded
+                    # confirmation window.
                     gripper_contact_settle_started = True
                     gripper_contact_settle_remaining = max(
                         GRIPPER_CONTACT_SETTLE_STEPS,
@@ -8192,18 +9544,13 @@ class PlannerExecutor:
                     "step": executed,
                     "position_error_m": final_pos_err,
                     "orientation_error_rad": final_ori_err,
-                    "joint_margin": joint_report,
-                    "collision_report": collision_report,
-                    "guarded_collision_contact": guarded_collision_contact,
-                    "actual_dynamics": actual_dynamics,
                     "joint_tracking": waypoint_tracking,
+                    "waypoint_attempts": waypoint_attempts,
                     "contact_stop_active": contact_stop_active,
                     "attachment_confirmed": attachment_confirmed,
                     "attachment_confirmation_steps": attachment_confirmation_steps,
                     "attachment_identity": attachment_identity,
-                    "contact_report": contact
-                    if contact_target_xyz is not None
-                    else None,
+                    "contact_report": contact,
                     "gripper_contact_settle_started": (gripper_contact_settle_started),
                     "gripper_contact_settle_remaining": (
                         gripper_contact_settle_remaining
@@ -8211,9 +9558,9 @@ class PlannerExecutor:
                     "gripper_command": float(
                         action[ENV_ACTION_SEGMENTS[f"{hand}_gripper"]][0]
                     ),
-                    "locked_joint_report": locked_joint_report,
-                    "locked_joint_peaks": locked_joint_peaks,
-                    "locked_gripper_command_report": (locked_gripper_command_report),
+                    "single_arm_isolation": (
+                        self._active_isolation_report if isolation_required else None
+                    ),
                     "hold_step": index >= planned_steps,
                 }
             )
@@ -8242,16 +9589,29 @@ class PlannerExecutor:
                             "gripper_contact_settle_steps_executed": (
                                 gripper_contact_settle_executed
                             ),
-                            "locked_joint_report": locked_joint_report,
-                            "locked_joint_peaks": locked_joint_peaks,
-                            "locked_gripper_command_report": (
-                                locked_gripper_command_report
-                            ),
                         },
                     )
                 # A gripper close succeeds only after the same target root has
                 # remained attached for the complete confirmation window.
                 continue
+            if waypoint_stalled:
+                return self._execution_result(
+                    primitive_success=False,
+                    stop_reason="stalled_tracking",
+                    recoverable=True,
+                    suggested_next_tool="move_to",
+                    executed=executed,
+                    trace=trace,
+                    final_pos_err=final_pos_err,
+                    final_ori_err=final_ori_err,
+                    held_steps=held_steps,
+                    started=started,
+                    extra_metrics={
+                        "final_joint_tracking": final_waypoint_tracking,
+                        "trajectory_complete": False,
+                        "waypoint_attempts": waypoint_attempts,
+                    },
+                )
             position_ok = contact_stop_active or (
                 final_pos_err is None or final_pos_err <= position_tolerance_m
             )
@@ -8276,7 +9636,8 @@ class PlannerExecutor:
                         held_steps=held_steps,
                         started=started,
                         extra_metrics={
-                            "dynamics": dynamics,
+                            "final_joint_tracking": final_waypoint_tracking,
+                            "trajectory_complete": True,
                             "attachment_confirmation_steps": (
                                 attachment_confirmation_steps
                             ),
@@ -8289,11 +9650,6 @@ class PlannerExecutor:
                             ),
                             "gripper_contact_settle_steps_executed": (
                                 gripper_contact_settle_executed
-                            ),
-                            "locked_joint_report": locked_joint_report,
-                            "locked_joint_peaks": locked_joint_peaks,
-                            "locked_gripper_command_report": (
-                                locked_gripper_command_report
                             ),
                         },
                     )
@@ -8344,7 +9700,10 @@ class PlannerExecutor:
                     final_ori_err=final_ori_err,
                     held_steps=held_steps,
                     started=started,
-                    extra_metrics={"dynamics": dynamics},
+                    extra_metrics={
+                        "final_joint_tracking": final_waypoint_tracking,
+                        "trajectory_complete": index >= planned_steps,
+                    },
                 )
             if index >= planned_steps and stalled_steps >= max(
                 1, self.max_stall_steps // 2
@@ -8370,7 +9729,8 @@ class PlannerExecutor:
             held_steps=held_steps,
             started=started,
             extra_metrics={
-                "dynamics": dynamics,
+                "final_joint_tracking": final_waypoint_tracking,
+                "trajectory_complete": index >= planned_steps,
                 "attachment_confirmation_steps": attachment_confirmation_steps,
                 "attachment_endpoint_held_steps": attachment_endpoint_held_steps,
                 "attachment_identity": attachment_identity,
@@ -8378,9 +9738,6 @@ class PlannerExecutor:
                 "gripper_contact_settle_steps_executed": (
                     gripper_contact_settle_executed
                 ),
-                "locked_joint_report": locked_joint_report,
-                "locked_joint_peaks": locked_joint_peaks,
-                "locked_gripper_command_report": locked_gripper_command_report,
             },
         )
 
@@ -8399,8 +9756,6 @@ class PlannerExecutor:
         started: float | None = None,
         extra_metrics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        joint_report = self._joint_margin_report()
-        collision_report = self._collision_report()
         metrics = {
             "executed_waypoints": int(executed),
             "final_position_error_m": final_pos_err,
@@ -8409,11 +9764,21 @@ class PlannerExecutor:
             "elapsed_s": round(time.monotonic() - started, 3)
             if started is not None
             else None,
-            "joint_margin": joint_report,
-            "collision_report": collision_report,
-            "collision_margin": collision_report.get("min_margin_m"),
         }
         metrics.update(extra_metrics or {})
+        if not primitive_success:
+            metrics.setdefault("post_stop_action_policy", "no_additional_env_action")
+            metrics.setdefault("post_stop_env_actions", 0)
+            if int(executed) > 0:
+                metrics.setdefault(
+                    "passive_hold_policy",
+                    "position_controller_last_target_remains_latched",
+                )
+        if isinstance(self._active_isolation_report, dict):
+            metrics.setdefault(
+                "single_arm_isolation",
+                self._active_isolation_report,
+            )
         trace_artifact = self._persist_trace_artifact(trace, stop_reason=stop_reason)
         return primitive_result(
             primitive_success=primitive_success,
@@ -8497,75 +9862,6 @@ class PlannerExecutor:
         except Exception:
             return None
 
-    def _joint_margin_report(self) -> dict[str, Any]:
-        report = _call_optional(self.backend, "joint_margin_report")
-        if isinstance(report, dict):
-            return report
-        margin = _call_optional(self.backend, "joint_margin")
-        if margin is None:
-            return {
-                "available": False,
-                "reason": "joint_margin_unavailable",
-                "min_normalized_margin": None,
-                "threshold_normalized": 0.03,
-                "threshold_raw_rad": 0.05,
-                "ok": None,
-            }
-        return {
-            "available": True,
-            "min_normalized_margin": float(margin),
-            "threshold_normalized": 0.03,
-            "threshold_raw_rad": 0.05,
-            "ok": bool(float(margin) >= 0.03),
-        }
-
-    def _collision_report(self, *, force: bool = False) -> dict[str, Any]:
-        fn = getattr(self.backend, "collision_report", None)
-        report = None
-        if callable(fn):
-            try:
-                parameters = inspect.signature(fn).parameters
-            except (TypeError, ValueError):
-                parameters = {}
-            try:
-                report = fn(force=force) if "force" in parameters else fn()
-            except TimeoutError:
-                raise
-            except Exception:
-                report = None
-        if isinstance(report, dict):
-            return report
-        margin = _call_optional(self.backend, "collision_margin")
-        return {
-            "available": margin is not None,
-            "reason": None if margin is not None else "collision_margin_unavailable",
-            "colliding": bool(margin is not None and float(margin) < 0.0),
-            "min_margin_m": float(margin) if margin is not None else None,
-            "margin_available": margin is not None,
-        }
-
-    def _actual_dynamics_report(self) -> dict[str, Any] | None:
-        fn = getattr(self.backend, "dynamics_report", None)
-        if not callable(fn):
-            return None
-        try:
-            report = fn()
-        except Exception as exc:
-            return {
-                "available": False,
-                "ok": None,
-                "reason": f"{type(exc).__name__}: {exc}",
-            }
-        return (
-            report
-            if isinstance(report, dict)
-            else {
-                "available": False,
-                "ok": None,
-                "reason": "dynamics_report returned a non-dict value",
-            }
-        )
-
     def _contact_report(
         self,
         *,
@@ -8589,132 +9885,35 @@ class PlannerExecutor:
             "expected_contact": False,
         }
 
-    def _contact_is_abort(
-        self,
-        contact: dict[str, Any],
-        *,
-        hand: str,
-        target_xyz: np.ndarray,
-        allow_expected_contact: bool,
-        eef_to_contact_vector: np.ndarray | None = None,
-    ) -> bool:
-        if bool(contact.get("unexpected_contact", False)):
-            return True
-        if not bool(contact.get("expected_contact", False)):
-            return False
-        if not allow_expected_contact:
-            return True
-        current = (
-            self.backend.get_eef_pose(hand)
-            if hasattr(self.backend, "get_eef_pose")
-            else None
-        )
-        if current is None:
-            return True
-        contact_point = np.asarray(current[0], dtype=np.float64)
-        if eef_to_contact_vector is not None:
-            contact_point = contact_point + np.asarray(
-                eef_to_contact_vector, dtype=np.float64
-            ).reshape(3)
-        distance = float(np.linalg.norm(contact_point - target_xyz))
-        allowed = contact.get("allowed_contact_distance_m", 0.025)
-        try:
-            allowed = float(allowed)
-        except Exception:
-            allowed = 0.025
-        return distance > max(allowed, GUARDED_TARGET_NEIGHBORHOOD_M)
-
-    def _guarded_target_collision_allowed(
-        self,
-        *,
-        hand: str,
-        target_xyz: np.ndarray | None,
-        enabled: bool,
-        eef_to_contact_vector: np.ndarray | None = None,
-    ) -> tuple[bool, dict[str, Any] | None]:
-        """Allow only a guarded-step world activation near its target point."""
-
-        if not enabled or target_xyz is None:
-            return False, None
-        current = self.backend.get_eef_pose(hand)
-        if current is None:
-            return False, {"available": False, "reason": "eef_pose_unavailable"}
-        allowed_distance = GUARDED_TARGET_NEIGHBORHOOD_M
-        contact_point = np.asarray(current[0], dtype=np.float64)
-        if eef_to_contact_vector is not None:
-            contact_point = contact_point + np.asarray(
-                eef_to_contact_vector, dtype=np.float64
-            ).reshape(3)
-        distance = float(
-            np.linalg.norm(contact_point - np.asarray(target_xyz, dtype=np.float64))
-        )
-        safety = _call_optional_kw(
-            self.backend,
-            "guarded_contact_safety_report",
-            hand=hand,
-            target_xyz=np.asarray(target_xyz, dtype=np.float64),
-            allowed_contact_distance_m=allowed_distance,
-        )
-        if not isinstance(safety, dict):
-            safety = {
-                "available": False,
-                "reason": "guarded_contact_safety_report_unavailable",
-            }
-        contact = safety.get("contact_report")
-        if not isinstance(contact, dict):
-            contact = {
-                "available": False,
-                "reason": "target_identity_contact_report_unavailable",
-                "unexpected_contact": False,
-                "expected_contact": False,
-            }
-        contact_count = int(contact.get("contact_count", 0) or 0)
-        target_contact_safe = bool(
-            contact.get("expected_contact", False)
-            and not contact.get("unexpected_contact", False)
-        )
-        activation_without_contact_safe = bool(
-            contact_count == 0 and safety.get("target_only_activation_verified", False)
-        )
-        allowed = bool(
-            safety.get("available", False)
-            and safety.get("target_object_resolved", False)
-            and not safety.get("self_colliding", True)
-            and not safety.get("world_without_target_colliding", True)
-            and not contact.get("unexpected_contact", False)
-            and (target_contact_safe or activation_without_contact_safe)
-            and distance <= allowed_distance
-            and not self._contact_is_abort(
-                contact,
-                hand=hand,
-                target_xyz=np.asarray(target_xyz, dtype=np.float64),
-                allow_expected_contact=True,
-                eef_to_contact_vector=eef_to_contact_vector,
-            )
-        )
-        return allowed, {
-            "safety_report": safety,
-            "contact_report": contact,
-            "eef_target_distance_m": distance,
-            "eef_contact_target_distance_m": distance,
-            "guarded_target_neighborhood_m": allowed_distance,
-            "world_collision_exception_allowed": allowed,
-            "exception_scope": (
-                "current_2mm_guarded_step_target_body_only;self_never_exempt"
-            ),
-            "target_contact_identity_confirmed": target_contact_safe,
-            "target_activation_without_physical_contact": (
-                activation_without_contact_safe
-            ),
-        }
-
-    def _step_env_action(self, action: np.ndarray) -> None:
+    def _step_env_action(self, action: np.ndarray) -> dict[str, bool | int]:
         step = getattr(self.env, "planner_step", None)
         if not callable(step):
             step = self.env.chunk_step
         ret = step(np.asarray(action, dtype=np.float32).reshape(1, ACTION_DIM))
-        if isinstance(ret, tuple) and len(ret) >= 5:
-            self.last_info = ret[4]
+        if not isinstance(ret, tuple) or len(ret) < 5:
+            raise RuntimeError(
+                "planner action did not return an execution receipt from the env"
+            )
+        self.last_info = ret[4]
+        info = ret[4]
+        rpent = info.get("_rpent") if isinstance(info, dict) else None
+        if not isinstance(rpent, dict) or "executed_steps" not in rpent:
+            raise RuntimeError("planner action execution receipt is missing")
+        executed_steps = rpent["executed_steps"]
+        if (
+            isinstance(executed_steps, bool)
+            or not isinstance(executed_steps, (int, np.integer))
+            or int(executed_steps) != 1
+        ):
+            raise RuntimeError(
+                "planner action was not executed exactly once by the env"
+            )
+        return {
+            "executed_steps": int(executed_steps),
+            "raw_success": official_task_success(info),
+            "terminated": bool(np.asarray(ret[2]).any()),
+            "truncated": bool(np.asarray(ret[3]).any()),
+        }
 
     def _world_target(self, target_xyz: Any, *, frame: str) -> np.ndarray:
         if str(frame) != "world":
@@ -8808,90 +10007,6 @@ def _call_optional_kw(obj: Any, name: str, **kwargs: Any) -> Any:
         return None
 
 
-def _accumulate_actual_dynamics_peak(
-    previous: Any,
-    current: dict[str, Any],
-) -> dict[str, Any]:
-    """Retain episode-local observed dynamics maxima and their source joints."""
-    peak = dict(previous) if isinstance(previous, dict) else {}
-    peak["available"] = bool(current.get("available", False))
-    peak["ok"] = bool(peak.get("ok", True) and current.get("ok", False))
-    peak["samples"] = int(peak.get("samples", 0)) + 1
-    peak["source"] = current.get("source")
-    for value_key, joint_key in (
-        ("max_actual_velocity", "max_actual_velocity_joint"),
-        ("max_actual_acceleration", "max_actual_acceleration_joint"),
-    ):
-        value = current.get(value_key)
-        if value is None:
-            continue
-        old = peak.get(value_key)
-        if old is None or float(value) > float(old):
-            peak[value_key] = float(value)
-            peak[joint_key] = current.get(joint_key)
-    for value_key in ("max_velocity_ratio", "max_acceleration_ratio"):
-        value = current.get(value_key)
-        if value is not None and (
-            peak.get(value_key) is None or float(value) > float(peak[value_key])
-        ):
-            peak[value_key] = float(value)
-    for key in (
-        "max_velocity_limit",
-        "max_acceleration_limit",
-        "sample_dt_s",
-    ):
-        if current.get(key) is not None:
-            peak[key] = current[key]
-    return peak
-
-
-def _action_dynamics_report(actions: np.ndarray) -> dict[str, Any]:
-    chunk = validate_action_chunk(actions)
-    if chunk.shape[0] < 2:
-        return {
-            "ok": True,
-            "max_velocity_command_delta": 0.0,
-            "max_acceleration_command_delta": 0.0,
-            "velocity_limit": 5.0,
-            "acceleration_limit": 10.0,
-        }
-    velocity = np.diff(chunk, axis=0)
-    acceleration = (
-        np.diff(velocity, axis=0)
-        if velocity.shape[0] >= 2
-        else np.zeros((0, ACTION_DIM))
-    )
-    max_velocity = float(np.max(np.abs(velocity))) if velocity.size else 0.0
-    max_acceleration = float(np.max(np.abs(acceleration))) if acceleration.size else 0.0
-    velocity_limit = 5.0
-    acceleration_limit = 10.0
-    if max_velocity > velocity_limit:
-        return {
-            "ok": False,
-            "stop_reason": "velocity_limit",
-            "max_velocity_command_delta": max_velocity,
-            "max_acceleration_command_delta": max_acceleration,
-            "velocity_limit": velocity_limit,
-            "acceleration_limit": acceleration_limit,
-        }
-    if max_acceleration > acceleration_limit:
-        return {
-            "ok": False,
-            "stop_reason": "acceleration_limit",
-            "max_velocity_command_delta": max_velocity,
-            "max_acceleration_command_delta": max_acceleration,
-            "velocity_limit": velocity_limit,
-            "acceleration_limit": acceleration_limit,
-        }
-    return {
-        "ok": True,
-        "max_velocity_command_delta": max_velocity,
-        "max_acceleration_command_delta": max_acceleration,
-        "velocity_limit": velocity_limit,
-        "acceleration_limit": acceleration_limit,
-    }
-
-
 def _interpolate_joint_trajectory(
     trajectory: Any,
     *,
@@ -8927,6 +10042,69 @@ def _interpolate_joint_trajectory(
     return result
 
 
+def _interpolate_whole_body_execution_trajectory(
+    trajectory: Any,
+    *,
+    joint_names: tuple[str, ...] | list[str],
+) -> np.ndarray:
+    """Densify a full-q path with the approved whole-body group step caps."""
+
+    q = np.asarray(_jsonable(trajectory), dtype=np.float32)
+    names = tuple(str(name) for name in joint_names)
+    if (
+        q.ndim != 2
+        or q.shape[0] < 1
+        or q.shape[1] != len(names)
+        or len(names) != len(set(names))
+    ):
+        raise ValueError(
+            "whole-body execution trajectory requires one unique name per q column"
+        )
+    if not np.isfinite(q).all():
+        raise ValueError("whole-body execution trajectory contains NaN or infinity")
+    missing = sorted(
+        (set(WHOLE_BODY_ACTIVE_JOINT_NAMES) | set(WHOLE_BODY_LOCKED_JOINT_NAMES))
+        - set(names)
+    )
+    if missing:
+        raise ValueError(f"whole-body execution trajectory is missing joints: {missing}")
+
+    caps = np.full((len(names),), np.inf, dtype=np.float64)
+    for index, name in enumerate(names):
+        if name in WHOLE_BODY_LOCKED_JOINT_NAMES:
+            if np.max(np.abs(q[:, index] - q[0, index])) > 1e-7:
+                raise RuntimeError(
+                    f"whole-body execution path changed locked joint {name!r}"
+                )
+        elif name in {
+            "base_footprint_x_joint",
+            "base_footprint_y_joint",
+        }:
+            caps[index] = WHOLE_BODY_EXECUTION_BASE_XY_STEP_M
+        elif name == "base_footprint_rz_joint":
+            caps[index] = WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD
+        elif name in WHOLE_BODY_ACTIVE_JOINT_NAMES:
+            caps[index] = WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD
+        else:
+            raise RuntimeError(f"unclassified R1Pro joint {name!r}")
+
+    interpolated: list[np.ndarray] = []
+    for start, end in zip(q[:-1], q[1:], strict=True):
+        ratios = np.abs(end.astype(np.float64) - start.astype(np.float64)) / caps
+        intervals = max(1, int(math.ceil(float(np.max(ratios)))))
+        for index in range(intervals):
+            alpha = index / intervals
+            interpolated.append(start + (end - start) * alpha)
+    interpolated.append(q[-1])
+    result = np.stack(interpolated, axis=0).astype(np.float32, copy=False)
+    if len(result) > 1:
+        deltas = np.abs(np.diff(result.astype(np.float64), axis=0))
+        finite_caps = np.isfinite(caps)
+        if bool(np.any(deltas[:, finite_caps] > caps[finite_caps] + 1e-6)):
+            raise RuntimeError("whole-body execution interpolation exceeded a group cap")
+    return result
+
+
 def _retime_joint_trajectory(
     trajectory: Any,
     *,
@@ -8934,13 +10112,12 @@ def _retime_joint_trajectory(
     max_command_velocity: float,
     max_command_acceleration: float,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Time-stretch a certified joint path without leaving its line segments.
+    """Time-stretch a joint path without leaving its line segments.
 
     cuRobo paths can contain a repeated waypoint at a stitching boundary.  At
     the 60 Hz controller that can command an abrupt stop close to the official
     acceleration limit, leaving no margin for tracking dynamics.  Linear
-    interpolation over a longer duration preserves the geometric path; callers
-    must still collision-check the returned samples in full.
+    interpolation over a longer duration preserves the geometric path.
     """
 
     q = np.asarray(_jsonable(trajectory), dtype=np.float64)
@@ -9023,7 +10200,6 @@ def _retime_joint_trajectory(
     return retimed.astype(np.float32), {
         "method": "piecewise_linear_time_stretch",
         "path_geometry": "original_joint_polyline",
-        "full_collision_recheck_required": True,
         "original_waypoints": int(len(q)),
         "retimed_waypoints": int(len(retimed)),
         "duration_scale": float((len(retimed) - 1) / max(len(q) - 1, 1)),

@@ -21,12 +21,12 @@
   (``pi0_pick``、``move_to``、``rotate_wrist``、``back_project``、
   ``finish``…) 来驱动机器人。每个工具的返回都以多模态上下文
   (文本 + 渲染图) 喂回, 让模型基于 *看到的世界* 推理。
-- **三进程架构。** **Agent 进程** (LLM cerebrum + toolkit, 不 import
+- **三进程架构。** **Agent 进程** (LLM planner + toolkit, 不 import
   ``torch``)、**env_server** (仿真器 + EGL 渲染)、**vla_server**
   (GPU 策略权重) 是三个独立进程, 用轻量 RPC 串起来。任一重量级
   进程都可以独立重启、迁到另一张 GPU、或指向远程主机。
-- **可插拔的 reasoning brain (cerebrum)。** 用一个 flag ——
-  ``--cerebrum {api, claude_code, codex}`` —— 就能换决策 brain, 不用
+- **可插拔的 reasoning brain (planner)。** 用一个 flag ——
+  ``--planner {api, claude_code, codex}`` —— 就能换决策 brain, 不用
   动 tool 或 prompt:
 
   - ``api`` —— 基于 `pydantic-ai <https://ai.pydantic.dev/>`_ 的
@@ -70,7 +70,7 @@
 .. code-block:: text
 
    rpent/
-     cerebrum/       # Reasoning brains: api_loop, claude_code, codex, base.
+     planner/       # Reasoning brains: api_loop, claude_code, codex, base.
      cli/            # main.py 入口 (无 __init__.py, 不是 subpackage)。
      context/        # Prompt bundles、prompt 工具、共享 prompt 分节。
      dashboard/      # FastAPI 监控 + SSE stream (可选)。
@@ -80,36 +80,47 @@
    robots/
      libero/         # LIBERO 的 env_client / env_server / vla_server /
                      # toolkit / prompt_bundle。参考实现。
-     (robocasa/)     # RoboCasa driver (见 scripts/run_robocasa.sh)。
+     (robocasa/)     # RoboCasa driver —— 研发中。
      (franka/)       # Franka driver —— 研发中。
      (so101/)        # SO-101 driver —— 研发中。
-   scripts/          # 安装脚本 (LIBERO PRO/PLUS、RoboCasa、codex proxy)。
+   scripts/          # 安装脚本 (LIBERO PRO/PLUS、codex proxy)。
 
 Runner (``rpent/cli/main.py``)
 ------------------------------
 
 ``rpent/cli/main.py`` 是编排者。每一次调用它会:
 
-1. 解析 CLI flag (:doc:`../quickstart` 说明了日常最常用的那些)。
-2. 创建 per-run 的 scratch 目录 (``--output-dir`` 或
-   ``runs/`` 下自动生成的目录)。
-3. 以子进程启动 **env_server**, 等待它在 stdout 上打印
-   ``transport_ready`` JSON 事件。事件里带着 socket RPC 监听的
-   host/port; ``rpent/cli/main.py`` 把 endpoint 记录到 ``<output_dir>/``
-   下, 供 client 找到。
-4. 以同样方式启动 (或复用) **vla_server**, 复用时用
-   ``--vla-endpoint``。
-5. 通过 env 的 ``get_toolkit(primitives_kwargs=...)`` 工厂为选中的
-   env 构造 **toolkit**, 把 env client 和 VLA client 传进去。
-6. 通过 ``rpent.cerebrum.base.build_cerebrum`` 构造 **cerebrum**,
-   根据 ``--cerebrum`` 选出 ``api_loop.py`` / ``claude_code.py`` /
+1. 用 ``parse_known_args`` 解析共享 CLI flag (:doc:`../quickstart` 说明了
+   日常最常用的那些), 提前拿到 ``--env`` 和 ``--dashboard``。
+2. 通过 ``get_env_spec(args.env_name)`` 找到 env, 调用
+   ``env_spec.add_cli_args(parser, use_dashboard=args.dashboard)`` —— env
+   把自己的 flag 加到共享 parser 上。``use_dashboard=True`` 时把原本必填
+   的 flag 变可选, 好让 dashboard 之后填。
+3. 再次调 ``parser.parse_args()`` —— 单次 argparse pass 负责全部校验并
+   产出最终的 ``args`` (argparse 自带 usage + error 输出)。
+4. 如果开了 ``--dashboard``, 用现在已填入 env CLI 值的 ``args`` 起
+   launcher, 把用户表单的选择 apply 回去。
+5. 调用 ``env_spec.parse_config(args)`` 派生
+   :class:`~rpent.envs.RunConfig`
+   (``recipe_tag`` / ``output_dir`` / ``prompt_vars`` / ``dashboard_state`` /
+   ``task_desc``)。dashboard 场景下, env 在这里强制之前变为可选的字段
+   现在必须已经填好了。
+6. 调用 ``init_output_dir`` 创建 per-run scratch 目录并挂 ``run.log``。
+7. 调用 ``env_spec.init_runtime(args, output_dir)`` —— env 自己 spawn
+   ``env_server`` + ``vla_server`` (或通过 ``--env-endpoint`` /
+   ``--vla-endpoint`` 连到已在跑的实例), 返回
+   ``(daemons, primitives_kwargs)``。
+8. 通过 env 的 ``get_toolkit(primitives_kwargs=...)`` 工厂构造 **toolkit**。
+9. 通过 ``rpent.planner.base.build_planner`` 构造 **planner**,
+   根据 ``--planner`` 选出 ``api_loop.py`` / ``claude_code.py`` /
    ``codex.py`` 之一。
-7. 跑 tool-calling 循环; 如果开了 ``--dashboard`` 就 stream 到 dashboard;
-   结束时写出 ``<output_dir>/transcript_*.json`` 和
-   ``<output_dir>/episode.mp4``。
+10. 跑 tool-calling 循环; 如果开了 ``--dashboard`` 就 stream 到 dashboard;
+    结束时写出 ``<output_dir>/transcript_*.json`` 和
+    ``<output_dir>/episode.mp4``。
 
 Runner 有意保持薄: 一切与 env 相关的东西在 ``robots/<env>/`` 下,
-一切与 brain 相关的东西在 ``rpent/cerebrum/`` 下。
+一切与 brain 相关的东西在 ``rpent/planner/`` 下。main.py 不 import
+任何 env-specific 的类或脚本。
 
 Env 侧的注册表
 --------------
@@ -121,16 +132,27 @@ Env 侧的注册表
 .. code-block:: python
 
    # robots/myenv/__init__.py
-   def get_env_spec() -> EnvSpec: ...
+   def get_env_spec() -> EnvSpec: ...           # 标识 + prompts + runner 钩子
    def get_toolkit(*, primitives_kwargs, video_path=None): ...
+
+``EnvSpec`` 有五个字段:
+
+- ``name`` / ``prompts`` —— env 标识与 :class:`PromptBundle`。
+- ``add_cli_args(parser, use_dashboard) -> None`` —— 把 env 的 flag 注册
+  到共享 argparse parser。``use_dashboard`` 控制原本必填的 flag 是否保持
+  可选 (dashboard 场景由表单填)。
+- ``parse_config(args) -> RunConfig`` —— 校验最终 ``args``
+  (dashboard 之后), 返回派生的 per-run 标识。
+- ``init_runtime(args, output_dir) -> (daemons, primitives_kwargs)`` ——
+  spawn env / VLA 子进程, 返回 toolkit 输入。
 
 env 是 **没有中央列表** 的。把包放到 ``robots/`` 下就行。这也是新增
 机器人时用的机制 (见 :doc:`add_robot`)。
 
-Cerebrum 接口
--------------
+Planner 接口
+------------
 
-每个 cerebrum 实现同一个很小的接口 (见 ``rpent.cerebrum.base``):
+每个 planner 实现同一个很小的接口 (见 ``rpent.planner.base``):
 
 - 接受渲染好的 ``prompt_bundle`` (system + user 分节)。
 - 接受一个 ``toolkit`` (暴露 tool schema 和 ``dispatch`` 方法)。
@@ -138,9 +160,9 @@ Cerebrum 接口
 - 把每个 tool 返回值以多模态上下文喂回。
 - 遇到 ``finish`` 或触达上限时终止。
 
-抽象就这些。三个内置 cerebrum 只在 *如何满足契约* 上不同 —— 用户视角
+抽象就这些。三个内置 planner 只在 *如何满足契约* 上不同 —— 用户视角
 见 :doc:`../usage/configure_planner`, 源码见
-``rpent/cerebrum/api_loop.py`` / ``claude_code.py`` / ``codex.py``。
+``rpent/planner/api_loop.py`` / ``claude_code.py`` / ``codex.py``。
 
 Toolkit 接口
 ------------
@@ -162,17 +184,22 @@ Toolkit 接口
 传输层
 ------
 
-内置支持两种编码:
+内置支持两种编码, 通过 server 端 ``--transport {http,socket}``
+(默认 ``http``) 选择, client 端由 ``--env-endpoint`` /
+``--vla-endpoint`` 里的 protocol 前缀对应:
 
-- **Pickle-framed socket RPC** (``rpent.utils.socket_rpc``) —— 所有
-  env_server 以及 RoboCasa vla_server 都走它。适合历史堆叠的嵌套
-  numpy dict (RLDX obs) 和 env_server 之间宽泛、形状多变的状态载荷。
-- **HTTP** —— LIBERO vla_server 用, 走 Pi0.5 的扁平
-  ``image+state → action`` 载荷。方便做标准负载均衡, 也方便
-  ``--vla-endpoint`` 式复用。
+- **HTTP** (``rpent.utils.http_rpc``) —— JSON body 走
+  ``POST /call``, 方便做标准负载均衡, 也方便跨语言 client。
+  Numpy 数组在 wire 上带标签 ``{"__ndarray__": <base64>, "dtype": ..., "shape": [...]}``。
+- **Pickle-framed socket RPC** (``rpent.utils.socket_rpc``) ——
+  适合历史堆叠的嵌套 numpy dict 和宽泛、形状多变的载荷 (JSON 重编码
+  在这种情况下太浪费)。
 
-新增一个传输只需要实现两个方法的 ``RpcClient`` 接口
-(``call(method, args, kwargs, timeout_s)``); toolkit 和 cerebrum 不用动。
+Server 端继承 :class:`rpent.utils.rpc.RpcFacade` 并实现
+``_dispatch(method, args, kwargs)`` 即可; base 负责 shutdown、healthz、
+transport 绑定、感知父进程死亡、以及干净收尾。新增一个传输只需要实现
+两个方法的 ``RpcClient`` 接口 (``call(method, args, kwargs, timeout_s)``);
+toolkit 和 planner 不用动。
 
 Dashboard (可选)
 ----------------

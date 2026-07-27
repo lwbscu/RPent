@@ -4,9 +4,10 @@
 
 <div align="center">
 <a href="https://arxiv.org/abs/2607.08448"><img src="https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv"></a>
-<a href="https://github.com/RLinf/RPent"><img src="https://img.shields.io/badge/GitHub-RPent-181717?logo=github"></a>
-<a href="https://github.com/RLinf/RPent"><img src="https://img.shields.io/badge/Code-RPent-blue?logo=github"></a>
 <a href="https://huggingface.co/RLinf"><img src="https://img.shields.io/badge/HuggingFace-yellow?logo=huggingface&logoColor=white" alt="Hugging Face"></a>
+<a href="https://rpent.readthedocs.io/en/latest/"><img src="https://img.shields.io/badge/Documentation-Purple?color=8A2BE2&logo=readthedocs"></a>
+<a href="https://rpent.readthedocs.io/zh-cn/latest/"><img src="https://img.shields.io/badge/中文文档-red?logo=readthedocs"></a>
+<a href="https://github.com/RLinf/misc/blob/main/pic/rpent_wechat.png?raw=true"><img src="https://img.shields.io/badge/微信-green?logo=wechat&amp"></a>
 </div>
 
 <div align="center">
@@ -34,13 +35,13 @@ RPent is built upon three core design principles: **service-oriented, standardiz
 
 ## Feature Matrix
 
-<table width="100%">
+<table width="100%" style="width: 100%; table-layout: auto; border-collapse: collapse;">
   <thead align="center" valign="bottom">
     <tr>
-      <th width="26%">Agentic Planner</th>
-      <th width="28%">Action Primitive</th>
-      <th width="26%" align="left">Simulator</th>
-      <th width="20%">Real World</th>
+      <th style="min-width: 300px;">Agentic Planner</th>
+      <th style="min-width: 340px;">Action Primitive</th>
+      <th style="min-width: 300px; text-align: left;">Simulator</th>
+      <th style="min-width: 260px;">Real World</th>
     </tr>
   </thead>
   <tbody valign="top">
@@ -49,17 +50,17 @@ RPent is built upon three core design principles: **service-oriented, standardiz
         <ul style="margin-left: 0; padding-left: 16px;">
           <li>Claude Code ✅</li>
           <li>Codex ✅</li>
-          <li>Custom planner ✅</li>
+          <li>Custom Planner ✅</li>
         </ul>
       </td>
       <td>
         <ul style="margin-left: 0; padding-left: 16px;">
-          <li><b>VLA manipulation</b></li>
+          <li><b>VLA</b></li>
           <ul>
             <li>Pi0.5 ✅</li>
             <li>RLDX-1</li>
           </ul>
-          <li><b>WAM manipulation</b></li>
+          <li><b>WAM</b></li>
           <ul>
             <li>DreamZero</li>
           </ul>
@@ -68,7 +69,6 @@ RPent is built upon three core design principles: **service-oriented, standardiz
       <td style="text-align: left; padding-left: 8px;">
         <ul style="margin-left: 0; padding-left: 16px;">
           <li>LIBERO-PRO ✅</li>
-          <li>BEHAVIOR-1K (R1Pro) ✅</li>
           <li>RoboCasa </li>
         </ul>
       </td>
@@ -84,47 +84,57 @@ RPent is built upon three core design principles: **service-oriented, standardiz
 
 ## Quick Start
 
-**1. Install RPent with a single `pip install`.** 
+**1. Install RPent with a single `pip install`.**
 
 ```bash
 git clone https://github.com/RLinf/RPent rpent && cd rpent
 pip install -e ".[full]"
 ```
 
-`.[full]` is the default end-to-end stack (openpi Pi0.5 VLA + LIBERO-PRO simulator on the RLinf runtime). 
-Pick a narrower extra if you don't need the whole stack:
+`.[full]` is the default end-to-end stack (openpi Pi0.5 VLA + LIBERO-PRO simulator + SAM 3.0 on the RLinf runtime).
+If you don't need the whole stack, see the [installation docs](https://rpent.readthedocs.io/en/latest/rst_source/installation.html) for narrower extras.
 
-| Extra | Installs |
-| --- | --- |
-| `.[full]` | `rlinf` + `openpi` + `libero-pro` — the default run stack |
-| `.[libero-pro]` | Base LIBERO + LIBERO-PRO simulator |
-| `.[libero-plus]` | Base LIBERO + LIBERO-plus simulator |
-| `.[libero]` | Base LIBERO only |
-| `.[openpi]` | openpi VLA only |
-| `.[rlinf]` | RLinf runtime only |
-
-**2. Configure keys and checkpoints, then run.**
+**2. Download the LIBERO-PRO simulator assets.**
 
 ```bash
-# LLM API keys (the `api` cerebrum)
+liberopro-download-assets --skip-existing
+```
+
+> 💡 Slow connection to Hugging Face? Download through the mirror: `HF_ENDPOINT=https://hf-mirror.com liberopro-download-assets --skip-existing`.
+
+See the [installation docs](https://rpent.readthedocs.io/en/latest/rst_source/installation.html) for other simulators.
+
+**3. Configure keys and checkpoints, then run.**
+
+```bash
+# Anthropic key; no need to export the base url if you use the official endpoint.
 export ANTHROPIC_BASE_URL=https://xxx
 export ANTHROPIC_API_KEY=sk-xxx
-export OPENAI_BASE_URL=https://xxx
-export OPENAI_API_KEY=sk-xxx
 
 # VLA checkpoint — download from
-# https://huggingface.co/datasets/RLinf/rlinf-pi05-libero-130-fullshot-sft
+# https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-130-fullshot-SFT
 export PI05_CHECKPOINT_PATH=/path/to/rlinf-pi05-libero-130-fullshot-sft
+# SAM 3.0 checkpoint — download from
+# https://huggingface.co/facebook/sam3
+# https://modelscope.cn/models/facebook/sam3
+export SAM3_CHECKPOINT_PATH=/path/to/sam3/sam3.pt
 export LIBERO_TYPE=pro
 export CUDA_VISIBLE_DEVICES=0
 
-# Run one task: libero_object_swap, task 2, seed 0, using the `api` cerebrum
-# with an Anthropic model and an 8192-token cap.
-#   • OpenAI-compatible chat endpoints:  --model openai-chat:glm-5.2
-#   • OpenAI responses endpoints:        --model openai:gpt-5.5
-#   • claude_code / codex cerebrums:     no provider prefix, e.g. --model claude-opus-4-8
-rpent --suite libero_object_swap --task 2 --seed 0 \
-  --cerebrum api --model anthropic:claude-opus-4-8 --max-tokens 8192
+# Run one task: libero_object_swap, task 2, seed 0, using the `claude_code` planner.
+rpent --env libero --suite libero_object_swap --task 2 --seed 0 \
+  --planner claude_code --model claude-opus-4-8
+```
+
+See the [planner docs](https://rpent.readthedocs.io/en/latest/rst_source/usage/configure_planner.html) to configure other planners (`api`, `codex`) and model providers.
+
+### Interactive CLI mode
+
+Add `--interactive` (`-i`) to steer the agent live from your terminal. At the `you>` prompt, the built-in task is pre-filled — press Enter to use it or replace it with your own — then type any message while it runs to steer the agent at the next turn (`/help` lists commands; `/quit` or Ctrl-D ends). Requires an interactive terminal (TTY).
+
+```bash
+rpent --env libero --suite libero_object_swap --task 2 --seed 0 \
+  --planner claude_code --model claude-opus-4-8 --interactive
 ```
 
 ### Live Dashboard
@@ -132,62 +142,42 @@ rpent --suite libero_object_swap --task 2 --seed 0 \
 Add `--dashboard` to open a browser monitor for the run. It boots a launcher screen where you pick the config, then streams reasoning, live views, and the action timeline. Use `--dashboard-language zh-cn` for the Chinese UI.
 
 ```bash
-rpent --dashboard --dashboard-language zh-cn \
-  --suite libero_goal_task --task 1 --seed 0 --cerebrum claude_code
+rpent --env libero --dashboard --dashboard-language zh-cn \
+  --suite libero_goal_task --task 1 --seed 0 --planner claude_code
 ```
 
-### RoboCasa
-
-RoboCasa uses a separate entrypoint and setup guide.
-
-```bash
-bash scripts/setup_robocasa.sh                                # one-time setup
-bash scripts/run_robocasa.sh PickPlaceCounterToCabinet 0 0    # <task> <gpu> <seed>
-```
-
-See [SETUP_ROBOCASA.zh.md](docs/SETUP_ROBOCASA.zh.md) for the full RoboCasa365 + RLDX-1 walkthrough.
-
-### BEHAVIOR
-
-BEHAVIOR uses a fresh Codex SDK context and an owned OmniGibson/Pi0.5 process
-stack. The checked-in serial runner evaluates the ordered public
-`turning_on_radio` slice one instance at a time, with no automatic retry:
-
-```bash
-python scripts/run_behavior_serial_eval.py --split official_first10 \
-  --cuda-device 0 --model YOUR_CODEX_MODEL \
-  --policy-checkpoint "$PI05_CHECKPOINT_PATH" \
-  --output-root /path/to/new-empty-eval-root
-```
-
-See [the BEHAVIOR guide](robots/behavior/README.md) for installation, prompt,
-checkpoint, success, and reproducibility rules.
+For more detailed documentation, see the [RPent documentation](https://rpent.readthedocs.io/en/latest/).
 
 ## Key CLI Options
 
-| Flag | Default | Description |
-| --- | --- | --- |
-| `--suite` | — (required) | Task suite, e.g. `libero_object_task`, `libero_spatial_swap` |
-| `--task` | — (required) | Task id within the suite |
-| `--seed` | `0` | Random seed |
-| `--cerebrum` | `api` | Reasoning brain: `api` \| `claude_code` \| `codex` |
-| `--model` | — | Model id; for `api`, prefix the provider (`anthropic:…`, `openai:…`, `openai-chat:…`) |
-| `--max-turns` | `100` | Max agent turns |
-| `--max-tokens` | `8192` | Max tokens per LLM reply |
-| `--max-episode-steps` | `10000` | Max env steps |
-| `--libero-type` | `LIBERO_TYPE` or `pro` | LIBERO variant: `standard` \| `pro` \| `plus` |
-| `--cuda-device` | inherited | GPU device(s) exposed to the env / vla servers |
-| `--dashboard` | off | Start the local dashboard for this run |
-| `--dashboard-language` | `en` | Dashboard UI language: `en` \| `zh-cn` |
-| `--vla-endpoint` | — | Reuse an already-running vla_server instead of spawning one |
-| `--no-driver` | off | Attach to an existing env_server / vla_server |
-
-## Documentation
-
-- [Adding a new environment](https://rpent.readthedocs.io/en/latest/rst_source/extending/new_env.html) — plug a new simulator / robot into the runner ([中文](https://rpent.readthedocs.io/zh-cn/latest/rst_source/extending/new_env.html)).
-- [RoboCasa setup](docs/SETUP_ROBOCASA.zh.md) — RoboCasa365 + RLDX-1 install and run guide.
-- [BEHAVIOR evaluation](robots/behavior/README.md) — R1Pro + Pi0.5 + Codex SDK, strict serial public-instance protocol.
-- [`docs/`](docs/README.md) — local Sphinx build and preview instructions.
+<table width="100%" style="width: 100%; table-layout: auto; border-collapse: collapse;">
+  <thead align="center" valign="bottom">
+    <tr>
+      <th style="min-width: 160px; text-align: left;">Flag</th>
+      <th style="min-width: 120px;">Default</th>
+      <th style="min-width: 360px;">Description</th>
+    </tr>
+  </thead>
+  <tbody valign="top">
+    <tr><td><code>--env</code></td><td>— (required)</td><td>Environment backend. Currently <code>libero</code>.</td></tr>
+    <tr><td><code>--suite</code></td><td>— (required)</td><td>Task suite, e.g. <code>libero_object_task</code>, <code>libero_spatial_swap</code></td></tr>
+    <tr><td><code>--task</code></td><td>— (required)</td><td>Task id within the suite</td></tr>
+    <tr><td><code>--seed</code></td><td><code>0</code></td><td>Random seed</td></tr>
+    <tr><td><code>--planner</code></td><td><code>api</code></td><td>Reasoning brain: <code>api</code> | <code>claude_code</code> | <code>codex</code></td></tr>
+    <tr><td><code>--model</code></td><td>—</td><td>Model id; for <code>api</code>, prefix the provider (<code>anthropic:…</code>, <code>openai:…</code>, <code>openai-chat:…</code>)</td></tr>
+    <tr><td><code>--max-turns</code></td><td><code>100</code></td><td>Max agent turns</td></tr>
+    <tr><td><code>--max-tokens</code></td><td><code>8192</code></td><td>Max tokens per LLM reply</td></tr>
+    <tr><td><code>--no-images</code></td><td>off</td><td>Text-only mode: never send image bytes (for models that reject image input)</td></tr>
+    <tr><td><code>--max-episode-steps</code></td><td><code>10000</code></td><td>Max env steps</td></tr>
+    <tr><td><code>--libero-type</code></td><td><code>LIBERO_TYPE</code> or <code>pro</code></td><td>LIBERO variant: <code>standard</code> | <code>pro</code> | <code>plus</code></td></tr>
+    <tr><td><code>--cuda-device</code></td><td>inherited</td><td>GPU device(s) exposed to the env / VLA / SAM3 servers</td></tr>
+    <tr><td><code>--dashboard</code></td><td>off</td><td>Start the local dashboard for this run</td></tr>
+    <tr><td><code>--dashboard-language</code></td><td><code>en</code></td><td>Dashboard UI language: <code>en</code> | <code>zh-cn</code></td></tr>
+    <tr><td><code>--env-endpoint</code></td><td>— (spawn)</td><td><code>[protocol://]host:port</code> of an existing env_server (<code>protocol=http|socket</code>, default <code>http</code>). If unset, one is spawned locally.</td></tr>
+    <tr><td><code>--vla-endpoint</code></td><td>— (spawn)</td><td><code>[protocol://]host:port</code> of an existing vla_server (same rules). If unset, one is spawned locally.</td></tr>
+    <tr><td><code>--sam3-endpoint</code></td><td>— (spawn)</td><td><code>[protocol://]host:port</code> of an existing RPent SAM3 service (same rules). If unset, one is spawned locally.</td></tr>
+  </tbody>
+</table>
 
 ## Citation and Acknowledgement
 

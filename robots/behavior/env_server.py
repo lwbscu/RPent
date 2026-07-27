@@ -5,17 +5,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import pickle
 import re
 import secrets
-import shutil
 import sys
 import threading
 import time
+import traceback
 from concurrent.futures import Future
 from copy import deepcopy
-from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
@@ -32,57 +32,32 @@ from robots.behavior.camera_geometry import (
     FrameCache,
     camera_point_from_pixel,
     canonical_camera,
+    frame_bound_hand_distance_report,
     load_camera_correction_profiles,
-    transform_point,
+    r1pro_wrist_camera_reference_transforms,
+    rigid_transform_residual,
+    robust_depth_sample,
+    validated_rigid_transform,
 )
 from robots.behavior.planner_executor import (
-    EEF_LINK_BY_HAND,
-    PRESS_EEF_TO_CONTACT_OFFSET_M,
     PlannerExecutor,
-)
-from robots.behavior.post_pick_debug_mirror import (
-    DEBUG_MIRROR_CHECKPOINT_NAME,
-    DEBUG_MIRROR_SCENE_NAME,
-    build_debug_mirror_manifest,
-    validate_debug_mirror_bundle,
-    write_debug_mirror_manifest,
-)
-from robots.behavior.prepress import (
-    BUTTON_FACE_CLASS,
-    CLEAR_SLOTTED_BACK_FACE_CLASS,
-    PREPRESS_AXIAL_STANDOFF_MAX_M,
-    PREPRESS_AXIAL_STANDOFF_MIN_M,
-    PREPRESS_LINE_DISTANCE_MAX_M,
-    PREPRESS_OPPOSITION_ANGLE_MAX_DEG,
-    PRESS_STAGING_AXIAL_STANDOFF_MAX_M,
-    RADIO_LOCAL_BUTTON_CENTER_M,
-    RADIO_LOCAL_BUTTON_FACE_NORMAL,
-    RADIO_LOCAL_UP_AXIS,
-    authorize_prepress_motion,
-    direct_back_to_front_alignment,
-    evaluate_geometry,
-    gate_token,
-    generate_button_goal_pose_candidates,
-    generate_press_staging_pose_candidates,
-    pose_matrix_xyzw,
-    quat_multiply_xyzw,
-    quat_rotate_xyzw,
-    validate_button_declaration,
+    _attachment_identity_status,
+    _quat_rotate_vector_xyzw,
 )
 from robots.behavior.schemas import (
-    CONTROL_MODES,
     ENV_ACTION_SEGMENTS,
-    FULL_TASK_VLA_MODE,
-    HYBRID_VLM_PI0_MODE,
-    PI0_NAV_PICK_VLA_MODE,
-    PI0_PICK_VLA_MODE,
-    PLANNER_TOOLS_MODE,
     POLICY_STATE_SEGMENTS,
-    STAGE3_PRESS_TOOL_NAMES,
-    TEMP_STATE_CHECKPOINT_PATTERN,
+    RAW_PROPRIO_SEGMENTS,
+    ROTATE_WRIST_RUNTIME_TIMEOUT_S,
     extract_policy_state,
     segment_ranges,
     validate_action_chunk,
+    validate_relative_navigation_motion,
+)
+from robots.behavior.task_specs import (
+    TURNING_ON_RADIO_TASK_SPEC,
+    BehaviorTaskSpec,
+    resolve_task_spec,
 )
 from rpent.utils.config import get_repo_root, get_rlinf_repo_path
 from rpent.utils.logging import get_logger
@@ -94,164 +69,47 @@ RLINF_ROOT = get_rlinf_repo_path() or (RPENT_ROOT.parent / "RLinf_agentic_push")
 if str(RLINF_ROOT) not in sys.path:
     sys.path.insert(0, str(RLINF_ROOT))
 
-_SHARED_ENV_RPC_METHODS = frozenset({"get_env_meta", "reset"})
-_PLANNER_ENV_RPC_METHODS = frozenset(
+_ENV_RPC_METHODS = frozenset(
     {
+        "get_env_meta",
+        "guard_tool_call",
+        "reset",
+        "prepare_vla_invocation",
+        "current_observation",
+        "finalize_paused_runtime",
         "observe",
         "pixel_to_world",
         "navigate_to",
         "move_to",
-        "pick",
         "rotate_wrist",
+        "close",
+        "open",
         "press",
-        "release",
+        "pi0_nav_pick_chunk_step",
+        "save_robot_state_checkpoint",
     }
 )
-_ENV_RPC_METHODS_BY_MODE = {
-    FULL_TASK_VLA_MODE: frozenset({"chunk_step"}),
-    PI0_PICK_VLA_MODE: frozenset({"pi0_chunk_step"}),
-    PLANNER_TOOLS_MODE: _PLANNER_ENV_RPC_METHODS,
-    HYBRID_VLM_PI0_MODE: (_PLANNER_ENV_RPC_METHODS - {"pick", "navigate_to"})
-    | frozenset(
-        {
-            "current_observation",
-            "pi0_chunk_step",
-            "pi0_navigate_to_chunk_step",
-            "restore_robot_state_checkpoint",
-            "save_robot_state_checkpoint",
-        }
-    ),
-    PI0_NAV_PICK_VLA_MODE: frozenset(
-        {
-            "current_observation",
-            "declare_button_visibility",
-            "evaluate_prepress_geometry",
-            "finalize_paused_runtime",
-            "inspect_post_pick_state",
-            "inspect_toggle_geometry",
-            "pixel_to_world",
-            "prepress_move_to",
-            "prepress_rotate_wrist",
-            "observe",
-            "pi0_nav_pick_chunk_step",
-            "restore_robot_state_checkpoint",
-            "save_prepress_checkpoint",
-            "save_robot_state_checkpoint",
-            "post_pick_close_press_gripper",
-            "post_pick_direct_finger_toggle",
-            "post_pick_recenter_held_button",
-            "post_success_hold_frames",
-        }
-    ),
-}
 
-_PLANNER_CONTROL_MODES = frozenset(
-    {PLANNER_TOOLS_MODE, HYBRID_VLM_PI0_MODE, PI0_NAV_PICK_VLA_MODE}
-)
-_PLANNER_POSITION_START_MODES = frozenset({PLANNER_TOOLS_MODE, HYBRID_VLM_PI0_MODE})
-_AUDIT_VIDEO_MODES = frozenset(
+_CONTROLLER_VLA = "vla"
+_CONTROLLER_PLANNER = "planner"
+_CONTROLLER_SWITCHING = "switching"
+_CONTROLLER_FAILED = "failed"
+_CONTROLLER_FROZEN = "frozen"
+_PHYSICAL_GRIPPER_CLOSED_M = 0.003
+_HELD_CLOSE_LATCH_MAX = -0.99
+_HELD_ATTACHMENT_CONFIRMATION_STEPS = 10
+_PI0_NAV_PICK_DISABLE_RECEIPT_FILENAME = "pi0_nav_pick_disable_receipt.json"
+_HAND_GEOMETRY_SYNC_RENDER_ITERATIONS = 3
+_HAND_GEOMETRY_TRANSLATION_TOLERANCE_M = 0.001
+_HAND_GEOMETRY_ROTATION_TOLERANCE_DEG = 0.25
+_HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M = 0.0001
+_FRAME_REVIEW_ASSESSMENTS = frozenset(
     {
-        PLANNER_TOOLS_MODE,
-        PI0_PICK_VLA_MODE,
-        HYBRID_VLM_PI0_MODE,
-        PI0_NAV_PICK_VLA_MODE,
+        "target_bearing_surface_confirmed",
+        "opposite_surface_confirmed",
+        "side_or_indeterminate",
     }
 )
-
-RESTORE_RENDER_SETTLE_FRAMES = 3
-MAX_TEMP_STATE_CHECKPOINTS = 4
-HANDOFF_VALIDATION_FRAMES = 8
-HANDOFF_GRIPPER_OPENING_MAX = 0.045
-HANDOFF_RADIO_LIFT_MIN_M = 0.04
-HANDOFF_POST_RELOAD_LIFT_TOLERANCE_M = 0.002
-HANDOFF_SUPPORT_GAP_MIN_M = 0.03
-HANDOFF_WINDOW_MOTION_MIN_M = 0.008
-HANDOFF_RELATIVE_DRIFT_MAX_M = 0.015
-HANDOFF_COMOTION_RESIDUAL_MAX_M = 0.005
-HANDOFF_MASK_GAP_MIN_PX = 3.0
-HANDOFF_RELATIVE_ANGULAR_DRIFT_MAX_RAD = 0.15
-HANDOFF_ARTICULATION_ERROR_MAX_RAD = 0.05
-POST_PICK_DEBUG_SAVE_POLICY = "debug_save_physics_warnings_non_blocking"
-_STRICT_GRASP_WARNING_CODES = frozenset(
-    {
-        "controller_reload_pose_jump",
-        "controller_hold_settling",
-        "episode_status_during_handoff",
-        "post_reload_grasp_not_strict",
-        "held_object_stability_not_strict",
-        "current_grasp_validator_unavailable",
-        "current_grasp_not_strict",
-        "post_pick_handoff_diagnostic_failed",
-        "insufficient_handoff_horizon",
-    }
-)
-
-_HANDOFF_VLA_ACTIVE = "VLA_ACTIVE"
-_HANDOFF_CHECKPOINTING = "CHECKPOINTING"
-_HANDOFF_CONTROLLER_RELOAD = "CONTROLLER_RELOAD"
-_HANDOFF_STABLE_VALIDATION = "STABLE_VALIDATION"
-_HANDOFF_PAUSED = "PAUSED"
-_HANDOFF_FAILED = "FAILED"
-_HANDOFF_OFFICIAL_SUCCESS = "OFFICIAL_SUCCESS"
-
-
-def _post_pick_warning(
-    code: str,
-    message: str,
-    *,
-    metrics: Any | None = None,
-) -> dict[str, Any]:
-    """Build one wire-stable diagnostic that never decides persistence."""
-
-    warning = {"code": str(code), "message": str(message)}
-    if metrics is not None:
-        warning["metrics"] = _wire_safe(metrics)
-    return warning
-
-
-def _handoff_controller_hold_warning(metrics: dict[str, Any]) -> bool:
-    """Controller settling is diagnostic-only after the reload jump gate."""
-
-    return bool(
-        float(metrics["base_xy_error_m"]) > 0.02
-        or float(metrics["base_yaw_error_rad"]) > 0.03
-        or float(metrics["articulation_error_rad"]) > HANDOFF_ARTICULATION_ERROR_MAX_RAD
-    )
-
-
-def _handoff_held_object_stable(
-    *, relative_drift_m: float, angular_drift_rad: float
-) -> bool:
-    """Hard handoff gate after reload: the held radio must remain stable."""
-
-    return bool(
-        float(relative_drift_m) <= HANDOFF_RELATIVE_DRIFT_MAX_M
-        and float(angular_drift_rad) <= HANDOFF_RELATIVE_ANGULAR_DRIFT_MAX_RAD
-    )
-
-
-def _post_reload_grasp_stable(
-    *, selected: dict[str, Any], other: dict[str, Any]
-) -> bool:
-    """Allow millimetric controller settling after a strict Pi0 grasp pass."""
-
-    criteria = selected.get("criteria")
-    if not isinstance(criteria, dict):
-        return False
-    lift = float(selected.get("radio_lift_m", -np.inf))
-    required = {
-        "opening_strict",
-        "support_gap",
-        "selected_attachment_or_two_finger_contact",
-        "other_hand_no_assisted_attachment",
-        "other_hand_no_backend_attachment",
-        "other_hand_no_radio_contact",
-    }
-    return bool(
-        lift >= HANDOFF_RADIO_LIFT_MIN_M - HANDOFF_POST_RELOAD_LIFT_TOLERANCE_M
-        and all(bool(criteria.get(name)) for name in required)
-        and not bool(other.get("instantaneous_pass"))
-    )
 
 
 def _numpy_tree(value: Any) -> Any:
@@ -269,18 +127,6 @@ def _numpy_tree(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_numpy_tree(item) for item in value)
     return value
-
-
-def _settle_visual_pipeline_after_restore(
-    simulator: Any, *, render_iterations: int = RESTORE_RENDER_SETTLE_FRAMES
-) -> None:
-    """Advance Kit's async renderer without advancing physics after restore."""
-
-    iterations = int(render_iterations)
-    if iterations < 3:
-        raise ValueError("restored RGB-D synchronization requires at least 3 renders")
-    for _ in range(iterations):
-        simulator.render()
 
 
 def _wire_safe(value: Any) -> Any:
@@ -342,51 +188,36 @@ def _write_json_atomic(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
+def _canonical_json_bytes(value: Any) -> bytes:
+    """Encode runtime receipt material deterministically without repr fallbacks."""
+
+    def encode_unknown(item: Any) -> Any:
+        if isinstance(item, np.ndarray):
+            return item.tolist()
+        if isinstance(item, np.generic):
+            return item.item()
+        if isinstance(item, bytes):
+            return {"__bytes_hex__": item.hex()}
+        raise TypeError(
+            "unsupported runtime receipt value: "
+            f"{type(item).__module__}.{type(item).__qualname__}"
+        )
+
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=encode_unknown,
+    ).encode("utf-8")
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-def _normalized_scene_name(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
-
-
-def _minimum_mask_gap_px(first: np.ndarray, second: np.ndarray) -> float:
-    """Return exact Euclidean pixel separation, failing closed on empty masks."""
-
-    first_mask = np.asarray(first, dtype=bool)
-    second_mask = np.asarray(second, dtype=bool)
-    if first_mask.shape != second_mask.shape or first_mask.ndim != 2:
-        raise ValueError("instance masks must be equal-shape 2D arrays")
-    if not first_mask.any() or not second_mask.any():
-        raise ValueError("instance mask is empty")
-    if np.logical_and(first_mask, second_mask).any():
-        return 0.0
-    try:
-        from scipy.ndimage import distance_transform_edt
-    except Exception as exc:  # pragma: no cover - production dependency probe
-        raise RuntimeError("scipy distance transform is unavailable") from exc
-    distances = distance_transform_edt(~second_mask)
-    gap = float(np.min(distances[first_mask]))
-    if not np.isfinite(gap):
-        raise RuntimeError("instance mask gap is non-finite")
-    return gap
-
-
-def _quaternion_angle_rad(first_xyzw: Any, second_xyzw: Any) -> float:
-    first = np.asarray(first_xyzw, dtype=np.float64).reshape(4)
-    second = np.asarray(second_xyzw, dtype=np.float64).reshape(4)
-    if not np.isfinite(first).all() or not np.isfinite(second).all():
-        raise ValueError("quaternion contains NaN or Inf")
-    first_norm = float(np.linalg.norm(first))
-    second_norm = float(np.linalg.norm(second))
-    if first_norm <= 1e-9 or second_norm <= 1e-9:
-        raise ValueError("quaternion norm is zero")
-    dot = float(np.dot(first / first_norm, second / second_norm))
-    return float(2.0 * np.arccos(np.clip(abs(dot), 0.0, 1.0)))
 
 
 def _single_observation(obs: dict[str, Any]) -> dict[str, Any]:
@@ -442,10 +273,15 @@ def _payload_camera_name(path: str) -> str | None:
 
 
 def _payload_depth(payload: dict[str, Any]) -> Any | None:
-    for key in ("depth_linear", "depth", "depths"):
-        if key in payload:
-            return payload[key]
-    return None
+    """Return only OmniGibson metric optical-axis depth.
+
+    ``depth_linear`` is ``distance_to_image_plane``.  OmniGibson's distinct
+    ``depth`` modality is ``distance_to_camera`` (Euclidean ray range), so
+    falling back to it would corrupt pinhole back-projection by treating range
+    as optical-axis Z.
+    """
+
+    return payload.get("depth_linear")
 
 
 def _payload_rgb(payload: dict[str, Any]) -> Any | None:
@@ -596,7 +432,7 @@ def _sensor_intrinsics(
     return None
 
 
-def _sensor_camera_to_world(sensor: Any) -> np.ndarray | None:
+def _sensor_render_camera_to_world(sensor: Any) -> np.ndarray | None:
     # Kit publishes the render-synchronous world-to-camera matrix here.  A
     # sensor pose getter can already reflect a newer articulation state because
     # the renderer is asynchronous, so prefer this exact frame metadata when
@@ -609,6 +445,13 @@ def _sensor_camera_to_world(sensor: Any) -> np.ndarray | None:
             return np.linalg.inv(matrix.T)
     except Exception:
         pass
+    return None
+
+
+def _sensor_camera_to_world(sensor: Any) -> np.ndarray | None:
+    render_matrix = _sensor_render_camera_to_world(sensor)
+    if render_matrix is not None:
+        return render_matrix
     for name in ("camera_to_world", "camera_to_world_matrix"):
         try:
             value = getattr(sensor, name)
@@ -647,11 +490,10 @@ def _scalar_bool(value: Any) -> bool:
 
 
 def _raw_success(info: Any) -> bool:
-    return bool(
-        isinstance(info, dict)
-        and isinstance(info.get("done"), dict)
-        and info["done"].get("success", False)
-    )
+    if not isinstance(info, dict) or not isinstance(info.get("done"), dict):
+        return False
+    value = info["done"].get("success")
+    return bool(value) if isinstance(value, (bool, np.bool_)) else False
 
 
 def _raw_done(info: Any) -> bool:
@@ -664,6 +506,118 @@ def _raw_done(info: Any) -> bool:
         isinstance(value, dict) and bool(value.get("done", False))
         for value in conditions.values()
     )
+
+
+def _strict_wire_bool(value: Any) -> bool | None:
+    """Return a strict scalar boolean without accepting truthy payloads."""
+
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return None
+
+
+def _classify_pi0_terminal_step(
+    *,
+    info: Any,
+    raw_terminated: Any,
+    raw_truncated: Any,
+) -> dict[str, Any]:
+    """Separate predicate-success termination from real Pi0 stop conditions.
+
+    OmniGibson's BEHAVIOR ``PredicateGoal`` is itself a success termination
+    condition, so a normal raw-success step reports ``terminated=True``.  That
+    aggregate flag cannot be used directly when an admitted Pi0 invocation must
+    finish its requested complete chunks.  A success-only predicate termination
+    is therefore soft inside the active invocation.  Timeout, failure
+    conditions, truncation, and malformed/inconsistent terminal envelopes remain
+    hard and fail closed.
+    """
+
+    terminated_flag = _scalar_bool(raw_terminated)
+    truncated_flag = _scalar_bool(raw_truncated)
+    raw_success = _raw_success(info)
+    done = info.get("done") if isinstance(info, dict) else None
+    conditions = done.get("termination_conditions") if isinstance(done, dict) else None
+
+    active_success: list[str] = []
+    active_failure: list[str] = []
+    active_timeout: list[str] = []
+    malformed = False
+    conditions_present = isinstance(conditions, dict) and bool(conditions)
+    if conditions_present:
+        for name, payload in conditions.items():
+            if not isinstance(name, str) or not name or not isinstance(payload, dict):
+                malformed = True
+                continue
+            condition_done = _strict_wire_bool(payload.get("done"))
+            condition_success = _strict_wire_bool(payload.get("success"))
+            if condition_done is None or condition_success is None:
+                malformed = True
+                continue
+            if not condition_done:
+                if condition_success:
+                    malformed = True
+                continue
+            if name == "timeout":
+                if condition_success:
+                    malformed = True
+                active_timeout.append(name)
+            elif condition_success:
+                active_success.append(name)
+            else:
+                active_failure.append(name)
+    elif raw_success or terminated_flag or truncated_flag:
+        malformed = True
+
+    info_done = bool(active_success or active_failure or active_timeout)
+    if conditions_present and info_done != bool(terminated_flag or truncated_flag):
+        malformed = True
+    if raw_success != bool(active_success):
+        malformed = True
+
+    hard_truncated = bool(truncated_flag or active_timeout)
+    hard_terminated = bool(active_failure)
+    soft_success_termination = bool(
+        raw_success
+        and active_success
+        and terminated_flag
+        and not truncated_flag
+        and not active_failure
+        and not active_timeout
+        and not malformed
+    )
+    if malformed:
+        hard_terminated = True
+        soft_success_termination = False
+    elif terminated_flag and not soft_success_termination:
+        hard_terminated = True
+    if hard_truncated:
+        soft_success_termination = False
+
+    if malformed:
+        reason = "malformed_or_inconsistent_terminal_envelope"
+    elif hard_truncated:
+        reason = "hard_truncation"
+    elif hard_terminated:
+        reason = "hard_termination"
+    elif soft_success_termination:
+        reason = "soft_predicate_success"
+    else:
+        reason = "running"
+    return {
+        "raw_terminated": bool(terminated_flag),
+        "raw_truncated": bool(truncated_flag),
+        "raw_success": bool(raw_success),
+        "info_done": bool(info_done),
+        "soft_success_termination": bool(soft_success_termination),
+        "hard_terminated": bool(hard_terminated),
+        "hard_truncated": bool(hard_truncated),
+        "terminal_envelope_malformed": bool(malformed),
+        "terminal_classification_reason": reason,
+        "active_success_conditions": active_success,
+        "active_failure_conditions": active_failure,
+        "active_timeout_conditions": active_timeout,
+    }
 
 
 def _bootstrap_template_path(
@@ -682,6 +636,52 @@ def _bootstrap_template_path(
             f"BEHAVIOR bootstrap scene template not found: {template_path}"
         )
     return template_path
+
+
+def _resolve_env_task_identity(
+    meta: dict[str, Any],
+) -> tuple[BehaviorTaskSpec, tuple[str, int, int]]:
+    """Validate the task-scoped native identity before constructing the env."""
+
+    task_spec = resolve_task_spec(
+        task_name=str(meta["task_name"]),
+        task_index=int(meta["task"]),
+    )
+    activity_definition_id = int(meta["activity_definition_id"])
+    if activity_definition_id != task_spec.activity_definition_id:
+        raise ValueError(
+            f"{task_spec.task_name} requires activity_definition_id "
+            f"{task_spec.activity_definition_id}, got {activity_definition_id}"
+        )
+    scene_model = str(meta["scene_model"])
+    if scene_model != task_spec.scene_model:
+        raise ValueError(
+            f"{task_spec.task_name} requires scene_model {task_spec.scene_model!r}, "
+            f"got {scene_model!r}"
+        )
+    activity_instance_id = int(meta["activity_instance_id"])
+    if activity_instance_id <= 0:
+        raise ValueError("activity_instance_id must be positive")
+    public_seed = int(meta["public_seed"])
+    if public_seed < 0:
+        raise ValueError("public_seed must be non-negative")
+    mapped_public_seed = task_spec.public_seed_for_instance(activity_instance_id)
+    if mapped_public_seed is not None and mapped_public_seed != public_seed:
+        raise ValueError(
+            f"{task_spec.task_name} instance {activity_instance_id} is public "
+            f"s{mapped_public_seed}, not s{public_seed}"
+        )
+    instance_dir = Path(str(meta["activity_instance_dir"])).expanduser()
+    if instance_dir.name != task_spec.state_dir_name:
+        raise ValueError(
+            f"{task_spec.task_name} requires state directory "
+            f"{task_spec.state_dir_name!r}, got {instance_dir.name!r}"
+        )
+    return task_spec, (
+        task_spec.task_name,
+        activity_definition_id,
+        activity_instance_id,
+    )
 
 
 def _load_env_config(args: argparse.Namespace) -> Any:
@@ -730,8 +730,6 @@ def _load_env_config(args: argparse.Namespace) -> Any:
             if modality not in modalities:
                 modalities.append(modality)
         robot_cfg.obs_modalities = modalities
-    _configure_control_mode(cfg, getattr(args, "control_mode", None))
-
     task = cfg.omni_config.task
     task.activity_name = str(args.task_name)
     task.activity_definition_id = int(args.activity_definition_id)
@@ -758,26 +756,6 @@ def _load_env_config(args: argparse.Namespace) -> Any:
     )
     scene.scene_instance = None
     return cfg
-
-
-def _configure_control_mode(cfg: Any, control_mode: str | None) -> None:
-    """Start planner surfaces in position mode; nav-pick starts as raw Pi0."""
-    if control_mode not in _PLANNER_POSITION_START_MODES:
-        return
-    robots = list(cfg.omni_config.robots)
-    if len(robots) != 1 or str(robots[0].type) != "R1Pro":
-        raise ValueError("planner control requires exactly one R1Pro robot")
-    base = robots[0].controller_config.base
-    if str(base.name) != "HolonomicBaseJointController":
-        raise ValueError(
-            "planner control requires OmniGibson HolonomicBaseJointController"
-        )
-    base.motor_type = "position"
-    base.command_input_limits = None
-    base.command_output_limits = None
-    base.use_impedances = False
-    base.isaac_kp = 2_000_000.0
-    base.isaac_kd = 100_000.0
 
 
 def _resize_video_tile(rgb: Any, *, height: int, width: int) -> np.ndarray:
@@ -809,11 +787,10 @@ class BehaviorEnvFacade:
         cfg: Any,
         meta: dict[str, Any],
         output_dir: Path,
-        control_mode: str | None = None,
-        stage3_press_enabled: bool = False,
     ) -> None:
         from rlinf.envs.behavior.behavior_env import BehaviorEnv
 
+        task_spec, task_identity = _resolve_env_task_identity(meta)
         self._env = BehaviorEnv(
             cfg=cfg,
             num_envs=1,
@@ -823,17 +800,79 @@ class BehaviorEnvFacade:
             record_metrics=False,
         )
         self._meta = dict(meta)
-        self._run_nonce = secrets.token_hex(16)
-        self._control_mode = control_mode
-        self._stage3_press_enabled = bool(stage3_press_enabled)
+        self._controller_mode = str(meta.get("controller_mode", "hybrid"))
+        if self._controller_mode not in {"hybrid", "pi0_nav_pick_only"}:
+            raise ValueError("unsupported BEHAVIOR controller mode")
+        self._task_spec = task_spec
+        self._task_identity = task_identity
+        expected_run_nonce = meta.get("expected_run_nonce")
+        if expected_run_nonce is not None and (
+            not isinstance(expected_run_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{32}", expected_run_nonce) is None
+        ):
+            raise ValueError("expected_run_nonce must be 32 lowercase hex characters")
+        self._run_nonce = (
+            expected_run_nonce
+            if isinstance(expected_run_nonce, str)
+            else secrets.token_hex(16)
+        )
+        trace_writer = getattr(self._env, "_write_trace_record", None)
+        if not callable(trace_writer):
+            # Official RLinf keeps the trace file on its in-process
+            # BehaviorProcess in direct mode.
+            trace_writer = getattr(
+                getattr(self._env, "_direct_process", None),
+                "_write_trace_record",
+                None,
+            )
+        if isinstance(expected_run_nonce, str):
+            if not callable(trace_writer):
+                raise RuntimeError(
+                    "expected run nonce requires an action-trace binding writer"
+                )
+            trace_writer(
+                {
+                    "event": "rpent_run_binding",
+                    "run_nonce": self._run_nonce,
+                    "attempt_index": int(meta["attempt_index"]),
+                }
+            )
+        self._attempt_index = int(meta["attempt_index"])
+        if self._attempt_index < 1:
+            raise ValueError("attempt_index must be positive")
+        self._attempt_nonce = secrets.token_hex(16)
+        self._active_vla_invocation: str | None = None
+        self._active_vla_call_index: int | None = None
+        self._pending_vla_visual_authorization: dict[str, Any] | None = None
+        self._pending_vla_attachment_snapshot: dict[str, Any] | None = None
+        self._pending_vla_baseline_internal_authorization = False
+        self._latest_successful_held_rotate_receipt: dict[str, Any] | None = None
+        self._latest_successful_held_rotate_attachment: Any = None
+        self._latest_successful_held_rotate_public_frame_ids: set[str] = set()
+        self._held_rotate_target_surface_review: dict[str, Any] | None = None
+        self._public_capture_sequence = 0
+        self._latest_unconsumed_public_capture_receipt: dict[str, Any] | None = None
+        self._active_rotate_pi0_candidate: dict[str, Any] | None = None
+        self._awaiting_opposite_surface_review: dict[str, Any] | None = None
+        self._completed_opposite_surface_cycles: list[dict[str, Any]] = []
+        self._pi0_nav_pick_disable_receipt: dict[str, Any] | None = None
+        self._pi0_nav_pick_disable_receipt_path = (
+            Path(output_dir) / _PI0_NAV_PICK_DISABLE_RECEIPT_FILENAME
+        )
+        self._motion_in_flight = False
+        self._official_success_latched = False
+        self._official_success_receipt: dict[str, Any] | None = None
+        self._official_success_receipt_path = (
+            Path(output_dir) / "official_success_receipt.json"
+        )
+        self._terminal_failure_receipt: dict[str, Any] | None = None
+        self._terminal_failure_receipt_path = (
+            Path(output_dir) / "terminal_failure_receipt.json"
+        )
         self._output_dir = Path(output_dir)
         self._done = False
         self._env_steps = 0
-        self._video_path = (
-            output_dir / "pi0_nav_pick_episode.mp4"
-            if control_mode == PI0_NAV_PICK_VLA_MODE
-            else output_dir / "episode.mp4"
-        )
+        self._video_path = output_dir / "episode.mp4"
         self._video_writer = None
         self._video_frames = 0
         self._video_error: str | None = None
@@ -848,56 +887,40 @@ class BehaviorEnvFacade:
             ttl_s=60.0,
             correction_profiles=load_camera_correction_profiles(correction_path),
         )
-        self._planner = (
-            PlannerExecutor(
-                env=self,
-                frame_cache=self._frame_cache,
-                output_dir=output_dir,
-            )
-            if self._control_mode in _PLANNER_CONTROL_MODES
-            else None
+        self._planner = PlannerExecutor(
+            env=self,
+            frame_cache=self._frame_cache,
+            output_dir=output_dir,
         )
         self._last_observation: dict[str, Any] | None = None
         self._last_info: Any = None
         self._gripper_latch = {"left": 1.0, "right": 1.0}
-        self._restored_state: dict[str, Any] | None = None
+        self._held_closure_receipts: dict[str, dict[str, Any]] = {}
         self._live_observation_counter = 0
-        self._base_controller_mode = (
-            "velocity"
-            if self._control_mode == PI0_NAV_PICK_VLA_MODE
-            else "position"
-            if self._control_mode in _PLANNER_POSITION_START_MODES
-            else None
-        )
-        self._action_source = (
-            "pi0_vla" if self._control_mode == PI0_NAV_PICK_VLA_MODE else None
-        )
-        self._vla_actions_enabled = self._control_mode == PI0_NAV_PICK_VLA_MODE
-        self._handoff_state = (
-            _HANDOFF_VLA_ACTIVE if self._control_mode == PI0_NAV_PICK_VLA_MODE else None
-        )
-        self._held_hand: str | None = None
-        self._pi0_terminal_success_finalized = False
+        self._visual_checkpoint_counter = 0
+        self._base_controller_mode = "velocity"
+        self._velocity_controller_config: Any = None
+        self._action_source = "pi0_vla"
+        self._vla_actions_enabled = True
+        self._controller_state = _CONTROLLER_VLA
+        self._motion_frozen = False
+        self._next_pi0_chunk_index = 1
         self._reset_completed = False
-        self._handoff_validator_frames: list[dict[str, Any]] = []
-        self._handoff_target_objects: tuple[Any, Any] | None = None
-        self._initial_radio_position: np.ndarray | None = None
-        self._last_instance_id_masks: dict[str, np.ndarray] = {}
         self._last_capture_step: int | None = None
-        self._validator_trace_path = output_dir / "handoff_validator_trace.json"
-        self._state_checkpoint_path = (
-            output_dir / "state_checkpoints" / "state_checkpoint_1.json"
-        )
-        self._paused_runtime_path = output_dir / "paused_runtime.json"
-        self._prepress_context: dict[str, Any] | None = None
-        self._prepress_gate: dict[str, Any] | None = None
-        self._prepress_projection: dict[str, Any] | None = None
-        self._prepress_geometry: dict[str, Any] | None = None
-        self._prepress_motion: dict[str, Any] | None = None
-        self._prepress_plan_certificate: dict[str, Any] | None = None
-        self._prepress_coarse_flip_used = False
-        self._prepress_round = 0
-        self._last_handoff_failure: dict[str, Any] | None = None
+        self._public_observed_frame_ids: set[str] = set()
+        self._latest_public_head_frame_id: str | None = None
+        self._latest_public_observation_lineage: dict[str, Any] | None = None
+        self._projection_receipts: dict[str, dict[str, Any]] = {}
+        self._consumed_projection_receipts: set[str] = set()
+
+    def _active_task_spec(self) -> BehaviorTaskSpec:
+        """Return the selected task contract.
+
+        The fallback exists only for lightweight ``__new__`` unit facades;
+        production construction always resolves and cross-checks ``meta``.
+        """
+
+        return getattr(self, "_task_spec", TURNING_ON_RADIO_TASK_SPEC)
 
     def _robot(self) -> Any | None:
         candidates = [
@@ -925,1386 +948,2001 @@ class BehaviorEnvFacade:
         return None
 
     def _require_planner(self) -> PlannerExecutor:
-        if self._control_mode not in _PLANNER_CONTROL_MODES or self._planner is None:
-            raise RuntimeError(
-                "planner primitives are unavailable outside planner-enabled modes"
-            )
+        if self._planner is None:
+            raise RuntimeError("planner primitives are unavailable")
         return self._planner
 
-    @staticmethod
-    def _object_position(obj: Any) -> np.ndarray:
-        getter = getattr(obj, "get_position_orientation", None)
-        if not callable(getter):
-            raise RuntimeError("scene object has no pose API")
-        position, _orientation = getter()
-        value = np.asarray(_numpy_tree(position), dtype=np.float64).reshape(3)
-        if not np.isfinite(value).all():
-            raise RuntimeError("scene object position is non-finite")
-        return value
+    def _assert_rpc_lifecycle(self, method: str) -> None:
+        """Enforce live lifecycle facts without prescribing a tool order."""
 
-    @staticmethod
-    def _object_pose(obj: Any) -> tuple[np.ndarray, np.ndarray]:
-        getter = getattr(obj, "get_position_orientation", None)
-        if not callable(getter):
-            raise RuntimeError("scene object has no pose API")
-        position, orientation = getter()
-        position_array = np.asarray(_numpy_tree(position), dtype=np.float64).reshape(3)
-        orientation_array = np.asarray(
-            _numpy_tree(orientation), dtype=np.float64
-        ).reshape(4)
-        if (
-            not np.isfinite(position_array).all()
-            or not np.isfinite(orientation_array).all()
+        if bool(getattr(self, "_official_success_latched", False)) or _raw_success(
+            getattr(self, "_last_info", None)
         ):
-            raise RuntimeError("scene object pose is non-finite")
-        norm = float(np.linalg.norm(orientation_array))
-        if norm <= 1e-9:
-            raise RuntimeError("scene object orientation is invalid")
-        return position_array, orientation_array / norm
-
-    @staticmethod
-    def _relative_pose(
-        parent_position: np.ndarray,
-        parent_quat_xyzw: np.ndarray,
-        child_position: np.ndarray,
-        child_quat_xyzw: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return child pose in parent coordinates using xyzw quaternions."""
-
-        def multiply(first: np.ndarray, second: np.ndarray) -> np.ndarray:
-            x1, y1, z1, w1 = first
-            x2, y2, z2, w2 = second
-            return np.asarray(
-                [
-                    w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-                    w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-                    w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-                    w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-                ],
-                dtype=np.float64,
-            )
-
-        inverse = np.asarray(
-            [
-                -parent_quat_xyzw[0],
-                -parent_quat_xyzw[1],
-                -parent_quat_xyzw[2],
-                parent_quat_xyzw[3],
-            ],
-            dtype=np.float64,
-        )
-        delta = child_position - parent_position
-        rotated = multiply(multiply(inverse, np.r_[delta, 0.0]), parent_quat_xyzw)[:3]
-        relative_quat = multiply(inverse, child_quat_xyzw)
-        relative_quat /= np.linalg.norm(relative_quat)
-        return rotated, relative_quat
-
-    @staticmethod
-    def _object_vertical_bounds(obj: Any) -> tuple[float, float]:
-        bbox = getattr(obj, "get_base_aligned_bbox", None)
-        if not callable(bbox):
-            raise RuntimeError("scene object has no base-aligned bounding box")
-        center, _quat, extent, _center_local = bbox(xy_aligned=True)
-        center_array = np.asarray(_numpy_tree(center), dtype=np.float64).reshape(3)
-        extent_array = np.asarray(_numpy_tree(extent), dtype=np.float64).reshape(3)
-        if not np.isfinite(center_array).all() or not np.isfinite(extent_array).all():
-            raise RuntimeError("scene object bounding box is non-finite")
-        if np.any(extent_array <= 0.0):
-            raise RuntimeError("scene object bounding box extent is not positive")
-        return (
-            float(center_array[2] - 0.5 * extent_array[2]),
-            float(center_array[2] + 0.5 * extent_array[2]),
-        )
-
-    def _resolve_handoff_targets(self) -> tuple[Any, Any]:
-        if self._handoff_target_objects is not None:
-            return self._handoff_target_objects
-        instance_dir = Path(str(self._meta["activity_instance_dir"]))
-        instance_path = instance_dir / (
-            f"{self._meta['scene_model']}_task_{self._meta['task_name']}_"
-            f"{int(self._meta['activity_definition_id'])}_"
-            f"{int(self._meta['activity_instance_id'])}_template-tro_state.json"
-        )
-        if not instance_path.is_file():
-            raise RuntimeError(f"handoff instance state is missing: {instance_path}")
-        instance = json.loads(instance_path.read_text(encoding="utf-8"))
-        object_names = [str(name) for name in instance if str(name) != "robot_poses"]
-        radio_names = [name for name in object_names if "radio_receiver" in name]
-        table_names = [name for name in object_names if name.startswith("table.")]
-        if len(radio_names) != 1 or len(table_names) != 1:
+            if method == "finalize_paused_runtime":
+                return
             raise RuntimeError(
-                "handoff requires exactly one radio_receiver and one table in "
-                f"the task instance, got radio={radio_names!r} table={table_names!r}"
+                "raw task success is terminal; no further RPC is allowed"
             )
-        robot = self._robot()
-        omni_env = getattr(self._env, "omnigibson_env", None)
-        task = getattr(omni_env, "task", None)
-        object_scope = getattr(task, "object_scope", None)
-        scene = getattr(omni_env, "scene", None)
-        if scene is None:
-            scene = getattr(robot, "scene", None) if robot is not None else None
-        objects = getattr(scene, "objects", None)
-        if isinstance(objects, dict):
-            objects = list(objects.values())
-        else:
-            objects = list(objects or ())
+        if method in {"get_env_meta", "guard_tool_call"}:
+            return
+        if method == "reset":
+            if bool(getattr(self, "_reset_completed", False)):
+                raise RuntimeError("the BEHAVIOR environment may be reset only once")
+            return
+        if method == "prepare_vla_invocation":
+            if not bool(getattr(self, "_reset_completed", False)):
+                raise RuntimeError(f"{method} requires the initialized episode")
+            return
+        if not bool(getattr(self, "_reset_completed", False)):
+            raise RuntimeError("physical tools require the initialized episode")
+        if bool(getattr(self, "_motion_frozen", False)):
+            raise RuntimeError("terminal state is frozen; no further RPCs are allowed")
+        if method == "finalize_paused_runtime":
+            if getattr(self, "_controller_state", None) not in {
+                _CONTROLLER_VLA,
+                _CONTROLLER_PLANNER,
+            }:
+                raise RuntimeError("controller cannot be transferred to planner")
+            return
+        if method == "pi0_nav_pick_chunk_step":
+            if (
+                getattr(self, "_controller_state", None) != _CONTROLLER_VLA
+                or getattr(self, "_vla_actions_enabled", None) is not True
+                or getattr(self, "_action_source", None) != "pi0_vla"
+            ):
+                raise RuntimeError("VLA controller is not active")
+            return
 
-        def resolve(spec_name: str) -> Any:
-            if isinstance(object_scope, dict):
-                scoped = object_scope.get(spec_name)
-                if scoped is not None:
-                    return scoped
-            wanted = _normalized_scene_name(spec_name)
-            matches = []
-            for obj in objects:
-                names = {
-                    _normalized_scene_name(getattr(obj, "name", "")),
-                    _normalized_scene_name(
-                        str(getattr(obj, "prim_path", "")).rstrip("/").split("/")[-1]
+    def guard_tool_call(
+        self, *, name: str, input_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Return read-only runtime facts used for side-effect-free rejection."""
+
+        failed: list[str] = []
+        if not self._reset_completed:
+            failed.append("episode_not_initialized")
+        if self._motion_in_flight:
+            failed.append("motion_in_flight")
+        if self._official_success_latched or _raw_success(self._last_info):
+            failed.append("official_success_latched")
+        if getattr(self, "_terminal_failure_receipt", None) is not None:
+            failed.append("terminal_failure_latched")
+        if name == "pi0_nav_pick":
+            if (
+                not (self._official_success_latched or _raw_success(self._last_info))
+                and self._pi0_nav_pick_is_receipt_disabled()
+            ):
+                failed.append("pi0_nav_pick_disabled_by_opposite_surface_receipt")
+            attachments = self._attachment_runtime_facts()
+            if attachments.get("available") is not True:
+                failed.append(
+                    "attachment_identity_conflict"
+                    if attachments.get("identity_conflict") is True
+                    else "attachment_feedback_unavailable"
+                )
+            elif int(attachments.get("attachment_count", 0)) > 0:
+                try:
+                    self._current_object_visual_authorization(
+                        input_dict.get("current_object_visual_check"),
+                        invocation_id=None,
+                    )
+                except Exception:
+                    failed.append("fresh_object_visual_check_required")
+            if self._controller_state not in {
+                _CONTROLLER_VLA,
+                _CONTROLLER_PLANNER,
+                _CONTROLLER_FAILED,
+            }:
+                failed.append("controller_not_vla_rearmable")
+        if name in {"move_to", "rotate_wrist", "close", "open", "press"}:
+            try:
+                analytic_hand, _selection_source, _visual_evidence = (
+                    self._authorize_analytic_hand(
+                        str(input_dict.get("hand", "")),
+                        input_dict.get("visual_hand_check"),
+                    )
+                )
+            except Exception:
+                failed.append("visual_hand_selection_unavailable")
+            else:
+                if (
+                    name == "open"
+                    and self._active_task_spec().release_visual_policy is not None
+                ):
+                    attachment_snapshot = self._attachment_fingerprint_snapshot()
+                    if analytic_hand in attachment_snapshot.get("hands", []):
+                        try:
+                            self._release_visual_authorization(
+                                selected_hand=analytic_hand,
+                                expected_attachment_fingerprint=dict(
+                                    attachment_snapshot.get("fingerprints", {})
+                                ).get(analytic_hand),
+                                release_visual_check=input_dict.get(
+                                    "release_visual_check"
+                                ),
+                            )
+                        except Exception:
+                            failed.append("fresh_release_visual_check_required")
+        if name == "navigate_to":
+            relative_mode = "relative_motion" in input_dict
+            if relative_mode:
+                try:
+                    if not set(input_dict).issubset(
+                        {"relative_motion", "timeout_s"}
+                    ):
+                        raise ValueError(
+                            "relative navigation contains projection arguments"
+                        )
+                    validate_relative_navigation_motion(
+                        input_dict.get("relative_motion")
+                    )
+                    self._validated_navigation_timeout(
+                        input_dict.get("timeout_s", 300.0)
+                    )
+                except Exception:
+                    failed.append("navigation_parameters_invalid")
+            else:
+                try:
+                    if not set(input_dict).issubset(
+                        {
+                            "projection_id",
+                            "navigation_visual_check",
+                            "standoff_m",
+                            "max_travel_m",
+                            "timeout_s",
+                        }
+                    ):
+                        raise ValueError("unknown projection navigation argument")
+                    self._validated_navigation_parameters(
+                        standoff_m=input_dict.get("standoff_m", 0.85),
+                        max_travel_m=input_dict.get("max_travel_m", 1.0),
+                        timeout_s=input_dict.get("timeout_s", 300.0),
+                    )
+                except Exception:
+                    failed.append("navigation_parameters_invalid")
+                projection_id = input_dict.get("projection_id")
+                receipt = (
+                    self._projection_receipts.get(str(projection_id))
+                    if isinstance(projection_id, str) and projection_id.strip()
+                    else None
+                )
+                if not self._projection_receipt_is_fresh(receipt):
+                    failed.append("fresh_projection_required")
+                elif str(projection_id) in self._consumed_projection_receipts:
+                    failed.append("projection_receipt_consumed")
+                else:
+                    try:
+                        self._navigation_visual_authorization(
+                            projection_receipt=receipt,
+                            navigation_visual_check=input_dict.get(
+                                "navigation_visual_check"
+                            ),
+                        )
+                    except Exception:
+                        failed.append("fresh_navigation_visual_check_required")
+            attachment_snapshot = self._attachment_fingerprint_snapshot()
+            if attachment_snapshot.get("available") is not True:
+                failed.append(
+                    "attachment_identity_conflict"
+                    if attachment_snapshot.get("identity_conflict") is True
+                    else "attachment_feedback_unavailable"
+                )
+        projection_id = None
+        if name == "move_to" and isinstance(input_dict.get("target"), dict):
+            projection_id = input_dict["target"].get("projection_id")
+        elif name == "press":
+            projection_id = input_dict.get("projection_id")
+        if name in {"move_to", "press"} and projection_id is not None:
+            projection_id = str(projection_id)
+            receipt = self._projection_receipts.get(projection_id)
+            if not self._projection_receipt_is_fresh(receipt):
+                failed.append("fresh_projection_required")
+            if projection_id in self._consumed_projection_receipts:
+                failed.append("projection_receipt_consumed")
+        if name == "press":
+            try:
+                hand, _source, _evidence = self._authorize_analytic_hand(
+                    str(input_dict.get("hand", "")),
+                    input_dict.get("visual_hand_check"),
+                )
+                facts = self._attachment_runtime_facts()
+                if hand in facts.get("hands", []):
+                    failed.append("press_hand_must_be_attachment_free")
+                if not self._press_gripper_is_strictly_closed(hand):
+                    failed.append("closed_gripper_required")
+            except Exception:
+                failed.append("gripper_state_unavailable")
+        failed = list(dict.fromkeys(failed))
+        return {
+            "primitive_success": not failed,
+            "task_success": bool(
+                self._official_success_latched or _raw_success(self._last_info)
+            ),
+            "official_success_source": 'info["done"]["success"]',
+            "stop_reason": "guard_passed" if not failed else "precondition_rejected",
+            "failed_preconditions": failed,
+            "attempt_index": self._attempt_index,
+            "attempt_nonce": self._attempt_nonce,
+            "total_env_steps": int(self._env_steps),
+        }
+
+    def _attachment_runtime_facts(self) -> dict[str, Any]:
+        attached_hands: list[str] = []
+        attached_objects: dict[str, Any] = {}
+        backend = getattr(getattr(self, "_planner", None), "backend", None)
+        getter = getattr(backend, "get_attached_object", None)
+        if not callable(getter):
+            facts = {
+                "available": False,
+                "attachment_count": 0,
+                "hands": [],
+                "identity_conflict": False,
+                "attached_objects": {},
+                "by_hand": {hand: {"attached": False} for hand in ("left", "right")},
+            }
+            self._invalidate_stale_held_closure_receipts(facts)
+            return facts
+        for hand in ("left", "right"):
+            try:
+                attached = getter(hand)
+                if attached:
+                    attached_hands.append(hand)
+                    attached_objects[hand] = attached
+            except Exception:
+                facts = {
+                    "available": False,
+                    "attachment_count": 0,
+                    "hands": [],
+                    "identity_conflict": False,
+                    "attached_objects": {},
+                    "by_hand": {
+                        side: {"attached": False} for side in ("left", "right")
+                    },
+                }
+                self._invalidate_stale_held_closure_receipts(facts)
+                return facts
+        identity_conflict = self._attachments_share_identity(
+            attached_objects.get("left"),
+            attached_objects.get("right"),
+        )
+        facts = {
+            "attachment_count": len(attached_hands),
+            "hands": attached_hands,
+            "identity_conflict": bool(identity_conflict),
+            "available": not identity_conflict,
+            # Private runtime objects are never copied into a public result.
+            # They let lifecycle receipts compare stable assisted-grasp roots.
+            "attached_objects": attached_objects,
+            "by_hand": {
+                hand: {"attached": hand in attached_hands} for hand in ("left", "right")
+            },
+        }
+        self._invalidate_stale_held_closure_receipts(facts)
+        return facts
+
+    @staticmethod
+    def _attachments_share_identity(left: Any, right: Any) -> bool:
+        """Reject one simulator object being reported under both physical hands."""
+
+        if left is None or right is None:
+            return False
+
+        def identities(attached: Any) -> set[tuple[str, Any]]:
+            if not isinstance(attached, dict):
+                return set()
+            result: set[tuple[str, Any]] = set()
+            for root in attached.values():
+                prim_path = str(getattr(root, "prim_path", "")).rstrip("/")
+                result.add(
+                    ("prim_path", prim_path)
+                    if prim_path
+                    else ("python_object_id", int(id(root)))
+                )
+            return result
+
+        left_identities = identities(left)
+        right_identities = identities(right)
+        return bool(
+            left_identities and right_identities and left_identities & right_identities
+        )
+
+    def _attachment_lineage_fingerprint(
+        self,
+        attached_object: Any,
+        *,
+        hand: str,
+    ) -> str | None:
+        """Hash one attempt-local assisted-grasp root without exposing its path."""
+
+        if not isinstance(attached_object, dict) or not attached_object:
+            return None
+        roots: list[dict[str, Any]] = []
+        for link_name, root in sorted(
+            attached_object.items(),
+            key=lambda item: str(item[0]),
+        ):
+            prim_path = str(getattr(root, "prim_path", "")).rstrip("/")
+            roots.append(
+                {
+                    "link_name": str(link_name),
+                    "root_identity": (
+                        {"kind": "prim_path", "value": prim_path}
+                        if prim_path
+                        else {"kind": "python_object_id", "value": int(id(root))}
                     ),
                 }
-                if wanted in names:
-                    matches.append(obj)
-            if len(matches) != 1:
-                raise RuntimeError(
-                    f"handoff scene object {spec_name!r} resolved to {len(matches)} bodies"
-                )
-            return matches[0]
-
-        radio = resolve(radio_names[0])
-        table = resolve(table_names[0])
-        self._object_position(radio)
-        self._object_vertical_bounds(radio)
-        self._object_vertical_bounds(table)
-        self._handoff_target_objects = (radio, table)
-        return radio, table
-
-    @staticmethod
-    def _object_mask(instance_ids: np.ndarray, obj: Any) -> np.ndarray:
-        try:
-            from omnigibson.sensors.vision_sensor import VisionSensor
-        except Exception as exc:
-            raise RuntimeError("OmniGibson instance registry is unavailable") from exc
-        target_root = str(getattr(obj, "prim_path", "")).rstrip("/")
-        if not target_root:
-            raise RuntimeError("mask target has no prim_path")
-        registry = dict(getattr(VisionSensor, "INSTANCE_ID_REGISTRY", {}))
-        matching_ids = [
-            int(instance_id)
-            for instance_id, label in registry.items()
-            if str(label).rstrip("/") == target_root
-            or str(label).rstrip("/").startswith(f"{target_root}/")
-        ]
-        if not matching_ids:
-            raise RuntimeError(f"instance registry has no labels for {target_root}")
-        return np.isin(np.asarray(instance_ids), np.asarray(matching_ids))
-
-    def _radio_table_mask_report(self, radio: Any, table: Any) -> dict[str, Any]:
-        if self._last_capture_step != self._env_steps:
-            raise RuntimeError(
-                "instance masks are not synchronized to the current step"
             )
-        if set(self._last_instance_id_masks) != {
-            "head",
-            "left_wrist",
-            "right_wrist",
-        }:
-            raise RuntimeError("current three-camera instance masks are unavailable")
-        gaps: dict[str, float | None] = {}
-        passing_cameras = []
-        errors: dict[str, str] = {}
-        for camera, instance_ids in self._last_instance_id_masks.items():
-            try:
-                radio_mask = self._object_mask(instance_ids, radio)
-                table_mask = self._object_mask(instance_ids, table)
-                gap = _minimum_mask_gap_px(radio_mask, table_mask)
-            except Exception as exc:
-                gaps[camera] = None
-                errors[camera] = f"{type(exc).__name__}: {exc}"
-                continue
-            gaps[camera] = gap
-            if gap >= HANDOFF_MASK_GAP_MIN_PX:
-                passing_cameras.append(camera)
-        return {
-            "available": any(value is not None for value in gaps.values()),
-            "passed": bool(passing_cameras),
-            "minimum_required_px": HANDOFF_MASK_GAP_MIN_PX,
-            "gaps_px": gaps,
-            "passing_cameras": passing_cameras,
-            "errors": errors,
-        }
-
-    def _attachment_matches(self, hand: str, target: Any) -> tuple[bool, bool]:
-        robot = self._robot()
-        if robot is None:
-            raise RuntimeError("R1Pro robot is unavailable")
-        assisted = getattr(robot, "_ag_obj_in_hand", {})
-        assisted_obj = assisted.get(hand) if isinstance(assisted, dict) else None
-        target_root = str(getattr(target, "prim_path", "")).rstrip("/")
-        assisted_root = str(getattr(assisted_obj, "prim_path", "")).rstrip("/")
-        assisted_match = bool(
-            assisted_obj is not None
-            and target_root
-            and (
-                assisted_root == target_root
-                or assisted_root.startswith(f"{target_root}/")
-            )
-        )
-        backend_attachment = self._require_planner().backend.get_attached_object(hand)
-        backend_match = False
-        if isinstance(backend_attachment, dict):
-            for attached in backend_attachment.values():
-                root = str(getattr(attached, "prim_path", "")).rstrip("/")
-                backend_match = backend_match or bool(
-                    target_root
-                    and (root == target_root or root.startswith(f"{target_root}/"))
-                )
-        return assisted_match, backend_match
-
-    def _hand_target_contact_report(
-        self, hand: str, radio_position: np.ndarray
-    ) -> dict[str, Any]:
-        report = self._require_planner().backend.contact_report(
-            hand=hand,
-            target_xyz=np.asarray(radio_position, dtype=np.float64),
-        )
-        if not isinstance(report, dict) or not bool(report.get("available", False)):
-            raise RuntimeError(
-                f"{hand} gripper contact report is unavailable: {report!r}"
-            )
-        count = report.get("target_contact_count")
-        if isinstance(count, bool) or not isinstance(count, (int, np.integer)):
-            raise RuntimeError(f"{hand} target contact count is invalid")
-        return {
-            "available": True,
-            "target_contact_count": int(count),
-            "target_two_finger_contact": bool(
-                report.get("target_two_finger_contact", False)
-            ),
-        }
-
-    def _handoff_validator_frame(self, observation: dict[str, Any]) -> dict[str, Any]:
-        radio, table = self._resolve_handoff_targets()
-        radio_position = self._object_position(radio)
-        if self._initial_radio_position is None:
-            raise RuntimeError("initial radio position was not captured at reset")
-        radio_bottom_z, _radio_top_z = self._object_vertical_bounds(radio)
-        _table_bottom_z, table_top_z = self._object_vertical_bounds(table)
-        mask_report = self._radio_table_mask_report(radio, table)
-        robot = self._robot()
-        if robot is None:
-            raise RuntimeError("R1Pro robot is unavailable")
-        eef_links = getattr(robot, "eef_links", {})
-        per_hand: dict[str, Any] = {}
-        attachment_by_hand: dict[str, tuple[bool, bool]] = {}
-        contact_by_hand: dict[str, dict[str, Any]] = {}
-        eef_by_hand: dict[str, np.ndarray] = {}
-        for hand in ("left", "right"):
-            link = eef_links.get(hand) if isinstance(eef_links, dict) else None
-            if link is None or not callable(
-                getattr(link, "get_position_orientation", None)
-            ):
-                raise RuntimeError(f"{hand} EEF pose is unavailable")
-            eef_position, _orientation = link.get_position_orientation()
-            eef = np.asarray(_numpy_tree(eef_position), dtype=np.float64).reshape(3)
-            if not np.isfinite(eef).all():
-                raise RuntimeError(f"{hand} EEF position is non-finite")
-            eef_by_hand[hand] = eef
-            attachment_by_hand[hand] = self._attachment_matches(hand, radio)
-            contact_by_hand[hand] = self._hand_target_contact_report(
-                hand, radio_position
-            )
-        radio_lift = float(radio_position[2] - self._initial_radio_position[2])
-        support_gap = float(radio_bottom_z - table_top_z)
-        for hand in ("left", "right"):
-            other = "right" if hand == "left" else "left"
-            opening = self._validated_selected_gripper_opening(
-                observation=observation,
-                hand=hand,
-            )
-            selected_assisted, selected_backend = attachment_by_hand[hand]
-            selected_contact = contact_by_hand[hand]
-            other_assisted, other_backend = attachment_by_hand[other]
-            criteria = {
-                "opening_strict": bool(opening < HANDOFF_GRIPPER_OPENING_MAX),
-                "radio_lift": bool(radio_lift >= HANDOFF_RADIO_LIFT_MIN_M),
-                "support_gap": bool(support_gap >= HANDOFF_SUPPORT_GAP_MIN_M),
-                "selected_attachment_or_two_finger_contact": bool(
-                    selected_assisted
-                    or selected_backend
-                    or selected_contact["target_two_finger_contact"]
-                ),
-                "other_hand_no_assisted_attachment": not other_assisted,
-                "other_hand_no_backend_attachment": not other_backend,
-                "other_hand_no_radio_contact": (
-                    contact_by_hand[other]["target_contact_count"] == 0
-                ),
-            }
-            per_hand[hand] = {
-                "opening": float(opening),
-                "opening_max_exclusive": HANDOFF_GRIPPER_OPENING_MAX,
-                "radio_position": radio_position.astype(float).tolist(),
-                "eef_position": eef_by_hand[hand].astype(float).tolist(),
-                "radio_lift_m": radio_lift,
-                "radio_lift_min_inclusive_m": HANDOFF_RADIO_LIFT_MIN_M,
-                "support_gap_m": support_gap,
-                "support_gap_min_inclusive_m": HANDOFF_SUPPORT_GAP_MIN_M,
-                "selected_assisted_attachment": selected_assisted,
-                "selected_backend_attachment": selected_backend,
-                "selected_contact": selected_contact,
-                "other_contact": contact_by_hand[other],
-                "criteria": criteria,
-                "instantaneous_pass": all(criteria.values()),
-            }
-        frame = {
-            "total_env_steps": int(self._env_steps),
-            "capture_step": self._last_capture_step,
-            "mask_report": mask_report,
-            "per_hand": per_hand,
-        }
-        if not all(np.isfinite(value) for value in (radio_lift, support_gap)):
-            raise RuntimeError("handoff validator geometry is non-finite")
-        return frame
-
-    @staticmethod
-    def _handoff_window_metrics(
-        frames: list[dict[str, Any]], hand: str
-    ) -> dict[str, Any]:
-        radio = np.asarray(
-            [frame["per_hand"][hand]["radio_position"] for frame in frames],
-            dtype=np.float64,
-        )
-        eef = np.asarray(
-            [frame["per_hand"][hand]["eef_position"] for frame in frames],
-            dtype=np.float64,
-        )
-        if radio.shape != (HANDOFF_VALIDATION_FRAMES, 3) or eef.shape != (
-            HANDOFF_VALIDATION_FRAMES,
-            3,
-        ):
-            raise RuntimeError("handoff validator window shape is invalid")
-        if not np.isfinite(radio).all() or not np.isfinite(eef).all():
-            raise RuntimeError("handoff validator window contains NaN or Inf")
-        radio_motion = float(np.linalg.norm(radio[-1] - radio[0]))
-        eef_motion = float(np.linalg.norm(eef[-1] - eef[0]))
-        relative = radio - eef
-        relative_drift = np.linalg.norm(relative - relative[0], axis=1)
-        max_relative_drift = float(np.max(relative_drift))
-        comotion = np.linalg.norm(np.diff(radio, axis=0) - np.diff(eef, axis=0), axis=1)
-        mean_comotion = float(np.mean(comotion))
-        criteria = {
-            "current_instantaneous_frame": bool(
-                frames[-1]["per_hand"][hand]["instantaneous_pass"]
-            ),
-            "held_opening_all_frames": all(
-                bool(
-                    frame["per_hand"][hand]
-                    .get("criteria", {})
-                    .get("opening_strict", False)
-                )
-                for frame in frames
-            ),
-            "radio_window_motion": radio_motion >= HANDOFF_WINDOW_MOTION_MIN_M,
-            "eef_window_motion": eef_motion >= HANDOFF_WINDOW_MOTION_MIN_M,
-            "relative_drift": max_relative_drift <= HANDOFF_RELATIVE_DRIFT_MAX_M,
-            "mean_comotion_residual": (
-                mean_comotion <= HANDOFF_COMOTION_RESIDUAL_MAX_M
-            ),
-        }
-        return {
-            "radio_displacement_m": radio_motion,
-            "eef_displacement_m": eef_motion,
-            "minimum_displacement_m": HANDOFF_WINDOW_MOTION_MIN_M,
-            "max_relative_drift_m": max_relative_drift,
-            "max_relative_drift_limit_m": HANDOFF_RELATIVE_DRIFT_MAX_M,
-            "mean_comotion_residual_m": mean_comotion,
-            "mean_comotion_residual_limit_m": HANDOFF_COMOTION_RESIDUAL_MAX_M,
-            "criteria": criteria,
-            "passed": all(criteria.values()),
-        }
-
-    def _update_handoff_validator(self, observation: dict[str, Any]) -> dict[str, Any]:
-        try:
-            frame = self._handoff_validator_frame(observation)
-        except Exception as exc:
-            frame = {
-                "total_env_steps": int(self._env_steps),
-                "capture_step": self._last_capture_step,
-                "error": f"{type(exc).__name__}: {exc}",
-                "per_hand": {
-                    hand: {"instantaneous_pass": False, "criteria": {}}
-                    for hand in ("left", "right")
-                },
-            }
-        self._handoff_validator_frames.append(frame)
-        window = self._handoff_validator_frames[-HANDOFF_VALIDATION_FRAMES:]
-        per_hand: dict[str, Any] = {}
-        if len(window) == HANDOFF_VALIDATION_FRAMES:
-            for hand in ("left", "right"):
-                try:
-                    per_hand[hand] = self._handoff_window_metrics(window, hand)
-                except Exception as exc:
-                    per_hand[hand] = {
-                        "passed": False,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-        else:
-            per_hand = {
-                hand: {
-                    "passed": False,
-                    "frames_collected": len(window),
-                    "frames_required": HANDOFF_VALIDATION_FRAMES,
+        return hashlib.sha256(
+            _canonical_json_bytes(
+                {
+                    "run_nonce": str(getattr(self, "_run_nonce", "unbound")),
+                    "attempt_nonce": str(getattr(self, "_attempt_nonce", "unbound")),
+                    "hand": str(hand),
+                    "roots": roots,
                 }
+            )
+        ).hexdigest()
+
+    def _attachment_fingerprint_snapshot(
+        self,
+        facts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Capture both attachment identities without exposing simulator paths."""
+
+        current = self._attachment_runtime_facts() if facts is None else facts
+        attached_objects = current.get("attached_objects", {})
+        if not isinstance(attached_objects, dict):
+            attached_objects = {}
+        return {
+            "available": bool(current.get("available", True)),
+            "identity_conflict": bool(current.get("identity_conflict", False)),
+            "attachment_count": int(current.get("attachment_count", 0)),
+            "hands": list(current.get("hands", [])),
+            "env_step": int(getattr(self, "_env_steps", 0)),
+            "fingerprints": {
+                hand: self._attachment_lineage_fingerprint(
+                    attached_objects.get(hand),
+                    hand=hand,
+                )
                 for hand in ("left", "right")
-            }
-        passed_hands = [hand for hand in ("left", "right") if per_hand[hand]["passed"]]
-        held_hand = passed_hands[0] if len(passed_hands) == 1 else None
-        result = {
-            "frames_required": HANDOFF_VALIDATION_FRAMES,
-            "frames_collected": len(window),
-            "unique_pass_required": True,
-            "passed_hands": passed_hands,
-            "held_hand": held_hand,
-            "local_grasp_success": held_hand is not None,
-            "current": frame,
-            "per_hand": per_hand,
-        }
-        _write_json_atomic(
-            self._validator_trace_path,
-            {
-                "schema_version": 1,
-                "frames": self._handoff_validator_frames,
-                "latest": result,
             },
-        )
-        return result
+        }
 
-    @staticmethod
-    def _validated_handoff_hands(*, held_hand: str, press_hand: str) -> tuple[str, str]:
-        if held_hand not in {"left", "right"}:
-            raise ValueError("held_hand must be 'left' or 'right'")
-        if press_hand not in {"left", "right"}:
-            raise ValueError("press_hand must be 'left' or 'right'")
-        if held_hand == press_hand:
-            raise ValueError("held_hand and press_hand must be different")
-        return held_hand, press_hand
+    def _seal_attempt_receipt(self, value: dict[str, Any]) -> dict[str, Any]:
+        """Bind one public receipt to this attempt and add a stable digest."""
 
-    def _robot_state_checkpoint_payload(
+        receipt = {
+            "schema_version": 1,
+            "run_nonce": str(getattr(self, "_run_nonce", "unbound")),
+            "attempt_nonce": str(getattr(self, "_attempt_nonce", "unbound")),
+            "attempt_index": int(getattr(self, "_attempt_index", 1)),
+            **value,
+        }
+        receipt["receipt_sha256"] = hashlib.sha256(
+            _canonical_json_bytes(receipt)
+        ).hexdigest()
+        return receipt
+
+    def _attempt_receipt_is_current(self, receipt: Any) -> bool:
+        if not isinstance(receipt, dict):
+            return False
+        try:
+            return bool(
+                receipt.get("run_nonce") == getattr(self, "_run_nonce", None)
+                and receipt.get("attempt_nonce")
+                == getattr(self, "_attempt_nonce", None)
+                and int(receipt.get("attempt_index", -1))
+                == int(getattr(self, "_attempt_index", -2))
+                and isinstance(receipt.get("receipt_sha256"), str)
+                and receipt.get("receipt_sha256")
+                == hashlib.sha256(
+                    _canonical_json_bytes(
+                        {
+                            key: value
+                            for key, value in receipt.items()
+                            if key != "receipt_sha256"
+                        }
+                    )
+                ).hexdigest()
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _clear_active_vla_invocation_state(
         self,
         *,
-        checkpoint_name: str,
-        stage: str,
-        held_hand: str,
-        press_hand: str,
-        object_name: str,
-        require_current_grasp: bool,
-        validation_evidence: dict[str, Any] | None,
+        clear_candidate: bool = True,
+    ) -> None:
+        """Remove invocation-local authority after finalization or failure."""
+
+        self._active_vla_invocation = None
+        self._active_vla_call_index = None
+        self._pending_vla_visual_authorization = None
+        self._pending_vla_attachment_snapshot = None
+        self._pending_vla_baseline_internal_authorization = False
+        self._next_pi0_chunk_index = 1
+        if clear_candidate:
+            self._active_rotate_pi0_candidate = None
+
+    def _invalidate_pi0_visual_regression_chain(
+        self,
+        *,
+        reset_completed: bool,
+    ) -> None:
+        """Invalidate every unconsumed receipt in the rotate/Pi0 review chain."""
+
+        self._latest_successful_held_rotate_receipt = None
+        self._latest_successful_held_rotate_attachment = None
+        self._latest_successful_held_rotate_public_frame_ids = set()
+        self._held_rotate_target_surface_review = None
+        self._latest_unconsumed_public_capture_receipt = None
+        self._active_rotate_pi0_candidate = None
+        self._awaiting_opposite_surface_review = None
+        if reset_completed:
+            self._completed_opposite_surface_cycles = []
+
+    def _register_public_capture(
+        self,
+        *,
+        requested_camera: str,
+        resolved_camera: str,
+        frame: Any,
+        image_bytes: bytes,
     ) -> dict[str, Any]:
-        held_hand, press_hand = self._validated_handoff_hands(
-            held_hand=held_hand, press_hand=press_hand
+        """Create the sole one-use frame-review authority for a fresh capture."""
+
+        if self._active_task_spec().surface_review_policy is None:
+            self._latest_unconsumed_public_capture_receipt = None
+            return {}
+        if getattr(self, "_held_rotate_target_surface_review", None) is not None:
+            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+        self._public_capture_sequence = (
+            int(getattr(self, "_public_capture_sequence", 0)) + 1
         )
-        radio, _table = self._resolve_handoff_targets()
-        resolved_name = str(getattr(radio, "name", ""))
-        if not object_name or _normalized_scene_name(object_name) not in {
-            _normalized_scene_name(resolved_name),
-            _normalized_scene_name("radio_receiver"),
-            _normalized_scene_name("radio"),
-        }:
-            raise ValueError(
-                f"object_name {object_name!r} does not identify the task radio"
+        receipt = self._seal_attempt_receipt(
+            {
+                "kind": "public_observe_capture",
+                "requested_camera": requested_camera,
+                "resolved_camera": resolved_camera,
+                "frame_id": str(frame.frame_id),
+                "capture_group_id": str(frame.capture_group_id),
+                "env_step": int(self._env_steps),
+                "capture_sequence": int(self._public_capture_sequence),
+                "rgb_sha256": hashlib.sha256(image_bytes).hexdigest(),
+            }
+        )
+        self._latest_unconsumed_public_capture_receipt = receipt
+        return receipt
+
+    @staticmethod
+    def _metric_depth_sha256(frame: Any) -> str:
+        """Hash the immutable, normalized metric depth samples for one frame."""
+
+        if not hasattr(frame, "depth_m"):
+            raise CameraGeometryError("metric depth is unavailable for RGB-D lineage")
+        depth = np.ascontiguousarray(np.asarray(frame.depth_m, dtype=np.dtype("<f8")))
+        material = (
+            json.dumps(
+                {
+                    "shape": list(depth.shape),
+                    "dtype": str(depth.dtype),
+                    "source_modality": "depth_linear",
+                    "measurement": "distance_to_image_plane",
+                    "unit": "m",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            + b"\0"
+            + depth.tobytes(order="C")
+        )
+        return hashlib.sha256(material).hexdigest()
+
+    @staticmethod
+    def _frame_geometry_sha256(frame: Any) -> str:
+        """Bind every transform used by frame-bound depth and hand distances."""
+
+        intrinsics = getattr(frame, "intrinsics", None)
+        if intrinsics is None:
+            raise CameraGeometryError("camera intrinsics are unavailable")
+        camera_to_world = validated_rigid_transform(
+            getattr(frame, "camera_to_world", None),
+            name="frame camera-to-world transform",
+        )
+        correction = getattr(frame, "correction_profile", None)
+        if correction is None:
+            raise CameraGeometryError("camera correction profile is unavailable")
+        correction_transform = validated_rigid_transform(
+            getattr(correction, "raw_to_corrected_camera", None),
+            name="camera correction transform",
+        )
+        metadata = getattr(frame, "capture_metadata", None)
+        hand_references = (
+            metadata.get("r1pro_hand_reference_transforms")
+            if isinstance(metadata, dict)
+            else None
+        )
+        sync_certificate = (
+            metadata.get("hand_geometry_sync_certificate")
+            if isinstance(metadata, dict)
+            else None
+        )
+        render_sync_iterations = (
+            metadata.get("render_sync_iterations")
+            if isinstance(metadata, dict)
+            else None
+        )
+        camera_pose_lineage = (
+            metadata.get("camera_pose_lineage") if isinstance(metadata, dict) else None
+        )
+        material = {
+            "schema_version": 1,
+            "camera": str(frame.camera),
+            "frame_id": str(frame.frame_id),
+            "capture_group_id": str(frame.capture_group_id),
+            "env_step": int(frame.step_index),
+            "intrinsics": {
+                "fx": float(intrinsics.fx),
+                "fy": float(intrinsics.fy),
+                "cx": float(intrinsics.cx),
+                "cy": float(intrinsics.cy),
+                "width": int(intrinsics.width),
+                "height": int(intrinsics.height),
+            },
+            "camera_to_world": camera_to_world.tolist(),
+            "correction": {
+                "enabled": bool(correction.enabled),
+                "raw_to_corrected_camera": correction_transform.tolist(),
+            },
+            "r1pro_hand_reference_transforms": hand_references,
+            "hand_geometry_sync_certificate": sync_certificate,
+            "camera_pose_lineage": camera_pose_lineage,
+            "render_sync_iterations": render_sync_iterations,
+        }
+        return hashlib.sha256(_canonical_json_bytes(material)).hexdigest()
+
+    @staticmethod
+    def _hand_geometry_sync_certificate_is_valid(
+        certificate: Any,
+        *,
+        hand: str,
+        env_step: int,
+    ) -> bool:
+        """Recompute certificate admission from sealed numeric residuals."""
+
+        if not isinstance(certificate, dict):
+            return False
+        try:
+            iterations = certificate["render_sync_iterations"]
+            translation_tolerance = float(certificate["translation_tolerance_m"])
+            rotation_tolerance = float(certificate["rotation_tolerance_deg"])
+            finger_tolerance = float(certificate["finger_joint_tolerance_m"])
+            selected = certificate["hands"][hand]
+            palm = selected["palm_from_camera"]
+            grip = selected["grip_point_from_camera"]
+            finger = selected["finger_joint_capture_match"]
+            values = [
+                translation_tolerance,
+                rotation_tolerance,
+                finger_tolerance,
+                float(palm["translation_error_m"]),
+                float(palm["rotation_error_rad"]),
+                float(palm["rotation_error_deg"]),
+                float(grip["translation_error_m"]),
+                float(grip["rotation_error_rad"]),
+                float(grip["rotation_error_deg"]),
+                float(finger["max_abs_error_m"]),
+            ]
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if (
+            isinstance(iterations, bool)
+            or not isinstance(iterations, (int, np.integer))
+            or not all(math.isfinite(value) and value >= 0.0 for value in values)
+        ):
+            return False
+        if (
+            certificate.get("available") is not True
+            or certificate.get("synchronized") is not True
+            or certificate.get("source")
+            != "render_sync_plus_official_r1pro_fixed_extrinsics"
+            or int(certificate.get("env_step", -1)) != int(env_step)
+            or int(iterations) < _HAND_GEOMETRY_SYNC_RENDER_ITERATIONS
+            or selected.get("passed") is not True
+            or selected.get("camera_pose_render_bound") is not True
+            or selected.get("camera_pose_source")
+            not in {
+                "payload_view_matrix",
+                "payload_view_transform",
+                "payload_world_to_camera",
+                "sensor_cameraViewTransform",
+            }
+            or palm.get("passed") is not True
+            or grip.get("passed") is not True
+            or finger.get("passed") is not True
+        ):
+            return False
+        if (
+            not math.isclose(
+                translation_tolerance,
+                _HAND_GEOMETRY_TRANSLATION_TOLERANCE_M,
+                rel_tol=0.0,
+                abs_tol=1e-12,
             )
+            or not math.isclose(
+                rotation_tolerance,
+                _HAND_GEOMETRY_ROTATION_TOLERANCE_DEG,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                finger_tolerance,
+                _HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            return False
+        for residual in (palm, grip):
+            if (
+                float(residual["translation_error_m"]) > translation_tolerance
+                or float(residual["rotation_error_deg"]) > rotation_tolerance
+                or not math.isclose(
+                    math.degrees(float(residual["rotation_error_rad"])),
+                    float(residual["rotation_error_deg"]),
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                )
+            ):
+                return False
+        return bool(float(finger["max_abs_error_m"]) <= finger_tolerance)
+
+    def _register_public_observation_lineage(
+        self,
+        *,
+        requested_camera: str,
+        resolved_camera: str,
+        frame: Any,
+        image_bytes: bytes,
+    ) -> dict[str, Any]:
+        """Bind depth probes to the immediately preceding public RGB-D frame.
+
+        This receipt is deliberately independent of the Radio-only, one-use
+        surface-review receipt.  A read-only depth probe therefore neither
+        consumes nor renews Radio visual authorization.
+        """
+
+        try:
+            depth_sha256: str | None = self._metric_depth_sha256(frame)
+            geometry_sha256: str | None = self._frame_geometry_sha256(frame)
+        except CameraGeometryError:
+            # Lightweight compatibility facades may expose RGB-only frames.
+            # They remain observable but cannot authorize any depth probe.
+            depth_sha256 = None
+            geometry_sha256 = None
+        receipt = self._seal_attempt_receipt(
+            {
+                "kind": "public_observe_rgbd_capture",
+                "requested_camera": str(requested_camera),
+                "resolved_camera": str(resolved_camera),
+                "frame_id": str(frame.frame_id),
+                "capture_group_id": str(frame.capture_group_id),
+                "env_step": int(self._env_steps),
+                "rgb_sha256": hashlib.sha256(image_bytes).hexdigest(),
+                "depth_sha256": depth_sha256,
+                "geometry_sha256": geometry_sha256,
+                "depth_source_modality": "depth_linear",
+                "depth_measurement": "distance_to_image_plane",
+                "depth_unit": "m",
+            }
+        )
+        self._latest_public_observation_lineage = receipt
+        return receipt
+
+    def _pi0_nav_pick_is_receipt_disabled(self) -> bool:
+        """Return whether this attempt has a valid two-cycle disable receipt."""
+
+        if self._active_task_spec().surface_review_policy is None:
+            return False
+        receipt = getattr(self, "_pi0_nav_pick_disable_receipt", None)
+        if not self._attempt_receipt_is_current(receipt):
+            return False
+        cycle_receipts = receipt.get("cycle_receipts")
+        return bool(
+            receipt.get("kind") == "pi0_nav_pick_attempt_disable"
+            and receipt.get("reason") == "two_consecutive_opposite_surface_cycles"
+            and isinstance(cycle_receipts, list)
+            and len(cycle_receipts) == 2
+            and len(
+                {
+                    item.get("cycle_id")
+                    for item in cycle_receipts
+                    if isinstance(item, dict)
+                }
+            )
+            == 2
+        )
+
+    def _pi0_nav_pick_disable_guard_result(self) -> dict[str, Any]:
+        return {
+            "primitive_success": False,
+            "task_success": bool(
+                getattr(self, "_official_success_latched", False)
+                or _raw_success(getattr(self, "_last_info", None))
+            ),
+            "official_success_source": 'info["done"]["success"]',
+            "stop_reason": "precondition_rejected",
+            "failed_preconditions": [
+                "pi0_nav_pick_disabled_by_opposite_surface_receipt"
+            ],
+            "attempt_index": int(getattr(self, "_attempt_index", 1)),
+            "attempt_nonce": str(getattr(self, "_attempt_nonce", "unbound")),
+            "total_env_steps": int(getattr(self, "_env_steps", 0)),
+            "pi0_nav_pick_disable_receipt": self._public_visual_receipt(
+                getattr(self, "_pi0_nav_pick_disable_receipt", None)
+            ),
+        }
+
+    @classmethod
+    def _public_visual_receipt(cls, value: Any) -> Any:
+        """Remove private dynamic-side lineage from Agent-visible receipts."""
+
+        if isinstance(value, dict):
+            return {
+                key: cls._public_visual_receipt(item)
+                for key, item in value.items()
+                if key not in {"resolved_camera", "resolved_hand"}
+            }
+        if isinstance(value, list):
+            return [cls._public_visual_receipt(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._public_visual_receipt(item) for item in value)
+        return _wire_safe(value)
+
+    def _bind_rotate_receipt_to_vla_invocation(
+        self,
+        *,
+        invocation_id: str,
+        call_index: int,
+    ) -> dict[str, Any] | None:
+        """Consume the immediately preceding held rotation for one Pi0 call."""
+
+        if self._active_task_spec().surface_review_policy is None:
+            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+            return None
+        rotate_receipt = getattr(self, "_latest_successful_held_rotate_receipt", None)
+        expected_attachment = getattr(
+            self, "_latest_successful_held_rotate_attachment", None
+        )
+        target_review = getattr(self, "_held_rotate_target_surface_review", None)
+        self._latest_successful_held_rotate_receipt = None
+        self._latest_successful_held_rotate_attachment = None
+        self._latest_successful_held_rotate_public_frame_ids = set()
+        self._held_rotate_target_surface_review = None
+        self._latest_unconsumed_public_capture_receipt = None
+        if (
+            not self._attempt_receipt_is_current(rotate_receipt)
+            or not self._attempt_receipt_is_current(target_review)
+            or int(rotate_receipt.get("env_step", -1)) != int(self._env_steps)
+            or int(target_review.get("env_step", -1)) != int(self._env_steps)
+            or target_review.get("rotate_receipt_sha256")
+            != rotate_receipt.get("receipt_sha256")
+            or target_review.get("assessment") != "target_bearing_surface_confirmed"
+            or expected_attachment is None
+        ):
+            self._completed_opposite_surface_cycles = []
+            return None
+        facts = self._attachment_runtime_facts()
+        hand = str(rotate_receipt.get("resolved_hand", ""))
+        current_attachment = facts.get("attached_objects", {}).get(hand)
+        matches, identity = _attachment_identity_status(
+            current_attachment,
+            expected_attachment,
+            hand=hand,
+        )
+        attachment_fingerprint = self._attachment_lineage_fingerprint(
+            current_attachment,
+            hand=hand,
+        )
+        if (
+            facts.get("available") is not True
+            or hand not in facts.get("hands", [])
+            or not matches
+            or attachment_fingerprint != rotate_receipt.get("attachment_fingerprint")
+        ):
+            self._completed_opposite_surface_cycles = []
+            return None
+        candidate = {
+            "rotate_receipt": rotate_receipt,
+            "target_surface_review_receipt": target_review,
+            "expected_attachment": expected_attachment,
+            "invocation_id": invocation_id,
+            "call_index": int(call_index),
+            "bound_env_step": int(self._env_steps),
+            "attachment_identity_at_bind": _wire_safe(identity),
+            "attachment_fingerprint": attachment_fingerprint,
+            "full_chunks_executed": 0,
+            "last_chunk_env_step": None,
+        }
+        self._active_rotate_pi0_candidate = candidate
+        return candidate
+
+    def _record_full_pi0_chunk_for_rotate_candidate(
+        self,
+        *,
+        executed_steps: int,
+        terminated: bool,
+        truncated: bool,
+    ) -> None:
+        if self._active_task_spec().surface_review_policy is None:
+            return
+        candidate = getattr(self, "_active_rotate_pi0_candidate", None)
+        if not isinstance(candidate, dict):
+            return
+        if (
+            int(executed_steps) != 32
+            or bool(terminated)
+            or bool(truncated)
+            or self._active_vla_invocation != candidate.get("invocation_id")
+        ):
+            self._active_rotate_pi0_candidate = None
+            self._completed_opposite_surface_cycles = []
+            return
+        candidate["full_chunks_executed"] = (
+            int(candidate.get("full_chunks_executed", 0)) + 1
+        )
+        candidate["last_chunk_env_step"] = int(self._env_steps)
+
+    def _finalize_rotate_pi0_candidate(self) -> dict[str, Any] | None:
+        """Finalize an admitted rotate→Pi0 cycle after planner transfer."""
+
+        if self._active_task_spec().surface_review_policy is None:
+            self._active_rotate_pi0_candidate = None
+            return None
+        candidate = getattr(self, "_active_rotate_pi0_candidate", None)
+        if (
+            not isinstance(candidate, dict)
+            or int(candidate.get("full_chunks_executed", 0)) < 1
+            or candidate.get("invocation_id") != self._active_vla_invocation
+        ):
+            self._active_rotate_pi0_candidate = None
+            return None
+        hand = str(candidate["rotate_receipt"].get("resolved_hand", ""))
+        facts = self._attachment_runtime_facts()
+        current_attachment = facts.get("attached_objects", {}).get(hand)
+        matches, identity = _attachment_identity_status(
+            current_attachment,
+            candidate.get("expected_attachment"),
+            hand=hand,
+        )
+        attachment_fingerprint = self._attachment_lineage_fingerprint(
+            current_attachment,
+            hand=hand,
+        )
+        if (
+            facts.get("available") is not True
+            or hand not in facts.get("hands", [])
+            or not matches
+            or attachment_fingerprint != candidate.get("attachment_fingerprint")
+        ):
+            self._active_rotate_pi0_candidate = None
+            self._completed_opposite_surface_cycles = []
+            return None
+        finalized = {
+            **candidate,
+            "finalized_env_step": int(self._env_steps),
+            "attachment_identity_at_finalize": _wire_safe(identity),
+            "attachment_fingerprint": attachment_fingerprint,
+            "public_frame_ids_at_finalize": set(
+                getattr(self, "_public_observed_frame_ids", set())
+            ),
+            "public_capture_sequence_at_finalize": int(
+                getattr(self, "_public_capture_sequence", 0)
+            ),
+        }
+        self._awaiting_opposite_surface_review = finalized
+        self._active_rotate_pi0_candidate = None
+        return finalized
+
+    def _record_frame_review_cycle(
+        self,
+        *,
+        requested_camera: str,
+        resolved_camera: str,
+        frame: Any,
+        capture_receipt: dict[str, Any],
+        assessment: str,
+    ) -> dict[str, Any]:
+        """Consume a post-finalization frame review and maybe disable Pi0."""
+
+        surface_policy = self._active_task_spec().surface_review_policy
+        if surface_policy is None:
+            raise ValueError(
+                f"{self._active_task_spec().task_name} does not define frame review"
+            )
+        review_receipt = self._seal_attempt_receipt(
+            {
+                "kind": "public_frame_review",
+                "env_step": int(self._env_steps),
+                "camera": requested_camera,
+                "resolved_camera": resolved_camera,
+                "frame_id": str(frame.frame_id),
+                "capture_group_id": str(frame.capture_group_id),
+                "capture_sequence": int(capture_receipt["capture_sequence"]),
+                "capture_receipt_sha256": capture_receipt["receipt_sha256"],
+                "rgb_sha256": capture_receipt["rgb_sha256"],
+                "assessment": assessment,
+            }
+        )
+        if assessment == surface_policy.target_assessment and not isinstance(
+            getattr(self, "_awaiting_opposite_surface_review", None), dict
+        ):
+            rotate_receipt = getattr(
+                self, "_latest_successful_held_rotate_receipt", None
+            )
+            expected_attachment = getattr(
+                self, "_latest_successful_held_rotate_attachment", None
+            )
+            prior_frame_ids = getattr(
+                self,
+                "_latest_successful_held_rotate_public_frame_ids",
+                set(),
+            )
+            target_qualifies = False
+            target_reason = "no_successful_held_rotate"
+            if (
+                self._attempt_receipt_is_current(rotate_receipt)
+                and expected_attachment is not None
+            ):
+                hand = str(rotate_receipt.get("resolved_hand", ""))
+                facts = self._attachment_runtime_facts()
+                current_attachment = facts.get("attached_objects", {}).get(hand)
+                matches, identity = _attachment_identity_status(
+                    current_attachment,
+                    expected_attachment,
+                    hand=hand,
+                )
+                attachment_fingerprint = self._attachment_lineage_fingerprint(
+                    current_attachment,
+                    hand=hand,
+                )
+                if int(rotate_receipt.get("env_step", -1)) != int(self._env_steps):
+                    target_reason = "target_review_not_at_rotate_env_step"
+                elif int(frame.step_index) != int(self._env_steps):
+                    target_reason = "target_review_frame_not_current"
+                elif frame.frame_id in prior_frame_ids or int(
+                    capture_receipt["env_step"]
+                ) != int(rotate_receipt.get("env_step", -1)):
+                    target_reason = "target_review_frame_was_not_captured_after_rotate"
+                elif (
+                    facts.get("available") is not True
+                    or hand not in facts.get("hands", [])
+                    or not matches
+                    or attachment_fingerprint
+                    != rotate_receipt.get("attachment_fingerprint")
+                ):
+                    target_reason = "held_attachment_changed_before_target_review"
+                else:
+                    authorization = self._seal_attempt_receipt(
+                        {
+                            "kind": "held_rotate_target_surface_review",
+                            "env_step": int(self._env_steps),
+                            "resolved_hand": hand,
+                            "rotate_receipt_sha256": rotate_receipt["receipt_sha256"],
+                            "frame_review_receipt_sha256": review_receipt[
+                                "receipt_sha256"
+                            ],
+                            "assessment": assessment,
+                            "attachment_identity": _wire_safe(identity),
+                            "attachment_fingerprint": attachment_fingerprint,
+                        }
+                    )
+                    self._held_rotate_target_surface_review = authorization
+                    target_qualifies = True
+                    target_reason = ""
+            if not target_qualifies:
+                self._held_rotate_target_surface_review = None
+                self._completed_opposite_surface_cycles = []
+            return {
+                "accepted": True,
+                "qualifying_cycle": False,
+                "qualifying_pre_vla_target_review": target_qualifies,
+                "nonqualifying_reason": target_reason or None,
+                "frame_review_receipt": review_receipt,
+                "capture_receipt": capture_receipt,
+                "target_surface_review_receipt": _wire_safe(
+                    getattr(self, "_held_rotate_target_surface_review", None)
+                ),
+                "cycle_receipt": None,
+                "completed_qualifying_cycles": len(
+                    getattr(self, "_completed_opposite_surface_cycles", [])
+                ),
+                "pi0_nav_pick_disabled": self._pi0_nav_pick_is_receipt_disabled(),
+                "pi0_nav_pick_disable_receipt": _wire_safe(
+                    getattr(self, "_pi0_nav_pick_disable_receipt", None)
+                ),
+            }
+        candidate = getattr(self, "_awaiting_opposite_surface_review", None)
+        self._awaiting_opposite_surface_review = None
+        qualifies = False
+        nonqualifying_reason = "no_finalized_rotate_pi0_candidate"
+        cycle_receipt = None
+        if isinstance(candidate, dict):
+            hand = str(candidate["rotate_receipt"].get("resolved_hand", ""))
+            facts = self._attachment_runtime_facts()
+            current_attachment = facts.get("attached_objects", {}).get(hand)
+            matches, identity = _attachment_identity_status(
+                current_attachment,
+                candidate.get("expected_attachment"),
+                hand=hand,
+            )
+            attachment_fingerprint = self._attachment_lineage_fingerprint(
+                current_attachment,
+                hand=hand,
+            )
+            if assessment != surface_policy.opposite_assessment:
+                nonqualifying_reason = "assessment_did_not_confirm_opposite_surface"
+            elif int(frame.step_index) != int(candidate["finalized_env_step"]):
+                nonqualifying_reason = "review_frame_not_at_finalized_env_step"
+            elif frame.frame_id in candidate["public_frame_ids_at_finalize"] or int(
+                capture_receipt["capture_sequence"]
+            ) <= int(candidate["public_capture_sequence_at_finalize"]):
+                nonqualifying_reason = "review_frame_was_not_captured_after_finalize"
+            elif (
+                facts.get("available") is not True
+                or hand not in facts.get("hands", [])
+                or not matches
+                or attachment_fingerprint != candidate.get("attachment_fingerprint")
+            ):
+                nonqualifying_reason = "held_attachment_changed_before_review"
+            else:
+                cycle_base = {
+                    "kind": "rotate_pi0_opposite_surface_cycle",
+                    "env_step": int(self._env_steps),
+                    "resolved_hand": hand,
+                    "rotate_receipt_sha256": candidate["rotate_receipt"][
+                        "receipt_sha256"
+                    ],
+                    "target_surface_review_receipt_sha256": candidate[
+                        "target_surface_review_receipt"
+                    ]["receipt_sha256"],
+                    "vla_invocation_id": candidate["invocation_id"],
+                    "vla_call_index": int(candidate["call_index"]),
+                    "vla_bound_env_step": int(candidate["bound_env_step"]),
+                    "full_chunks_executed": int(candidate["full_chunks_executed"]),
+                    "vla_finalized_env_step": int(candidate["finalized_env_step"]),
+                    "attachment_identity": _wire_safe(identity),
+                    "attachment_fingerprint": attachment_fingerprint,
+                    "frame_review_receipt_sha256": review_receipt["receipt_sha256"],
+                }
+                cycle_base["cycle_id"] = (
+                    "cycle_"
+                    + hashlib.sha256(_canonical_json_bytes(cycle_base)).hexdigest()[:24]
+                )
+                cycle_receipt = self._seal_attempt_receipt(cycle_base)
+                qualifies = True
+                nonqualifying_reason = ""
+        if qualifies and isinstance(cycle_receipt, dict):
+            completed = list(getattr(self, "_completed_opposite_surface_cycles", []))
+            if completed and (
+                completed[-1].get("resolved_hand") != cycle_receipt.get("resolved_hand")
+                or completed[-1].get("attachment_fingerprint")
+                != cycle_receipt.get("attachment_fingerprint")
+            ):
+                completed = []
+            if completed and (
+                completed[-1].get("cycle_id") == cycle_receipt.get("cycle_id")
+                or completed[-1].get("vla_invocation_id")
+                == cycle_receipt.get("vla_invocation_id")
+            ):
+                completed = []
+            completed.append(cycle_receipt)
+            cycle_limit = surface_policy.opposite_cycles_before_pi0_disable
+            self._completed_opposite_surface_cycles = completed[-cycle_limit:]
+            if (
+                len(self._completed_opposite_surface_cycles)
+                == surface_policy.opposite_cycles_before_pi0_disable
+                and not self._pi0_nav_pick_is_receipt_disabled()
+                and not (
+                    self._official_success_latched or _raw_success(self._last_info)
+                )
+            ):
+                disable = self._seal_attempt_receipt(
+                    {
+                        "kind": "pi0_nav_pick_attempt_disable",
+                        "reason": "two_consecutive_opposite_surface_cycles",
+                        "env_step": int(self._env_steps),
+                        "cycle_receipts": deepcopy(
+                            self._completed_opposite_surface_cycles
+                        ),
+                    }
+                )
+                _write_json_atomic(self._pi0_nav_pick_disable_receipt_path, disable)
+                self._pi0_nav_pick_disable_receipt = disable
+        else:
+            self._completed_opposite_surface_cycles = []
+        return {
+            "accepted": True,
+            "qualifying_cycle": qualifies,
+            "nonqualifying_reason": nonqualifying_reason or None,
+            "frame_review_receipt": review_receipt,
+            "capture_receipt": capture_receipt,
+            "cycle_receipt": cycle_receipt,
+            "completed_qualifying_cycles": len(
+                getattr(self, "_completed_opposite_surface_cycles", [])
+            ),
+            "pi0_nav_pick_disabled": self._pi0_nav_pick_is_receipt_disabled(),
+            "pi0_nav_pick_disable_receipt": _wire_safe(
+                getattr(self, "_pi0_nav_pick_disable_receipt", None)
+            ),
+        }
+
+    def _held_closure_receipt_matches(
+        self,
+        *,
+        hand: str,
+        attached_object: Any,
+    ) -> bool:
+        receipts = getattr(self, "_held_closure_receipts", {})
+        receipt = receipts.get(hand) if isinstance(receipts, dict) else None
+        if not isinstance(receipt, dict):
+            return False
+        if (
+            receipt.get("run_nonce") != getattr(self, "_run_nonce", None)
+            or receipt.get("attempt_nonce") != getattr(self, "_attempt_nonce", None)
+            or int(receipt.get("attempt_index", -1))
+            != int(getattr(self, "_attempt_index", -2))
+            or receipt.get("hand") != hand
+            or float(receipt.get("close_latch", 1.0)) > _HELD_CLOSE_LATCH_MAX
+            or int(receipt.get("confirmed_env_step", -1)) < 0
+            or int(receipt.get("confirmed_env_step", -1))
+            > int(getattr(self, "_env_steps", -2))
+            or int(receipt.get("attachment_endpoint_held_steps", 0))
+            < _HELD_ATTACHMENT_CONFIRMATION_STEPS
+            or float(getattr(self, "_gripper_latch", {}).get(hand, 1.0))
+            > _HELD_CLOSE_LATCH_MAX
+        ):
+            return False
+        matches, _identity = _attachment_identity_status(
+            attached_object,
+            receipt.get("expected_attachment"),
+            hand=hand,
+        )
+        return bool(matches)
+
+    def _press_gripper_is_strictly_closed(self, hand: str) -> bool:
+        return bool(
+            self._physical_gripper_opening(hand) <= _PHYSICAL_GRIPPER_CLOSED_M
+            and float(getattr(self, "_gripper_latch", {}).get(hand, 1.0))
+            <= _HELD_CLOSE_LATCH_MAX
+        )
+
+    def _invalidate_stale_held_closure_receipts(self, facts: dict[str, Any]) -> None:
+        receipts = getattr(self, "_held_closure_receipts", None)
+        if not isinstance(receipts, dict):
+            self._held_closure_receipts = {}
+            return
+        attached_objects = facts.get("attached_objects", {})
+        attached_objects = (
+            attached_objects if isinstance(attached_objects, dict) else {}
+        )
+        for hand in tuple(receipts):
+            if facts.get(
+                "available"
+            ) is not True or not self._held_closure_receipt_matches(
+                hand=hand,
+                attached_object=attached_objects.get(hand),
+            ):
+                receipts.pop(hand, None)
+
+    def _current_object_visual_authorization(
+        self,
+        visual_check: Any,
+        *,
+        invocation_id: str | None,
+    ) -> dict[str, Any]:
+        """Bind one LLM-reviewed public frame to a held-state VLA invocation."""
+
+        if not isinstance(visual_check, dict):
+            raise ValueError("current_object_visual_check must be an object")
+        required = {"camera", "frame_id", "assessment"}
+        if set(visual_check) != required:
+            raise ValueError(
+                "current_object_visual_check requires exactly camera, frame_id, "
+                "and assessment"
+            )
+        camera = str(visual_check["camera"])
+        if camera not in {"head", "left_wrist", "right_wrist"}:
+            raise ValueError(
+                "current_object_visual_check.camera must be head, left_wrist, "
+                "or right_wrist"
+            )
+        frame_id = str(visual_check["frame_id"]).strip()
+        if not frame_id:
+            raise ValueError("current_object_visual_check.frame_id must be non-empty")
+        if (
+            str(visual_check["assessment"])
+            != "current_task_object_configuration_reviewed"
+        ):
+            raise ValueError(
+                "current_object_visual_check.assessment must confirm that the "
+                "current task-object configuration was reviewed"
+            )
+        resolved_camera = self._resolve_camera_role(camera)
+        frame = self._frame_cache.get_current(resolved_camera, frame_id)
+        if frame.frame_id not in self._public_observed_frame_ids:
+            raise RuntimeError(
+                "current_object_visual_check must reference a public observe result"
+            )
+        if int(frame.step_index) != int(self._env_steps):
+            raise RuntimeError(
+                "current_object_visual_check must reference the current env step"
+            )
+        if not isinstance(frame.capture_group_id, str) or not frame.capture_group_id:
+            raise RuntimeError(
+                "current_object_visual_check must reference a synchronized public "
+                "observe capture"
+            )
+        return {
+            "schema_version": 1,
+            "source": "llm_fresh_public_observation",
+            "run_nonce": self._run_nonce,
+            "attempt_nonce": self._attempt_nonce,
+            "attempt_index": int(self._attempt_index),
+            "invocation_id": invocation_id,
+            "env_step": int(self._env_steps),
+            "camera": camera,
+            "resolved_camera": resolved_camera,
+            "frame_id": frame.frame_id,
+            "capture_group_id": frame.capture_group_id,
+            "assessment": "current_task_object_configuration_reviewed",
+        }
+
+    def _baseline_internal_visual_authorization(
+        self,
+        *,
+        invocation_id: str,
+        attachment_snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Bind a private synchronized capture for the pure-VLA baseline.
+
+        This is not a public ``observe`` receipt and cannot authorize any
+        analytic primitive. It exists only so the baseline can repeatedly
+        invoke Pi0 while attachments are present without introducing an LLM or
+        an additional public tool call.
+        """
+
+        if self._controller_mode != "pi0_nav_pick_only":
+            raise RuntimeError(
+                "baseline internal authorization requires pi0_nav_pick_only mode"
+            )
+        self._refresh_observation_without_step(synchronize_hand_geometry=True)
+        refreshed = self._attachment_fingerprint_snapshot()
+        if (
+            refreshed.get("available") is not True
+            or refreshed.get("hands") != attachment_snapshot.get("hands")
+            or refreshed.get("fingerprints") != attachment_snapshot.get("fingerprints")
+        ):
+            raise RuntimeError(
+                "attachment identity changed during baseline synchronized capture"
+            )
+        frames = {
+            camera: self._frame_cache.latest(camera)
+            for camera in ("head", "left_wrist", "right_wrist")
+        }
+        capture_groups = {frame.capture_group_id for frame in frames.values()}
+        if len(capture_groups) != 1 or None in capture_groups:
+            raise RuntimeError(
+                "baseline internal authorization lacks one synchronized capture"
+            )
+        if any(
+            int(frame.step_index) != int(self._env_steps) for frame in frames.values()
+        ):
+            raise RuntimeError(
+                "baseline internal authorization capture is not at current env step"
+            )
+        head = frames["head"]
+        return {
+            "schema_version": 1,
+            "source": "baseline_internal_synchronized_capture",
+            "controller_mode": self._controller_mode,
+            "run_nonce": self._run_nonce,
+            "attempt_nonce": self._attempt_nonce,
+            "attempt_index": int(self._attempt_index),
+            "invocation_id": invocation_id,
+            "env_step": int(self._env_steps),
+            "resolved_camera": "head",
+            "frame_id": head.frame_id,
+            "capture_group_id": head.capture_group_id,
+            "camera_frame_ids": {
+                camera: frame.frame_id for camera, frame in frames.items()
+            },
+            "attachment_fingerprints": dict(refreshed.get("fingerprints", {})),
+            "assessment": "runtime_synchronized_state_only",
+        }
+
+    def _visual_hand_authorization(
+        self,
+        *,
+        selected_hand: str,
+        visual_hand_check: Any,
+    ) -> dict[str, Any]:
+        """Bind an LLM-confirmed physical hand to the latest public head frame."""
+
+        if not isinstance(visual_hand_check, dict):
+            raise ValueError("visual_hand_check is required for analytic primitives")
+        required = {"camera", "frame_id", "selected_hand", "assessment"}
+        if set(visual_hand_check) != required:
+            raise ValueError(
+                "visual_hand_check requires exactly camera, frame_id, "
+                "selected_hand, and assessment"
+            )
+        camera = str(visual_hand_check["camera"])
+        if camera != "head":
+            raise ValueError("visual_hand_check.camera must be head")
+        checked_hand = str(visual_hand_check["selected_hand"])
+        if checked_hand != selected_hand:
+            raise ValueError(
+                "visual_hand_check.selected_hand must match the resolved physical hand"
+            )
+        assessment = str(visual_hand_check["assessment"])
+        if assessment != "selected_hand_visually_confirmed":
+            raise ValueError(
+                "visual_hand_check.assessment must be selected_hand_visually_confirmed"
+            )
+        frame_id = str(visual_hand_check["frame_id"]).strip()
+        if not frame_id:
+            raise ValueError("visual_hand_check.frame_id must be non-empty")
+        resolved_camera = canonical_camera(camera)
+        frame = self._frame_cache.get_current(resolved_camera, frame_id)
+        if frame.frame_id not in getattr(self, "_public_observed_frame_ids", set()):
+            raise RuntimeError(
+                "visual_hand_check must reference a public observe result"
+            )
+        if frame.frame_id != getattr(self, "_latest_public_head_frame_id", None):
+            raise RuntimeError(
+                "visual_hand_check must reference the latest public head observation"
+            )
+        if int(frame.step_index) != int(self._env_steps):
+            raise RuntimeError("visual_hand_check must reference the current env step")
+        if not isinstance(frame.capture_group_id, str) or not frame.capture_group_id:
+            raise RuntimeError(
+                "visual_hand_check must reference a synchronized public observe capture"
+            )
+        return self._seal_attempt_receipt(
+            {
+                "kind": "visual_hand_authorization",
+                "source": "llm_fresh_public_head_observation",
+                "env_step": int(self._env_steps),
+                "camera": camera,
+                "resolved_camera": resolved_camera,
+                "frame_id": frame.frame_id,
+                "capture_group_id": frame.capture_group_id,
+                "selected_hand": selected_hand,
+                "assessment": "selected_hand_visually_confirmed",
+            }
+        )
+
+    def _navigation_visual_authorization(
+        self,
+        *,
+        projection_receipt: Any,
+        navigation_visual_check: Any,
+    ) -> dict[str, Any]:
+        """Bind a base-navigation projection to the latest public head frame."""
+
+        if not self._projection_receipt_is_fresh(projection_receipt):
+            raise RuntimeError("fresh projection receipt is required")
+        if not isinstance(navigation_visual_check, dict):
+            raise ValueError("navigation_visual_check is required for navigate_to")
+        required = {"camera", "frame_id", "assessment"}
+        if set(navigation_visual_check) != required:
+            raise ValueError(
+                "navigation_visual_check requires exactly camera, frame_id, "
+                "and assessment"
+            )
+        camera = str(navigation_visual_check["camera"])
+        if camera != "head":
+            raise ValueError("navigation_visual_check.camera must be head")
+        assessment = str(navigation_visual_check["assessment"])
+        if assessment != "navigation_target_visually_confirmed":
+            raise ValueError(
+                "navigation_visual_check.assessment must be "
+                "navigation_target_visually_confirmed"
+            )
+        frame_id = str(navigation_visual_check["frame_id"]).strip()
+        if not frame_id:
+            raise ValueError("navigation_visual_check.frame_id must be non-empty")
+        resolved_camera = canonical_camera(camera)
+        frame = self._frame_cache.get_current(resolved_camera, frame_id)
+        if frame.frame_id not in getattr(self, "_public_observed_frame_ids", set()):
+            raise RuntimeError(
+                "navigation_visual_check must reference a public observe result"
+            )
+        if frame.frame_id != getattr(self, "_latest_public_head_frame_id", None):
+            raise RuntimeError(
+                "navigation_visual_check must reference the latest public head "
+                "observation"
+            )
+        if int(frame.step_index) != int(self._env_steps):
+            raise RuntimeError(
+                "navigation_visual_check must reference the current env step"
+            )
+        if not isinstance(frame.capture_group_id, str) or not frame.capture_group_id:
+            raise RuntimeError(
+                "navigation_visual_check must reference a synchronized public "
+                "observe capture"
+            )
+        if (
+            projection_receipt.get("camera") != camera
+            or projection_receipt.get("resolved_camera") != resolved_camera
+            or projection_receipt.get("frame_id") != frame.frame_id
+            or projection_receipt.get("capture_group_id") != frame.capture_group_id
+        ):
+            raise RuntimeError(
+                "navigation projection and visual check must reference the same "
+                "fresh public head frame"
+            )
+        projection_id = projection_receipt.get("projection_id")
+        if not isinstance(projection_id, str) or not projection_id:
+            raise RuntimeError("navigation projection receipt has no identity")
+        return self._seal_attempt_receipt(
+            {
+                "kind": "navigation_visual_authorization",
+                "source": "llm_fresh_public_head_observation",
+                "env_step": int(self._env_steps),
+                "camera": camera,
+                "resolved_camera": resolved_camera,
+                "frame_id": frame.frame_id,
+                "capture_group_id": frame.capture_group_id,
+                "projection_id": projection_id,
+                "assessment": "navigation_target_visually_confirmed",
+            }
+        )
+
+    @staticmethod
+    def _validated_navigation_parameters(
+        *,
+        standoff_m: Any,
+        max_travel_m: Any,
+        timeout_s: Any,
+    ) -> tuple[float, float, float]:
+        """Mirror the public navigate_to numeric bounds at the RPC boundary."""
+
+        values = {
+            "standoff_m": (standoff_m, 0.45, 1.50, True),
+            "max_travel_m": (max_travel_m, 0.0, 1.50, False),
+            "timeout_s": (timeout_s, 0.0, None, False),
+        }
+        validated: dict[str, float] = {}
+        for name, (value, minimum, maximum, minimum_inclusive) in values.items():
+            if isinstance(value, bool) or not isinstance(
+                value, (int, float, np.integer, np.floating)
+            ):
+                raise ValueError(f"{name} must be a finite number")
+            number = float(value)
+            lower_ok = number >= minimum if minimum_inclusive else number > minimum
+            upper_ok = maximum is None or number <= maximum
+            if not np.isfinite(number) or not lower_ok or not upper_ok:
+                raise ValueError(f"{name} is outside the public schema bounds")
+            validated[name] = number
+        return (
+            validated["standoff_m"],
+            validated["max_travel_m"],
+            validated["timeout_s"],
+        )
+
+    @staticmethod
+    def _validated_navigation_timeout(value: Any) -> float:
+        """Validate the timeout shared by both navigate_to modes."""
+
+        if isinstance(value, bool) or not isinstance(
+            value, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError("timeout_s must be a finite number")
+        timeout = float(value)
+        if not np.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("timeout_s is outside the public schema bounds")
+        return timeout
+
+    def _release_visual_authorization(
+        self,
+        *,
+        selected_hand: str,
+        expected_attachment_fingerprint: str,
+        release_visual_check: Any,
+    ) -> dict[str, Any]:
+        """Bind a task-scoped release decision to one attachment and fresh RGB."""
+
+        policy = self._active_task_spec().release_visual_policy
+        if policy is None:
+            raise RuntimeError("the active task has no visual release policy")
+        if not isinstance(release_visual_check, dict):
+            raise ValueError(
+                "release_visual_check is required before releasing an attached "
+                "task object"
+            )
+        required = {"camera", "frame_id", "selected_hand", "assessment"}
+        if set(release_visual_check) != required:
+            raise ValueError(
+                "release_visual_check requires exactly camera, frame_id, "
+                "selected_hand, and assessment"
+            )
+        if release_visual_check.get("camera") != policy.camera:
+            raise ValueError(f"release_visual_check.camera must be {policy.camera}")
+        if release_visual_check.get("selected_hand") != selected_hand:
+            raise ValueError(
+                "release_visual_check.selected_hand must match the selected hand"
+            )
+        if release_visual_check.get("assessment") != policy.assessment:
+            raise ValueError(
+                f"release_visual_check.assessment must be {policy.assessment}"
+            )
+        frame_id = str(release_visual_check.get("frame_id", "")).strip()
+        if not frame_id:
+            raise ValueError("release_visual_check.frame_id must be non-empty")
+        resolved_camera = canonical_camera(policy.camera)
+        frame = self._frame_cache.get_current(resolved_camera, frame_id)
+        if frame.frame_id not in getattr(self, "_public_observed_frame_ids", set()):
+            raise RuntimeError(
+                "release_visual_check must reference a public observe result"
+            )
+        if frame.frame_id != getattr(self, "_latest_public_head_frame_id", None):
+            raise RuntimeError(
+                "release_visual_check must reference the latest public head observation"
+            )
+        if int(frame.step_index) != int(self._env_steps):
+            raise RuntimeError(
+                "release_visual_check must reference the current env step"
+            )
+        if not isinstance(frame.capture_group_id, str) or not frame.capture_group_id:
+            raise RuntimeError(
+                "release_visual_check must reference a synchronized public observe "
+                "capture"
+            )
+        if not isinstance(expected_attachment_fingerprint, str) or not (
+            expected_attachment_fingerprint
+        ):
+            raise RuntimeError(
+                "release_visual_check requires one stable selected attachment identity"
+            )
+        return self._seal_attempt_receipt(
+            {
+                "kind": "trash_release_visual_authorization",
+                "source": "llm_fresh_public_head_observation",
+                "env_step": int(self._env_steps),
+                "camera": policy.camera,
+                "resolved_camera": resolved_camera,
+                "frame_id": frame.frame_id,
+                "capture_group_id": frame.capture_group_id,
+                "selected_hand": selected_hand,
+                "assessment": policy.assessment,
+                "attachment_fingerprint": expected_attachment_fingerprint,
+                "semantic_target_verified": False,
+                "collision_authorization": False,
+                "distance_authorization": False,
+            }
+        )
+
+    def _authorize_analytic_hand(
+        self,
+        hand: str,
+        visual_hand_check: Any,
+    ) -> tuple[str, str, dict[str, Any]]:
+        """Authorize one explicit anatomical hand for an analytic primitive."""
+
+        selected_hand = str(hand)
+        if selected_hand not in {"left", "right"}:
+            raise ValueError("hand must be left or right")
+        facts = self._attachment_runtime_facts()
+        if facts.get("available") is not True:
+            raise RuntimeError(
+                "attachment identity conflict"
+                if facts.get("identity_conflict") is True
+                else "attachment feedback is unavailable"
+            )
+        evidence = self._visual_hand_authorization(
+            selected_hand=selected_hand,
+            visual_hand_check=visual_hand_check,
+        )
+        return selected_hand, "llm_visual_hand_selection", evidence
+
+    def _sanitized_capability_summary(self) -> dict[str, Any]:
+        facts = self._attachment_runtime_facts()
+        grippers: dict[str, str] = {}
+        gripper_basis: dict[str, str] = {}
+        attached_objects = facts.get("attached_objects", {})
+        attached_objects = (
+            attached_objects if isinstance(attached_objects, dict) else {}
+        )
+        for hand in ("left", "right"):
+            try:
+                opening = self._physical_gripper_opening(hand)
+                physically_closed = opening <= _PHYSICAL_GRIPPER_CLOSED_M
+                stable_object_grasp = bool(
+                    hand in facts.get("hands", [])
+                    and self._held_closure_receipt_matches(
+                        hand=hand,
+                        attached_object=attached_objects.get(hand),
+                    )
+                )
+                grippers[hand] = (
+                    "closed" if physically_closed or stable_object_grasp else "open"
+                )
+                gripper_basis[hand] = (
+                    "physical_closure"
+                    if physically_closed
+                    else "stable_object_grasp"
+                    if stable_object_grasp
+                    else "physical_opening"
+                )
+            except Exception:
+                grippers[hand] = "unknown"
+                gripper_basis[hand] = "unavailable"
+        return {
+            "controller_state": self._controller_state,
+            "attachments": {
+                "available": bool(facts.get("available", False)),
+                "count": int(facts.get("attachment_count", 0)),
+                "conflict": bool(facts.get("identity_conflict", False)),
+                "by_hand": {
+                    hand: {"attached": hand in facts.get("hands", [])}
+                    for hand in ("left", "right")
+                },
+            },
+            "gripper_state": grippers,
+            "gripper_state_basis": gripper_basis,
+            "motion_in_flight": bool(self._motion_in_flight),
+            "official_success_latched": bool(self._official_success_latched),
+        }
+
+    def _projection_receipt_is_fresh(self, receipt: Any) -> bool:
+        if not isinstance(receipt, dict):
+            return False
+        return bool(
+            receipt.get("run_nonce") == self._run_nonce
+            and receipt.get("attempt_nonce") == self._attempt_nonce
+            and int(receipt.get("env_step", -1)) == int(self._env_steps)
+            and isinstance(receipt.get("projection_id"), str)
+        )
+
+    def _switch_controller(
+        self,
+        target: str,
+    ) -> dict[str, Any]:
+        """Switch controller ownership atomically when no action is in flight."""
+
+        if target not in {_CONTROLLER_VLA, _CONTROLLER_PLANNER}:
+            raise ValueError("target controller must be vla or planner")
+        if self._motion_in_flight:
+            raise RuntimeError("controller switch rejected while motion is in flight")
+        if self._official_success_latched:
+            raise RuntimeError("controller switch rejected after official success")
+        if self._controller_state == target:
+            return {"from": target, "to": target, "changed": False}
+        facts = self._attachment_runtime_facts()
+        if facts.get("available") is not True:
+            raise RuntimeError(
+                "attachment identity conflict"
+                if facts.get("identity_conflict") is True
+                else "attachment feedback is unavailable"
+            )
+        before_attachments = self._attachment_fingerprint_snapshot(facts)
+        if not before_attachments["available"]:
+            raise RuntimeError("attachment feedback is unavailable")
         robot = self._robot()
         if robot is None:
             raise RuntimeError("R1Pro robot is unavailable")
-        q = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(-1)
-        if not np.isfinite(q).all():
-            raise RuntimeError("robot joint motion state is invalid")
-        robot_position, robot_orientation = self._object_pose(robot)
-        radio_position, radio_orientation = self._object_pose(radio)
-        eef_links = getattr(robot, "eef_links", {})
-        held_link = eef_links.get(held_hand) if isinstance(eef_links, dict) else None
-        press_link = eef_links.get(press_hand) if isinstance(eef_links, dict) else None
-        if held_link is None or press_link is None:
-            raise RuntimeError("held or press EEF link is unavailable")
-        eef_position, eef_orientation = self._object_pose(held_link)
-        press_eef_position, press_eef_orientation = self._object_pose(press_link)
-        relative_position, relative_orientation = self._relative_pose(
-            eef_position,
-            eef_orientation,
-            radio_position,
-            radio_orientation,
-        )
-        base_indices = list(
-            np.asarray(_numpy_tree(getattr(robot, "base_control_idx", [])), dtype=int)
-        )
-        trunk_indices = list(
-            np.asarray(_numpy_tree(getattr(robot, "trunk_control_idx", [])), dtype=int)
-        )
-        arm_indices = getattr(robot, "arm_control_idx", {}) or {}
-        left_indices = list(
-            np.asarray(_numpy_tree(arm_indices.get("left", [])), dtype=int)
-        )
-        right_indices = list(
-            np.asarray(_numpy_tree(arm_indices.get("right", [])), dtype=int)
-        )
-        if not (
-            len(base_indices) == 3
-            and len(trunk_indices) == 4
-            and len(left_indices) == 7
-            and len(right_indices) == 7
-        ):
-            raise RuntimeError("R1Pro controlled joint layout is unavailable")
-        controlled_indices = base_indices + trunk_indices + left_indices + right_indices
-        if min(controlled_indices) < 0 or max(controlled_indices) >= len(q):
-            raise RuntimeError("R1Pro controlled joint indices are invalid")
-        observation = self._last_observation
-        if observation is None:
-            raise RuntimeError("checkpoint requires a current public observation")
-        openings = {
-            side: self._validated_selected_gripper_opening(
-                observation=observation, hand=side
-            )
-            for side in ("left", "right")
-        }
-        evidence = validation_evidence
-        if evidence is None and self._handoff_validator_frames:
-            evidence = {
-                "latest_frame": self._handoff_validator_frames[-1],
-                "validator_trace_path": str(self._validator_trace_path),
-            }
-        nonblocking_post_pick_save = bool(
-            self._control_mode == PI0_NAV_PICK_VLA_MODE
-            and checkpoint_name == "state_checkpoint_1"
-        )
-        checkpoint_warnings = list(
-            (evidence or {}).get("post_pick_warnings", [])
-            if isinstance(evidence, dict)
-            else []
-        )
-        checkpoint_grasp_pass = not require_current_grasp
-        current_validation: dict[str, Any] | None = None
-        if require_current_grasp:
-            settling_aware = False
-            try:
-                current_validation = self._handoff_validator_frame(observation)
-                selected = current_validation["per_hand"][held_hand]
-                other = current_validation["per_hand"][press_hand]
-                stable_frames = (
-                    (evidence or {}).get("stable_hold_frames", [])
-                    if isinstance(evidence, dict)
-                    else []
-                )
-                settling_aware = bool(
-                    nonblocking_post_pick_save
-                    and stage == "post_pi0_nav_pick"
-                    and isinstance(stable_frames, list)
-                    and len(stable_frames) == HANDOFF_VALIDATION_FRAMES
-                )
-                checkpoint_grasp_pass = bool(
-                    _post_reload_grasp_stable(selected=selected, other=other)
-                    if settling_aware
-                    else bool(selected.get("instantaneous_pass", False))
-                    and not bool(other.get("instantaneous_pass", False))
-                )
-            except Exception as exc:
-                if not nonblocking_post_pick_save:
-                    raise
-                checkpoint_grasp_pass = False
-                checkpoint_warnings.append(
-                    _post_pick_warning(
-                        "current_grasp_validator_unavailable",
-                        f"{type(exc).__name__}: {exc}",
-                    )
-                )
-            if not checkpoint_grasp_pass:
-                if not nonblocking_post_pick_save:
+        reload_controllers = getattr(robot, "reload_controllers", None)
+        if not callable(reload_controllers):
+            raise RuntimeError("R1Pro controller reload API is unavailable")
+        self._controller_state = _CONTROLLER_SWITCHING
+        try:
+            if target == _CONTROLLER_PLANNER:
+                report = self._reload_base_controller_position()
+            else:
+                if self._velocity_controller_config is None:
                     raise RuntimeError(
-                        "checkpoint current-grasp validation did not uniquely pass held_hand"
+                        "initial velocity controller config is unavailable"
                     )
-                checkpoint_warnings.append(
-                    _post_pick_warning(
-                        "current_grasp_not_strict",
-                        "checkpoint current-grasp validator did not uniquely pass held_hand",
-                        metrics=current_validation,
-                    )
+                reload_controllers(deepcopy(self._velocity_controller_config))
+                self._base_controller_mode = "velocity"
+                report = {"from": "position", "to": "velocity"}
+            self._require_planner().on_runtime_state_changed()
+            after = self._attachment_runtime_facts()
+            after_attachments = self._attachment_fingerprint_snapshot(after)
+            if (
+                not after_attachments["available"]
+                or after_attachments["hands"] != before_attachments["hands"]
+                or after_attachments["fingerprints"]
+                != before_attachments["fingerprints"]
+            ):
+                raise RuntimeError(
+                    "attachment identity changed during controller switch"
                 )
-            evidence = {
-                **(evidence or {}),
-                "checkpoint_current_validation": current_validation,
-                "checkpoint_current_validation_policy": (
-                    "post_reload_2mm_lift_settling_tolerance"
-                    if settling_aware
-                    else "strict_instantaneous"
-                ),
-            }
-        held_validation = (
-            current_validation["per_hand"][held_hand]
-            if isinstance(current_validation, dict)
-            else {}
-        )
-        press_validation = (
-            current_validation["per_hand"][press_hand]
-            if isinstance(current_validation, dict)
-            else {}
-        )
-        lift_delta = (
-            float(radio_position[2] - self._initial_radio_position[2])
-            if (self._initial_radio_position is not None)
-            else None
-        )
-        payload = {
-            "schema_version": 1,
-            "kind": "robot_motion_checkpoint",
-            "not_simulator_restore": True,
-            "checkpoint_name": checkpoint_name,
-            "stage": stage,
-            "strict_local_grasp_success": bool(checkpoint_grasp_pass),
-            "usable_post_pick_saved": bool(nonblocking_post_pick_save),
-            "save_policy": (
-                POST_PICK_DEBUG_SAVE_POLICY
-                if nonblocking_post_pick_save
-                else "strict_checkpoint_validation"
-            ),
-            "warnings": _wire_safe(checkpoint_warnings),
-            "env_step": int(self._env_steps),
-            "held_hand": held_hand,
-            "press_hand": press_hand,
-            "object_name": resolved_name or object_name,
-            "robot": {
-                "base_xy_yaw": q[base_indices].astype(float).tolist(),
-                "trunk_q": q[trunk_indices].astype(float).tolist(),
-                "left_arm_q": q[left_indices].astype(float).tolist(),
-                "right_arm_q": q[right_indices].astype(float).tolist(),
-                "left_gripper": {
-                    "command": float(self._gripper_latch["left"]),
-                    "opening": float(openings["left"]),
-                    "opening_threshold_exclusive": HANDOFF_GRIPPER_OPENING_MAX,
-                    "close_command": -1.0,
-                },
-                "right_gripper": {
-                    "command": float(self._gripper_latch["right"]),
-                    "opening": float(openings["right"]),
-                    "opening_threshold_exclusive": HANDOFF_GRIPPER_OPENING_MAX,
-                    "close_command": -1.0,
-                },
-                "left_gripper_command": float(self._gripper_latch["left"]),
-                "left_gripper_opening_m": float(openings["left"]),
-                "right_gripper_command": float(self._gripper_latch["right"]),
-                "right_gripper_opening_m": float(openings["right"]),
-                "gripper_opening_threshold_exclusive_m": HANDOFF_GRIPPER_OPENING_MAX,
-                "held_gripper_close_command": -1.0,
-                "q_space_target": {
-                    "indices": [int(index) for index in controlled_indices],
-                    "values": q[controlled_indices].astype(float).tolist(),
-                },
-            },
-            "poses": {
-                "held_eef_pose_world": {
-                    "position": eef_position.astype(float).tolist(),
-                    "quat_xyzw": eef_orientation.astype(float).tolist(),
-                },
-                "press_eef_pose_world": {
-                    "position": press_eef_position.astype(float).tolist(),
-                    "quat_xyzw": press_eef_orientation.astype(float).tolist(),
-                },
-                "object_pose_world": {
-                    "position": radio_position.astype(float).tolist(),
-                    "quat_xyzw": radio_orientation.astype(float).tolist(),
-                },
-                "object_pose_in_held_eef": {
-                    "position": relative_position.astype(float).tolist(),
-                    "quat_xyzw": relative_orientation.astype(float).tolist(),
-                },
-                "robot_pose_world": {
-                    "position": robot_position.astype(float).tolist(),
-                    "quat_xyzw": robot_orientation.astype(float).tolist(),
-                },
-            },
-            "validation": {
-                "require_current_grasp": bool(require_current_grasp),
-                "strict_local_grasp_success": bool(checkpoint_grasp_pass),
-                "usable_post_pick_saved": bool(nonblocking_post_pick_save),
-                "save_policy": (
-                    POST_PICK_DEBUG_SAVE_POLICY
-                    if nonblocking_post_pick_save
-                    else "strict_checkpoint_validation"
-                ),
-                "warnings": _wire_safe(checkpoint_warnings),
-                "held_gripper_closed": bool(
-                    held_validation.get("criteria", {}).get("opening_strict", False)
-                ),
-                "held_object_stable": bool(checkpoint_grasp_pass),
-                "inactive_hand_clear": bool(
-                    not press_validation.get("instantaneous_pass", False)
-                    and held_validation.get("criteria", {}).get(
-                        "other_hand_no_assisted_attachment", False
-                    )
-                    and held_validation.get("criteria", {}).get(
-                        "other_hand_no_backend_attachment", False
-                    )
-                    and held_validation.get("criteria", {}).get(
-                        "other_hand_no_radio_contact", False
-                    )
-                ),
-                "lift_delta_m": lift_delta,
-                "official_task_success": bool(_raw_success(self._last_info)),
-                "validator_trace_path": str(self._validator_trace_path),
-                "evidence_summary": _wire_safe(
-                    {
-                        "stable_post_reload_frame_count": len(
-                            (evidence or {}).get("stable_hold_frames", [])
-                        ),
-                        "strict_held_hand": (evidence or {})
-                        .get("strict_vla_window", {})
-                        .get("held_hand"),
-                        "controller_reload": (evidence or {}).get(
-                            "controller_reload", {}
-                        ),
-                    }
-                ),
-            },
-            "visual_evidence": {},
-        }
-        run_binding = self._expected_checkpoint_run_binding()
-        if run_binding is not None:
-            payload["run_binding"] = run_binding
-        return payload
+            self._controller_state = target
+            self._action_source = "pi0_vla" if target == _CONTROLLER_VLA else "planner"
+            self._vla_actions_enabled = target == _CONTROLLER_VLA
+            return {**report, "changed": True}
+        except Exception:
+            self._controller_state = _CONTROLLER_FAILED
+            raise
 
-    def _expected_checkpoint_run_binding(self) -> dict[str, Any] | None:
-        """Return the immutable identity for checkpoints created by this run."""
+    def _capture_official_success(self, info: Any) -> dict[str, Any] | None:
+        """Persist the first raw success without freezing an active Pi0 call."""
 
-        meta = getattr(self, "_meta", None)
-        nonce = getattr(self, "_run_nonce", None)
-        if not isinstance(meta, dict) or not isinstance(nonce, str) or not nonce:
+        if self._official_success_receipt is not None:
+            self._official_success_latched = True
+            return self._official_success_receipt
+        if not _raw_success(info):
             return None
-        return {
-            "nonce": nonce,
-            "suite": meta.get("suite"),
-            "task": meta.get("task"),
-            "task_name": meta.get("task_name"),
-            "activity_definition_id": meta.get("activity_definition_id"),
-            "activity_instance_id": meta.get("activity_instance_id"),
-            "scene_model": meta.get("scene_model"),
-            "seed": meta.get("seed"),
+        raw_done = _wire_safe(info.get("done")) if isinstance(info, dict) else None
+        receipt = {
+            "schema_version": 1,
+            "source": 'info["done"]["success"]',
+            "run_nonce": self._run_nonce,
+            "attempt_nonce": self._attempt_nonce,
+            "attempt_index": int(self._attempt_index),
+            "env_step": int(self._env_steps),
+            "raw_done": raw_done,
         }
+        receipt["receipt_sha256"] = hashlib.sha256(
+            _canonical_json_bytes(receipt)
+        ).hexdigest()
+        _write_json_atomic(self._official_success_receipt_path, receipt)
+        self._official_success_receipt = receipt
+        self._official_success_latched = True
+        return receipt
+
+    def _freeze_official_success_runtime(self) -> None:
+        """Freeze physical control only after a successful invocation boundary."""
+
+        if not self._official_success_latched or not isinstance(
+            self._official_success_receipt, dict
+        ):
+            raise RuntimeError(
+                "official-success runtime freeze requires an immutable receipt"
+            )
+        self._motion_frozen = True
+        self._controller_state = _CONTROLLER_FROZEN
+        self._action_source = "frozen"
+        self._vla_actions_enabled = False
+        self._done = True
+        try:
+            self._finalize_video_segment()
+            self._video_sealed = bool(
+                self._video_error is None
+                and self._video_path.is_file()
+                and self._video_path.stat().st_size > 0
+            )
+        except Exception:
+            logger.exception("best-effort success video sealing failed")
+
+    def _latch_official_success(self, info: Any) -> dict[str, Any] | None:
+        """Preserve raw success and immediately freeze outside active Pi0 work."""
+
+        if self._official_success_receipt is None and not _raw_success(info):
+            return None
+        receipt = self._capture_official_success(info)
+        if receipt is None:
+            return None
+        self._freeze_official_success_runtime()
+        return receipt
 
     def save_robot_state_checkpoint(
         self,
         *,
-        checkpoint_name: str,
-        stage: str,
-        held_hand: str,
-        press_hand: str,
-        object_name: str,
-        require_current_grasp: bool = True,
-        visual_review: bool = True,
+        semantic_label: str | None = None,
+        terminal_failure: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Atomically save robot motion state, never a whole-scene simulator dump."""
+        """Persist one synchronized RGB-D visual anchor without simulator state."""
 
-        temporary = bool(re.fullmatch(TEMP_STATE_CHECKPOINT_PATTERN, checkpoint_name))
+        if semantic_label is not None:
+            if not isinstance(semantic_label, str) or not semantic_label.strip():
+                raise ValueError("semantic_label must be a non-empty string")
+            semantic_label = semantic_label.strip()
+            if len(semantic_label) > 128:
+                raise ValueError("semantic_label must contain at most 128 characters")
+        failure_declaration: dict[str, str] | None = None
+        evidence_frame = None
+        evidence_camera = None
+        if terminal_failure is not None:
+            terminal_policy = self._active_task_spec().terminal_failure_policy
+            if terminal_policy is None:
+                raise ValueError(
+                    f"{self._active_task_spec().task_name} does not define a visual "
+                    "terminal-failure policy"
+                )
+            if not isinstance(terminal_failure, dict):
+                raise ValueError("terminal_failure must be an object")
+            required = {"condition", "cause", "camera", "frame_id"}
+            if set(terminal_failure) != required:
+                raise ValueError(
+                    "terminal_failure requires exactly condition, cause, camera, "
+                    "and frame_id"
+                )
+            failure_declaration = {
+                key: str(terminal_failure[key]).strip() for key in sorted(required)
+            }
+            if failure_declaration["condition"] != terminal_policy.condition:
+                raise ValueError(
+                    f"terminal_failure.condition must be {terminal_policy.condition}"
+                )
+            if failure_declaration["cause"] not in terminal_policy.causes:
+                raise ValueError("terminal_failure.cause is invalid")
+            if failure_declaration["camera"] not in terminal_policy.cameras:
+                raise ValueError("terminal_failure.camera is invalid")
+            if not failure_declaration["frame_id"]:
+                raise ValueError("terminal_failure.frame_id must be non-empty")
+            evidence_camera = self._resolve_camera_role(failure_declaration["camera"])
+            evidence_frame = self._frame_cache.get_current(
+                evidence_camera,
+                failure_declaration["frame_id"],
+            )
+            if evidence_frame.frame_id not in getattr(
+                self, "_public_observed_frame_ids", set()
+            ):
+                raise RuntimeError(
+                    "terminal failure evidence must reference a public observe result"
+                )
+            if int(evidence_frame.step_index) != int(self._env_steps):
+                raise RuntimeError(
+                    "terminal failure evidence frame is not from the current env step"
+                )
+        if failure_declaration is None:
+            self._refresh_observation_without_step()
+        self._visual_checkpoint_counter = (
+            int(getattr(self, "_visual_checkpoint_counter", 0)) + 1
+        )
+        visual_checkpoint_id = (
+            f"visual_checkpoint_{self._visual_checkpoint_counter:03d}"
+        )
+        root = self._output_dir / "visual_checkpoints" / visual_checkpoint_id
+        cameras: dict[str, dict[str, Any]] = {}
+        public_images: dict[str, dict[str, Any]] = {}
+        capture_group_ids: set[str] = set()
+        for camera in ("head", "left_wrist", "right_wrist"):
+            payload = self._frame_cache.observe_payload(camera)
+            rgb = payload.get("_image_bytes")
+            depth = payload.get("_depth_image_bytes")
+            if not isinstance(rgb, bytes) or not isinstance(depth, bytes):
+                raise RuntimeError(f"visual checkpoint omitted RGB-D for {camera}")
+            group = payload.get("capture_group")
+            group_id = group.get("id") if isinstance(group, dict) else None
+            if not isinstance(group_id, str) or not group_id:
+                raise RuntimeError("visual checkpoint capture group is unavailable")
+            capture_group_ids.add(group_id)
+            frame = self._frame_cache.get_current(camera, str(payload.get("frame_id")))
+            if int(frame.step_index) != int(self._env_steps):
+                raise RuntimeError("visual checkpoint frame is not current")
+            rgb_path = root / f"{camera}_rgb.png"
+            depth_path = root / f"{camera}_depth.png"
+            _write_bytes_atomic(rgb_path, rgb)
+            _write_bytes_atomic(depth_path, depth)
+            cameras[camera] = {
+                "camera": camera,
+                "frame_id": frame.frame_id,
+                "capture_group_id": group_id,
+                "capture_env_step": int(frame.step_index),
+                "rgb_path": str(rgb_path),
+                "depth_path": str(depth_path),
+            }
+            public_images[camera] = {
+                **cameras[camera],
+                "_image_bytes": rgb,
+                "_depth_image_bytes": depth,
+            }
+        if len(capture_group_ids) != 1:
+            raise RuntimeError("visual checkpoint cameras are not synchronized")
+        capture_group_id = next(iter(capture_group_ids))
         if (
-            getattr(self, "_control_mode", None) == PI0_NAV_PICK_VLA_MODE
-            and checkpoint_name == "state_checkpoint_1"
+            failure_declaration is not None
+            and evidence_frame is not None
+            and capture_group_id != evidence_frame.capture_group_id
         ):
             raise RuntimeError(
-                "state_checkpoint_1 is immutable and owned by the atomic "
-                "pi0_nav_pick handoff"
+                "terminal failure checkpoint does not match the cited capture group"
             )
-        if (
-            getattr(self, "_control_mode", None) == PI0_NAV_PICK_VLA_MODE
-            and checkpoint_name == "state_checkpoint_2"
-        ):
-            if stage != "pre_press_alignment":
-                raise ValueError("state_checkpoint_2 stage must be pre_press_alignment")
-            if require_current_grasp is not True or visual_review is not True:
-                raise ValueError(
-                    "state_checkpoint_2 requires current grasp and visual review"
-                )
-            return self.save_prepress_checkpoint(
-                checkpoint_name="state_checkpoint_2",
-                stage="pre_press_alignment",
-                visual_review=True,
-            )
-
-        if checkpoint_name != "state_checkpoint_1" and not temporary:
-            raise ValueError(
-                "checkpoint save accepts state_checkpoint_1 or tmp_state_checkpoint_*"
-            )
-        if temporary and stage != "temporary_restore_point":
-            raise ValueError(
-                "temporary checkpoint stage must be temporary_restore_point"
-            )
-        if temporary and require_current_grasp is not True:
-            raise ValueError("temporary checkpoints require the current grasp")
-        if not isinstance(stage, str) or not stage.strip():
-            raise ValueError("stage must be a non-empty string")
-        if not isinstance(require_current_grasp, bool) or not isinstance(
-            visual_review, bool
-        ):
-            raise ValueError("require_current_grasp and visual_review must be booleans")
-        checkpoint_root = self._output_dir / "state_checkpoints"
-        if temporary and len(
-            list(checkpoint_root.glob("tmp_state_checkpoint_*.json"))
-        ) >= (MAX_TEMP_STATE_CHECKPOINTS):
-            raise RuntimeError("temporary checkpoint limit reached")
-        checkpoint_path = checkpoint_root / f"{checkpoint_name}.json"
-        if checkpoint_path.exists():
-            raise RuntimeError(f"{checkpoint_name} is immutable and already exists")
-        if checkpoint_name == "state_checkpoint_1":
-            self._state_checkpoint_path = checkpoint_path
-        payload = self._robot_state_checkpoint_payload(
-            checkpoint_name=checkpoint_name,
-            stage=stage,
-            held_hand=held_hand,
-            press_hand=press_hand,
-            object_name=object_name,
-            require_current_grasp=require_current_grasp,
-            validation_evidence=None,
-        )
-        checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp").unlink(
-            missing_ok=True
-        )
-        visual_paths = (
-            self._checkpoint_visual_evidence(
-                checkpoint_name=checkpoint_name,
-                held_hand=held_hand,
-                press_hand=press_hand,
-            )
-            if visual_review
-            else {}
-        )
-        payload["visual_evidence"] = visual_paths
-        _write_json_atomic(checkpoint_path, payload)
-        return {
-            "_finish": False,
-            "primitive_success": True,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "stop_reason": "saved_robot_state_checkpoint",
-            "checkpoint_name": checkpoint_name,
-            "checkpoint_path": str(checkpoint_path),
-            "state_checkpoint_path": str(checkpoint_path),
-            "temporary": temporary,
-            "sha256": _sha256_file(checkpoint_path),
-            "held_hand": held_hand,
-            "press_hand": press_hand,
-            "object_name": payload["object_name"],
-            "total_env_steps": int(self._env_steps),
-            "visual_evidence": visual_paths,
+        metadata_path = root / "metadata.json"
+        metadata = {
+            "schema_version": 1,
+            "kind": "visual_checkpoint",
+            "visual_checkpoint_id": visual_checkpoint_id,
+            "semantic_label": semantic_label,
+            "capture_group_id": capture_group_id,
+            "env_step": int(self._env_steps),
+            "cameras": cameras,
+            "contains_simulator_state": False,
+            "authorizes_motion": False,
+            "terminal_failure": failure_declaration,
         }
-
-    def _checkpoint_visual_evidence(
-        self, *, checkpoint_name: str, held_hand: str, press_hand: str
-    ) -> dict[str, str]:
-        review_dir = self._output_dir / "visual_review" / checkpoint_name
-        visual_paths: dict[str, str] = {}
-        for label, camera in {
-            "head": "head",
-            "held_wrist": f"{held_hand}_wrist",
-            "press_wrist": f"{press_hand}_wrist",
-        }.items():
-            observed = self._require_planner().observe(camera)
-            image = observed.get("_image_bytes")
-            if not isinstance(image, bytes):
-                raise RuntimeError(f"checkpoint visual evidence missing {camera} PNG")
-            image_path = review_dir / f"{label}.png"
-            _write_bytes_atomic(image_path, image)
-            visual_paths[label] = str(image_path)
-        return visual_paths
-
-    def restore_robot_state_checkpoint(
-        self,
-        *,
-        checkpoint_name: str,
-        checkpoint_path: str | None,
-        mode: str,
-        keep_held_gripper_closed: bool,
-        require_object_still_held: bool,
-        timeout_s: float = 180.0,
-    ) -> dict[str, Any]:
-        """Restore robot q-state through certified q-space controller motion."""
-
-        if self._base_controller_mode != "position":
-            raise RuntimeError("robot checkpoint restore requires position controllers")
-        if mode != "plan_and_execute":
-            raise ValueError("restore mode must be 'plan_and_execute'")
-        if (
-            keep_held_gripper_closed is not True
-            or require_object_still_held is not True
-        ):
-            raise ValueError(
-                "restore requires held-gripper closure and held-object validation"
-            )
-        if checkpoint_name not in {
-            "state_checkpoint_1",
-            "state_checkpoint_2",
-        } and not re.fullmatch(TEMP_STATE_CHECKPOINT_PATTERN, checkpoint_name):
-            raise ValueError(
-                "checkpoint restore accepts state_checkpoint_1, "
-                "state_checkpoint_2, or tmp_state_checkpoint_*"
-            )
-        timeout = float(timeout_s)
-        if not np.isfinite(timeout) or timeout <= 0.0:
-            raise ValueError("timeout_s must be finite and positive")
-        deadline = time.monotonic() + timeout
-        checkpoint_root = (self._output_dir / "state_checkpoints").resolve()
-        expected_candidate = checkpoint_root / f"{checkpoint_name}.json"
-        supplied_candidate = (
-            expected_candidate
-            if checkpoint_path is None
-            else Path(checkpoint_path).expanduser()
-        )
-        if expected_candidate.is_symlink() or supplied_candidate.is_symlink():
-            raise ValueError("checkpoint_path may not be a symbolic link")
-        expected_path = expected_candidate.resolve()
-        path = supplied_candidate.resolve()
-        if path != expected_path or path.parent != checkpoint_root:
-            raise ValueError(
-                "checkpoint_path must resolve to this run's named checkpoint"
-            )
-        if not path.is_file():
-            raise RuntimeError(f"robot checkpoint is missing: {path}")
-        checkpoint = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            not isinstance(checkpoint, dict)
-            or checkpoint.get("kind") != "robot_motion_checkpoint"
-            or checkpoint.get("not_simulator_restore") is not True
-        ):
-            raise RuntimeError("robot checkpoint schema is invalid")
-        expected_binding = self._expected_checkpoint_run_binding()
-        if (
-            expected_binding is not None
-            and checkpoint.get("run_binding") != expected_binding
-        ):
-            raise RuntimeError("robot checkpoint does not belong to this run")
-        if checkpoint.get("checkpoint_name") != checkpoint_name:
-            raise RuntimeError("checkpoint_name does not match checkpoint JSON")
-        if (
-            re.fullmatch(TEMP_STATE_CHECKPOINT_PATTERN, checkpoint_name)
-            and checkpoint.get("stage") != "temporary_restore_point"
-        ):
-            raise RuntimeError("temporary checkpoint stage is invalid")
-        if checkpoint_name == "state_checkpoint_2":
-            checkpoint1 = checkpoint_root / "state_checkpoint_1.json"
-            expected_sha = checkpoint.get("prepress", {}).get(
-                "source_checkpoint_sha256"
-            )
-            if (
-                not checkpoint1.is_file()
-                or not isinstance(expected_sha, str)
-                or _sha256_file(checkpoint1) != expected_sha
-            ):
-                raise RuntimeError(
-                    "state_checkpoint_2 lineage does not match state_checkpoint_1"
-                )
-        held_hand, press_hand = self._validated_handoff_hands(
-            held_hand=str(checkpoint.get("held_hand")),
-            press_hand=str(checkpoint.get("press_hand")),
-        )
-        robot_state = checkpoint.get("robot")
-        poses = checkpoint.get("poses")
-        if not isinstance(robot_state, dict) or not isinstance(poses, dict):
-            raise RuntimeError("robot checkpoint payload is incomplete")
-        robot = self._robot()
-        if robot is None:
-            raise RuntimeError("R1Pro robot is unavailable")
-        current_q = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(-1)
-        q_target = robot_state.get("q_space_target")
-        if not isinstance(q_target, dict):
-            raise RuntimeError("checkpoint q_space_target is missing")
-        target_indices = np.asarray(q_target.get("indices"), dtype=int).reshape(-1)
-        target_values = np.asarray(q_target.get("values"), dtype=np.float64).reshape(-1)
-        target_q = current_q.copy()
-        if (
-            len(target_indices) != len(target_values)
-            or len(target_indices) != 21
-            or len(set(target_indices.tolist())) != len(target_indices)
-            or np.any(target_indices < 0)
-            or np.any(target_indices >= len(current_q))
-        ):
-            raise RuntimeError("checkpoint controlled q-space layout is invalid")
-        expected_controlled: list[int] = []
-        for values in (
-            getattr(robot, "base_control_idx", []),
-            getattr(robot, "trunk_control_idx", []),
-            (getattr(robot, "arm_control_idx", {}) or {}).get("left", []),
-            (getattr(robot, "arm_control_idx", {}) or {}).get("right", []),
-        ):
-            expected_controlled.extend(
-                int(value)
-                for value in np.asarray(_numpy_tree(values), dtype=int).reshape(-1)
-            )
-        if expected_controlled and expected_controlled != target_indices.tolist():
-            raise RuntimeError("checkpoint q-space indices do not match loaded R1Pro")
-        target_q[target_indices] = target_values
-        yaw_index = int(target_indices[2])
-        yaw_delta = float(
-            np.arctan2(
-                np.sin(target_values[2] - current_q[yaw_index]),
-                np.cos(target_values[2] - current_q[yaw_index]),
-            )
-        )
-        target_q[yaw_index] = current_q[yaw_index] + yaw_delta
-        if (
-            target_q.shape != current_q.shape
-            or not np.isfinite(target_q).all()
-            or not np.isfinite(current_q).all()
-        ):
-            raise RuntimeError("checkpoint q-state does not match the loaded R1Pro")
-        steps = max(
-            2,
-            int(np.ceil(float(np.max(np.abs(target_q - current_q))) / 0.01)) + 1,
-        )
-        if steps > 600:
-            raise RuntimeError("checkpoint q-space path exceeds the bounded horizon")
-        q_path = np.linspace(current_q, target_q, steps, dtype=np.float64)
-        planner = self._require_planner()
-        backend = planner.backend
-        generator_getter = getattr(backend, "_generator", None)
-        collision_checker = getattr(backend, "_check_q_trajectory_collisions", None)
-        if not callable(generator_getter) or not callable(collision_checker):
-            raise RuntimeError("cuRobo q-space certification API is unavailable")
-        generator = generator_getter(kind="arm", hand=held_hand)
-        radio, _table = self._resolve_handoff_targets()
-        attachment_getter = getattr(backend, "get_attached_object", None)
-        attached_obj = (
-            attachment_getter(held_hand) if callable(attachment_getter) else radio
-        )
-        if callable(attachment_getter):
-            root_link = getattr(radio, "root_link", None)
-            if root_link is None:
-                raise RuntimeError(
-                    "radio root link is unavailable for attached planning"
-                )
-            target_root = str(getattr(root_link, "prim_path", "")).rstrip("/")
-            attached_matches = bool(
-                isinstance(attached_obj, dict)
-                and attached_obj
-                and any(
-                    value is root_link
-                    or (
-                        target_root
-                        and str(getattr(value, "prim_path", "")).rstrip("/")
-                        == target_root
-                    )
-                    for value in attached_obj.values()
-                )
-            )
-            if not attached_matches:
-                attached_obj = {EEF_LINK_BY_HAND[held_hand]: root_link}
-        collision = collision_checker(generator, q_path, attached_obj=attached_obj)
-        trace_path = self._output_dir / "state_checkpoints" / "restore_trace.json"
-        restore_video_path: Path | None = None
-
-        def restore_result(
-            *,
-            primitive_success: bool,
-            stop_reason: str,
-            trace: list[dict[str, Any]],
-            metrics: dict[str, Any],
-        ) -> dict[str, Any]:
-            _write_json_atomic(trace_path, trace)
-            if restore_video_path is not None:
-                self._finalize_video_segment()
-                self._video_sealed = True
-            public_metrics = {
-                key: metrics.get(key)
-                for key in (
-                    "joint_error_max_rad",
-                    "base_error_m",
-                    "base_yaw_error_rad",
-                    "held_object_drift_m",
-                    "held_gripper_opening_m",
-                )
-            }
-            return {
-                "_finish": False,
-                "primitive_success": bool(primitive_success),
-                "task_success": bool(_raw_success(self._last_info)),
+        _write_json_atomic(metadata_path, metadata)
+        task_success = bool(_raw_success(self._last_info))
+        terminal_failure_receipt = None
+        stop_reason = "saved_visual_checkpoint"
+        if task_success:
+            self._latch_official_success(self._last_info)
+            stop_reason = "task_success"
+        elif failure_declaration is not None:
+            if evidence_frame is None or evidence_camera is None:
+                raise RuntimeError("terminal failure evidence binding is unavailable")
+            terminal_failure_receipt = {
+                "schema_version": 1,
+                "source": "llm_fresh_visual_observation",
+                "condition": failure_declaration["condition"],
+                "cause": failure_declaration["cause"],
+                "camera": failure_declaration["camera"],
+                "frame_id": evidence_frame.frame_id,
+                "capture_group_id": evidence_frame.capture_group_id,
+                "env_step": int(evidence_frame.step_index),
+                "visual_checkpoint_id": visual_checkpoint_id,
+                "visual_checkpoint_capture_group_id": capture_group_id,
+                "visual_checkpoint_metadata_sha256": hashlib.sha256(
+                    metadata_path.read_bytes()
+                ).hexdigest(),
+                "images_sha256": {
+                    camera: {
+                        "rgb": hashlib.sha256(
+                            Path(values["rgb_path"]).read_bytes()
+                        ).hexdigest(),
+                        "depth": hashlib.sha256(
+                            Path(values["depth_path"]).read_bytes()
+                        ).hexdigest(),
+                    }
+                    for camera, values in cameras.items()
+                },
+                "run_nonce": self._run_nonce,
+                "attempt_nonce": self._attempt_nonce,
+                "attempt_index": int(self._attempt_index),
+                "task_success": False,
                 "official_success_source": 'info["done"]["success"]',
-                "stop_reason": stop_reason,
-                "checkpoint_name": checkpoint_name,
-                "checkpoint_path": str(path),
-                "held_hand": held_hand,
-                "press_hand": press_hand,
-                "object_name": checkpoint.get("object_name"),
-                "executed_steps": len(trace),
-                "total_env_steps": int(self._env_steps),
-                "restore_trace_path": str(trace_path),
-                "video_path": (
-                    str(restore_video_path) if restore_video_path is not None else None
-                ),
-                "metrics": _wire_safe(public_metrics),
-                "cuRobo_q_space_collision_report": _wire_safe(collision),
             }
-
-        if not isinstance(collision, dict) or not bool(
-            collision.get("available", False)
-        ):
-            return restore_result(
-                primitive_success=False,
-                stop_reason="curobo_collision_check_unavailable",
-                trace=[],
-                metrics={},
+            terminal_failure_receipt["receipt_sha256"] = hashlib.sha256(
+                _canonical_json_bytes(terminal_failure_receipt)
+            ).hexdigest()
+            _write_json_atomic(
+                self._terminal_failure_receipt_path,
+                terminal_failure_receipt,
             )
-        if time.monotonic() >= deadline:
-            return restore_result(
-                primitive_success=False,
-                stop_reason="timeout",
-                trace=[],
-                metrics={},
-            )
-        if bool(collision.get("colliding", True)):
-            return restore_result(
-                primitive_success=False,
-                stop_reason="curobo_path_in_collision",
-                trace=[],
-                metrics={},
-            )
-
-        eef_links = getattr(robot, "eef_links", {})
-        held_link = eef_links.get(held_hand) if isinstance(eef_links, dict) else None
-        if held_link is None:
-            raise RuntimeError(f"{held_hand} EEF link is unavailable")
-        start_eef_position, start_eef_orientation = self._object_pose(held_link)
-        start_radio_position, start_radio_orientation = self._object_pose(radio)
-        current_relative_position, current_relative_orientation = self._relative_pose(
-            start_eef_position,
-            start_eef_orientation,
-            start_radio_position,
-            start_radio_orientation,
-        )
-        object_world = poses.get("object_pose_world")
-        expected_relative = poses.get("object_pose_in_held_eef")
-        if not isinstance(object_world, dict):
-            raise RuntimeError("checkpoint object pose is missing")
-        expected_relative_position = (
-            np.asarray(expected_relative.get("position"), dtype=np.float64).reshape(3)
-            if isinstance(expected_relative, dict)
-            else current_relative_position.copy()
-        )
-        expected_relative_orientation = (
-            np.asarray(expected_relative.get("quat_xyzw"), dtype=np.float64).reshape(4)
-            if isinstance(expected_relative, dict)
-            else current_relative_orientation.copy()
-        )
-        if not np.isfinite(expected_relative_position).all():
-            raise RuntimeError("checkpoint relative object pose is invalid")
-        preflight_relative_drift = float(
-            np.linalg.norm(current_relative_position - expected_relative_position)
-        )
-        preflight_angular_drift = _quaternion_angle_rad(
-            current_relative_orientation, expected_relative_orientation
-        )
-        checkpoint_height = float(object_world.get("position", [0, 0, np.nan])[2])
-        if not np.isfinite(checkpoint_height):
-            raise RuntimeError("checkpoint target height is invalid")
-        if self._last_observation is None:
-            raise RuntimeError("restore preflight has no synchronized observation")
-        preflight_opening = self._validated_selected_gripper_opening(
-            observation=self._last_observation, hand=held_hand
-        )
-        preflight_held_attachment = self._attachment_matches(held_hand, radio)
-        preflight_held_contact = self._hand_target_contact_report(
-            held_hand, start_radio_position
-        )
-        preflight_press_attachment = self._attachment_matches(press_hand, radio)
-        preflight_press_contact = self._hand_target_contact_report(
-            press_hand, start_radio_position
-        )
-        if (
-            preflight_relative_drift > HANDOFF_RELATIVE_DRIFT_MAX_M
-            or preflight_angular_drift > HANDOFF_RELATIVE_ANGULAR_DRIFT_MAX_RAD
-        ):
-            return restore_result(
-                primitive_success=False,
-                stop_reason="held_object_drift",
-                trace=[],
-                metrics={"held_object_drift_m": preflight_relative_drift},
-            )
-        if preflight_opening >= HANDOFF_GRIPPER_OPENING_MAX:
-            return restore_result(
-                primitive_success=False,
-                stop_reason="held_object_lost",
-                trace=[],
-                metrics={"held_gripper_opening_m": preflight_opening},
-            )
-        if isinstance(expected_relative, dict) and not (
-            preflight_held_attachment[0]
-            or preflight_held_attachment[1]
-            or preflight_held_contact["target_contact_count"] > 0
-        ):
-            return restore_result(
-                primitive_success=False,
-                stop_reason="held_object_lost",
-                trace=[],
-                metrics={"held_gripper_opening_m": preflight_opening},
-            )
-        if isinstance(expected_relative, dict) and (
-            preflight_press_attachment[0]
-            or preflight_press_attachment[1]
-            or preflight_press_contact["target_contact_count"] != 0
-        ):
-            return restore_result(
-                primitive_success=False,
-                stop_reason="press_hand_contacted_object",
-                trace=[],
-                metrics={"held_gripper_opening_m": preflight_opening},
-            )
-        self._gripper_latch[held_hand] = -1.0
-        if hasattr(self, "_video_path"):
-            restore_video_path = (
-                self._output_dir
-                / f"curobo_checkpoint_restore_{checkpoint_name}_episode.mp4"
-            )
-            self.start_video_segment(restore_video_path)
-        trace: list[dict[str, Any]] = []
-        official_success = False
-        stop_reason: str | None = None
-        for index, waypoint in enumerate(q_path[1:], start=1):
-            if time.monotonic() >= deadline:
-                stop_reason = "timeout"
-                break
-            restore_horizon = int(
-                getattr(self, "_meta", {}).get("max_episode_steps", 2**63 - 1)
-            )
-            if self._env_steps >= restore_horizon:
-                stop_reason = "horizon"
-                break
-            action = np.asarray(
-                backend.joint_target_to_action(waypoint, hand=None), dtype=np.float32
-            ).reshape(23)
-            action[ENV_ACTION_SEGMENTS[f"{held_hand}_gripper"]] = -1.0
-            action[ENV_ACTION_SEGMENTS[f"{press_hand}_gripper"]] = float(
-                self._gripper_latch[press_hand]
-            )
-            step_obs, _reward, step_term, step_trunc, step_infos = (
-                self._env._direct_process.step_env(
-                    __import__("torch").as_tensor(action).reshape(1, 23),
-                    need_obs=True,
+            self._terminal_failure_receipt = terminal_failure_receipt
+            self._motion_frozen = True
+            self._controller_state = _CONTROLLER_FROZEN
+            self._action_source = "frozen"
+            self._vla_actions_enabled = False
+            self._done = True
+            stop_reason = terminal_policy.condition
+            try:
+                self._finalize_video_segment()
+                self._video_sealed = bool(
+                    self._video_error is None
+                    and self._video_path.is_file()
+                    and self._video_path.stat().st_size > 0
                 )
-            )
-            self._env_steps += 1
-            step_info = _numpy_tree(step_infos[0])
-            self._last_info = step_info
-            official_success = official_success or _raw_success(step_info)
-            observation = _single_observation(self._env._wrap_obs(step_obs))
-            self._last_observation = observation
-            self._record_rgbd_frames(step_obs, observation)
-            self._append_video(observation)
-            eef_position, eef_orientation = self._object_pose(held_link)
-            radio_position, radio_orientation = self._object_pose(radio)
-            relative_position, relative_orientation = self._relative_pose(
-                eef_position, eef_orientation, radio_position, radio_orientation
-            )
-            relative_drift = float(
-                np.linalg.norm(relative_position - expected_relative_position)
-            )
-            angular_drift = _quaternion_angle_rad(
-                relative_orientation, expected_relative_orientation
-            )
-            assisted, backend_attached = self._attachment_matches(press_hand, radio)
-            contact = self._hand_target_contact_report(press_hand, radio_position)
-            held_assisted, held_backend_attached = self._attachment_matches(
-                held_hand, radio
-            )
-            held_contact = self._hand_target_contact_report(held_hand, radio_position)
-            held_opening = self._validated_selected_gripper_opening(
-                observation=observation, hand=held_hand
-            )
-            sample = {
-                "waypoint": index,
-                "total_env_steps": int(self._env_steps),
-                "relative_drift_m": relative_drift,
-                "held_object_angular_drift_rad": angular_drift,
-                "radio_height_m": float(radio_position[2]),
-                "press_hand_assisted_attachment": assisted,
-                "press_hand_backend_attachment": backend_attached,
-                "press_hand_contact_count": contact["target_contact_count"],
-                "held_hand_assisted_attachment": held_assisted,
-                "held_hand_backend_attachment": held_backend_attached,
-                "held_hand_contact_count": held_contact["target_contact_count"],
-                "held_gripper_opening_m": float(held_opening),
-                "official_task_success": bool(_raw_success(step_info)),
-            }
-            trace.append(sample)
-            if (
-                relative_drift > HANDOFF_RELATIVE_DRIFT_MAX_M
-                or angular_drift > HANDOFF_RELATIVE_ANGULAR_DRIFT_MAX_RAD
-            ):
-                stop_reason = "held_object_drift"
-                break
-            if float(radio_position[2]) < checkpoint_height - 0.02:
-                stop_reason = "held_object_lost"
-                break
-            if held_opening >= HANDOFF_GRIPPER_OPENING_MAX:
-                stop_reason = "held_gripper_opened"
-                break
-            if not (
-                held_assisted
-                or held_backend_attached
-                or held_contact["target_contact_count"] > 0
-            ):
-                stop_reason = "held_object_lost"
-                break
-            if assisted or backend_attached or contact["target_contact_count"] != 0:
-                stop_reason = "press_hand_contacted_object"
-                break
-            if official_success:
-                break
-            if _scalar_bool(step_term) or _scalar_bool(step_trunc):
-                stop_reason = "episode_stopped"
-                break
-        final_q = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(-1)
-        base_error = float(
-            np.linalg.norm(final_q[target_indices[:2]] - target_values[:2])
-        )
-        base_yaw_error = float(
-            abs(
-                np.arctan2(
-                    np.sin(final_q[target_indices[2]] - target_values[2]),
-                    np.cos(final_q[target_indices[2]] - target_values[2]),
-                )
-            )
-        )
-        joint_error = float(
-            np.max(np.abs(final_q[target_indices[3:]] - target_values[3:]))
-        )
-        metrics = {
-            "joint_error_max_rad": joint_error,
-            "base_error_m": base_error,
-            "base_yaw_error_rad": base_yaw_error,
-            "held_object_drift_m": (
-                float(trace[-1]["relative_drift_m"]) if trace else None
+            except Exception:
+                logger.exception("best-effort terminal failure video sealing failed")
+        return {
+            "_finish": bool(task_success or terminal_failure_receipt is not None),
+            "primitive_success": True,
+            "task_success": task_success,
+            "official_success_source": 'info["done"]["success"]',
+            "stop_reason": stop_reason,
+            "runner_termination_reason": (
+                "official_task_success"
+                if task_success
+                else terminal_policy.runner_reason
+                if terminal_failure_receipt is not None
+                else None
             ),
-            "held_gripper_opening_m": (
-                float(trace[-1]["held_gripper_opening_m"]) if trace else None
-            ),
+            "visual_checkpoint_id": visual_checkpoint_id,
+            "semantic_label": semantic_label,
+            "capture_group_id": capture_group_id,
+            "env_step": int(self._env_steps),
+            "metadata_path": str(metadata_path),
+            "cameras": cameras,
+            "images": public_images,
+            "terminal_failure_receipt": terminal_failure_receipt,
+            "total_env_steps": int(self._env_steps),
         }
-        success = bool(
-            stop_reason is None
-            and joint_error <= 0.02
-            and base_error <= 0.02
-            and base_yaw_error <= 0.03
-        )
-        if stop_reason is None and not success:
-            stop_reason = "joint_target_not_reached"
-        if success and checkpoint_name == "state_checkpoint_1":
-            self._prepress_coarse_flip_used = False
-        return restore_result(
-            primitive_success=success,
-            stop_reason=(
-                "restored_robot_state_checkpoint" if success else str(stop_reason)
-            ),
-            trace=trace,
-            metrics=metrics,
-        )
 
     def _reload_base_controller_position(self) -> dict[str, Any]:
         if self._base_controller_mode != "velocity":
@@ -2369,200 +3007,14 @@ class BehaviorEnvFacade:
             "controller_layout": [list(item) for item in actual_layout],
         }
 
-    @staticmethod
-    def _base_controller_signature(robot: Any) -> dict[str, Any]:
-        controllers = getattr(robot, "controllers", {})
-        controller = controllers.get("base") if isinstance(controllers, dict) else None
-        config = getattr(robot, "_controller_config", None)
-        base_config = (
-            config.get("base")
-            if isinstance(config, dict)
-            else getattr(config, "base", None)
-        )
-
-        def configured(name: str) -> Any:
-            if isinstance(base_config, dict):
-                return base_config.get(name)
-            return getattr(base_config, name, None)
-
-        dof_idx = getattr(controller, "dof_idx", None)
-        if dof_idx is None:
-            dof_idx = getattr(controller, "control_idx", None)
-        return {
-            "class": (
-                f"{type(controller).__module__}.{type(controller).__qualname__}"
-                if controller is not None
-                else None
-            ),
-            "command_dim": int(getattr(controller, "command_dim", -1)),
-            "motor_type": str(getattr(controller, "motor_type", "")),
-            "dof_idx": np.asarray(_numpy_tree(dof_idx), dtype=int).reshape(-1).tolist()
-            if dof_idx is not None
-            else None,
-            "config": {
-                "motor_type": str(configured("motor_type")),
-                "command_input_limits": _wire_safe(configured("command_input_limits")),
-                "command_output_limits": _wire_safe(
-                    configured("command_output_limits")
-                ),
-                "use_impedances": _wire_safe(configured("use_impedances")),
-                "isaac_kp": _wire_safe(configured("isaac_kp")),
-                "isaac_kd": _wire_safe(configured("isaac_kd")),
-            },
-        }
-
-    def run_controller_switch_smoke(self) -> dict[str, Any]:
-        """Exercise the real velocity-to-position handoff without invoking Pi0."""
-
-        import torch
-
-        if self._control_mode != PI0_NAV_PICK_VLA_MODE:
-            raise RuntimeError("controller switch smoke requires pi0_nav_pick_vla mode")
-        if self._reset_completed:
-            raise RuntimeError("controller switch smoke must own the initial reset")
-        self.reset()
-        robot = self._robot()
-        if robot is None:
-            raise RuntimeError("R1Pro robot is unavailable")
-        self.start_video_segment(
-            self._output_dir / "controller_switch_smoke_episode.mp4"
-        )
-        pre_reload_q = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(-1)
-        if not np.isfinite(pre_reload_q).all():
-            raise RuntimeError("controller smoke initial q-state is invalid")
-        reload_report = self._reload_base_controller_position()
-        post_reload_q = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(-1)
-        if (
-            post_reload_q.shape != pre_reload_q.shape
-            or not np.isfinite(post_reload_q).all()
-        ):
-            raise RuntimeError("controller smoke post-reload q-state is invalid")
-
-        base_indices = np.asarray(
-            _numpy_tree(getattr(robot, "base_control_idx", [])), dtype=int
-        )
-        trunk_indices = np.asarray(
-            _numpy_tree(getattr(robot, "trunk_control_idx", [])), dtype=int
-        )
-        arm_indices = getattr(robot, "arm_control_idx", {}) or {}
-        left_indices = np.asarray(_numpy_tree(arm_indices.get("left", [])), dtype=int)
-        right_indices = np.asarray(_numpy_tree(arm_indices.get("right", [])), dtype=int)
-        if not (
-            base_indices.shape == (3,)
-            and trunk_indices.shape == (4,)
-            and left_indices.shape == (7,)
-            and right_indices.shape == (7,)
-        ):
-            raise RuntimeError("controller smoke R1Pro joint layout is invalid")
-        articulation_indices = np.r_[trunk_indices, left_indices, right_indices]
-
-        hold = np.asarray(
-            self._require_planner().backend.hold_action(), dtype=np.float32
-        ).reshape(-1)
-        if hold.shape != (23,) or not np.isfinite(hold).all():
-            raise RuntimeError("controller smoke hold must be one finite 23D action")
-        stable_frames: list[dict[str, Any]] = []
-        for hold_index in range(HANDOFF_VALIDATION_FRAMES):
-            if self._env_steps >= int(self._meta["max_episode_steps"]):
-                raise RuntimeError("controller smoke exhausted the episode horizon")
-            step_obs, _reward, step_term, step_trunc, step_infos = (
-                self._env._direct_process.step_env(
-                    torch.as_tensor(hold, dtype=torch.float32).reshape(1, 23),
-                    need_obs=True,
-                )
-            )
-            self._env_steps += 1
-            self._last_info = _numpy_tree(step_infos[0])
-            if _scalar_bool(step_term) or _scalar_bool(step_trunc):
-                raise RuntimeError(
-                    "controller smoke episode stopped during stable hold"
-                )
-            observation = _single_observation(self._env._wrap_obs(step_obs))
-            self._last_observation = observation
-            self._record_rgbd_frames(step_obs, observation)
-            self._append_video(observation)
-            current_q = np.asarray(
-                _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-            ).reshape(-1)
-            base_error = float(
-                np.linalg.norm(
-                    current_q[base_indices[:2]] - pre_reload_q[base_indices[:2]]
-                )
-            )
-            yaw_error = float(
-                abs(
-                    np.arctan2(
-                        np.sin(
-                            current_q[base_indices[2]] - pre_reload_q[base_indices[2]]
-                        ),
-                        np.cos(
-                            current_q[base_indices[2]] - pre_reload_q[base_indices[2]]
-                        ),
-                    )
-                )
-            )
-            articulation_error = float(
-                np.max(
-                    np.abs(
-                        current_q[articulation_indices]
-                        - pre_reload_q[articulation_indices]
-                    )
-                )
-            )
-            if base_error > 0.02 or yaw_error > 0.03 or articulation_error > 0.02:
-                raise RuntimeError("controller smoke current-target hold drifted")
-            stable_frames.append(
-                {
-                    "hold_index": hold_index + 1,
-                    "env_step": int(self._env_steps),
-                    "base_error_m": base_error,
-                    "base_yaw_error_rad": yaw_error,
-                    "joint_error_max_rad": articulation_error,
-                }
-            )
-
-        pre_warmup_q = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(-1)
-        self._require_planner().on_simulator_state_restored()
-        warmup = self._require_planner().warmup()
-        post_warmup_q = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(-1)
-        warmup_pose_jump = float(np.max(np.abs(post_warmup_q - pre_warmup_q)))
-        if warmup_pose_jump > 1e-6:
-            raise RuntimeError("cuRobo smoke warmup moved the robot")
-        self._finalize_video_segment()
-        self._video_sealed = True
-        result = {
-            "schema_version": 1,
-            "success": True,
-            "control_mode": PI0_NAV_PICK_VLA_MODE,
-            "controller_reload": reload_report,
-            "first_command": "current_target_hold",
-            "stable_hold_frames": stable_frames,
-            "stable_hold_frames_required": HANDOFF_VALIDATION_FRAMES,
-            "planner_warmup": _wire_safe(warmup),
-            "warmup_pose_jump_max": warmup_pose_jump,
-            "total_env_steps": int(self._env_steps),
-            "video_path": str(self._video_path),
-        }
-        result_path = self._output_dir / "controller_switch_smoke.json"
-        result["result_path"] = str(result_path)
-        _write_json_atomic(result_path, result)
-        return result
-
     def _persist_pi0_nav_pick_views(
         self, *, chunk_index: int, validator: dict[str, Any]
     ) -> dict[str, Any]:
         root = (
             self._output_dir
+            / "vla_calls"
+            / f"call_{int(self._active_vla_call_index or 0):03d}"
             / "visual_review"
-            / "pi0_nav_pick"
             / f"chunk_{chunk_index:04d}"
         )
         views: dict[str, Any] = {}
@@ -2592,11 +3044,8 @@ class BehaviorEnvFacade:
                 {
                     key: validator.get(key)
                     for key in (
-                        "frames_collected",
-                        "passed_hands",
-                        "held_hand",
                         "local_grasp_success",
-                        "per_hand",
+                        "capability",
                     )
                 }
             ),
@@ -2605,892 +3054,10 @@ class BehaviorEnvFacade:
         metadata_path = root / "metadata.json"
         metadata["metadata_path"] = str(metadata_path)
         _write_json_atomic(metadata_path, metadata)
-        return metadata
-
-    @staticmethod
-    def _terminal_success_roles(validator: dict[str, Any]) -> dict[str, Any]:
-        """Resolve terminal wrist roles only from same-run grasp evidence."""
-
-        held = validator.get("held_hand")
-        source = "strict_handoff" if held in {"left", "right"} else None
-        if held not in {"left", "right"}:
-            criteria = validator.get("current_criteria")
-            candidates: list[str] = []
-            if isinstance(criteria, dict):
-                for hand in ("left", "right"):
-                    hand_criteria = criteria.get(hand)
-                    if not isinstance(hand_criteria, dict):
-                        continue
-                    if (
-                        hand_criteria.get("selected_attachment_or_two_finger_contact")
-                        is not True
-                    ):
-                        continue
-                    if not all(
-                        hand_criteria.get(field) is True
-                        for field in ("radio_lift", "support_gap")
-                    ):
-                        continue
-                    if all(
-                        hand_criteria.get(field) is True
-                        for field in (
-                            "other_hand_no_assisted_attachment",
-                            "other_hand_no_backend_attachment",
-                            "other_hand_no_radio_contact",
-                        )
-                    ):
-                        candidates.append(hand)
-            if len(candidates) == 1:
-                held = candidates[0]
-                source = "unique_terminal_attachment_evidence"
-        if held not in {"left", "right"}:
-            return {
-                "held_hand": None,
-                "press_hand": None,
-                "role_resolution_source": None,
-            }
         return {
-            "held_hand": held,
-            "press_hand": "right" if held == "left" else "left",
-            "role_resolution_source": source,
-        }
-
-    def _post_success_stationary_action(self) -> tuple[np.ndarray, str]:
-        """Build a controller-compatible stationary action after raw success."""
-
-        if self._base_controller_mode == "velocity":
-            velocity_hold = getattr(
-                self._require_planner().backend, "velocity_base_hold_action", None
-            )
-            if not callable(velocity_hold):
-                raise RuntimeError("velocity-mode terminal hold adapter is unavailable")
-            action = np.asarray(velocity_hold(), dtype=np.float32).reshape(23)
-            return action, "current_joint_targets_zero_velocity_base"
-        action = np.asarray(
-            self._require_planner().backend.hold_action(), dtype=np.float32
-        ).reshape(23)
-        return action, "planner_current_target_hold"
-
-    def _persist_terminal_success_views(
-        self,
-        *,
-        roles: dict[str, Any],
-        end_env_step: int,
-    ) -> dict[str, Any]:
-        """Persist one fresh same-step terminal head/two-wrist capture."""
-
-        from PIL import Image
-
-        root = self._output_dir / "visual_review" / "terminal_success"
-        if root.exists():
-            raise RuntimeError("terminal success evidence is non-overwritable")
-        self._refresh_observation_without_step()
-        views: dict[str, Any] = {}
-        capture_group_id: str | None = None
-        for camera in ("head", "left_wrist", "right_wrist"):
-            payload = self._require_planner().observe(camera)
-            image = payload.get("_image_bytes")
-            if not isinstance(image, bytes):
-                raise RuntimeError(f"terminal {camera} PNG is unavailable")
-            group = payload.get("capture_group")
-            group_id = str(group.get("id")) if isinstance(group, dict) else None
-            if not group_id:
-                raise RuntimeError("terminal capture lacks capture-group identity")
-            if capture_group_id is None:
-                capture_group_id = group_id
-            elif capture_group_id != group_id:
-                raise RuntimeError("terminal views are not synchronized")
-            frame_id = payload.get("frame_id")
-            if not isinstance(frame_id, str) or not frame_id:
-                raise RuntimeError(f"terminal {camera} frame identity is missing")
-            frame = self._frame_cache.get_current(camera, frame_id)
-            if (
-                int(frame.step_index) != int(end_env_step)
-                or frame.capture_group_id != group_id
-            ):
-                raise RuntimeError(
-                    f"terminal {camera} frame is stale or capture-mismatched"
-                )
-            with Image.open(BytesIO(image)) as decoded:
-                decoded.verify()
-            with Image.open(BytesIO(image)) as decoded:
-                width, height = decoded.size
-            image_path = root / f"{camera}.png"
-            _write_bytes_atomic(image_path, image)
-            views[camera] = {
-                "camera": camera,
-                "path": str(image_path),
-                "sha256": _sha256_file(image_path),
-                "width": int(width),
-                "height": int(height),
-                "frame_id": frame_id,
-                "capture_group_id": group_id,
-                "env_step": int(end_env_step),
-            }
-        press_hand = roles.get("press_hand")
-        resolved_camera = (
-            f"{press_hand}_wrist" if press_hand in {"left", "right"} else None
-        )
-        return {
-            "root": str(root),
             "capture_group_id": capture_group_id,
+            "metadata_path": str(metadata_path),
             "views": views,
-            "logical_camera": "press_wrist" if resolved_camera else None,
-            "resolved_camera": resolved_camera,
-            "terminal_press_wrist": (
-                views.get(resolved_camera) if resolved_camera is not None else None
-            ),
-        }
-
-    def _finalize_pi0_terminal_success(
-        self, *, validator: dict[str, Any], frames: int = 4
-    ) -> dict[str, Any]:
-        """Atomically hold and capture terminal evidence before Pi0 returns."""
-
-        if self._pi0_terminal_success_finalized:
-            raise RuntimeError("Pi0 terminal success finalization is one-shot")
-        self._pi0_terminal_success_finalized = True
-        start_env_step = int(self._env_steps)
-        roles = self._terminal_success_roles(validator)
-        evidence: dict[str, Any] = {
-            "schema_version": 1,
-            "source": "pi0_nav_pick_internal_terminal_finalize",
-            "complete": False,
-            "task_success_before_hold": bool(_raw_success(self._last_info)),
-            "task_success_after_hold": False,
-            "hold_frames_requested": int(frames),
-            "hold_frames_executed": 0,
-            "start_env_step": start_env_step,
-            "end_env_step": start_env_step,
-            **roles,
-            "logical_camera": None,
-            "resolved_camera": None,
-            "terminal_press_wrist": None,
-            "views": {},
-            "error": None,
-        }
-        try:
-            if evidence["task_success_before_hold"] is not True:
-                raise RuntimeError("terminal finalization requires raw task success")
-            hold_result = self.post_success_hold_frames(frames=int(frames))
-            evidence.update(
-                {
-                    "hold_frames_executed": int(hold_result.get("executed_frames", 0)),
-                    "end_env_step": int(self._env_steps),
-                    "task_success_after_hold": bool(
-                        hold_result.get("task_success", False)
-                    ),
-                    "hold_action_source": hold_result.get("hold_action_source"),
-                    "hold_action_sha256": hold_result.get("hold_action_sha256"),
-                }
-            )
-            if roles.get("press_hand") not in {"left", "right"}:
-                raise RuntimeError(
-                    "terminal grasp evidence does not uniquely resolve press_hand"
-                )
-            if evidence["hold_frames_executed"] != int(frames):
-                raise RuntimeError(
-                    "terminal hold did not execute every requested frame"
-                )
-            if evidence["task_success_after_hold"] is not True:
-                raise RuntimeError(
-                    "raw task success did not persist through terminal hold"
-                )
-            views = self._persist_terminal_success_views(
-                roles=roles,
-                end_env_step=int(self._env_steps),
-            )
-            evidence.update(views)
-            evidence["complete"] = True
-        except Exception as exc:
-            logger.exception("Pi0 terminal success evidence failed closed")
-            evidence["error"] = f"{type(exc).__name__}: {exc}"
-            evidence["end_env_step"] = int(self._env_steps)
-            evidence["task_success_after_hold"] = bool(_raw_success(self._last_info))
-        finally:
-            self._done = bool(_raw_success(self._last_info))
-            try:
-                self._finalize_video_segment()
-            except Exception as exc:
-                logger.exception("failed to finalize Pi0 terminal video")
-                evidence["complete"] = False
-                evidence["error"] = f"{type(exc).__name__}: {exc}"
-            finally:
-                self._video_sealed = True
-        metadata_path = (
-            self._output_dir
-            / "visual_review"
-            / "terminal_success"
-            / "terminal_success_evidence.json"
-        )
-        evidence["metadata_path"] = str(metadata_path)
-        try:
-            _write_json_atomic(metadata_path, evidence)
-        except Exception as exc:
-            logger.exception("failed to persist Pi0 terminal success metadata")
-            evidence["complete"] = False
-            evidence["error"] = f"{type(exc).__name__}: {exc}"
-        return evidence
-
-    def _complete_pi0_nav_pick_handoff(
-        self, *, held_hand: str, validator: dict[str, Any]
-    ) -> dict[str, Any]:
-        import torch
-
-        held_hand, press_hand = self._validated_handoff_hands(
-            held_hand=held_hand,
-            press_hand="right" if held_hand == "left" else "left",
-        )
-        self._state_checkpoint_path = (
-            self._output_dir / "state_checkpoints" / "state_checkpoint_1.json"
-        )
-        generated = (
-            self._state_checkpoint_path,
-            self._paused_runtime_path,
-        )
-        state_pending = self._state_checkpoint_path.with_suffix(".json.pending")
-        handoff_env_steps = 0
-        stable_frames: list[dict[str, Any]] = []
-        post_pick_warnings: list[dict[str, Any]] = []
-        latest_metrics: dict[str, Any] | None = None
-        reload_report: dict[str, Any] | None = None
-        diagnostics_path = self._output_dir / "handoff_failure_diagnostics.json"
-        for path in generated:
-            path.unlink(missing_ok=True)
-            path.with_suffix(path.suffix + ".tmp").unlink(missing_ok=True)
-        state_pending.unlink(missing_ok=True)
-        try:
-            remaining_horizon = max(
-                0, int(self._meta["max_episode_steps"]) - int(self._env_steps)
-            )
-            validation_frame_budget = min(HANDOFF_VALIDATION_FRAMES, remaining_horizon)
-            if validation_frame_budget < HANDOFF_VALIDATION_FRAMES:
-                post_pick_warnings.append(
-                    _post_pick_warning(
-                        "insufficient_handoff_horizon",
-                        "fewer than eight post-reload diagnostic hold frames remain",
-                        metrics={
-                            "available_frames": validation_frame_budget,
-                            "requested_frames": HANDOFF_VALIDATION_FRAMES,
-                        },
-                    )
-                )
-            self._handoff_state = _HANDOFF_CHECKPOINTING
-            self._gripper_latch[held_hand] = -1.0
-            robot = self._robot()
-            if robot is None:
-                raise RuntimeError("R1Pro robot is unavailable")
-            pre_reload_q = np.asarray(
-                _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-            ).reshape(-1)
-            if not np.isfinite(pre_reload_q).all():
-                raise RuntimeError("pre-reload R1Pro q-state is invalid")
-            state_payload = self._robot_state_checkpoint_payload(
-                checkpoint_name="state_checkpoint_1",
-                stage="post_pick_pre_controller_reload",
-                held_hand=held_hand,
-                press_hand=press_hand,
-                object_name="radio",
-                require_current_grasp=True,
-                validation_evidence={"strict_vla_window": validator},
-            )
-            try:
-                state_payload["visual_evidence"] = self._checkpoint_visual_evidence(
-                    checkpoint_name="state_checkpoint_1",
-                    held_hand=held_hand,
-                    press_hand=press_hand,
-                )
-            except Exception as exc:
-                post_pick_warnings.append(
-                    _post_pick_warning(
-                        "visual_evidence_unavailable",
-                        f"{type(exc).__name__}: {exc}",
-                    )
-                )
-                state_payload["visual_evidence"] = {}
-            state_payload["warnings"] = _wire_safe(post_pick_warnings)
-            _write_json_atomic(state_pending, state_payload)
-            self._finalize_video_segment()
-            self._video_sealed = True
-            self.start_video_segment(
-                self._output_dir / "curobo_checkpoint_restore_episode.mp4"
-            )
-            self._handoff_state = _HANDOFF_CONTROLLER_RELOAD
-            reload_report = self._reload_base_controller_position()
-            post_reload_q = np.asarray(
-                _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-            ).reshape(-1)
-            if (
-                post_reload_q.shape != pre_reload_q.shape
-                or not np.isfinite(post_reload_q).all()
-            ):
-                raise RuntimeError("post-reload R1Pro q-state is invalid")
-            base_indices = np.asarray(
-                _numpy_tree(getattr(robot, "base_control_idx", [])), dtype=int
-            )
-            trunk_indices = np.asarray(
-                _numpy_tree(getattr(robot, "trunk_control_idx", [])), dtype=int
-            )
-            arm_indices = getattr(robot, "arm_control_idx", {}) or {}
-            left_indices = np.asarray(
-                _numpy_tree(arm_indices.get("left", [])), dtype=int
-            )
-            right_indices = np.asarray(
-                _numpy_tree(arm_indices.get("right", [])), dtype=int
-            )
-            if not (
-                base_indices.shape == (3,)
-                and trunk_indices.shape == (4,)
-                and left_indices.shape == (7,)
-                and right_indices.shape == (7,)
-            ):
-                raise RuntimeError("post-reload R1Pro joint index layout is invalid")
-            base_xy_jump = float(
-                np.max(
-                    np.abs(
-                        post_reload_q[base_indices[:2]] - pre_reload_q[base_indices[:2]]
-                    )
-                )
-            )
-            base_yaw_jump = float(
-                abs(post_reload_q[base_indices[2]] - pre_reload_q[base_indices[2]])
-            )
-            articulation_indices = np.r_[trunk_indices, left_indices, right_indices]
-            articulation_jump = float(
-                np.max(
-                    np.abs(
-                        post_reload_q[articulation_indices]
-                        - pre_reload_q[articulation_indices]
-                    )
-                )
-            )
-            if base_xy_jump > 0.02 or base_yaw_jump > 0.03 or articulation_jump > 0.02:
-                post_pick_warnings.append(
-                    _post_pick_warning(
-                        "controller_reload_pose_jump",
-                        "controller reload exceeded strict pose-jump diagnostics",
-                        metrics={
-                            "base_xy_jump_m": base_xy_jump,
-                            "base_yaw_jump_rad": base_yaw_jump,
-                            "articulation_jump_rad": articulation_jump,
-                            "limits": {
-                                "base_xy_jump_m": 0.02,
-                                "base_yaw_jump_rad": 0.03,
-                                "articulation_jump_rad": 0.02,
-                            },
-                        },
-                    )
-                )
-            hold = np.asarray(
-                self._require_planner().backend.hold_action(), dtype=np.float32
-            ).reshape(-1)
-            if hold.shape != (23,) or not np.isfinite(hold).all():
-                raise RuntimeError(
-                    "first post-reload hold is not one finite 23D action"
-                )
-            hold[ENV_ACTION_SEGMENTS[f"{held_hand}_gripper"]] = -1.0
-            hold[ENV_ACTION_SEGMENTS[f"{press_hand}_gripper"]] = float(
-                self._gripper_latch[press_hand]
-            )
-            self._handoff_state = _HANDOFF_STABLE_VALIDATION
-            radio, _table = self._resolve_handoff_targets()
-            eef_links = getattr(robot, "eef_links", {})
-            held_link = (
-                eef_links.get(held_hand) if isinstance(eef_links, dict) else None
-            )
-            if held_link is None:
-                raise RuntimeError(f"{held_hand} EEF link is unavailable")
-            eef_position, eef_orientation = self._object_pose(held_link)
-            radio_position, radio_orientation = self._object_pose(radio)
-            initial_relative_position, initial_relative_orientation = (
-                self._relative_pose(
-                    eef_position, eef_orientation, radio_position, radio_orientation
-                )
-            )
-            for hold_index in range(validation_frame_budget):
-                step_obs, _reward, step_term, step_trunc, step_infos = (
-                    self._env._direct_process.step_env(
-                        torch.as_tensor(hold, dtype=torch.float32).reshape(1, 23),
-                        need_obs=True,
-                    )
-                )
-                self._env_steps += 1
-                handoff_env_steps += 1
-                self._last_info = _numpy_tree(step_infos[0])
-                observation = _single_observation(self._env._wrap_obs(step_obs))
-                self._last_observation = observation
-                self._record_rgbd_frames(step_obs, observation)
-                frame = self._handoff_validator_frame(observation)
-                selected = frame["per_hand"][held_hand]
-                other = frame["per_hand"][press_hand]
-                current_q = np.asarray(
-                    _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-                ).reshape(-1)
-                eef_position, eef_orientation = self._object_pose(held_link)
-                radio_position, radio_orientation = self._object_pose(radio)
-                relative_position, relative_orientation = self._relative_pose(
-                    eef_position, eef_orientation, radio_position, radio_orientation
-                )
-                relative_drift = float(
-                    np.linalg.norm(relative_position - initial_relative_position)
-                )
-                angular_drift = _quaternion_angle_rad(
-                    relative_orientation, initial_relative_orientation
-                )
-                latest_metrics = {
-                    "hold_index": hold_index + 1,
-                    "env_step": int(self._env_steps),
-                    "base_xy_error_m": float(
-                        np.max(
-                            np.abs(
-                                current_q[base_indices[:2]]
-                                - pre_reload_q[base_indices[:2]]
-                            )
-                        )
-                    ),
-                    "base_yaw_error_rad": float(
-                        abs(current_q[base_indices[2]] - pre_reload_q[base_indices[2]])
-                    ),
-                    "articulation_error_rad": float(
-                        np.max(
-                            np.abs(
-                                current_q[articulation_indices]
-                                - pre_reload_q[articulation_indices]
-                            )
-                        )
-                    ),
-                    "object_relative_drift_m": relative_drift,
-                    "held_object_angular_drift_rad": angular_drift,
-                    "limits": {
-                        "base_xy_error_m": 0.02,
-                        "base_yaw_error_rad": 0.03,
-                        "articulation_error_rad": HANDOFF_ARTICULATION_ERROR_MAX_RAD,
-                        "object_relative_drift_m": HANDOFF_RELATIVE_DRIFT_MAX_M,
-                        "held_object_angular_drift_rad": HANDOFF_RELATIVE_ANGULAR_DRIFT_MAX_RAD,
-                    },
-                    "validator": frame,
-                    "episode_status": {
-                        "terminated": bool(_scalar_bool(step_term)),
-                        "truncated": bool(_scalar_bool(step_trunc)),
-                        "done": bool(_raw_done(self._last_info)),
-                        "official_task_success": bool(_raw_success(self._last_info)),
-                    },
-                }
-                latest_metrics["controller_hold_warning"] = (
-                    _handoff_controller_hold_warning(latest_metrics)
-                )
-                if latest_metrics["controller_hold_warning"]:
-                    post_pick_warnings.append(
-                        _post_pick_warning(
-                            "controller_hold_settling",
-                            "post-reload controller settling exceeded diagnostic limits",
-                            metrics=latest_metrics,
-                        )
-                    )
-                if any(latest_metrics["episode_status"].values()):
-                    post_pick_warnings.append(
-                        _post_pick_warning(
-                            "episode_status_during_handoff",
-                            "episode stopped before eight-frame diagnostic hold completed",
-                            metrics=latest_metrics["episode_status"],
-                        )
-                    )
-                    stable_frames.append(latest_metrics)
-                    self._append_video(observation)
-                    break
-                if not _post_reload_grasp_stable(
-                    selected=selected,
-                    other=other,
-                ):
-                    post_pick_warnings.append(
-                        _post_pick_warning(
-                            "post_reload_grasp_not_strict",
-                            "post-reload strict grasp diagnostics did not pass",
-                            metrics=frame,
-                        )
-                    )
-                if not _handoff_held_object_stable(
-                    relative_drift_m=relative_drift,
-                    angular_drift_rad=angular_drift,
-                ):
-                    post_pick_warnings.append(
-                        _post_pick_warning(
-                            "held_object_stability_not_strict",
-                            "held-radio drift exceeded strict diagnostic thresholds",
-                            metrics={
-                                "relative_drift_m": relative_drift,
-                                "angular_drift_rad": angular_drift,
-                            },
-                        )
-                    )
-                stable_frames.append(latest_metrics)
-                self._append_video(observation)
-            try:
-                warmup = self._prepare_prepress_planner_readiness(held_hand=held_hand)
-            except Exception as exc:
-                warmup = {"status": "warning", "error": f"{type(exc).__name__}: {exc}"}
-                post_pick_warnings.append(
-                    _post_pick_warning(
-                        "prepress_planner_readiness_failed",
-                        warmup["error"],
-                    )
-                )
-            try:
-                verification_views = self._checkpoint_visual_evidence(
-                    checkpoint_name="restore_verification",
-                    held_hand=held_hand,
-                    press_hand=press_hand,
-                )
-            except Exception as exc:
-                verification_views = {}
-                post_pick_warnings.append(
-                    _post_pick_warning(
-                        "restore_verification_visual_unavailable",
-                        f"{type(exc).__name__}: {exc}",
-                    )
-                )
-            verification_path = self._output_dir / "restore_verification.json"
-            _write_json_atomic(
-                verification_path,
-                {
-                    "controller_reload": reload_report,
-                    "planner_warmup": _wire_safe(warmup),
-                    "stable_hold_frames": stable_frames,
-                    "visual_evidence": verification_views,
-                    "save_policy": POST_PICK_DEBUG_SAVE_POLICY,
-                    "strict_local_grasp_success": not bool(post_pick_warnings),
-                    "usable_post_pick_saved": True,
-                    "warnings": _wire_safe(post_pick_warnings),
-                    "official_task_success": bool(_raw_success(self._last_info)),
-                },
-            )
-            # The authoritative checkpoint is the actual stable post-reload
-            # observation, not the pre-reload target.  This keeps the robot-
-            # motion checkpoint aligned with the PAUSED state while the strict
-            # pre/post metrics above still guard controller-switch continuity.
-            final_state_payload = self._robot_state_checkpoint_payload(
-                checkpoint_name="state_checkpoint_1",
-                stage="post_pi0_nav_pick",
-                held_hand=held_hand,
-                press_hand=press_hand,
-                object_name="radio",
-                require_current_grasp=True,
-                validation_evidence={
-                    "strict_vla_window": validator,
-                    "controller_reload": reload_report,
-                    "stable_hold_frames": stable_frames,
-                    "post_pick_warnings": post_pick_warnings,
-                },
-            )
-            try:
-                final_state_payload["visual_evidence"] = (
-                    self._checkpoint_visual_evidence(
-                        checkpoint_name="state_checkpoint_1",
-                        held_hand=held_hand,
-                        press_hand=press_hand,
-                    )
-                )
-            except Exception as exc:
-                post_pick_warnings.append(
-                    _post_pick_warning(
-                        "state1_visual_evidence_unavailable",
-                        f"{type(exc).__name__}: {exc}",
-                    )
-                )
-                final_state_payload["visual_evidence"] = {}
-            final_state_payload["strict_local_grasp_success"] = bool(
-                final_state_payload.get("strict_local_grasp_success")
-                and bool(validator.get("local_grasp_success"))
-                and not any(
-                    warning.get("code") in _STRICT_GRASP_WARNING_CODES
-                    for warning in post_pick_warnings
-                    if isinstance(warning, dict)
-                )
-            )
-            final_state_payload["usable_post_pick_saved"] = True
-            final_state_payload["save_policy"] = POST_PICK_DEBUG_SAVE_POLICY
-            final_state_payload["warnings"] = _wire_safe(post_pick_warnings)
-            final_state_payload["validation"].update(
-                {
-                    "strict_local_grasp_success": final_state_payload[
-                        "strict_local_grasp_success"
-                    ],
-                    "usable_post_pick_saved": True,
-                    "save_policy": POST_PICK_DEBUG_SAVE_POLICY,
-                    "warnings": _wire_safe(post_pick_warnings),
-                }
-            )
-            _write_json_atomic(state_pending, final_state_payload)
-            os.replace(state_pending, self._state_checkpoint_path)
-            self._held_hand = held_hand
-            self._action_source = "curobo"
-            self._finalize_video_segment()
-            self._video_sealed = True
-            self._handoff_state = _HANDOFF_PAUSED
-            paused = {
-                "schema_version": 1,
-                "control_mode": PI0_NAV_PICK_VLA_MODE,
-                "handoff_state": _HANDOFF_PAUSED,
-                "env_pid": os.getpid(),
-                "env_step": int(self._env_steps),
-                "held_hand": held_hand,
-                "press_hand": press_hand,
-                "action_source": self._action_source,
-                "vla_actions_enabled": True,
-                "vla_action_gate_confirmed": False,
-                "lifecycle_finalized": False,
-                "state_checkpoint_path": str(self._state_checkpoint_path),
-                "state_checkpoint_sha256": _sha256_file(self._state_checkpoint_path),
-                "video_path": str(self._video_path),
-                "pi0_nav_pick_video_path": str(
-                    self._output_dir / "pi0_nav_pick_episode.mp4"
-                ),
-                "curobo_restore_video_path": str(
-                    self._output_dir / "curobo_checkpoint_restore_episode.mp4"
-                ),
-                "restore_verification_path": str(verification_path),
-                "strict_local_grasp_success": bool(
-                    final_state_payload["strict_local_grasp_success"]
-                ),
-                "usable_post_pick_saved": True,
-                "save_policy": POST_PICK_DEBUG_SAVE_POLICY,
-                "warnings": _wire_safe(post_pick_warnings),
-            }
-            _write_json_atomic(self._paused_runtime_path, paused)
-            return {
-                "held_hand": held_hand,
-                "press_hand": press_hand,
-                "state_checkpoint_path": str(self._state_checkpoint_path),
-                "paused_runtime_path": str(self._paused_runtime_path),
-                "controller_reload": reload_report,
-                "handoff_env_steps": handoff_env_steps,
-                "strict_local_grasp_success": bool(
-                    final_state_payload["strict_local_grasp_success"]
-                ),
-                "usable_post_pick_saved": True,
-                "save_policy": POST_PICK_DEBUG_SAVE_POLICY,
-                "warnings": _wire_safe(post_pick_warnings),
-            }
-        except Exception as exc:
-            self._vla_actions_enabled = False
-            post_pick_warnings.append(
-                _post_pick_warning(
-                    "post_pick_handoff_diagnostic_failed",
-                    f"{type(exc).__name__}: {exc}",
-                    metrics={
-                        "controller_reload": reload_report,
-                        "latest_metrics": latest_metrics,
-                    },
-                )
-            )
-            diagnostics = {
-                "schema_version": 1,
-                "error": f"{type(exc).__name__}: {exc}",
-                "held_hand": held_hand,
-                "press_hand": press_hand,
-                "env_step": int(self._env_steps),
-                "handoff_env_steps": int(handoff_env_steps),
-                "strict_vla_validator": _wire_safe(validator),
-                "controller_reload": _wire_safe(reload_report),
-                "stable_frames": _wire_safe(stable_frames),
-                "latest_metrics": _wire_safe(latest_metrics),
-                "warnings": _wire_safe(post_pick_warnings),
-            }
-            _write_json_atomic(diagnostics_path, diagnostics)
-            self._last_handoff_failure = {
-                **diagnostics,
-                "handoff_failure_diagnostics_path": str(diagnostics_path),
-            }
-            if state_pending.is_file() and not self._state_checkpoint_path.exists():
-                # The pre-controller snapshot is already a complete robot-motion
-                # payload.  Operational handoff/readiness/validator failures do
-                # not revoke its value as a development restart artifact.
-                fallback = json.loads(state_pending.read_text(encoding="utf-8"))
-                if not isinstance(fallback, dict):
-                    raise RuntimeError("pending state_checkpoint_1 payload is invalid")
-                fallback.update(
-                    {
-                        "stage": "post_pick_debug_fallback",
-                        "strict_local_grasp_success": False,
-                        "usable_post_pick_saved": True,
-                        "save_policy": POST_PICK_DEBUG_SAVE_POLICY,
-                        "warnings": _wire_safe(post_pick_warnings),
-                        "snapshot_phase": "pre_controller_reload",
-                    }
-                )
-                validation = fallback.get("validation")
-                if not isinstance(validation, dict):
-                    raise RuntimeError(
-                        "pending state_checkpoint_1 validation schema is invalid"
-                    )
-                validation.update(
-                    {
-                        "strict_local_grasp_success": False,
-                        "usable_post_pick_saved": True,
-                        "save_policy": POST_PICK_DEBUG_SAVE_POLICY,
-                        "warnings": _wire_safe(post_pick_warnings),
-                    }
-                )
-                _write_json_atomic(state_pending, fallback)
-                os.replace(state_pending, self._state_checkpoint_path)
-                self._held_hand = held_hand
-                self._action_source = (
-                    "curobo" if reload_report is not None else "pi0_vla"
-                )
-                self._handoff_state = _HANDOFF_PAUSED
-                paused = {
-                    "schema_version": 1,
-                    "control_mode": PI0_NAV_PICK_VLA_MODE,
-                    "handoff_state": _HANDOFF_PAUSED,
-                    "controller_handoff_pass": False,
-                    "env_pid": os.getpid(),
-                    "env_step": int(self._env_steps),
-                    "held_hand": held_hand,
-                    "press_hand": press_hand,
-                    "action_source": self._action_source,
-                    "vla_actions_enabled": False,
-                    "vla_action_gate_confirmed": False,
-                    "lifecycle_finalized": False,
-                    "state_checkpoint_path": str(self._state_checkpoint_path),
-                    "state_checkpoint_sha256": _sha256_file(
-                        self._state_checkpoint_path
-                    ),
-                    "strict_local_grasp_success": False,
-                    "usable_post_pick_saved": True,
-                    "save_policy": POST_PICK_DEBUG_SAVE_POLICY,
-                    "warnings": _wire_safe(post_pick_warnings),
-                    "handoff_failure_diagnostics_path": str(diagnostics_path),
-                }
-                _write_json_atomic(self._paused_runtime_path, paused)
-                return {
-                    "held_hand": held_hand,
-                    "press_hand": press_hand,
-                    "state_checkpoint_path": str(self._state_checkpoint_path),
-                    "paused_runtime_path": str(self._paused_runtime_path),
-                    "controller_reload": reload_report,
-                    "handoff_env_steps": handoff_env_steps,
-                    "strict_local_grasp_success": False,
-                    "usable_post_pick_saved": True,
-                    "save_policy": POST_PICK_DEBUG_SAVE_POLICY,
-                    "warnings": _wire_safe(post_pick_warnings),
-                }
-            self._handoff_state = _HANDOFF_FAILED
-            # A committed state checkpoint is immutable evidence even when a
-            # later paused-runtime or mirror write fails.  Only incomplete
-            # temporary files are safe to discard here.
-            for path in generated:
-                path.with_suffix(path.suffix + ".tmp").unlink(missing_ok=True)
-            state_pending.unlink(missing_ok=True)
-            raise
-
-    def _prepare_prepress_planner_readiness(
-        self,
-        *,
-        held_hand: str,
-        ignore_collision_checks: bool = False,
-    ) -> dict[str, Any]:
-        """Prepare only the planner generator used after the pick handoff.
-
-        A post-pick current-q query intentionally contains gripper/radio contact.
-        The generic planner warmup includes the unrelated BASE generator and
-        treats that contact as a world collision, so it cannot be a valid
-        readiness gate for the held-arm-only pre-press phase.  Target-specific
-        plan and attached-radio full-path collision validation remain mandatory
-        in ``prepress_move_to`` before any waypoint can execute.
-        """
-
-        if held_hand not in {"left", "right"}:
-            raise ValueError(f"invalid held_hand {held_hand!r}")
-        planner = self._require_planner()
-        planner.on_simulator_state_restored()
-        radio, _table = self._resolve_handoff_targets()
-        expected_root = getattr(radio, "root_link", None)
-        if expected_root is None:
-            raise RuntimeError("radio root link is unavailable for pre-press warmup")
-        warmup_kwargs = {
-            "hand": held_hand,
-            "expected_attached_root": expected_root,
-        }
-        if ignore_collision_checks:
-            warmup_kwargs["ignore_collision_checks"] = True
-        readiness = planner.warmup_prepress(**warmup_kwargs)
-        stages = readiness.get("stages")
-        required_stages = (
-            "current_q_attached_combined_collision",
-            "current_pose_attached_full_trajectory",
-            "identity_neighborhood_connected_path",
-        )
-        valid = bool(
-            readiness.get("status") == "complete"
-            and readiness.get("generator_kind") == "prepress_arm"
-            and readiness.get("held_hand") == held_hand
-            and readiness.get("base_generator_warmed") is False
-            and readiness.get("unrelated_press_arm_generator_warmed") is False
-            and isinstance(stages, dict)
-            and all(
-                isinstance(stages.get(name), dict) and stages[name].get("ok") is True
-                for name in required_stages
-            )
-            and readiness.get("attached_collision_body", {}).get(
-                "root_matches_expected_radio"
-            )
-            is True
-            and isinstance(readiness.get("robot_q_pose_jump_max"), (int, float))
-            and not isinstance(readiness.get("robot_q_pose_jump_max"), bool)
-            and float(readiness["robot_q_pose_jump_max"]) <= 1e-6
-        )
-        if not valid:
-            raise RuntimeError("pre-press planner readiness report is invalid")
-        return readiness
-
-    def finalize_paused_runtime(self, vla_status: dict[str, Any]) -> dict[str, Any]:
-        if self._control_mode != PI0_NAV_PICK_VLA_MODE:
-            raise RuntimeError(
-                "paused runtime finalization is exclusive to pi0_nav_pick"
-            )
-        if (
-            self._handoff_state != _HANDOFF_PAUSED
-            or not self._paused_runtime_path.is_file()
-        ):
-            raise RuntimeError("runtime is not in a checkpointed PAUSED state")
-        if (
-            not isinstance(vla_status, dict)
-            or vla_status.get("actions_enabled") is not False
-        ):
-            raise RuntimeError("VLA action disable confirmation is missing")
-        health = vla_status.get("healthz")
-        if not isinstance(health, dict) or health.get("actions_enabled") is not False:
-            raise RuntimeError("VLA health did not confirm actions_enabled=false")
-        pid = health.get("pid")
-        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-            raise RuntimeError("VLA health pid is invalid")
-        endpoint = vla_status.get("endpoint")
-        if not isinstance(endpoint, str) or not endpoint:
-            raise RuntimeError(
-                "VLA endpoint is required for paused runtime finalization"
-            )
-        paused = json.loads(self._paused_runtime_path.read_text(encoding="utf-8"))
-        paused.update(
-            {
-                "vla_pid": pid,
-                "vla_endpoint": endpoint,
-                "vla_actions_enabled": False,
-                "vla_action_gate_confirmed": True,
-                "vla_status": _wire_safe(vla_status),
-                "lifecycle_finalized": True,
-                "finalized_at_unix_s": time.time(),
-            }
-        )
-        _write_json_atomic(self._paused_runtime_path, paused)
-        self._vla_actions_enabled = False
-        return {
-            "paused_runtime_path": str(self._paused_runtime_path),
-            "handoff_state": self._handoff_state,
-            "vla_actions_enabled": False,
-            "lifecycle_finalized": True,
-            "env_pid": os.getpid(),
-            "vla_pid": pid,
-            "vla_endpoint": endpoint,
         }
 
     def _sensor_for_camera(self, camera: str) -> Any | None:
@@ -3518,18 +3085,37 @@ class BehaviorEnvFacade:
         payload: dict[str, Any],
         sensor: Any | None,
     ) -> np.ndarray:
+        matrix, _source, _render_bound = self._camera_to_world_with_source(
+            camera=camera,
+            payload=payload,
+            sensor=sensor,
+        )
+        return matrix
+
+    def _camera_to_world_with_source(
+        self,
+        *,
+        camera: str,
+        payload: dict[str, Any],
+        sensor: Any | None,
+    ) -> tuple[np.ndarray, str, bool]:
+        """Resolve camera pose while preserving pixel-binding provenance."""
+
         # Explicit Kit view matrices and the sensor's render annotator are tied
         # to the pixels just returned. Pose-like payload fields may already
         # reflect a newer articulation state, especially for wrist cameras.
-        view = _payload_matrix(
-            payload, ("view_matrix", "view_transform", "world_to_camera")
-        )
-        if view is not None:
-            return np.linalg.inv(view.T)
+        for name in ("view_matrix", "view_transform", "world_to_camera"):
+            view = _payload_matrix(payload, (name,))
+            if view is not None:
+                return (
+                    np.linalg.inv(view.T),
+                    f"payload_{name}",
+                    True,
+                )
         if sensor is not None:
-            sensor_matrix = _sensor_camera_to_world(sensor)
-            if sensor_matrix is not None:
-                return sensor_matrix
+            render_matrix = _sensor_render_camera_to_world(sensor)
+            if render_matrix is not None:
+                return render_matrix, "sensor_cameraViewTransform", True
         direct = _payload_matrix(
             payload,
             (
@@ -3540,17 +3126,269 @@ class BehaviorEnvFacade:
             ),
         )
         if direct is not None:
-            return direct
+            return direct, "payload_pose_matrix_fallback", False
+        if sensor is not None:
+            sensor_matrix = _sensor_camera_to_world(sensor)
+            if sensor_matrix is not None:
+                return sensor_matrix, "live_sensor_pose_fallback", False
         pose = payload.get("pose") or payload.get("camera_pose")
         if isinstance(pose, dict) and "position" in pose and "orientation" in pose:
-            return _matrix_from_pose(pose["position"], pose["orientation"])
+            return (
+                _matrix_from_pose(pose["position"], pose["orientation"]),
+                "payload_pose_fallback",
+                False,
+            )
         raise CameraGeometryError(f"camera pose unavailable for {camera}")
 
+    @staticmethod
+    def _live_link_world_transform(link: Any, *, reference: str) -> np.ndarray:
+        getter = getattr(link, "get_position_orientation", None)
+        if not callable(getter):
+            raise CameraGeometryError(f"{reference} live pose is unavailable")
+        position, orientation = getter()
+        return validated_rigid_transform(
+            _matrix_from_pose(position, orientation),
+            name=f"{reference} live world transform",
+        )
+
+    def _capture_r1pro_hand_reference_transforms(
+        self,
+        *,
+        camera_to_world_by_camera: dict[str, Any],
+        camera_pose_lineage_by_camera: dict[str, Any],
+        raw_proprio: Any,
+        render_sync_iterations: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Snapshot both hands' complete live link transforms for one RGB-D group.
+
+        These matrices remain simulator-internal. Public probes expose only
+        frame-bound distances and a digest, never simulator prim paths.
+        """
+
+        references_unavailable = {
+            "schema_version": 1,
+            "available": False,
+            "reason": "hand_geometry_sync_certificate_unavailable",
+            "env_step": int(self._env_steps),
+            "source": "capture_time_live_r1pro_link_transforms",
+            "hands": {},
+        }
+        certificate_unavailable = {
+            "schema_version": 1,
+            "available": False,
+            "synchronized": False,
+            "reason": "r1pro_live_hand_geometry_unavailable",
+            "env_step": int(self._env_steps),
+            "render_sync_iterations": int(render_sync_iterations),
+            "translation_tolerance_m": _HAND_GEOMETRY_TRANSLATION_TOLERANCE_M,
+            "rotation_tolerance_deg": _HAND_GEOMETRY_ROTATION_TOLERANCE_DEG,
+            "finger_joint_tolerance_m": (_HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M),
+            "source": "render_sync_plus_official_r1pro_fixed_extrinsics",
+            "hands": {},
+        }
+        robot = self._robot()
+        if robot is None:
+            return references_unavailable, certificate_unavailable
+        links = getattr(robot, "links", None)
+        eef_names = getattr(robot, "eef_link_names", None)
+        finger_names = getattr(robot, "finger_link_names", None)
+        gripper_indices = getattr(robot, "gripper_control_idx", None)
+        if (
+            not isinstance(links, dict)
+            or not isinstance(eef_names, dict)
+            or not isinstance(finger_names, dict)
+            or not isinstance(gripper_indices, dict)
+        ):
+            return references_unavailable, certificate_unavailable
+
+        raw = np.asarray(_numpy_tree(raw_proprio), dtype=np.float64).reshape(-1)
+        qpos = np.asarray(
+            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
+        ).reshape(-1)
+        if (
+            raw.size < RAW_PROPRIO_SEGMENTS["right_gripper"].stop
+            or not np.isfinite(raw).all()
+            or not np.isfinite(qpos).all()
+        ):
+            return references_unavailable, certificate_unavailable
+
+        hands: dict[str, Any] = {}
+        hand_certificates: dict[str, Any] = {}
+        expected = r1pro_wrist_camera_reference_transforms()
+        try:
+            for hand in ("left", "right"):
+                palm_name = f"{hand}_gripper_link"
+                grip_name = str(eef_names[hand])
+                current_finger_names = list(finger_names[hand])
+                if len(current_finger_names) != 2:
+                    raise CameraGeometryError(
+                        f"{hand} hand does not expose exactly two finger roots"
+                    )
+                if (
+                    palm_name not in links
+                    or grip_name not in links
+                    or any(name not in links for name in current_finger_names)
+                ):
+                    raise CameraGeometryError(
+                        f"{hand} hand reference links are unavailable"
+                    )
+                palm = self._live_link_world_transform(
+                    links[palm_name],
+                    reference=f"{hand} palm",
+                )
+                grip_point = self._live_link_world_transform(
+                    links[grip_name],
+                    reference=f"{hand} grip point",
+                )
+                finger_roots = [
+                    self._live_link_world_transform(
+                        links[name],
+                        reference=f"{hand} finger root {index + 1}",
+                    )
+                    for index, name in enumerate(current_finger_names)
+                ]
+                camera_to_world = validated_rigid_transform(
+                    camera_to_world_by_camera[f"{hand}_wrist"],
+                    name=f"{hand} wrist camera-to-world transform",
+                )
+                camera_pose_lineage = camera_pose_lineage_by_camera.get(f"{hand}_wrist")
+                camera_pose_render_bound = bool(
+                    isinstance(camera_pose_lineage, dict)
+                    and camera_pose_lineage.get("render_bound") is True
+                    and int(camera_pose_lineage.get("env_step", -1))
+                    == int(self._env_steps)
+                    and int(camera_pose_lineage.get("render_sync_iterations", -1))
+                    >= _HAND_GEOMETRY_SYNC_RENDER_ITERATIONS
+                    and camera_pose_lineage.get("source")
+                    in {
+                        "payload_view_matrix",
+                        "payload_view_transform",
+                        "payload_world_to_camera",
+                        "sensor_cameraViewTransform",
+                    }
+                )
+                palm_residual = rigid_transform_residual(
+                    np.linalg.inv(palm) @ camera_to_world,
+                    expected["palm_from_camera"],
+                )
+                grip_residual = rigid_transform_residual(
+                    np.linalg.inv(grip_point) @ camera_to_world,
+                    expected["grip_point_from_camera"],
+                )
+                indices = np.asarray(
+                    _numpy_tree(gripper_indices[hand]), dtype=np.int64
+                ).reshape(-1)
+                if (
+                    indices.shape != (2,)
+                    or np.any(indices < 0)
+                    or int(indices.max()) >= qpos.size
+                ):
+                    raise CameraGeometryError(
+                        f"{hand} gripper joint indices are unavailable"
+                    )
+                live_finger_q = qpos[indices]
+                capture_finger_q = raw[RAW_PROPRIO_SEGMENTS[f"{hand}_gripper"]]
+                if capture_finger_q.shape != (2,):
+                    raise CameraGeometryError(
+                        f"{hand} capture finger joints are unavailable"
+                    )
+                finger_error = float(np.max(np.abs(live_finger_q - capture_finger_q)))
+                palm_passed = bool(
+                    palm_residual["translation_error_m"]
+                    <= _HAND_GEOMETRY_TRANSLATION_TOLERANCE_M
+                    and palm_residual["rotation_error_deg"]
+                    <= _HAND_GEOMETRY_ROTATION_TOLERANCE_DEG
+                )
+                grip_passed = bool(
+                    grip_residual["translation_error_m"]
+                    <= _HAND_GEOMETRY_TRANSLATION_TOLERANCE_M
+                    and grip_residual["rotation_error_deg"]
+                    <= _HAND_GEOMETRY_ROTATION_TOLERANCE_DEG
+                )
+                finger_passed = bool(
+                    finger_error <= _HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M
+                )
+                hand_certificates[hand] = {
+                    "passed": bool(
+                        camera_pose_render_bound
+                        and palm_passed
+                        and grip_passed
+                        and finger_passed
+                    ),
+                    "camera_pose_source": (
+                        camera_pose_lineage.get("source")
+                        if isinstance(camera_pose_lineage, dict)
+                        else None
+                    ),
+                    "camera_pose_render_bound": camera_pose_render_bound,
+                    "palm_from_camera": {
+                        **palm_residual,
+                        "passed": palm_passed,
+                    },
+                    "grip_point_from_camera": {
+                        **grip_residual,
+                        "passed": grip_passed,
+                    },
+                    "finger_joint_capture_match": {
+                        "max_abs_error_m": finger_error,
+                        "passed": finger_passed,
+                    },
+                }
+                hands[hand] = {
+                    "palm": palm.tolist(),
+                    "grip_point": grip_point.tolist(),
+                    # R1Pro declares finger_link_names in finger1/finger2 order.
+                    # Their live link origins track the current articulation.
+                    "finger_roots": [transform.tolist() for transform in finger_roots],
+                }
+        except (CameraGeometryError, KeyError, TypeError, ValueError):
+            return references_unavailable, certificate_unavailable
+
+        synchronized = bool(
+            int(render_sync_iterations) >= _HAND_GEOMETRY_SYNC_RENDER_ITERATIONS
+            and all(certificate["passed"] for certificate in hand_certificates.values())
+        )
+        certificate = {
+            "schema_version": 1,
+            "available": True,
+            "synchronized": synchronized,
+            "reason": None if synchronized else "hand_geometry_sync_residual_failed",
+            "env_step": int(self._env_steps),
+            "render_sync_iterations": int(render_sync_iterations),
+            "translation_tolerance_m": _HAND_GEOMETRY_TRANSLATION_TOLERANCE_M,
+            "rotation_tolerance_deg": _HAND_GEOMETRY_ROTATION_TOLERANCE_DEG,
+            "finger_joint_tolerance_m": (_HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M),
+            "source": "render_sync_plus_official_r1pro_fixed_extrinsics",
+            "hands": hand_certificates,
+        }
+        if not synchronized:
+            return references_unavailable, certificate
+        return (
+            {
+                "schema_version": 1,
+                "available": True,
+                "env_step": int(self._env_steps),
+                "source": "capture_time_live_r1pro_link_transforms",
+                "hands": hands,
+            },
+            certificate,
+        )
+
     def _record_rgbd_frames(
-        self, raw_observations: Any, observation: dict[str, Any]
+        self,
+        raw_observations: Any,
+        observation: dict[str, Any],
+        *,
+        strict: bool = False,
+        synchronize_hand_geometry: bool = False,
+        render_sync_iterations: int = 0,
     ) -> None:
         raw = _first_env_value(raw_observations)
         if raw is None:
+            if strict:
+                raise RuntimeError(
+                    "canonical RGB-D refresh returned no raw observation"
+                )
             return
         payloads: dict[str, dict[str, Any]] = {}
         for path, payload in _iter_sensor_payloads(raw):
@@ -3565,6 +3403,7 @@ class BehaviorEnvFacade:
                     f"same-step RGB-D capture missing cameras: {missing}"
                 )
             frames: dict[str, dict[str, Any]] = {}
+            camera_pose_lineage: dict[str, dict[str, Any]] = {}
             for camera in expected_cameras:
                 payload = payloads[camera]
                 rgb = _payload_rgb(payload)
@@ -3586,17 +3425,68 @@ class BehaviorEnvFacade:
                     raise CameraGeometryError(
                         f"verified camera intrinsics unavailable for {camera}"
                     )
+                (
+                    camera_to_world,
+                    camera_pose_source,
+                    camera_pose_render_bound,
+                ) = self._camera_to_world_with_source(
+                    camera=camera,
+                    payload=payload,
+                    sensor=sensor,
+                )
                 frames[camera] = {
                     "rgb": rgb_array,
                     "depth_m": depth,
                     "intrinsics": intrinsics,
-                    "camera_to_world": self._camera_to_world(
-                        camera=camera,
-                        payload=payload,
-                        sensor=sensor,
-                    ),
+                    "camera_to_world": camera_to_world,
                 }
-            compact_proprio = extract_policy_state(observation["states"])
+                camera_pose_lineage[camera] = {
+                    "source": camera_pose_source,
+                    "render_bound": bool(camera_pose_render_bound),
+                    "env_step": int(self._env_steps),
+                    "render_sync_iterations": int(render_sync_iterations),
+                }
+            raw_proprio = np.asarray(
+                _numpy_tree(observation["states"]), dtype=np.float64
+            ).reshape(-1)
+            compact_proprio = extract_policy_state(raw_proprio)
+            if synchronize_hand_geometry:
+                (
+                    hand_reference_transforms,
+                    hand_geometry_sync_certificate,
+                ) = self._capture_r1pro_hand_reference_transforms(
+                    camera_to_world_by_camera={
+                        camera: frames[camera]["camera_to_world"]
+                        for camera in expected_cameras
+                    },
+                    camera_pose_lineage_by_camera=camera_pose_lineage,
+                    raw_proprio=raw_proprio,
+                    render_sync_iterations=render_sync_iterations,
+                )
+            else:
+                hand_reference_transforms = {
+                    "schema_version": 1,
+                    "available": False,
+                    "reason": "render_sync_not_requested",
+                    "env_step": int(self._env_steps),
+                    "source": "capture_time_live_r1pro_link_transforms",
+                    "hands": {},
+                }
+                hand_geometry_sync_certificate = {
+                    "schema_version": 1,
+                    "available": False,
+                    "synchronized": False,
+                    "reason": "render_sync_not_requested",
+                    "env_step": int(self._env_steps),
+                    "render_sync_iterations": int(render_sync_iterations),
+                    "translation_tolerance_m": (_HAND_GEOMETRY_TRANSLATION_TOLERANCE_M),
+                    "rotation_tolerance_deg": (_HAND_GEOMETRY_ROTATION_TOLERANCE_DEG),
+                    "finger_joint_tolerance_m": (
+                        _HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M
+                    ),
+                    "source": ("render_sync_plus_official_r1pro_fixed_extrinsics"),
+                    "hands": {},
+                }
             self._frame_cache.add_capture_group(
                 frames=frames,
                 step_index=self._env_steps,
@@ -3606,31 +3496,29 @@ class BehaviorEnvFacade:
                         "dimension": int(compact_proprio.size),
                         "layout": "POLICY_STATE_SEGMENTS",
                         "segments": segment_ranges(POLICY_STATE_SEGMENTS),
-                    }
+                    },
+                    "r1pro_hand_reference_transforms": hand_reference_transforms,
+                    "hand_geometry_sync_certificate": (hand_geometry_sync_certificate),
+                    "camera_pose_lineage": camera_pose_lineage,
+                    "render_sync_iterations": int(render_sync_iterations),
                 },
             )
-            instance_masks: dict[str, np.ndarray] = {}
-            for camera in expected_cameras:
-                raw_mask = payloads[camera].get("seg_instance_id")
-                if raw_mask is None:
-                    instance_masks = {}
-                    break
-                mask = np.asarray(_numpy_tree(raw_mask))
-                if mask.ndim == 3 and mask.shape[-1] == 1:
-                    mask = mask[..., 0]
-                if mask.ndim != 2 or not np.issubdtype(mask.dtype, np.integer):
-                    instance_masks = {}
-                    break
-                instance_masks[camera] = np.ascontiguousarray(mask)
-            self._last_instance_id_masks = instance_masks
-            self._last_capture_step = self._env_steps if instance_masks else None
-        except Exception:
+            self._last_capture_step = self._env_steps
+        except Exception as exc:
             # Atomicity is intentional: never publish one camera from a newer
             # simulator step beside two cameras from an older step.
             logger.exception(
                 "failed to cache atomic BEHAVIOR RGB-D capture group at sim step %s",
                 self._env_steps,
             )
+            if strict:
+                cache = getattr(self, "_frame_cache", None)
+                if cache is not None:
+                    cache.clear()
+                self._last_capture_step = None
+                raise RuntimeError(
+                    "canonical RGB-D capture group validation failed"
+                ) from exc
 
     def _append_video(self, observation: dict[str, Any]) -> None:
         if self._video_error is not None or self._video_sealed:
@@ -3646,21 +3534,20 @@ class BehaviorEnvFacade:
                 )
             self._video_source_shapes["head"] = list(head.shape)
             frame = head[..., :3]
-            if self._control_mode in _AUDIT_VIDEO_MODES:
-                wrists = np.asarray(observation["wrist_images"], dtype=np.uint8)
-                if wrists.ndim != 4 or wrists.shape[0] != 2:
-                    raise RuntimeError(
-                        "planner video requires synchronized left/right wrist RGB"
-                    )
-                height, width = head.shape[:2]
-                self._video_source_shapes["left_wrist"] = list(wrists[0].shape)
-                self._video_source_shapes["right_wrist"] = list(wrists[1].shape)
-                left_wrist = _resize_video_tile(wrists[0], height=height, width=width)
-                right_wrist = _resize_video_tile(wrists[1], height=height, width=width)
-                frame = np.zeros((height * 2, width * 2, 3), dtype=np.uint8)
-                frame[:height, :width] = head[..., :3]
-                frame[:height, width:] = left_wrist
-                frame[height:, :width] = right_wrist
+            wrists = np.asarray(observation["wrist_images"], dtype=np.uint8)
+            if wrists.ndim != 4 or wrists.shape[0] != 2:
+                raise RuntimeError(
+                    "planner video requires synchronized left/right wrist RGB"
+                )
+            height, width = head.shape[:2]
+            self._video_source_shapes["left_wrist"] = list(wrists[0].shape)
+            self._video_source_shapes["right_wrist"] = list(wrists[1].shape)
+            left_wrist = _resize_video_tile(wrists[0], height=height, width=width)
+            right_wrist = _resize_video_tile(wrists[1], height=height, width=width)
+            frame = np.zeros((height * 2, width * 2, 3), dtype=np.uint8)
+            frame[:height, :width] = head[..., :3]
+            frame[:height, width:] = left_wrist
+            frame[height:, :width] = right_wrist
             self._video_source_shapes["output"] = list(frame.shape)
             # Open the encoder only after a complete frame has validated.  A
             # malformed first capture must not leave an empty MP4 handle.
@@ -3684,11 +3571,7 @@ class BehaviorEnvFacade:
             "frames": self._video_frames,
             "error": self._video_error,
             "source_shapes": dict(self._video_source_shapes),
-            "layout": (
-                "2x2:head,left_wrist/right_wrist,blank"
-                if self._control_mode in _AUDIT_VIDEO_MODES
-                else "head"
-            ),
+            "layout": "2x2:head,left_wrist/right_wrist,blank",
         }
         self._video_path.parent.mkdir(parents=True, exist_ok=True)
         _write_json_atomic(
@@ -3697,737 +3580,9 @@ class BehaviorEnvFacade:
         )
         _write_json_atomic(self._video_path.parent / "video_meta.json", video_meta)
 
-    def start_video_segment(self, path: str | Path) -> None:
-        """Rotate acceptance video without exposing a new planner RPC method."""
-
-        self._finalize_video_segment()
-        self._video_path = Path(path).expanduser().resolve()
-        self._video_writer = None
-        self._video_sealed = False
-        self._video_frames = 0
-        self._video_error = None
-        self._video_source_shapes = {}
-        if self._last_observation is not None:
-            self._append_video(self._last_observation)
-
-    def dump_simulator_state(self, *, serialized: bool = True) -> Any:
-        """Capture the complete in-process simulator state for test isolation."""
-
-        import omnigibson as og
-
-        return og.sim.dump_state(serialized=bool(serialized))
-
-    @staticmethod
-    def _scene_assisted_grasp_entries(value: Any) -> list[dict[str, Any]]:
-        """Collect assisted-grasp mappings from a decoded official scene JSON."""
-
-        entries: list[dict[str, Any]] = []
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key == "ag_obj_constraint_params" and isinstance(item, dict):
-                    entries.append(item)
-                entries.extend(BehaviorEnvFacade._scene_assisted_grasp_entries(item))
-        elif isinstance(value, list):
-            for item in value:
-                entries.extend(BehaviorEnvFacade._scene_assisted_grasp_entries(item))
-        return entries
-
-    def save_post_pick_debug_mirror(self) -> dict[str, Any]:
-        """Save a debug-only official scene JSON that preserves assisted grasp.
-
-        This is intentionally an internal env RPC rather than an LLM tool.  It
-        is never a substitute for ``state_checkpoint_1.json`` and can only be
-        produced after the formal post-pick handoff has been finalized.
-        """
-
-        if self._control_mode != PI0_NAV_PICK_VLA_MODE:
-            raise RuntimeError("post-pick debug mirror requires pi0_nav_pick_vla")
-        mirror_warnings: list[dict[str, Any]] = []
-        if (
-            self._handoff_state != _HANDOFF_PAUSED
-            or self._action_source != "curobo"
-            or self._vla_actions_enabled is not False
-            or not self._paused_runtime_path.is_file()
-        ):
-            mirror_warnings.append(
-                _post_pick_warning(
-                    "runtime_not_strict_paused_curobo",
-                    "debug mirror source is not a strict finalized PAUSED/CuRobo runtime",
-                    metrics={
-                        "handoff_state": self._handoff_state,
-                        "action_source": self._action_source,
-                        "vla_actions_enabled": self._vla_actions_enabled,
-                        "paused_runtime_exists": self._paused_runtime_path.is_file(),
-                    },
-                )
-            )
-        if not self._paused_runtime_path.is_file():
-            raise RuntimeError("post-pick debug mirror paused runtime JSON is missing")
-        paused = json.loads(self._paused_runtime_path.read_text(encoding="utf-8"))
-        if (
-            paused.get("lifecycle_finalized") is not True
-            or paused.get("vla_action_gate_confirmed") is not True
-        ):
-            mirror_warnings.append(
-                _post_pick_warning(
-                    "vla_gate_not_confirmed",
-                    "debug mirror source lacks a finalized VLA action-gate confirmation",
-                )
-            )
-        checkpoint_path, checkpoint, checkpoint_sha = self._read_post_pick_checkpoint()
-        if paused.get("state_checkpoint_sha256") != checkpoint_sha:
-            raise RuntimeError("paused runtime and state_checkpoint_1 SHA differ")
-        mirror_warnings.extend(
-            warning
-            for warning in checkpoint.get("warnings", [])
-            if isinstance(warning, dict)
-        )
-        held = checkpoint["held_hand"]
-        press = checkpoint["press_hand"]
-        radio, _table = self._resolve_handoff_targets()
-        robot = self._robot()
-        if robot is None:
-            raise RuntimeError("post-pick debug mirror robot is unavailable")
-        constraint_params = getattr(robot, "_ag_obj_constraint_params", {})
-        held_params = (
-            constraint_params.get(held, {})
-            if isinstance(constraint_params, dict)
-            else {}
-        )
-        press_params = (
-            constraint_params.get(press, {})
-            if isinstance(constraint_params, dict)
-            else {}
-        )
-        radio_prim_path = str(getattr(radio, "prim_path", ""))
-        radio_root_link = getattr(radio, "root_link", None)
-        radio_root_prim_path = str(getattr(radio_root_link, "prim_path", ""))
-        assisted_grasp_prim_path = str(
-            held_params.get("ag_obj_prim_path", "")
-            if isinstance(held_params, dict)
-            else ""
-        )
-        if not radio_prim_path:
-            raise RuntimeError("post-pick debug mirror radio prim path is unavailable")
-        manifest_assisted_grasp_prim_path = (
-            assisted_grasp_prim_path or radio_root_prim_path or radio_prim_path
-        )
-        source_attachment = self._attachment_matches(held, radio)
-        press_attachment = self._attachment_matches(press, radio)
-        source_attachment_bound = bool(
-            source_attachment[0]
-            and isinstance(held_params, dict)
-            and bool(assisted_grasp_prim_path)
-            and assisted_grasp_prim_path in {radio_prim_path, radio_root_prim_path}
-        )
-        press_clear = bool(
-            not press_attachment[0]
-            and not press_attachment[1]
-            and not bool(press_params)
-        )
-        if not source_attachment_bound:
-            mirror_warnings.append(
-                _post_pick_warning(
-                    "source_assisted_grasp_not_bound",
-                    "source runtime does not have an exact held-hand radio binding",
-                )
-            )
-        if not press_clear:
-            mirror_warnings.append(
-                _post_pick_warning(
-                    "press_hand_not_clear",
-                    "press hand has radio attachment/contact bookkeeping at mirror save",
-                )
-            )
-        opening: float | None = None
-        if self._last_observation is None:
-            mirror_warnings.append(
-                _post_pick_warning(
-                    "mirror_observation_unavailable",
-                    "current public observation is unavailable for gripper diagnostics",
-                )
-            )
-        else:
-            try:
-                opening = self._validated_selected_gripper_opening(
-                    observation=self._last_observation, hand=held
-                )
-            except Exception as exc:
-                mirror_warnings.append(
-                    _post_pick_warning(
-                        "held_gripper_opening_unavailable",
-                        f"{type(exc).__name__}: {exc}",
-                    )
-                )
-        held_opening_closed = bool(
-            opening is not None and opening < HANDOFF_GRIPPER_OPENING_MAX
-        )
-        if not held_opening_closed:
-            mirror_warnings.append(
-                _post_pick_warning(
-                    "held_gripper_not_strictly_closed",
-                    "held gripper opening does not pass the strict diagnostic threshold",
-                    metrics={"opening_m": opening},
-                )
-            )
-        held_latch_closed = bool(float(self._gripper_latch.get(held, 1.0)) == -1.0)
-        if not held_latch_closed:
-            mirror_warnings.append(
-                _post_pick_warning(
-                    "held_latch_not_closed",
-                    "live held-hand command latch is not exactly close",
-                )
-            )
-        if self._initial_radio_position is None:
-            current_radio_position, _ = self._object_pose(radio)
-            initial_radio_position = current_radio_position.astype(float).tolist()
-            mirror_warnings.append(
-                _post_pick_warning(
-                    "initial_radio_position_unavailable",
-                    "using current radio position as the debug reference",
-                )
-            )
-        else:
-            initial_radio_position = self._initial_radio_position.astype(float).tolist()
-
-        bundle = self._output_dir / "debug_mirror_post_pick"
-        pending_bundle = self._output_dir / ".debug_mirror_post_pick.pending"
-        if bundle.exists() or pending_bundle.exists():
-            raise RuntimeError("post-pick debug mirror bundle already exists")
-        pending_bundle.mkdir(parents=True)
-        scene_path = pending_bundle / DEBUG_MIRROR_SCENE_NAME
-        bundled_checkpoint = pending_bundle / DEBUG_MIRROR_CHECKPOINT_NAME
-        shutil.copyfile(checkpoint_path, bundled_checkpoint)
-
-        import omnigibson as og
-
-        try:
-            if len(og.sim.scenes) != 1:
-                raise RuntimeError("post-pick debug mirror requires exactly one scene")
-            # OmniGibson's current assisted-grasp dump uses a shallow copy and
-            # rewrites contact_pos into scene coordinates.  Preserve the live
-            # robot bookkeeping around the official scene save.
-            assisted_grasp_backup = deepcopy(robot._ag_obj_constraint_params)
-            try:
-                og.sim.save([str(scene_path)])
-            finally:
-                robot._ag_obj_constraint_params = assisted_grasp_backup
-            if not scene_path.is_file():
-                raise RuntimeError("OmniGibson did not create the debug mirror scene")
-            scene_payload = json.loads(scene_path.read_text(encoding="utf-8"))
-            grasp_entries = self._scene_assisted_grasp_entries(
-                scene_payload.get("state")
-            )
-            matched = [
-                entry
-                for entry in grasp_entries
-                if isinstance(entry.get(held), dict)
-                and entry[held].get("ag_obj_prim_path") == assisted_grasp_prim_path
-                and not entry.get(press)
-            ]
-            attachment_serialized = bool(len(matched) == 1 and len(grasp_entries) == 1)
-            if source_attachment_bound and not attachment_serialized:
-                raise RuntimeError(
-                    "official scene JSON lost the source held-radio grasp binding"
-                )
-            if not attachment_serialized:
-                mirror_warnings.append(
-                    _post_pick_warning(
-                        "assisted_grasp_not_serialized",
-                        "diagnostic mirror does not contain one exact held-radio grasp",
-                    )
-                )
-            live_attachment_unchanged = bool(
-                self._attachment_matches(held, radio) == (True, True)
-            )
-            if source_attachment_bound and not live_attachment_unchanged:
-                raise RuntimeError("scene save changed the live radio attachment")
-            if not live_attachment_unchanged:
-                mirror_warnings.append(
-                    _post_pick_warning(
-                        "live_attachment_not_strict_after_save",
-                        "live attachment diagnostics are not strict after scene save",
-                    )
-                )
-
-            controllers = getattr(robot, "controllers", {})
-            layout = [
-                [str(name), int(controller.command_dim)]
-                for name, controller in controllers.items()
-            ]
-            base_motor_type = str(getattr(controllers.get("base"), "motor_type", ""))
-            try:
-                base_controller_signature = self._base_controller_signature(robot)
-            except Exception as exc:
-                base_controller_signature = {}
-                mirror_warnings.append(
-                    _post_pick_warning(
-                        "base_controller_signature_unavailable",
-                        f"{type(exc).__name__}: {exc}",
-                    )
-                )
-            position_controller_ready = bool(base_motor_type == "position")
-            if not position_controller_ready:
-                mirror_warnings.append(
-                    _post_pick_warning(
-                        "base_controller_not_position",
-                        "source mirror controller is not confirmed position-base",
-                        metrics={"base_motor_type": base_motor_type},
-                    )
-                )
-            strict_local_grasp_success = bool(
-                checkpoint.get("strict_local_grasp_success", False)
-                and source_attachment_bound
-                and press_clear
-                and held_opening_closed
-                and held_latch_closed
-            )
-            payload = build_debug_mirror_manifest(
-                scene_path=scene_path,
-                checkpoint_path=bundled_checkpoint,
-                meta=self._meta,
-                held_hand=held,
-                press_hand=press,
-                object_name=checkpoint["object_name"],
-                object_prim_path=radio_prim_path,
-                assisted_grasp_prim_path=manifest_assisted_grasp_prim_path,
-                source_env_step=self._env_steps,
-                initial_radio_position=initial_radio_position,
-                gripper_latches={
-                    "left": float(self._gripper_latch["left"]),
-                    "right": float(self._gripper_latch["right"]),
-                },
-                controller_layout=layout,
-                base_motor_type=base_motor_type,
-                base_controller_signature=base_controller_signature,
-                official_task_success=bool(_raw_success(self._last_info)),
-                strict_local_grasp_success=strict_local_grasp_success,
-                validation={
-                    "source_assisted_grasp_bound": source_attachment_bound,
-                    "press_hand_clear": press_clear,
-                    "held_gripper_closed": held_opening_closed,
-                    "held_latch_closed": held_latch_closed,
-                    "attachment_serialized": attachment_serialized,
-                    "live_attachment_unchanged": live_attachment_unchanged,
-                    "position_controller_ready": position_controller_ready,
-                    "restore_eligible": bool(
-                        attachment_serialized
-                        and source_attachment_bound
-                        and position_controller_ready
-                    ),
-                },
-                warnings=_wire_safe(mirror_warnings),
-            )
-            write_debug_mirror_manifest(pending_bundle, payload)
-            # Integrity, task binding, role identity, checkpoint schema, and
-            # hashes are hard requirements even though physical diagnostics
-            # are warning-only.
-            validate_debug_mirror_bundle(scene_path, meta=self._meta)
-            os.replace(pending_bundle, bundle)
-        except BaseException:
-            shutil.rmtree(pending_bundle, ignore_errors=True)
-            raise
-        scene_path = bundle / DEBUG_MIRROR_SCENE_NAME
-        bundled_checkpoint = bundle / DEBUG_MIRROR_CHECKPOINT_NAME
-        manifest_path = bundle / "debug_mirror_post_pick.manifest.json"
-        return {
-            "debug_only": True,
-            "not_robot_motion_checkpoint": True,
-            "scene_path": str(scene_path),
-            "manifest_path": str(manifest_path),
-            "checkpoint_path": str(bundled_checkpoint),
-            "checkpoint_sha256": checkpoint_sha,
-            "strict_local_grasp_success": bool(payload["strict_local_grasp_success"]),
-            "usable_post_pick_saved": True,
-            "save_policy": POST_PICK_DEBUG_SAVE_POLICY,
-            "warnings": _wire_safe(mirror_warnings),
-            "restore_eligible": bool(payload["validation"].get("restore_eligible")),
-            "held_hand": held,
-            "press_hand": press,
-            "object_name": checkpoint["object_name"],
-            "source_env_step": int(self._env_steps),
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-        }
-
-    def restore_simulator_state(
-        self,
-        state: Any,
-        *,
-        serialized: bool = True,
-        gripper_latches: dict[str, float] | None = None,
-    ) -> None:
-        """Restore a trusted in-process snapshot and invalidate stale caches."""
-
-        from copy import deepcopy
-
-        import omnigibson as og
-
-        restore_state = deepcopy(state)
-        if serialized:
-            template = og.sim.dump_state(serialized=True)
-            if int(restore_state.numel()) != int(template.numel()):
-                raise RuntimeError(
-                    "simulator snapshot size does not match loaded scene: "
-                    f"snapshot={int(restore_state.numel())} "
-                    f"scene={int(template.numel())}"
-                )
-            restore_state = restore_state.to(
-                device=template.device, dtype=template.dtype
-            )
-        og.sim.load_state(restore_state, serialized=bool(serialized))
-        # Set the command latch before OmniGibson's mandatory propagation
-        # step, so the first subsequent facade action cannot reopen the held
-        # gripper and release the restored assisted grasp.
-        self._gripper_latch = (
-            {"left": 1.0, "right": 1.0}
-            if gripper_latches is None
-            else {
-                "left": float(gripper_latches["left"]),
-                "right": float(gripper_latches["right"]),
-            }
-        )
-        # OmniGibson documents that one physics update is required after load
-        # for spatial object states to become current.
-        og.sim.step_physics()
-        self._done = False
-        self._last_info = None
-        self._frame_cache.clear()
-        if self._planner is not None:
-            self._planner.on_simulator_state_restored()
-        # Kit camera annotators trail articulation changes.  OmniGibson's own
-        # camera wrapper documents that at least three render calls are needed
-        # before RGB/depth/cameraViewTransform describe the restored pose.
-        # Rendering does not advance task physics or alter official success.
-        _settle_visual_pipeline_after_restore(og.sim)
-        self._refresh_observation_without_step()
-        if self._last_observation is not None:
-            self._append_video(self._last_observation)
-
-    def _restore_post_pick_debug_mirror(self, configured_path: Path) -> dict[str, Any]:
-        """Load a trusted post-pick scene into the already-created task env."""
-
-        if self._control_mode != PI0_NAV_PICK_VLA_MODE:
-            raise RuntimeError("post-pick debug mirror requires pi0_nav_pick_vla")
-        manifest, scene_path, bundled_checkpoint = validate_debug_mirror_bundle(
-            configured_path, meta=self._meta
-        )
-        scene = json.loads(scene_path.read_text(encoding="utf-8"))
-        if not isinstance(scene, dict) or not isinstance(scene.get("state"), dict):
-            raise RuntimeError("post-pick debug mirror scene state is invalid")
-        if self._state_checkpoint_path.exists():
-            raise RuntimeError("debug mirror output state_checkpoint_1 already exists")
-        import omnigibson as og
-
-        if len(og.sim.scenes) != 1:
-            raise RuntimeError(
-                "post-pick debug mirror requires exactly one loaded scene"
-            )
-        current_scene = og.sim.scenes[0]
-        objects_info = scene.get("objects_info")
-        scene_object_init = (
-            objects_info.get("init_info") if isinstance(objects_info, dict) else None
-        )
-        if not isinstance(scene_object_init, dict):
-            raise RuntimeError("post-pick debug mirror lacks object registry binding")
-        current_object_names = set(
-            current_scene.object_registry.get_dict("name").keys()
-        )
-        if set(scene_object_init) != current_object_names:
-            raise RuntimeError("post-pick debug mirror object registry mismatch")
-        state_registry = scene["state"].get("registry")
-        scene_systems = (
-            state_registry.get("system_registry")
-            if isinstance(state_registry, dict)
-            else None
-        )
-        if not isinstance(scene_systems, dict) or set(scene_systems) != set(
-            current_scene.active_systems
-        ):
-            raise RuntimeError("post-pick debug mirror system registry mismatch")
-        roles = manifest["roles"]
-        held = roles["held_hand"]
-        press = roles["press_hand"]
-        grasp_entries = self._scene_assisted_grasp_entries(scene["state"])
-        matching_grasps = [
-            entry
-            for entry in grasp_entries
-            if isinstance(entry.get(held), dict)
-            and entry[held].get("ag_obj_prim_path") == roles["assisted_grasp_prim_path"]
-            and not entry.get(press)
-        ]
-        if len(matching_grasps) != 1 or len(grasp_entries) != 1:
-            raise RuntimeError("post-pick debug mirror lacks the bound radio grasp")
-        initial_radio, _table = self._resolve_handoff_targets()
-        if str(getattr(initial_radio, "prim_path", "")) != roles["object_prim_path"]:
-            raise RuntimeError("post-pick debug mirror radio prim path mismatch")
-
-        reload_report = self._reload_base_controller_position()
-        expected_layout = manifest["controller"].get("layout")
-        if reload_report.get("controller_layout") != expected_layout:
-            raise RuntimeError("post-pick debug mirror controller layout mismatch")
-        robot_before_load = self._robot()
-        controllers = getattr(robot_before_load, "controllers", {})
-        current_motor_type = str(getattr(controllers.get("base"), "motor_type", ""))
-        if current_motor_type != manifest["controller"].get("base_motor_type"):
-            raise RuntimeError("post-pick debug mirror base motor type mismatch")
-        if self._base_controller_signature(robot_before_load) != manifest[
-            "controller"
-        ].get("base_controller_signature"):
-            raise RuntimeError(
-                "post-pick debug mirror base controller signature mismatch"
-            )
-        from omnigibson.utils.python_utils import recursively_convert_to_torch
-
-        scene_state = recursively_convert_to_torch(scene["state"])
-        latches = manifest["controller"]["gripper_latches"]
-        latches[held] = -1.0
-        self.restore_simulator_state(
-            {0: scene_state},
-            serialized=False,
-            gripper_latches=latches,
-        )
-        self._state_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint_temporary = self._state_checkpoint_path.with_suffix(".json.tmp")
-        shutil.copyfile(bundled_checkpoint, checkpoint_temporary)
-        os.replace(checkpoint_temporary, self._state_checkpoint_path)
-
-        self._initial_radio_position = np.asarray(
-            manifest["source"]["initial_radio_position"], dtype=np.float64
-        )
-        if (
-            self._initial_radio_position.shape != (3,)
-            or not np.isfinite(self._initial_radio_position).all()
-        ):
-            raise RuntimeError("debug mirror initial radio position is invalid")
-        radio, _table = self._resolve_handoff_targets()
-        robot = self._robot()
-        if robot is None:
-            raise RuntimeError("debug mirror robot is unavailable after restore")
-        restored_params = getattr(robot, "_ag_obj_constraint_params", {})
-        restored_constraints = getattr(robot, "_ag_obj_constraints", {})
-        held_params = (
-            restored_params.get(held, {}) if isinstance(restored_params, dict) else {}
-        )
-        press_params = (
-            restored_params.get(press, {}) if isinstance(restored_params, dict) else {}
-        )
-        held_constraint = (
-            restored_constraints.get(held)
-            if isinstance(restored_constraints, dict)
-            else None
-        )
-        press_constraint = (
-            restored_constraints.get(press)
-            if isinstance(restored_constraints, dict)
-            else None
-        )
-        constraint_valid = held_constraint is not None and (
-            not hasattr(held_constraint, "IsValid") or bool(held_constraint.IsValid())
-        )
-        restored_held_attachment = self._attachment_matches(held, radio)
-        restored_press_attachment = self._attachment_matches(press, radio)
-        if (
-            not restored_held_attachment[0]
-            or restored_press_attachment[0]
-            or restored_press_attachment[1]
-            or str(getattr(radio, "prim_path", "")) != roles["object_prim_path"]
-            or held_params.get("ag_obj_prim_path") != roles["assisted_grasp_prim_path"]
-            or bool(press_params)
-            or not constraint_valid
-            or press_constraint is not None
-        ):
-            raise RuntimeError("debug mirror did not rebuild the bound assisted grasp")
-        self._held_hand = held
-        self._action_source = "curobo"
-        # The runtime provider disables and health-checks the VLA before it
-        # enters env.reset() for a mirror startup.  Toolkit creation still
-        # happens only after finalize_paused_runtime binds that proof.
-        self._vla_actions_enabled = False
-        self._handoff_state = _HANDOFF_STABLE_VALIDATION
-        self._prepress_context = {
-            "checkpoint_path": str(self._state_checkpoint_path),
-            "checkpoint_sha256": manifest["checkpoint"]["sha256"],
-            "checkpoint": json.loads(
-                self._state_checkpoint_path.read_text(encoding="utf-8")
-            ),
-            "held_hand": held,
-            "press_hand": press,
-            "object_name": roles["object_name"],
-            "bound_env_step": int(self._env_steps),
-        }
-        import torch
-
-        initial_q = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(-1)
-        hold = np.asarray(
-            self._require_planner().backend.hold_action(), dtype=np.float32
-        ).reshape(-1)
-        if hold.shape != (23,) or not np.isfinite(hold).all():
-            raise RuntimeError("debug mirror first hold action is invalid")
-        hold[ENV_ACTION_SEGMENTS[f"{held}_gripper"]] = -1.0
-        hold[ENV_ACTION_SEGMENTS[f"{press}_gripper"]] = float(
-            self._gripper_latch[press]
-        )
-        hold_trace: list[dict[str, Any]] = []
-        source_already_successful = bool(
-            manifest.get("source", {}).get("official_task_success", False)
-        )
-        for hold_index in range(HANDOFF_VALIDATION_FRAMES):
-            step_obs, _reward, step_term, step_trunc, step_infos = (
-                self._env._direct_process.step_env(
-                    torch.as_tensor(hold, dtype=torch.float32).reshape(1, 23),
-                    need_obs=True,
-                )
-            )
-            self._env_steps += 1
-            self._last_info = _numpy_tree(step_infos[0])
-            observation = _single_observation(self._env._wrap_obs(step_obs))
-            self._last_observation = observation
-            self._record_rgbd_frames(step_obs, observation)
-            self._append_video(observation)
-            stability = self._prepress_stability_snapshot()
-            current_q = np.asarray(
-                _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-            ).reshape(-1)
-            frame = {
-                "hold_index": hold_index + 1,
-                "env_step": int(self._env_steps),
-                "robot_q_drift_max": float(np.max(np.abs(current_q - initial_q))),
-                "stability": _wire_safe(stability),
-                "held_constraint_present": bool(
-                    getattr(robot, "_ag_obj_constraints", {}).get(held) is not None
-                ),
-                "press_constraint_absent": bool(
-                    getattr(robot, "_ag_obj_constraints", {}).get(press) is None
-                ),
-                "episode_status": {
-                    "terminated": bool(_scalar_bool(step_term)),
-                    "truncated": bool(_scalar_bool(step_trunc)),
-                    "done": bool(_raw_done(self._last_info)),
-                    "official_task_success": bool(_raw_success(self._last_info)),
-                },
-            }
-            hold_trace.append(frame)
-            if any(frame["episode_status"].values()):
-                if (
-                    source_already_successful
-                    and frame["episode_status"]["official_task_success"]
-                    and not frame["episode_status"]["truncated"]
-                ):
-                    # A success mirror is used only for the bounded post-success
-                    # hold/retreat/open cleanup.  The simulator necessarily
-                    # reports termination on its first controlled frame, so
-                    # one stable frame is the complete restore validation.
-                    held_stable_for_cleanup = bool(
-                        float(stability["relative_drift_m"])
-                        <= HANDOFF_RELATIVE_DRIFT_MAX_M
-                        and float(stability["angular_drift_rad"])
-                        <= HANDOFF_RELATIVE_ANGULAR_DRIFT_MAX_RAD
-                        and float(stability["air_gap_m"]) >= HANDOFF_SUPPORT_GAP_MIN_M
-                        and float(stability["held_gripper_opening_m"])
-                        < HANDOFF_GRIPPER_OPENING_MAX
-                        and any(stability["held_attachment"])
-                        and not any(stability["press_attachment"])
-                    )
-                    if (
-                        not held_stable_for_cleanup
-                        or not frame["held_constraint_present"]
-                        or not frame["press_constraint_absent"]
-                    ):
-                        raise RuntimeError(
-                            "successful debug mirror failed stable cleanup restore"
-                        )
-                    break
-                raise RuntimeError(
-                    "debug mirror episode stopped during close-hold validation"
-                )
-            if (
-                not stability["stable"]
-                or not frame["held_constraint_present"]
-                or not frame["press_constraint_absent"]
-            ):
-                raise RuntimeError("debug mirror grasp failed close-hold validation")
-        self._prepress_context = None
-        self._handoff_state = _HANDOFF_PAUSED
-        self._reset_completed = True
-        self._done = bool(_raw_success(self._last_info))
-        warmup = self._prepare_prepress_planner_readiness(
-            held_hand=held,
-            ignore_collision_checks=True,
-        )
-        visual_evidence = self._checkpoint_visual_evidence(
-            checkpoint_name="debug_mirror_restore",
-            held_hand=held,
-            press_hand=press,
-        )
-        verification_path = self._output_dir / "debug_mirror_restore_verification.json"
-        verification = {
-            "schema_version": 1,
-            "debug_only": True,
-            "not_official_episode_resume": True,
-            "source_env_step": int(manifest["source"]["env_step"]),
-            "restored_env_step": int(self._env_steps),
-            "held_hand": held,
-            "press_hand": press,
-            "object_name": roles["object_name"],
-            "controller_reload": reload_report,
-            "stability": _wire_safe(stability),
-            "mandatory_uncontrolled_physics_steps": 1,
-            "first_controlled_action": hold.astype(float).tolist(),
-            "close_hold_trace": hold_trace,
-            "planner_warmup": _wire_safe(warmup),
-            "visual_evidence": visual_evidence,
-            "official_task_success": bool(_raw_success(self._last_info)),
-        }
-        _write_json_atomic(verification_path, verification)
-        paused = {
-            "schema_version": 1,
-            "control_mode": PI0_NAV_PICK_VLA_MODE,
-            "handoff_state": _HANDOFF_PAUSED,
-            "env_pid": os.getpid(),
-            "env_step": int(self._env_steps),
-            "source_env_step": int(manifest["source"]["env_step"]),
-            "held_hand": held,
-            "press_hand": press,
-            "action_source": "curobo",
-            "vla_actions_enabled": False,
-            "vla_action_gate_confirmed": False,
-            "lifecycle_finalized": False,
-            "debug_mirror_restore": True,
-            "not_official_episode_resume": True,
-            "debug_mirror_scene_path": str(scene_path),
-            "state_checkpoint_path": str(self._state_checkpoint_path),
-            "state_checkpoint_sha256": manifest["checkpoint"]["sha256"],
-            "restore_verification_path": str(verification_path),
-        }
-        _write_json_atomic(self._paused_runtime_path, paused)
-        self._restored_state = {
-            "kind": "post_pick_debug_mirror",
-            "debug_only": True,
-            "scene_path": str(scene_path),
-            "manifest_path": str(
-                scene_path.parent / "debug_mirror_post_pick.manifest.json"
-            ),
-            "source_env_step": int(manifest["source"]["env_step"]),
-        }
-        return verification
-
     def reset(self) -> tuple[dict[str, Any], Any]:
-        if self._control_mode == PI0_NAV_PICK_VLA_MODE and (
-            bool(getattr(self, "_reset_completed", False))
-            or self._handoff_state
-            in {
-                _HANDOFF_CHECKPOINTING,
-                _HANDOFF_CONTROLLER_RELOAD,
-                _HANDOFF_STABLE_VALIDATION,
-                _HANDOFF_PAUSED,
-                _HANDOFF_FAILED,
-                _HANDOFF_OFFICIAL_SUCCESS,
-            }
-        ):
-            raise RuntimeError("pi0_nav_pick permits exactly one initial reset")
+        if bool(getattr(self, "_reset_completed", False)):
+            raise RuntimeError("the env process permits one lifecycle initialization")
         started_at = time.monotonic()
         logger.info("BEHAVIOR reset started on thread %s", threading.get_ident())
         raw_observations, infos = self._env.env_reset()
@@ -4436,92 +3591,306 @@ class BehaviorEnvFacade:
         self._env_steps = 0
         self._last_observation = observation
         self._last_info = _numpy_tree(infos[0])
-        if self._control_mode == PI0_NAV_PICK_VLA_MODE:
-            self._video_sealed = False
-            self._base_controller_mode = "velocity"
-            self._action_source = "pi0_vla"
-            self._vla_actions_enabled = True
-            self._handoff_state = _HANDOFF_VLA_ACTIVE
-            self._held_hand = None
-            self._handoff_validator_frames.clear()
-            self._handoff_target_objects = None
-            self._initial_radio_position = None
+        self._video_sealed = False
+        self._base_controller_mode = "velocity"
+        robot = self._robot()
+        controller_config = (
+            None if robot is None else getattr(robot, "_controller_config", None)
+        )
+        if controller_config is None:
+            raise RuntimeError("initial velocity controller config is unavailable")
+        self._velocity_controller_config = deepcopy(controller_config)
+        self._action_source = "pi0_vla"
+        self._vla_actions_enabled = True
+        self._controller_state = _CONTROLLER_VLA
+        self._pending_vla_visual_authorization = None
+        self._latest_successful_held_rotate_receipt = None
+        self._latest_successful_held_rotate_attachment = None
+        self._latest_successful_held_rotate_public_frame_ids = set()
+        self._held_rotate_target_surface_review = None
+        self._public_capture_sequence = 0
+        self._latest_unconsumed_public_capture_receipt = None
+        self._active_rotate_pi0_candidate = None
+        self._awaiting_opposite_surface_review = None
+        self._completed_opposite_surface_cycles = []
+        self._pi0_nav_pick_disable_receipt = None
+        self._clear_active_vla_invocation_state()
+        self._next_pi0_chunk_index = 1
+        self._motion_frozen = False
+        self._projection_receipts.clear()
+        self._consumed_projection_receipts.clear()
+        self._public_observed_frame_ids.clear()
+        self._latest_public_head_frame_id = None
+        self._latest_public_observation_lineage = None
+        self._official_success_latched = False
+        self._official_success_receipt = None
+        self._terminal_failure_receipt = None
+        self._held_closure_receipts = {}
         restore_path_value = os.environ.get("RPENT_BEHAVIOR_RESTORE_STATE")
         if restore_path_value:
             raise RuntimeError(
-                "simulator-state restore is forbidden; use this run's "
-                "state_checkpoint_1.json or state_checkpoint_2.json through "
-                "restore_robot_state_checkpoint"
+                "simulator-state restore is unsupported; the outer Explore "
+                "harness must start a fresh env process"
             )
-        self._record_rgbd_frames(raw_observations, observation)
+        self._record_rgbd_frames(raw_observations, observation, strict=True)
         self._append_video(observation)
-        self._restored_state = None
-        if self._control_mode in {
-            PI0_NAV_PICK_VLA_MODE,
-            HYBRID_VLM_PI0_MODE,
-        }:
-            radio, _table = self._resolve_handoff_targets()
-            self._initial_radio_position = self._object_position(radio).copy()
-        if self._control_mode in _PLANNER_POSITION_START_MODES:
-            warmup = self._require_planner().warmup()
-            logger.info(
-                "BEHAVIOR planner cuRobo warmup completed in %.1fs artifact=%s",
-                float(warmup.get("elapsed_s", 0.0)),
-                warmup.get("artifact"),
-            )
+        self._planner_warmup_report = None
+        if self._controller_mode == "hybrid":
+            planner_warmup = self._planner.warmup()
+            if planner_warmup.get("status") != "complete":
+                raise RuntimeError(
+                    "hybrid R1Pro cuRobo warmup did not complete successfully"
+                )
+            self._planner_warmup_report = planner_warmup
         logger.info(
             "BEHAVIOR reset completed in %.1fs on thread %s",
             time.monotonic() - started_at,
             threading.get_ident(),
         )
-        if self._control_mode == PI0_NAV_PICK_VLA_MODE:
-            self._reset_completed = True
-        return observation, _numpy_tree(infos[0])
+        self._reset_completed = True
+        return observation, self._info_with_accounting()
 
-    def chunk_step(self, actions: Any) -> tuple[Any, Any, bool, bool, Any]:
-        return self._step_action_chunk(actions, observe_final=True)
-
-    def pi0_chunk_step(
+    def prepare_vla_invocation(
         self,
-        actions: Any,
         *,
-        hand: str,
-        gripper_closed_threshold: float = 0.045,
-        required_closed_steps: int = 3,
-        stop_on_candidate: bool = False,
-    ) -> tuple[Any, Any, bool, bool, Any]:
-        """Execute a Pi0 chunk while monitoring the selected physical gripper.
+        invocation_id: str,
+        call_index: int,
+        vla_status: dict[str, Any] | None,
+        current_object_visual_check: dict[str, Any] | None = None,
+        baseline_internal_authorization: bool = False,
+    ) -> dict[str, Any]:
+        """Validate VLA use and confirm a repeatable controller re-arm."""
 
-        This Pi0-only RPC samples the actual selected gripper joints and the
-        public raw proprio at every simulator step.  It fails closed if the two
-        same-step openings disagree.  The configured number of consecutive
-        closed steps (three by default) establishes only a local closure
-        *candidate*, never a grasp or task success.
-        """
-
-        if hand not in {"left", "right"}:
-            raise ValueError("hand must be 'left' or 'right'")
-        threshold = float(gripper_closed_threshold)
-        if not np.isfinite(threshold) or threshold < 0.0:
-            raise ValueError("gripper_closed_threshold must be finite and non-negative")
+        if not isinstance(invocation_id, str) or not invocation_id:
+            raise ValueError("invocation_id must be a non-empty string")
+        if isinstance(call_index, bool) or int(call_index) < 1:
+            raise ValueError("call_index must be positive")
+        if not isinstance(baseline_internal_authorization, bool):
+            raise TypeError("baseline_internal_authorization must be boolean")
         if (
-            isinstance(required_closed_steps, bool)
-            or int(required_closed_steps) != required_closed_steps
-            or int(required_closed_steps) <= 0
+            baseline_internal_authorization
+            and self._controller_mode != "pi0_nav_pick_only"
         ):
-            raise ValueError("required_closed_steps must be a positive integer")
-        if not isinstance(stop_on_candidate, bool):
-            raise ValueError("stop_on_candidate must be a boolean")
-        return self._step_action_chunk(
-            actions,
-            observe_final=True,
-            local_gripper_monitor={
-                "hand": hand,
-                "threshold": threshold,
-                "required_closed_steps": int(required_closed_steps),
-                "stop_on_candidate": stop_on_candidate,
-            },
-        )
+            raise RuntimeError(
+                "baseline internal authorization is unavailable in hybrid mode"
+            )
+        if baseline_internal_authorization and current_object_visual_check is not None:
+            raise ValueError(
+                "baseline internal authorization cannot consume public visual evidence"
+            )
+        if self._official_success_latched or _raw_success(self._last_info):
+            receipt = self._latch_official_success(self._last_info)
+            self._clear_active_vla_invocation_state()
+            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+            return {
+                "primitive_success": False,
+                "task_success": True,
+                "official_success_source": 'info["done"]["success"]',
+                "official_success_receipt": _wire_safe(receipt),
+                "stop_reason": "official_success_latched",
+                "failed_preconditions": ["official_success_latched"],
+                "attempt_index": self._attempt_index,
+                "attempt_nonce": self._attempt_nonce,
+                "total_env_steps": int(self._env_steps),
+                "vla_actions_enabled": False,
+            }
+        if vla_status is None:
+            if (
+                not (self._official_success_latched or _raw_success(self._last_info))
+                and self._pi0_nav_pick_is_receipt_disabled()
+            ):
+                return self._pi0_nav_pick_disable_guard_result()
+            if self._awaiting_opposite_surface_review is not None:
+                self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+            if self._active_vla_invocation is not None:
+                self._clear_active_vla_invocation_state()
+                self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+            facts = self.guard_tool_call(
+                name="pi0_nav_pick",
+                input_dict={"current_object_visual_check": current_object_visual_check},
+            )
+            # The public tool-envelope guard has the requested chunk count. This
+            # internal two-phase controller preflight does not; Pure VLA uses its
+            # own fixed exact-N baseline contract.
+            if baseline_internal_authorization:
+                failed = [
+                    item
+                    for item in facts["failed_preconditions"]
+                    if item != "fresh_object_visual_check_required"
+                ]
+                facts = {
+                    **facts,
+                    "primitive_success": not failed,
+                    "stop_reason": (
+                        "guard_passed" if not failed else "precondition_rejected"
+                    ),
+                    "failed_preconditions": failed,
+                }
+            failed = list(facts["failed_preconditions"])
+            if failed:
+                return facts
+            attachments = self._attachment_runtime_facts()
+            attachment_snapshot = self._attachment_fingerprint_snapshot(attachments)
+            if attachment_snapshot.get("available") is not True:
+                raise RuntimeError("attachment snapshot is unavailable")
+            visual_authorization = None
+            if int(attachments.get("attachment_count", 0)) > 0:
+                if baseline_internal_authorization:
+                    visual_authorization = self._baseline_internal_visual_authorization(
+                        invocation_id=invocation_id,
+                        attachment_snapshot=attachment_snapshot,
+                    )
+                else:
+                    visual_authorization = self._current_object_visual_authorization(
+                        current_object_visual_check,
+                        invocation_id=invocation_id,
+                    )
+                visual_authorization["attachment_count"] = int(
+                    attachment_snapshot["attachment_count"]
+                )
+            controller = self._switch_controller(_CONTROLLER_VLA)
+            after_snapshot = self._attachment_fingerprint_snapshot()
+            if (
+                after_snapshot.get("available") is not True
+                or after_snapshot.get("hands") != attachment_snapshot.get("hands")
+                or after_snapshot.get("fingerprints")
+                != attachment_snapshot.get("fingerprints")
+            ):
+                raise RuntimeError(
+                    "attachment identity changed while arming the VLA controller"
+                )
+            self._bind_rotate_receipt_to_vla_invocation(
+                invocation_id=invocation_id,
+                call_index=int(call_index),
+            )
+            self._active_vla_invocation = invocation_id
+            self._active_vla_call_index = int(call_index)
+            self._pending_vla_visual_authorization = visual_authorization
+            self._pending_vla_attachment_snapshot = attachment_snapshot
+            self._pending_vla_baseline_internal_authorization = bool(
+                baseline_internal_authorization
+            )
+            self._next_pi0_chunk_index = 1
+            return {
+                **facts,
+                "stop_reason": "vla_rearm_preflight_passed",
+                "invocation_id": invocation_id,
+                "call_index": int(call_index),
+                "vla_actions_enabled": bool(self._vla_actions_enabled),
+                "controller_transition": controller,
+                "attachment_count_at_invocation_start": int(
+                    attachments.get("attachment_count", 0)
+                ),
+                "attachments_present_at_invocation_start": bool(
+                    int(attachments.get("attachment_count", 0)) > 0
+                ),
+                "current_object_visual_authorization": visual_authorization,
+                "baseline_internal_authorization": bool(
+                    baseline_internal_authorization
+                ),
+            }
+        if (
+            not (self._official_success_latched or _raw_success(self._last_info))
+            and self._pi0_nav_pick_is_receipt_disabled()
+        ):
+            self._clear_active_vla_invocation_state()
+            return self._pi0_nav_pick_disable_guard_result()
+        facts = {
+            "primitive_success": True,
+            "task_success": bool(self._official_success_latched),
+            "official_success_source": 'info["done"]["success"]',
+            "failed_preconditions": [],
+            "attempt_index": self._attempt_index,
+            "attempt_nonce": self._attempt_nonce,
+            "total_env_steps": int(self._env_steps),
+        }
+        if self._active_vla_invocation != invocation_id:
+            raise RuntimeError("VLA re-arm confirmation does not match preflight")
+        if self._active_vla_call_index != int(call_index):
+            raise RuntimeError(
+                "VLA re-arm confirmation call index does not match preflight"
+            )
+        pending_is_baseline = bool(self._pending_vla_baseline_internal_authorization)
+        if pending_is_baseline != baseline_internal_authorization:
+            raise RuntimeError("VLA re-arm authorization mode changed after preflight")
+        attachments = self._attachment_runtime_facts()
+        if attachments.get("available") is not True:
+            raise RuntimeError("attachment state is unavailable during VLA re-arm")
+        attachment_snapshot = self._attachment_fingerprint_snapshot(attachments)
+        expected_attachment_snapshot = self._pending_vla_attachment_snapshot
+        if (
+            not isinstance(expected_attachment_snapshot, dict)
+            or expected_attachment_snapshot.get("hands")
+            != attachment_snapshot.get("hands")
+            or expected_attachment_snapshot.get("fingerprints")
+            != attachment_snapshot.get("fingerprints")
+        ):
+            raise RuntimeError("attachment identity changed during VLA re-arm")
+        candidate = getattr(self, "_active_rotate_pi0_candidate", None)
+        if isinstance(candidate, dict):
+            candidate_hand = str(candidate["rotate_receipt"].get("resolved_hand", ""))
+            current_attachment = attachments.get("attached_objects", {}).get(
+                candidate_hand
+            )
+            matches, _identity = _attachment_identity_status(
+                current_attachment,
+                candidate.get("expected_attachment"),
+                hand=candidate_hand,
+            )
+            if (
+                candidate.get("invocation_id") != invocation_id
+                or int(candidate.get("bound_env_step", -1)) != int(self._env_steps)
+                or not matches
+                or not self._attempt_receipt_is_current(
+                    candidate.get("target_surface_review_receipt")
+                )
+            ):
+                self._active_rotate_pi0_candidate = None
+                self._completed_opposite_surface_cycles = []
+        if int(attachments.get("attachment_count", 0)) > 0:
+            authorization = self._pending_vla_visual_authorization
+            if (
+                not isinstance(authorization, dict)
+                or authorization.get("invocation_id") != invocation_id
+                or authorization.get("run_nonce") != self._run_nonce
+                or authorization.get("attempt_nonce") != self._attempt_nonce
+                or int(authorization.get("env_step", -1)) != int(self._env_steps)
+                or int(authorization.get("attachment_count", -1))
+                != int(attachment_snapshot.get("attachment_count", -2))
+            ):
+                raise RuntimeError(
+                    "attached-state VLA re-arm lacks its fresh visual authorization"
+                )
+            self._frame_cache.get_current(
+                str(authorization["resolved_camera"]),
+                str(authorization["frame_id"]),
+            )
+        elif self._pending_vla_visual_authorization is not None:
+            raise RuntimeError(
+                "attachment changed after held-state visual authorization"
+            )
+        if (
+            not isinstance(vla_status, dict)
+            or vla_status.get("actions_enabled") is not True
+        ):
+            raise RuntimeError("VLA server enable confirmation is invalid")
+        self._controller_state = _CONTROLLER_VLA
+        self._action_source = "pi0_vla"
+        self._vla_actions_enabled = True
+        return {
+            **facts,
+            "stop_reason": "vla_runtime_rearmed",
+            "invocation_id": invocation_id,
+            "call_index": int(call_index),
+            "vla_actions_enabled": True,
+            "attachment_count_at_invocation_start": int(
+                attachments.get("attachment_count", 0)
+            ),
+            "attachments_present_at_invocation_start": bool(
+                int(attachments.get("attachment_count", 0)) > 0
+            ),
+            "baseline_internal_authorization": bool(baseline_internal_authorization),
+        }
 
     def pi0_nav_pick_chunk_step(
         self,
@@ -4529,25 +3898,39 @@ class BehaviorEnvFacade:
         *,
         chunk_index: int,
     ) -> tuple[Any, Any, bool, bool, Any]:
-        """Execute an unmodified complete Pi0 chunk with strict local handoff."""
+        """Execute one admitted Pi0 chunk, stopping on the exact success step."""
 
-        if self._control_mode != PI0_NAV_PICK_VLA_MODE:
+        if self._active_vla_invocation is None:
+            raise RuntimeError("Pi0 chunk requires prepare_vla_invocation")
+        if self._official_success_latched or _raw_success(self._last_info):
             raise RuntimeError(
-                "pi0_nav_pick is available only in pi0_nav_pick_vla mode"
+                "raw task success is terminal; no further Pi0 chunk is admissible"
             )
-        if self._handoff_state != _HANDOFF_VLA_ACTIVE or not self._vla_actions_enabled:
-            raise RuntimeError("Pi0 actions are gated after handoff or failure")
+        if self._controller_state != _CONTROLLER_VLA or not self._vla_actions_enabled:
+            raise RuntimeError("VLA controller is not active")
+        remaining = int(self._meta["max_episode_steps"]) - int(self._env_steps)
+        if remaining < 32:
+            raise RuntimeError(
+                "global env-step budget cannot admit one complete 32-step chunk"
+            )
         if (
             isinstance(chunk_index, bool)
             or int(chunk_index) != chunk_index
-            or int(chunk_index) <= 0
+            or int(chunk_index) != self._next_pi0_chunk_index
         ):
-            raise ValueError("chunk_index must be a positive integer")
+            raise ValueError(
+                "chunk_index must be the next exact sequence value: "
+                f"expected={self._next_pi0_chunk_index} got={chunk_index!r}"
+            )
+        self._next_pi0_chunk_index += 1
         action_array = validate_action_chunk(actions, max_horizon=32)
         if action_array.shape != (32, 23):
             raise ValueError(
                 f"pi0_nav_pick requires one complete [32,23] chunk, got {action_array.shape}"
             )
+        if self._motion_in_flight:
+            raise RuntimeError("another physical action is already in flight")
+        self._motion_in_flight = True
         try:
             ret = self._step_action_chunk(
                 action_array,
@@ -4561,42 +3944,18 @@ class BehaviorEnvFacade:
             )
             if not isinstance(monitor, dict):
                 raise RuntimeError("pi0_nav_pick monitor was not produced")
-            if _raw_success(info):
-                terminal = self._finalize_pi0_terminal_success(validator=monitor)
-                terminal_steps = int(self._env_steps) - int(
-                    terminal.get("start_env_step", self._env_steps)
-                )
-                monitor["terminal_evidence_env_steps"] = terminal_steps
-                monitor["terminal_success_evidence"] = terminal
-                monitor["total_env_steps"] = int(self._env_steps)
-                public_info = self._info_with_accounting()
-                public_rpent = public_info.setdefault("_rpent", {})
-                if not isinstance(public_rpent, dict):
-                    raise RuntimeError("terminal accounting envelope is invalid")
-                public_rpent.update(
-                    {
-                        "executed_steps": int(monitor["executed_steps"]),
-                        "handoff_env_steps": int(monitor["handoff_env_steps"]),
-                        "terminal_evidence_env_steps": terminal_steps,
-                        "total_env_steps": int(self._env_steps),
-                        "pi0_nav_pick_monitor": monitor,
-                    }
-                )
-                info = public_info
-                observation = self._last_observation
-                if observation is None:
-                    raise RuntimeError("terminal finalization produced no observation")
-                # The terminal finalizer already persisted a synchronized fresh
-                # head/two-wrist capture.  Reusing that evidence prevents a
-                # redundant second observe/write failure from hiding the raw
-                # success return from this exact-once RPC.
+            executed_steps = int(monitor.get("executed_steps", 0))
+            if monitor.get("official_success_first_observed_this_chunk") is True:
                 monitor["visual_review"] = {
-                    "source": "terminal_success_evidence",
-                    "capture_group_id": terminal.get("capture_group_id"),
-                    "views": terminal.get("views", {}),
-                    "metadata_path": terminal.get("metadata_path"),
+                    "skipped": True,
+                    "reason": "official_task_success",
                 }
             else:
+                self._record_full_pi0_chunk_for_rotate_candidate(
+                    executed_steps=executed_steps,
+                    terminated=bool(terminated),
+                    truncated=bool(truncated),
+                )
                 monitor["visual_review"] = self._persist_pi0_nav_pick_views(
                     chunk_index=int(chunk_index), validator=monitor
                 )
@@ -4605,64 +3964,23 @@ class BehaviorEnvFacade:
             return result
         except Exception:
             self._vla_actions_enabled = False
-            self._finalize_video_segment()
-            self._video_sealed = True
-            if self._state_checkpoint_path.is_file():
-                self._handoff_state = _HANDOFF_PAUSED
+            self._awaiting_opposite_surface_review = None
+            self._completed_opposite_surface_cycles = []
+            self._clear_active_vla_invocation_state()
+            if self._official_success_latched or _raw_success(self._last_info):
+                self._latch_official_success(self._last_info)
             else:
-                self._handoff_state = _HANDOFF_FAILED
-            # Never revoke already-committed development evidence because a
-            # later visual/tool-envelope step failed.
-            self._state_checkpoint_path.with_suffix(".json.tmp").unlink(missing_ok=True)
-            self._paused_runtime_path.with_suffix(".json.tmp").unlink(missing_ok=True)
-            if _raw_success(self._last_info):
-                self._handoff_state = _HANDOFF_OFFICIAL_SUCCESS
-                self._done = True
+                self._controller_state = _CONTROLLER_FAILED
+                self._action_source = "failed"
+            self._finalize_video_segment()
+            self._video_sealed = bool(
+                self._video_error is None
+                and self._video_path.is_file()
+                and self._video_path.stat().st_size > 0
+            )
             raise
-
-    def pi0_navigate_to_chunk_step(
-        self,
-        actions: Any,
-        *,
-        segment_index: int,
-        chunk_index: int,
-    ) -> tuple[Any, Any, bool, bool, Any]:
-        """Execute up to eight adapted 23D Pi0 navigation actions."""
-
-        if (
-            isinstance(segment_index, bool)
-            or int(segment_index) != segment_index
-            or int(segment_index) <= 0
-        ):
-            raise ValueError("segment_index must be a positive integer")
-        if (
-            isinstance(chunk_index, bool)
-            or int(chunk_index) != chunk_index
-            or int(chunk_index) <= 0
-        ):
-            raise ValueError("chunk_index must be a positive integer")
-        action_array = validate_action_chunk(actions, max_horizon=8)
-        ret = self._step_action_chunk(
-            action_array,
-            observe_final=True,
-            pi0_navigate_to=True,
-        )
-        observation, reward, terminated, truncated, info = ret
-        artifacts = self._persist_pi0_navigate_to_views(
-            segment_index=int(segment_index),
-            chunk_index=int(chunk_index),
-        )
-        public_info = dict(info) if isinstance(info, dict) else {"raw": info}
-        rpent = public_info.setdefault("_rpent", {})
-        if not isinstance(rpent, dict):
-            raise RuntimeError("pi0_navigate_to accounting envelope is invalid")
-        monitor = rpent.setdefault("pi0_navigate_to_monitor", {})
-        if not isinstance(monitor, dict):
-            raise RuntimeError("pi0_navigate_to monitor envelope is invalid")
-        monitor["visual_review"] = artifacts
-        result = (observation, reward, terminated, truncated, public_info)
-        pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
-        return result
+        finally:
+            self._motion_in_flight = False
 
     def planner_step(self, action: Any) -> tuple[Any, Any, bool, bool, Any]:
         """Execute one internal planner action without forcing RGB-D rendering.
@@ -4684,154 +4002,60 @@ class BehaviorEnvFacade:
         actions: Any,
         *,
         observe_final: bool,
-        local_gripper_monitor: dict[str, Any] | None = None,
-        pi0_navigate_to: bool = False,
         pi0_nav_pick: bool = False,
     ) -> tuple[Any, Any, bool, bool, Any]:
+        """Execute a chunk and derive only sanitized live capabilities."""
+
         import torch
 
-        post_success_cleanup = bool(
-            getattr(self, "_post_success_cleanup_active", False)
-        )
-        if self._done and not post_success_cleanup:
+        if self._done:
             raise RuntimeError("env.chunk_step called after episode stop")
         action_array = validate_action_chunk(actions)
-        if pi0_navigate_to:
-            if self._control_mode != HYBRID_VLM_PI0_MODE:
-                raise RuntimeError("pi0_navigate_to is available only in hybrid mode")
-            if action_array.shape[0] > 8:
-                raise ValueError(
-                    "pi0_navigate_to executes at most eight actions per chunk"
-                )
-            if local_gripper_monitor is not None:
-                raise ValueError("pi0_navigate_to cannot monitor or modify a gripper")
-        if pi0_nav_pick:
-            if self._control_mode != PI0_NAV_PICK_VLA_MODE:
-                raise RuntimeError(
-                    "pi0_nav_pick is available only in its isolated mode"
-                )
-            if local_gripper_monitor is not None or pi0_navigate_to:
-                raise ValueError("pi0_nav_pick cannot combine action adapters")
         action_tensor = torch.as_tensor(action_array, dtype=torch.float32).reshape(
             1, action_array.shape[0], action_array.shape[1]
         )
+        pi0_admission_capability = (
+            self._sanitized_capability_summary() if pi0_nav_pick else None
+        )
         final_observation = self._last_observation
-        final_reward = None
+        final_reward: Any = None
         official_info: Any = {}
         terminated = False
         truncated = False
         executed_steps = 0
-        monitor_result: dict[str, Any] | None = None
-        monitor_candidate_env_step: int | None = None
-        monitor_closed_streak = 0
-        monitor_min_opening = float("inf")
-        monitor_opening: float | None = None
-        monitor_hand = (
-            str(local_gripper_monitor["hand"])
-            if local_gripper_monitor is not None
-            else None
-        )
-        monitor_threshold = (
-            float(local_gripper_monitor["threshold"])
-            if local_gripper_monitor is not None
-            else None
-        )
-        monitor_stop_on_candidate = bool(
-            local_gripper_monitor is not None
-            and local_gripper_monitor["stop_on_candidate"]
-        )
-        monitor_required_closed_steps = (
-            int(local_gripper_monitor["required_closed_steps"])
-            if local_gripper_monitor is not None
-            else None
-        )
-        nav_checks: list[dict[str, Any]] = []
-        nav_stop_reason: str | None = None
-        nav_raw_base_actions: list[list[float]] = []
-        nav_position_deltas: list[list[float]] = []
-        nav_input_clip_count = 0
-        nav_delta_clip_count = 0
-        handoff_validator: dict[str, Any] = {
-            "local_grasp_success": False,
-            "held_hand": None,
-            "per_hand": {},
-            "current": {},
+        soft_success_observed = False
+        first_success_observed_this_chunk = False
+        terminal_classification: dict[str, Any] = {
+            "raw_terminated": False,
+            "raw_truncated": False,
+            "raw_success": False,
+            "info_done": False,
+            "soft_success_termination": False,
+            "hard_terminated": False,
+            "hard_truncated": False,
+            "terminal_envelope_malformed": False,
+            "terminal_classification_reason": "not_started",
+            "active_success_conditions": [],
+            "active_failure_conditions": [],
+            "active_timeout_conditions": [],
         }
-        handoff_artifacts: dict[str, Any] = {}
-        handoff_stop_reason: str | None = None
         for step_index in range(action_tensor.shape[1]):
-            if pi0_nav_pick and self._env_steps >= int(self._meta["max_episode_steps"]):
+            if self._env_steps >= int(self._meta["max_episode_steps"]):
+                truncated = True
+                terminal_classification = {
+                    **terminal_classification,
+                    "hard_truncated": True,
+                    "terminal_classification_reason": "global_episode_horizon",
+                }
                 break
-            is_last_action = step_index == action_tensor.shape[1] - 1
-            observation_interval = (
-                4 if bool(observe_final) else self._planner_video_interval_steps
-            )
-            need_observation = (
+            is_last = step_index == action_tensor.shape[1] - 1
+            interval = 1 if pi0_nav_pick else self._planner_video_interval_steps
+            need_observation = bool(
                 pi0_nav_pick
-                or local_gripper_monitor is not None
-                or (bool(observe_final) and is_last_action)
-                or (self._env_steps + 1) % observation_interval == 0
+                or (observe_final and is_last)
+                or (self._env_steps + 1) % interval == 0
             )
             step_action = action_tensor[:, step_index]
-            if pi0_navigate_to:
-                raw = np.asarray(
-                    step_action.detach().cpu().numpy(), dtype=np.float32
-                ).reshape(23)
-                base = ENV_ACTION_SEGMENTS["base"]
-                raw_base = np.asarray(raw[base], dtype=np.float32)
-                clipped_input = np.clip(raw_base, -1.0, 1.0)
-                nav_input_clip_count += int(np.count_nonzero(clipped_input != raw_base))
-                scaled_delta = (
-                    clipped_input
-                    * np.asarray([0.75, 0.75, 1.0], dtype=np.float32)
-                    / 60.0
-                )
-                delta = np.clip(scaled_delta, -0.01, 0.01)
-                nav_delta_clip_count += int(np.count_nonzero(delta != scaled_delta))
-                # Keep the policy's trunk and both arm commands so its
-                # receding visual/proprio trajectory advances beyond the
-                # repeated eight-step startup motion. Only the position-base
-                # segment needs a controller-specific adapter.
-                adapted = raw.copy()
-                # HolonomicBaseJointController's position input is a local
-                # per-step delta, not an absolute base pose. Never add a hold
-                # residual to the normalized VLA delta.
-                adapted[base] = delta
-                # Navigation may move the whole body but may never grasp. Lock
-                # both grippers to the exact latches inherited from the current
-                # episode, ignoring all predicted gripper values.
-                for side in ("left", "right"):
-                    gripper = ENV_ACTION_SEGMENTS[f"{side}_gripper"]
-                    adapted[gripper] = float(self._gripper_latch[side])
-                step_action = torch.as_tensor(
-                    adapted,
-                    dtype=step_action.dtype,
-                    device=step_action.device,
-                ).reshape(1, 23)
-                nav_raw_base_actions.append(raw_base.astype(float).tolist())
-                nav_position_deltas.append(delta.astype(float).tolist())
-            if (
-                getattr(self, "_control_mode", None) == HYBRID_VLM_PI0_MODE
-                and local_gripper_monitor is not None
-            ):
-                # Hybrid runs the official position-base planner controller. Pi0.5
-                # was trained with a velocity-base action, so its first three
-                # outputs must never be reinterpreted as position targets. Build a
-                # fresh position-controller hold command at every executed step.
-                hold_action = np.asarray(
-                    self._require_planner().backend.hold_action(), dtype=np.float32
-                ).reshape(-1)
-                if hold_action.shape != (23,) or not np.isfinite(hold_action).all():
-                    raise RuntimeError(
-                        "hybrid planner hold action must be one finite 23D vector"
-                    )
-                base = ENV_ACTION_SEGMENTS["base"]
-                step_action = step_action.clone()
-                step_action[:, base] = torch.as_tensor(
-                    hold_action[base],
-                    dtype=step_action.dtype,
-                    device=step_action.device,
-                )
             step_obs, step_reward, step_term, step_trunc, step_infos = (
                 self._env._direct_process.step_env(
                     step_action,
@@ -4840,320 +4064,113 @@ class BehaviorEnvFacade:
             )
             self._env_steps += 1
             executed_steps += 1
-            if pi0_nav_pick:
-                executed_action = np.asarray(
-                    step_action.detach().cpu().numpy(), dtype=np.float32
-                ).reshape(23)
-                for side in ("left", "right"):
-                    gripper = ENV_ACTION_SEGMENTS[f"{side}_gripper"]
-                    self._gripper_latch[side] = float(executed_action[gripper][0])
-            if (
-                getattr(self, "_control_mode", None) == HYBRID_VLM_PI0_MODE
-                and local_gripper_monitor is not None
-            ):
-                # Planner commands after Pi0 must hold the exact most recently
-                # executed gripper command for both hands. Update only after the
-                # simulator step returns, so an unexecuted action is never latched.
-                executed_action = np.asarray(
-                    step_action.detach().cpu().numpy(), dtype=np.float32
-                ).reshape(23)
-                for side in ("left", "right"):
-                    gripper = ENV_ACTION_SEGMENTS[f"{side}_gripper"]
-                    self._gripper_latch[side] = float(executed_action[gripper][0])
-            step_info = step_infos[0]
-            official_info = step_info
+            executed = np.asarray(_numpy_tree(step_action), dtype=np.float32).reshape(
+                23
+            )
+            for side in ("left", "right"):
+                segment = ENV_ACTION_SEGMENTS[f"{side}_gripper"]
+                self._gripper_latch[side] = float(executed[segment][0])
+            official_info = step_infos[0]
+            self._last_info = _numpy_tree(official_info)
             final_reward = step_reward[0]
-            terminated = terminated or _scalar_bool(step_term) or _raw_done(step_info)
-            truncated = truncated or _scalar_bool(step_trunc)
-            self._last_info = _numpy_tree(step_info)
+            if pi0_nav_pick:
+                terminal_classification = _classify_pi0_terminal_step(
+                    info=official_info,
+                    raw_terminated=step_term,
+                    raw_truncated=step_trunc,
+                )
+                terminated = bool(
+                    terminated or terminal_classification["hard_terminated"]
+                )
+                truncated = bool(truncated or terminal_classification["hard_truncated"])
+            else:
+                terminated = bool(
+                    terminated or _scalar_bool(step_term) or _raw_done(official_info)
+                )
+                truncated = bool(truncated or _scalar_bool(step_trunc))
+            raw_success_this_step = _raw_success(official_info)
+            if pi0_nav_pick and raw_success_this_step:
+                receipt_before = self._official_success_receipt
+                self._capture_official_success(self._last_info)
+                first_success_observed_this_chunk = bool(
+                    first_success_observed_this_chunk
+                    or (
+                        receipt_before is None
+                        and isinstance(self._official_success_receipt, dict)
+                    )
+                )
+                soft_success_observed = bool(
+                    soft_success_observed
+                    or terminal_classification["soft_success_termination"]
+                )
             if need_observation:
                 if step_obs is None:
-                    raise RuntimeError(
-                        "BEHAVIOR requested observation but received None"
-                    )
+                    raise RuntimeError("requested observation was not returned")
                 final_observation = _single_observation(self._env._wrap_obs(step_obs))
                 self._last_observation = final_observation
-                self._record_rgbd_frames(step_obs, final_observation)
-                if self._env_steps % observation_interval == 0:
+                if not (pi0_nav_pick and raw_success_this_step):
+                    self._record_rgbd_frames(step_obs, final_observation)
                     self._append_video(final_observation)
-            if (
-                pi0_nav_pick
-                and not _raw_success(step_info)
-                and not terminated
-                and not truncated
-            ):
-                if not need_observation or final_observation is None:
-                    raise RuntimeError(
-                        "pi0_nav_pick validation requires same-step observations"
-                    )
-                handoff_validator = self._update_handoff_validator(final_observation)
-                if bool(handoff_validator["local_grasp_success"]):
-                    held = handoff_validator.get("held_hand")
-                    if held not in {"left", "right"}:
-                        raise RuntimeError(
-                            "strict handoff did not select exactly one hand"
-                        )
-                    remaining = int(self._meta["max_episode_steps"]) - int(
-                        self._env_steps
-                    )
-                    if remaining < HANDOFF_VALIDATION_FRAMES:
-                        handoff_stop_reason = "insufficient_handoff_horizon"
-                        handoff_validator = {
-                            **handoff_validator,
-                            "handoff_failed": True,
-                        }
-                        self._handoff_state = _HANDOFF_FAILED
-                        self._vla_actions_enabled = False
-                    else:
-                        try:
-                            handoff_artifacts = self._complete_pi0_nav_pick_handoff(
-                                held_hand=str(held), validator=handoff_validator
-                            )
-                        except Exception as exc:
-                            logger.exception("pi0_nav_pick handoff failed closed")
-                            handoff_stop_reason = (
-                                f"handoff_failed:{type(exc).__name__}: {exc}"
-                            )
-                            failure = getattr(self, "_last_handoff_failure", None) or {}
-                            handoff_artifacts = {
-                                "handoff_env_steps": int(
-                                    failure.get("handoff_env_steps", 0)
-                                ),
-                                "handoff_failure_diagnostics_path": failure.get(
-                                    "handoff_failure_diagnostics_path"
-                                ),
-                            }
-                            handoff_validator = {
-                                **handoff_validator,
-                                "handoff_failed": True,
-                                "handoff_failure_diagnostics_path": failure.get(
-                                    "handoff_failure_diagnostics_path"
-                                ),
-                            }
-                            self._handoff_state = _HANDOFF_FAILED
-                            self._vla_actions_enabled = False
-                    break
-            elif pi0_nav_pick and _raw_success(step_info):
-                if not need_observation or final_observation is None:
-                    raise RuntimeError(
-                        "Pi0 terminal role evidence requires a same-step observation"
-                    )
-                # Refresh role evidence on the exact success frame without
-                # entering the normal local-grasp/controller handoff path.
-                handoff_validator = self._update_handoff_validator(final_observation)
-            if local_gripper_monitor is not None:
-                if not need_observation or final_observation is None:
-                    raise RuntimeError(
-                        "Pi0 gripper monitoring requires a same-step public observation"
-                    )
-                assert monitor_hand is not None
-                assert monitor_threshold is not None
-                assert monitor_required_closed_steps is not None
-                monitor_opening = self._validated_selected_gripper_opening(
-                    observation=final_observation,
-                    hand=monitor_hand,
-                )
-                monitor_min_opening = min(monitor_min_opening, monitor_opening)
-                if monitor_opening <= monitor_threshold:
-                    monitor_closed_streak += 1
-                else:
-                    monitor_closed_streak = 0
-                if (
-                    monitor_candidate_env_step is None
-                    and monitor_closed_streak >= monitor_required_closed_steps
-                ):
-                    monitor_candidate_env_step = self._env_steps
-                monitor_result = {
-                    "hand": monitor_hand,
-                    "opening": monitor_opening,
-                    "min_opening": monitor_min_opening,
-                    "closed_streak": monitor_closed_streak,
-                    "candidate": monitor_candidate_env_step is not None,
-                    "candidate_env_step": monitor_candidate_env_step,
-                    "executed_steps": executed_steps,
-                }
-                if (
-                    monitor_stop_on_candidate
-                    and monitor_candidate_env_step is not None
-                    and not _raw_success(step_info)
-                    and not terminated
-                    and not truncated
-                ):
-                    # Synchronize the returned RGB/proprio with the stopped
-                    # articulation without taking an additional physics step.
-                    self._refresh_observation_without_step()
-                    final_observation = self._last_observation
-                    if final_observation is None:
-                        raise RuntimeError(
-                            "Pi0 candidate refresh produced no observation"
-                        )
-                    if self._env_steps % observation_interval != 0:
-                        self._append_video(final_observation)
-                    break
-            if pi0_navigate_to and executed_steps % 4 == 0:
-                backend = self._require_planner().backend
-                try:
-                    collision = backend.collision_report(force=True)
-                except Exception as exc:
-                    collision = {
-                        "available": False,
-                        "reason": f"{type(exc).__name__}: {exc}",
-                    }
-                try:
-                    dynamics = backend.dynamics_report()
-                except Exception as exc:
-                    dynamics = {
-                        "available": False,
-                        "ok": None,
-                        "reason": f"{type(exc).__name__}: {exc}",
-                    }
-                check = {
-                    "executed_steps": executed_steps,
-                    "total_env_steps": self._env_steps,
-                    "collision": _wire_safe(collision),
-                    "dynamics": _wire_safe(dynamics),
-                }
-                nav_checks.append(check)
-                if not bool(collision.get("available", False)):
-                    nav_stop_reason = "collision_feedback_unavailable"
-                elif bool(collision.get("colliding", True)):
-                    nav_stop_reason = "collision"
-                elif not bool(dynamics.get("available", False)):
-                    nav_stop_reason = "dynamics_feedback_unavailable"
-                elif not bool(dynamics.get("ok", False)):
-                    nav_stop_reason = "dynamics_violation"
-                if nav_stop_reason is not None:
-                    self._refresh_observation_without_step()
-                    final_observation = self._last_observation
-                    if final_observation is None:
-                        raise RuntimeError(
-                            "pi0_navigate_to safety stop produced no final observation"
-                        )
-                    self._append_video(final_observation)
-                    break
-            if _raw_success(step_info) or terminated or truncated:
+            if raw_success_this_step:
+                if not pi0_nav_pick:
+                    self._latch_official_success(self._last_info)
                 break
-
+            if terminated or truncated:
+                break
         if final_observation is None:
             raise RuntimeError("BEHAVIOR action chunk executed zero steps")
-        task_success = _raw_success(official_info)
-        self._done = bool(
-            (task_success or terminated or truncated) and not post_success_cleanup
-        )
+        if pi0_nav_pick:
+            self._done = bool(self._official_success_latched or terminated or truncated)
+        elif not self._official_success_latched:
+            self._done = bool(terminated or truncated)
         returned_info = _wire_safe(official_info)
         if not isinstance(returned_info, dict):
             returned_info = {"raw": returned_info}
-        handoff_env_steps = int(handoff_artifacts.get("handoff_env_steps", 0))
-        returned_info["_rpent"] = {"executed_steps": int(executed_steps)}
-        if pi0_nav_pick:
-            returned_info["_rpent"]["handoff_env_steps"] = handoff_env_steps
-        if getattr(self, "_control_mode", None) in {
-            HYBRID_VLM_PI0_MODE,
-            PI0_NAV_PICK_VLA_MODE,
-        }:
-            returned_info["_rpent"]["total_env_steps"] = self._env_steps
-        if monitor_result is not None:
-            returned_info["_rpent"]["local_gripper_monitor"] = monitor_result
-        if pi0_navigate_to:
-            returned_info["_rpent"]["pi0_navigate_to_monitor"] = {
-                "executed_steps": executed_steps,
-                "safety_check_interval_steps": 4,
-                "checks": nav_checks,
-                "safety_stop": nav_stop_reason is not None,
-                "stop_reason": nav_stop_reason,
-                "raw_base_actions": nav_raw_base_actions,
-                "position_deltas": nav_position_deltas,
-                "input_clip_count": nav_input_clip_count,
-                "delta_clip_count": nav_delta_clip_count,
-                "delta_scale_per_second": [0.75, 0.75, 1.0],
-                "controller_hz": 60,
-                "per_axis_delta_limit": 0.01,
-                "execution_mode": "adapted_23d_vla_receding_horizon",
-                "predicted_action_dim": 23,
-                "vla_passthrough_segments": [
-                    "trunk",
-                    "left_arm",
-                    "right_arm",
-                ],
-                "adapted_segments": ["base"],
-                "held_segments": ["left_gripper", "right_gripper"],
-                "gripper_latches_unchanged": True,
-                "grasp_allowed": False,
-            }
-        if pi0_nav_pick:
-            local_success = bool(handoff_validator.get("local_grasp_success", False))
-            if not local_success and task_success:
-                self._handoff_state = _HANDOFF_OFFICIAL_SUCCESS
-                self._vla_actions_enabled = False
-            elif not local_success and (
-                terminated
-                or truncated
-                or self._env_steps >= int(self._meta["max_episode_steps"])
-                or handoff_stop_reason is not None
-            ):
-                self._handoff_state = _HANDOFF_FAILED
-                self._vla_actions_enabled = False
-            current = handoff_validator.get("current")
-            current_per_hand = (
-                current.get("per_hand") if isinstance(current, dict) else {}
-            )
-            returned_info["_rpent"]["pi0_nav_pick_monitor"] = {
+        envelope = returned_info.setdefault("_rpent", {})
+        if not isinstance(envelope, dict):
+            raise RuntimeError("runtime accounting envelope is invalid")
+        envelope.update(
+            {
                 "executed_steps": int(executed_steps),
-                "handoff_env_steps": handoff_env_steps,
+                "handoff_env_steps": 0,
                 "total_env_steps": int(self._env_steps),
-                "local_grasp_success": local_success,
-                "held_hand": handoff_validator.get("held_hand"),
-                "per_hand": _wire_safe(handoff_validator.get("per_hand", {})),
-                "current_criteria": _wire_safe(
-                    {
-                        hand: value.get("criteria", {})
-                        for hand, value in current_per_hand.items()
-                        if isinstance(value, dict)
-                    }
-                ),
-                "validator_trace_path": str(self._validator_trace_path),
-                "state_checkpoint_path": (
-                    handoff_artifacts.get("state_checkpoint_path")
-                    if local_success
-                    else None
-                ),
-                "handoff_state": self._handoff_state,
+            }
+        )
+        if pi0_nav_pick:
+            capability = (
+                pi0_admission_capability
+                if self._official_success_latched
+                else self._sanitized_capability_summary()
+            )
+            if not isinstance(capability, dict):
+                raise RuntimeError("Pi0 admission capability is unavailable")
+            attachment_state = capability.get("attachments", {})
+            local_grasp = bool(
+                not self._official_success_latched
+                and int(executed_steps) == 32
+                and isinstance(attachment_state, dict)
+                and attachment_state.get("available") is True
+                and int(attachment_state.get("count", 0)) > 0
+            )
+            envelope["pi0_nav_pick_monitor"] = {
+                "executed_steps": int(executed_steps),
+                "handoff_env_steps": 0,
+                "total_env_steps": int(self._env_steps),
+                "local_grasp_success": bool(local_grasp),
+                "capability": capability,
+                "controller_state": self._controller_state,
                 "action_source": self._action_source,
                 "vla_actions_enabled": bool(self._vla_actions_enabled),
-                "paused_runtime_path": (
-                    handoff_artifacts.get("paused_runtime_path")
-                    if local_success
-                    else None
+                "official_success_receipt": _wire_safe(self._official_success_receipt),
+                "official_success_first_observed_this_chunk": bool(
+                    first_success_observed_this_chunk
                 ),
-                "strict_local_grasp_success": bool(
-                    handoff_artifacts.get("strict_local_grasp_success", local_success)
+                "stop_reason": (
+                    "official_task_success" if self._official_success_latched else None
                 ),
-                "usable_post_pick_saved": bool(
-                    handoff_artifacts.get("usable_post_pick_saved", False)
-                ),
-                "save_policy": handoff_artifacts.get("save_policy"),
-                "warnings": _wire_safe(handoff_artifacts.get("warnings", [])),
-                "stop_reason": handoff_stop_reason,
-                "handoff_failure_diagnostics_path": handoff_artifacts.get(
-                    "handoff_failure_diagnostics_path"
-                ),
+                "soft_success_observed": bool(soft_success_observed),
+                "terminal_classification": _wire_safe(terminal_classification),
             }
-            if (
-                not local_success
-                and not task_success
-                and (
-                    terminated
-                    or truncated
-                    or self._env_steps >= int(self._meta["max_episode_steps"])
-                )
-            ):
-                self._handoff_state = _HANDOFF_FAILED
-                self._vla_actions_enabled = False
-                self._finalize_video_segment()
-                self._video_sealed = True
-            elif not local_success and handoff_stop_reason is not None:
-                self._finalize_video_segment()
-                self._video_sealed = True
         result = _wire_safe(
             (
                 final_observation,
@@ -5163,61 +4180,8 @@ class BehaviorEnvFacade:
                 returned_info,
             )
         )
-        # Catch simulator-owned objects here so the transport can return a
-        # useful RPC error instead of closing the socket without a frame.
         pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
         return result
-
-    def _persist_pi0_navigate_to_views(
-        self,
-        *,
-        segment_index: int,
-        chunk_index: int,
-    ) -> dict[str, Any]:
-        """Atomically persist one same-capture three-camera navigation audit."""
-
-        root = (
-            self._output_dir
-            / "visual_review"
-            / "pi0_navigate_to"
-            / f"segment_{segment_index:04d}"
-            / f"chunk_{chunk_index:04d}"
-        )
-        views: dict[str, Any] = {}
-        capture_group_id: str | None = None
-        for camera in ("head", "left_wrist", "right_wrist"):
-            payload = self._require_planner().observe(camera)
-            image = payload.get("_image_bytes")
-            if not isinstance(image, bytes):
-                raise RuntimeError(
-                    f"pi0_navigate_to {camera} audit view is not PNG bytes"
-                )
-            group = payload.get("capture_group")
-            group_id = str(group.get("id")) if isinstance(group, dict) else None
-            if capture_group_id is None:
-                capture_group_id = group_id
-            elif group_id != capture_group_id:
-                raise RuntimeError(
-                    "pi0_navigate_to audit views are not from one capture group"
-                )
-            image_path = root / f"{camera}.png"
-            _write_bytes_atomic(image_path, image)
-            views[camera] = {
-                "rgb_path": str(image_path),
-                "frame_id": payload.get("frame_id"),
-                "capture_group": group,
-            }
-        metadata = {
-            "segment_index": segment_index,
-            "chunk_index": chunk_index,
-            "total_env_steps": int(self._env_steps),
-            "capture_group_id": capture_group_id,
-            "views": views,
-        }
-        metadata_path = root / "metadata.json"
-        metadata["metadata_path"] = str(metadata_path)
-        _write_json_atomic(metadata_path, metadata)
-        return metadata
 
     def _physical_gripper_opening(self, hand: str) -> float:
         """Return the physical two-finger joint opening without a sensor join."""
@@ -5276,15 +4240,21 @@ class BehaviorEnvFacade:
         return actual_opening
 
     def get_env_meta(self) -> dict[str, Any]:
-        return {
-            **self._meta,
-            "control_mode": self._control_mode,
-            "stage3_press_enabled": self._stage3_press_enabled,
-            "restored_state": self._restored_state,
-        }
+        """Return only public benchmark identity, never native simulator bindings."""
 
-    def _info_with_accounting(self) -> dict[str, Any]:
-        info = _wire_safe(self._last_info)
+        return {
+            key: _wire_safe(self._meta.get(key))
+            for key in (
+                "suite",
+                "task",
+                "task_name",
+                "public_seed",
+                "max_episode_steps",
+            )
+        } | {"run_nonce": self._run_nonce}
+
+    def _info_with_accounting(self, source_info: Any = None) -> dict[str, Any]:
+        info = _wire_safe(self._last_info if source_info is None else source_info)
         if not isinstance(info, dict):
             info = {"raw": info}
         rpent = info.get("_rpent")
@@ -5292,6 +4262,10 @@ class BehaviorEnvFacade:
             rpent = {}
             info["_rpent"] = rpent
         rpent["total_env_steps"] = int(self._env_steps)
+        rpent["global_env_steps"] = int(self._env_steps)
+        rpent["run_nonce"] = str(getattr(self, "_run_nonce", "unbound"))
+        rpent["attempt_index"] = int(getattr(self, "_attempt_index", 1))
+        rpent["attempt_nonce"] = str(getattr(self, "_attempt_nonce", "unbound"))
         return info
 
     def current_observation(self) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -5309,14 +4283,29 @@ class BehaviorEnvFacade:
         return result
 
     def _planner_result_with_accounting(self, result: dict[str, Any]) -> dict[str, Any]:
-        public = dict(result)
-        if (
-            self._control_mode == HYBRID_VLM_PI0_MODE
-            and public.get("suggested_next_tool") == "navigate_to"
-        ):
-            public["suggested_next_tool"] = "pi0_navigate_to"
+        public = self._strip_flow_advice(result)
         public["total_env_steps"] = int(self._env_steps)
+        public["global_env_steps"] = int(self._env_steps)
+        public["run_nonce"] = str(getattr(self, "_run_nonce", "unbound"))
+        public["attempt_index"] = int(getattr(self, "_attempt_index", 1))
+        public["attempt_nonce"] = str(getattr(self, "_attempt_nonce", "unbound"))
         return public
+
+    @classmethod
+    def _strip_flow_advice(cls, value: Any) -> Any:
+        """Remove ordering and stage advice from Agent-visible tool results."""
+
+        if isinstance(value, dict):
+            return {
+                key: cls._strip_flow_advice(item)
+                for key, item in value.items()
+                if key != "suggested_next_tool" and "stage" not in key.lower()
+            }
+        if isinstance(value, list):
+            return [cls._strip_flow_advice(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._strip_flow_advice(item) for item in value)
+        return value
 
     def _persist_live_observation(self, payload: dict[str, Any]) -> dict[str, Any]:
         # Lightweight unit facades built with ``__new__`` predate live review.
@@ -5354,7 +4343,34 @@ class BehaviorEnvFacade:
         }
         return public
 
-    def _refresh_observation_without_step(self) -> None:
+    @staticmethod
+    def _render_only_for_hand_geometry() -> None:
+        """Advance Kit rendering once without stepping physics.
+
+        Calling ``Environment.render`` is insufficient in headless runs because
+        it may return before invoking Kit when no external debug sensor exists.
+        OmniGibson's own reset synchronization calls the simulator directly.
+        """
+
+        try:
+            import omnigibson as og
+        except Exception as exc:  # pragma: no cover - production dependency
+            raise RuntimeError(
+                "OmniGibson render-only synchronization is unavailable"
+            ) from exc
+        simulator = getattr(og, "sim", None)
+        render = getattr(simulator, "render", None)
+        if not callable(render):
+            raise RuntimeError(
+                "OmniGibson simulator render-only synchronization is unavailable"
+            )
+        render()
+
+    def _refresh_observation_without_step(
+        self,
+        *,
+        synchronize_hand_geometry: bool = False,
+    ) -> None:
         """Capture current synchronized sensors without advancing simulation time.
 
         Planning can legitimately take longer than the RGB-D cache TTL while no
@@ -5364,91 +4380,566 @@ class BehaviorEnvFacade:
         """
 
         omni_env = self._env.omnigibson_env
+        render_sync_iterations = 0
+        if synchronize_hand_geometry:
+            for _ in range(_HAND_GEOMETRY_SYNC_RENDER_ITERATIONS):
+                self._render_only_for_hand_geometry()
+                render_sync_iterations += 1
         raw_observation, _sensor_info = omni_env.get_obs()
         observation = _single_observation(self._env._wrap_obs([raw_observation]))
         self._last_observation = observation
-        self._record_rgbd_frames([raw_observation], observation)
+        self._record_rgbd_frames(
+            [raw_observation],
+            observation,
+            strict=synchronize_hand_geometry,
+            synchronize_hand_geometry=synchronize_hand_geometry,
+            render_sync_iterations=render_sync_iterations,
+        )
 
-    def _resolve_post_pick_camera(self, camera: str) -> str:
-        """Resolve dynamic wrist roles without exposing literal hands publicly."""
-
+    def _resolve_camera_role(self, camera: str) -> str:
         requested = str(camera)
-        if requested not in {"held_wrist", "press_wrist"}:
-            return canonical_camera(requested)
-        context = self._prepress_context
-        if not isinstance(context, dict):
-            raise RuntimeError("dynamic wrist cameras require inspect_post_pick_state")
-        role = "held_hand" if requested == "held_wrist" else "press_hand"
-        return canonical_camera(f"{context[role]}_wrist")
+        if requested not in {"head", "left_wrist", "right_wrist"}:
+            raise ValueError("camera must be head, left_wrist, or right_wrist")
+        return canonical_camera(requested)
 
-    def observe(self, camera: str) -> dict[str, Any]:
-        requested_camera = str(camera)
-        resolved_camera = self._resolve_post_pick_camera(requested_camera)
-        try:
-            frame = self._frame_cache.latest(resolved_camera)
-            self._frame_cache.get_current(resolved_camera, frame.frame_id)
-            # Planner warmup can consume nearly the entire cache TTL without
-            # advancing simulation.  Do not hand a VLM a frame that is valid
-            # at observe() time but likely to expire before pixel_to_world().
-            if time.monotonic() - frame.timestamp_s > 5.0:
-                self._refresh_observation_without_step()
-        except CameraGeometryError:
-            self._refresh_observation_without_step()
-            refreshed = self._frame_cache.latest(resolved_camera)
-            self._frame_cache.get_current(resolved_camera, refreshed.frame_id)
-        payload = self._require_planner().observe(resolved_camera)
-        payload = self._persist_live_observation(payload)
+    def _decorate_public_observation(
+        self,
+        *,
+        payload: dict[str, Any],
+        requested_camera: str,
+        resolved_camera: str,
+        current_frame: Any,
+    ) -> dict[str, Any]:
         payload["camera"] = requested_camera
-        payload["resolved_camera"] = resolved_camera
-        certificate = getattr(self, "_prepress_plan_certificate", None)
-        if isinstance(certificate, dict):
-            gate_binding = certificate.get("gate_binding")
-            capture_group = payload.get("capture_group") or {}
-            if (
-                isinstance(gate_binding, dict)
-                and gate_binding.get("capture_group_id") is not None
-                and gate_binding.get("capture_group_id") != capture_group.get("id")
-            ):
-                self._prepress_plan_certificate = None
-        motion = getattr(self, "_prepress_motion", None)
-        if (
-            isinstance(motion, dict)
-            and motion.get("primitive_success") is True
-            and motion.get("end_env_step") == self._env_steps
-        ):
-            frame = self._frame_cache.get_current(
-                resolved_camera, str(payload.get("frame_id"))
+        payload.pop("visual_review", None)
+        capture_group = payload.get("capture_group")
+        if isinstance(capture_group, dict):
+            capture_group.pop("cameras", None)
+        metrics = payload.get("metrics")
+        if isinstance(metrics, dict):
+            metrics["camera"] = requested_camera
+        payload["camera_metadata"] = {
+            "camera": requested_camera,
+            "frame_id": current_frame.frame_id,
+            "capture_group_id": current_frame.capture_group_id,
+            "capture_env_step": int(current_frame.step_index),
+            "current_env_step": int(self._env_steps),
+            "fresh": bool(int(current_frame.step_index) == int(self._env_steps)),
+            "frame_age_s": float(
+                max(0.0, time.monotonic() - current_frame.timestamp_s)
+            ),
+            "frame_ttl_s": float(self._frame_cache.ttl_s),
+            "width": int(current_frame.intrinsics.width),
+            "height": int(current_frame.intrinsics.height),
+            "intrinsics": {
+                "fx": float(current_frame.intrinsics.fx),
+                "fy": float(current_frame.intrinsics.fy),
+                "cx": float(current_frame.intrinsics.cx),
+                "cy": float(current_frame.intrinsics.cy),
+            },
+            "camera_to_world": np.asarray(
+                current_frame.camera_to_world, dtype=np.float64
+            ).tolist(),
+        }
+        payload["capability"] = self._sanitized_capability_summary()
+        return payload
+
+    def _review_public_observation(
+        self,
+        *,
+        requested_camera: str,
+        frame_review: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Review an existing public frame without refreshing any sensor."""
+
+        surface_policy = self._active_task_spec().surface_review_policy
+        if surface_policy is None:
+            raise ValueError(
+                f"{self._active_task_spec().task_name} does not define frame review"
             )
-            if int(frame.step_index) != int(self._env_steps):
-                raise RuntimeError("post-motion public review frame is stale")
-            reviews = motion.setdefault("public_visual_review", {})
-            reviews[resolved_camera] = {
-                "camera": requested_camera,
+        if not isinstance(frame_review, dict):
+            raise ValueError("frame_review must be an object")
+        if set(frame_review) != {"frame_id", "assessment"}:
+            raise ValueError("frame_review requires exactly frame_id and assessment")
+        frame_id = str(frame_review["frame_id"]).strip()
+        if not frame_id:
+            raise ValueError("frame_review.frame_id must be a non-empty string")
+        assessment = str(frame_review["assessment"])
+        if assessment not in {
+            surface_policy.target_assessment,
+            surface_policy.opposite_assessment,
+            surface_policy.indeterminate_assessment,
+        }:
+            raise ValueError("frame_review.assessment is invalid")
+        resolved_camera = self._resolve_camera_role(requested_camera)
+        if getattr(self, "_held_rotate_target_surface_review", None) is not None:
+            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+            raise RuntimeError(
+                "another frame review invalidated the pending target-surface "
+                "authorization"
+            )
+        capture_receipt = getattr(
+            self, "_latest_unconsumed_public_capture_receipt", None
+        )
+        if (
+            not self._attempt_receipt_is_current(capture_receipt)
+            or capture_receipt.get("kind") != "public_observe_capture"
+            or capture_receipt.get("requested_camera") != requested_camera
+            or capture_receipt.get("resolved_camera") != resolved_camera
+            or capture_receipt.get("frame_id") != frame_id
+            or int(capture_receipt.get("env_step", -1)) != int(self._env_steps)
+            or int(capture_receipt.get("capture_sequence", -1))
+            != int(getattr(self, "_public_capture_sequence", 0))
+        ):
+            raise RuntimeError(
+                "frame_review must consume the immediately preceding, "
+                "same-camera public capture"
+            )
+        frame = self._frame_cache.get_current(resolved_camera, frame_id)
+        if frame.frame_id not in getattr(self, "_public_observed_frame_ids", set()):
+            raise RuntimeError(
+                "frame_review must reference a frame returned by public observe"
+            )
+        if int(frame.step_index) != int(self._env_steps):
+            raise RuntimeError("frame_review must reference the current env step")
+        if not isinstance(frame.capture_group_id, str) or not frame.capture_group_id:
+            raise RuntimeError(
+                "frame_review must reference a synchronized public capture"
+            )
+        if capture_receipt.get("capture_group_id") != frame.capture_group_id:
+            raise RuntimeError("frame_review capture-group lineage changed")
+        payload = self._require_planner().observe(resolved_camera)
+        if str(payload.get("frame_id", "")) != frame.frame_id:
+            raise RuntimeError("frame_review cache head changed during review")
+        image_bytes = payload.get("_image_bytes")
+        if not isinstance(image_bytes, bytes) or hashlib.sha256(
+            image_bytes
+        ).hexdigest() != capture_receipt.get("rgb_sha256"):
+            raise RuntimeError("frame_review RGB digest does not match its capture")
+        self._latest_unconsumed_public_capture_receipt = None
+        payload = self._decorate_public_observation(
+            payload=payload,
+            requested_camera=requested_camera,
+            resolved_camera=resolved_camera,
+            current_frame=frame,
+        )
+        payload["frame_review"] = self._public_visual_receipt(
+            self._record_frame_review_cycle(
+                requested_camera=requested_camera,
+                resolved_camera=resolved_camera,
+                frame=frame,
+                capture_receipt=capture_receipt,
+                assessment=assessment,
+            )
+        )
+        return self._planner_result_with_accounting(payload)
+
+    def _probe_public_observation(
+        self,
+        *,
+        requested_camera: str,
+        depth_probe: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Measure one LLM-selected pixel in the latest public RGB-D frame.
+
+        This is a read-only follow-up to ``observe``: it neither refreshes
+        sensors nor advances physics, registers a new public capture, consumes
+        the Radio surface-review receipt, or creates motion authority.
+        """
+
+        if not isinstance(depth_probe, dict):
+            raise ValueError("depth_probe must be an object")
+        required = {
+            "frame_id",
+            "u",
+            "v",
+            "depth_window_px",
+            "assessment",
+        }
+        if set(depth_probe) != required:
+            raise ValueError(
+                "depth_probe requires exactly frame_id, u, v, "
+                "depth_window_px, and assessment"
+            )
+        frame_id = depth_probe["frame_id"]
+        if not isinstance(frame_id, str) or not frame_id.strip():
+            raise ValueError("depth_probe.frame_id must be a non-empty string")
+        frame_id = frame_id.strip()
+        coordinates: dict[str, int] = {}
+        for field in ("u", "v"):
+            value = depth_probe[field]
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(
+                    f"depth_probe.{field} must be an integer pixel coordinate"
+                )
+            coordinates[field] = int(value)
+        depth_window_px = depth_probe["depth_window_px"]
+        if (
+            isinstance(depth_window_px, bool)
+            or not isinstance(depth_window_px, (int, np.integer))
+            or not 1 <= int(depth_window_px) <= 31
+        ):
+            raise ValueError("depth_probe.depth_window_px must be an integer in [1,31]")
+        depth_window_px = int(depth_window_px)
+        if depth_probe["assessment"] != "target_point_visually_confirmed":
+            raise ValueError(
+                "depth_probe.assessment must be target_point_visually_confirmed"
+            )
+
+        resolved_camera = self._resolve_camera_role(requested_camera)
+        capture_receipt = getattr(self, "_latest_public_observation_lineage", None)
+        if (
+            not self._attempt_receipt_is_current(capture_receipt)
+            or capture_receipt.get("kind") != "public_observe_rgbd_capture"
+            or capture_receipt.get("requested_camera") != requested_camera
+            or capture_receipt.get("resolved_camera") != resolved_camera
+            or capture_receipt.get("frame_id") != frame_id
+            or int(capture_receipt.get("env_step", -1)) != int(self._env_steps)
+            or capture_receipt.get("depth_source_modality") != "depth_linear"
+            or capture_receipt.get("depth_measurement") != "distance_to_image_plane"
+            or capture_receipt.get("depth_unit") != "m"
+            or not isinstance(capture_receipt.get("depth_sha256"), str)
+            or not isinstance(capture_receipt.get("geometry_sha256"), str)
+        ):
+            raise RuntimeError(
+                "depth_probe must reference the immediately preceding, "
+                "same-camera public RGB-D capture"
+            )
+
+        # get_current validates latest-frame identity, current capture group,
+        # and TTL without refreshing the cache.
+        frame = self._frame_cache.get_current(resolved_camera, frame_id)
+        if frame.frame_id not in getattr(self, "_public_observed_frame_ids", set()):
+            raise RuntimeError(
+                "depth_probe must reference a frame returned by public observe"
+            )
+        if int(frame.step_index) != int(self._env_steps):
+            raise RuntimeError("depth_probe must reference the current env step")
+        if not isinstance(frame.capture_group_id, str) or not frame.capture_group_id:
+            raise RuntimeError(
+                "depth_probe must reference a synchronized public capture"
+            )
+        if capture_receipt.get("capture_group_id") != frame.capture_group_id:
+            raise RuntimeError("depth_probe capture-group lineage changed")
+        if capture_receipt.get("depth_sha256") != self._metric_depth_sha256(frame):
+            raise RuntimeError("depth_probe metric-depth lineage changed")
+        geometry_sha256 = self._frame_geometry_sha256(frame)
+        if capture_receipt.get("geometry_sha256") != geometry_sha256:
+            raise RuntimeError("depth_probe frame-geometry lineage changed")
+
+        stats = robust_depth_sample(
+            frame,
+            u=coordinates["u"],
+            v=coordinates["v"],
+            window_px=depth_window_px,
+        )
+        optical_axis_depth_m = float(stats["depth_m"])
+        camera_point = camera_point_from_pixel(
+            frame.intrinsics,
+            u=coordinates["u"],
+            v=coordinates["v"],
+            depth_m=optical_axis_depth_m,
+        )
+        camera_range_m = float(np.linalg.norm(camera_point))
+        if not np.isfinite(camera_range_m) or camera_range_m <= 0.0:
+            raise CameraGeometryError("depth_probe produced an invalid camera range")
+        effective_camera_point = frame.correction_profile.apply_camera_point(
+            camera_point
+        )
+        if (
+            np.asarray(effective_camera_point).shape != (3,)
+            or not np.isfinite(effective_camera_point).all()
+        ):
+            raise CameraGeometryError(
+                "depth_probe produced an invalid effective camera point"
+            )
+
+        hand_geometry: dict[str, Any] = {
+            "available": False,
+            "reason": "requires_resolved_wrist_camera",
+            "geometry_sha256": geometry_sha256,
+            "frame_id": frame.frame_id,
+            "capture_group_id": frame.capture_group_id,
+            "env_step": int(self._env_steps),
+            "source": "frame_bound_live_r1pro_link_transforms",
+            "target_point_camera_frame": "effective_usd_camera",
+            "camera_axes": "+X right,+Y up,-Z forward",
+            "distance_computation_frame": "world",
+            "guidance_only": True,
+            "semantic_target_verified": False,
+            "collision_authorization": False,
+            "close_authorization": False,
+            "open_authorization": False,
+        }
+        distance_report: dict[str, Any] | None = None
+        if resolved_camera in {"left_wrist", "right_wrist"}:
+            resolved_hand = resolved_camera.removesuffix("_wrist")
+            sync_certificate = frame.capture_metadata.get(
+                "hand_geometry_sync_certificate"
+            )
+            camera_pose_lineage = frame.capture_metadata.get("camera_pose_lineage")
+            selected_pose_lineage = (
+                camera_pose_lineage.get(resolved_camera)
+                if isinstance(camera_pose_lineage, dict)
+                else None
+            )
+            selected_hand_certificate = (
+                sync_certificate.get("hands", {}).get(resolved_hand)
+                if isinstance(sync_certificate, dict)
+                else None
+            )
+            if not self._hand_geometry_sync_certificate_is_valid(
+                sync_certificate,
+                hand=resolved_hand,
+                env_step=int(frame.step_index),
+            ) or not (
+                isinstance(selected_pose_lineage, dict)
+                and isinstance(selected_hand_certificate, dict)
+                and selected_pose_lineage.get("render_bound") is True
+                and selected_pose_lineage.get("source")
+                == selected_hand_certificate.get("camera_pose_source")
+                and int(selected_pose_lineage.get("env_step", -1))
+                == int(frame.step_index)
+                and int(selected_pose_lineage.get("render_sync_iterations", -1))
+                == int(sync_certificate["render_sync_iterations"])
+            ):
+                raise RuntimeError(
+                    "depth_probe wrist hand-geometry sync certificate is unavailable"
+                )
+            references = frame.capture_metadata.get("r1pro_hand_reference_transforms")
+            if (
+                not isinstance(references, dict)
+                or references.get("available") is not True
+                or int(references.get("env_step", -1)) != int(frame.step_index)
+                or references.get("source") != "capture_time_live_r1pro_link_transforms"
+                or not isinstance(references.get("hands"), dict)
+                or resolved_hand not in references["hands"]
+            ):
+                raise RuntimeError(
+                    "depth_probe wrist hand-reference geometry is unavailable"
+                )
+            distance_report = frame_bound_hand_distance_report(
+                frame,
+                raw_target_point_camera_xyz_m=camera_point,
+                hand_reference_transforms_world=references["hands"][resolved_hand],
+            )
+            if not np.allclose(
+                np.asarray(distance_report["target_point_camera_xyz_m"]),
+                np.asarray(effective_camera_point),
+                atol=1e-12,
+                rtol=0.0,
+            ):
+                raise RuntimeError(
+                    "depth_probe camera-point geometry changed during measurement"
+                )
+            hand_geometry = {
+                **hand_geometry,
+                "available": True,
+                "reason": None,
+                "resolved_hand": resolved_hand,
+                "sync_certificate": {
+                    "synchronized": True,
+                    "render_sync_iterations": int(
+                        sync_certificate["render_sync_iterations"]
+                    ),
+                    "translation_tolerance_m": float(
+                        sync_certificate["translation_tolerance_m"]
+                    ),
+                    "rotation_tolerance_deg": float(
+                        sync_certificate["rotation_tolerance_deg"]
+                    ),
+                    "finger_joint_tolerance_m": float(
+                        sync_certificate["finger_joint_tolerance_m"]
+                    ),
+                    "selected_hand_passed": True,
+                    "camera_pose_source": sync_certificate["hands"][resolved_hand][
+                        "camera_pose_source"
+                    ],
+                    "camera_pose_render_bound": True,
+                },
+                "target_to_finger_roots_individual_m": list(
+                    distance_report["target_to_finger_roots_individual_m"]
+                ),
+            }
+        relative_dispersion = float(stats["mad_m"]) / max(optical_axis_depth_m, 1e-6)
+        confidence = max(
+            0.0,
+            min(
+                1.0,
+                float(stats["cluster_ratio"])
+                * (1.0 - min(1.0, relative_dispersion / 0.04)),
+            ),
+        )
+        quality = {
+            "mad_m": float(stats["mad_m"]),
+            "valid_ratio": float(stats["valid_ratio"]),
+            "cluster_ratio": float(stats["cluster_ratio"]),
+            "sample_count": int(stats["sample_count"]),
+            "valid_count": int(stats["valid_count"]),
+            "cluster_count": int(stats["cluster_count"]),
+            "confidence": float(confidence),
+        }
+        probe_receipt = self._seal_attempt_receipt(
+            {
+                "kind": "public_observe_depth_probe",
+                "capture_receipt_sha256": capture_receipt["receipt_sha256"],
+                "requested_camera": requested_camera,
                 "resolved_camera": resolved_camera,
                 "frame_id": frame.frame_id,
                 "capture_group_id": frame.capture_group_id,
                 "env_step": int(self._env_steps),
-                "image_path": (payload.get("visual_review") or {}).get("rgb_path"),
+                "pixel": dict(coordinates),
+                "depth_window_px": depth_window_px,
+                "source": "llm_selected_pixel",
+                "measurement": ("first_visible_surface_at_llm_selected_pixel"),
+                "optical_axis_depth_m": optical_axis_depth_m,
+                "camera_range_m": camera_range_m,
+                "target_point_camera_xyz_m": np.asarray(
+                    effective_camera_point, dtype=np.float64
+                ).tolist(),
+                **(
+                    {
+                        key: float(distance_report[key])
+                        for key in (
+                            "target_to_palm_m",
+                            "target_to_grip_point_m",
+                            "target_to_finger_roots_m",
+                        )
+                    }
+                    if distance_report is not None
+                    else {}
+                ),
+                "hand_geometry": hand_geometry,
+                "quality": quality,
+                "semantic_target_verified": False,
+                "motion_authorization": False,
             }
-            context = self._prepress_context or {}
-            required = {
-                "head",
-                f"{context.get('held_hand')}_wrist",
-                f"{context.get('press_hand')}_wrist",
-            }
-            selected = [reviews.get(name) for name in required]
-            capture_group_ids = {
-                item.get("capture_group_id")
-                for item in selected
-                if isinstance(item, dict)
-            }
-            motion["three_view_observed_by_vlm"] = bool(
-                all(isinstance(item, dict) for item in selected)
-                and all(item.get("env_step") == self._env_steps for item in selected)
-                and None not in capture_group_ids
-                and len(capture_group_ids) == 1
+        )
+
+        # Re-encode the already cached frame so the LLM receives the exact RGB-D
+        # pair it selected.  PlannerExecutor.observe only reads FrameCache.
+        payload = self._require_planner().observe(resolved_camera)
+        if str(payload.get("frame_id", "")) != frame.frame_id:
+            raise RuntimeError("depth_probe cache head changed during sampling")
+        image_bytes = payload.get("_image_bytes")
+        if not isinstance(image_bytes, bytes) or hashlib.sha256(
+            image_bytes
+        ).hexdigest() != capture_receipt.get("rgb_sha256"):
+            raise RuntimeError("depth_probe RGB digest does not match its capture")
+        payload = self._decorate_public_observation(
+            payload=payload,
+            requested_camera=requested_camera,
+            resolved_camera=resolved_camera,
+            current_frame=frame,
+        )
+        payload["depth_probe"] = {
+            "source": "llm_selected_pixel",
+            "measurement": "first_visible_surface_at_llm_selected_pixel",
+            "pixel": dict(coordinates),
+            "depth_window_px": depth_window_px,
+            "optical_axis_depth_m": optical_axis_depth_m,
+            "camera_range_m": camera_range_m,
+            "target_point_camera_xyz_m": np.asarray(
+                effective_camera_point, dtype=np.float64
+            ).tolist(),
+            **(
+                {
+                    key: float(distance_report[key])
+                    for key in (
+                        "target_to_palm_m",
+                        "target_to_grip_point_m",
+                        "target_to_finger_roots_m",
+                    )
+                }
+                if distance_report is not None
+                else {}
+            ),
+            "hand_geometry": hand_geometry,
+            "quality": quality,
+            "semantic_target_verified": False,
+            "motion_authorization": False,
+            "lineage": {
+                "camera": requested_camera,
+                "frame_id": frame.frame_id,
+                "capture_group_id": frame.capture_group_id,
+                "env_step": int(self._env_steps),
+                "receipt_sha256": probe_receipt["receipt_sha256"],
+            },
+        }
+        return self._planner_result_with_accounting(payload)
+
+    def observe(
+        self,
+        camera: str,
+        frame_review: dict[str, Any] | None = None,
+        depth_probe: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        requested_camera = str(camera)
+        if frame_review is not None and depth_probe is not None:
+            raise ValueError("frame_review and depth_probe are mutually exclusive")
+        if frame_review is not None:
+            return self._review_public_observation(
+                requested_camera=requested_camera,
+                frame_review=frame_review,
             )
-            self._persist_prepress_motion_record(motion)
+        if depth_probe is not None:
+            return self._probe_public_observation(
+                requested_camera=requested_camera,
+                depth_probe=depth_probe,
+            )
+        resolved_camera = self._resolve_camera_role(requested_camera)
+        if resolved_camera in {"left_wrist", "right_wrist"}:
+            # A wrist hand-distance chain is admitted only from a fresh
+            # render-synchronized capture with a fixed-extrinsic certificate.
+            # Action-loop frames are intentionally never upgraded in place.
+            self._refresh_observation_without_step(synchronize_hand_geometry=True)
+        else:
+            try:
+                frame = self._frame_cache.latest(resolved_camera)
+                self._frame_cache.get_current(resolved_camera, frame.frame_id)
+                if (
+                    int(frame.step_index) != int(self._env_steps)
+                    or time.monotonic() - frame.timestamp_s > 5.0
+                ):
+                    self._refresh_observation_without_step()
+            except CameraGeometryError:
+                self._refresh_observation_without_step()
+        refreshed = self._frame_cache.latest(resolved_camera)
+        self._frame_cache.get_current(resolved_camera, refreshed.frame_id)
+        payload = self._require_planner().observe(resolved_camera)
+        image_bytes = payload.get("_image_bytes")
+        if not isinstance(image_bytes, bytes):
+            raise RuntimeError("observe payload did not contain PNG bytes")
+        payload = self._persist_live_observation(payload)
+        current_frame = self._frame_cache.get_current(
+            resolved_camera, str(payload.get("frame_id"))
+        )
+        observed_frame_ids = getattr(self, "_public_observed_frame_ids", None)
+        if not isinstance(observed_frame_ids, set):
+            observed_frame_ids = set()
+            self._public_observed_frame_ids = observed_frame_ids
+        observed_frame_ids.add(current_frame.frame_id)
+        if requested_camera == "head" and resolved_camera == canonical_camera("head"):
+            self._latest_public_head_frame_id = current_frame.frame_id
+        self._register_public_observation_lineage(
+            requested_camera=requested_camera,
+            resolved_camera=resolved_camera,
+            frame=current_frame,
+            image_bytes=image_bytes,
+        )
+        capture_receipt = self._register_public_capture(
+            requested_camera=requested_camera,
+            resolved_camera=resolved_camera,
+            frame=current_frame,
+            image_bytes=image_bytes,
+        )
+        payload = self._decorate_public_observation(
+            payload=payload,
+            requested_camera=requested_camera,
+            resolved_camera=resolved_camera,
+            current_frame=current_frame,
+        )
+        payload["capture_receipt"] = self._public_visual_receipt(capture_receipt)
         return self._planner_result_with_accounting(payload)
 
     def _pixel_to_world_raw(
@@ -5458,7 +4949,6 @@ class BehaviorEnvFacade:
         u: Any = None,
         v: Any = None,
         depth_window_px: int = 7,
-        output_frame: str = "world",
     ) -> dict[str, Any]:
         result = self._require_planner().pixel_to_world(
             camera=camera,
@@ -5466,3191 +4956,1141 @@ class BehaviorEnvFacade:
             u=u,
             v=v,
             depth_window_px=depth_window_px,
-            output_frame=output_frame,
+            output_frame="world",
         )
         return self._planner_result_with_accounting(result)
-
-    def _record_button_projection(
-        self,
-        *,
-        gate: dict[str, Any],
-        projected: dict[str, Any],
-    ) -> dict[str, Any]:
-        if gate.get("face_class") != BUTTON_FACE_CLASS:
-            raise RuntimeError(
-                "only a BUTTON_FACE gate may authorize button projection"
-            )
-        if not projected.get("primitive_success"):
-            return projected
-        diagnostics = projected.get("diagnostics", {})
-        xyz, normal = diagnostics.get("xyz"), diagnostics.get("surface_normal")
-        if xyz is None or normal is None:
-            raise RuntimeError("button projection omitted xyz or surface normal")
-        gate_id = str(gate["gate_id"])
-        projection = {
-            "projection_id": "button_projection_"
-            + hashlib.sha256(f"{gate_id}:{xyz}:{normal}".encode()).hexdigest()[:20],
-            "gate_id": gate_id,
-            "camera": gate["camera"],
-            "resolved_camera": gate["resolved_camera"],
-            "frame_id": gate["frame_id"],
-            "capture_group_id": gate["capture_group_id"],
-            "env_step": int(self._env_steps),
-            "button_center_world": xyz,
-            "button_normal_world": normal,
-            "projection_metrics": projected.get("metrics", {}),
-        }
-        self._prepress_projection = projection
-        self._prepress_geometry = None
-        return {
-            **projected,
-            "stop_reason": "button_projected",
-            **_wire_safe(projection),
-            "total_env_steps": int(self._env_steps),
-        }
 
     def pixel_to_world(
         self,
         camera: str,
         frame_id: str,
-        u: Any = None,
-        v: Any = None,
+        u: Any,
+        v: Any,
         depth_window_px: int = 7,
-        output_frame: str = "world",
     ) -> dict[str, Any]:
         requested_camera = str(camera)
-        resolved_camera = self._resolve_post_pick_camera(requested_camera)
+        if not isinstance(frame_id, str) or not frame_id.strip():
+            raise ValueError("frame_id must be a non-empty string")
+        for field, value in (("u", u), ("v", v)):
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"{field} must be an integer pixel coordinate")
+        if (
+            isinstance(depth_window_px, bool)
+            or not isinstance(depth_window_px, (int, np.integer))
+            or int(depth_window_px) < 1
+        ):
+            raise ValueError("depth_window_px must be a positive integer")
+        resolved_camera = self._resolve_camera_role(requested_camera)
+        frame = self._frame_cache.get_current(resolved_camera, frame_id.strip())
+        if frame.frame_id not in getattr(self, "_public_observed_frame_ids", set()):
+            raise RuntimeError("pixel_to_world requires a public observe frame")
+        if int(frame.step_index) != int(self._env_steps):
+            raise RuntimeError("pixel_to_world frame is not from the current env step")
         projected = self._pixel_to_world_raw(
             camera=resolved_camera,
-            frame_id=frame_id,
+            frame_id=frame.frame_id,
             u=u,
             v=v,
             depth_window_px=depth_window_px,
-            output_frame=output_frame,
         )
-        projected["camera"] = requested_camera
-        projected["resolved_camera"] = resolved_camera
-        gate = self._prepress_gate
+        projected_metrics = projected.get("metrics")
+        if isinstance(projected_metrics, dict):
+            projected_metrics["camera"] = requested_camera
+        if projected.get("primitive_success") is not True:
+            return {**projected, "camera": requested_camera}
+        diagnostics = projected.get("diagnostics")
+        metrics = projected.get("metrics")
+        if not isinstance(diagnostics, dict) or not isinstance(metrics, dict):
+            raise RuntimeError("projection omitted diagnostics or metrics")
+        point = np.asarray(diagnostics.get("xyz"), dtype=np.float64).reshape(3)
+        normal = np.asarray(
+            diagnostics.get("surface_normal"), dtype=np.float64
+        ).reshape(3)
+        norm = float(np.linalg.norm(normal))
         if (
-            isinstance(gate, dict)
-            and gate.get("button_visible") is True
-            and gate.get("face_class") == BUTTON_FACE_CLASS
-            and gate.get("env_step") == self._env_steps
-            and gate.get("camera") == requested_camera
-            and gate.get("resolved_camera") == resolved_camera
-            and gate.get("frame_id") == str(frame_id)
-            and output_frame == "world"
+            not np.isfinite(point).all()
+            or not np.isfinite(normal).all()
+            or norm <= 1e-9
         ):
-            center = np.asarray(gate.get("center_uv"), dtype=np.float64).reshape(2)
-            requested = np.asarray([u, v], dtype=np.float64).reshape(2)
-            if np.max(np.abs(center - requested)) <= 0.5:
-                return self._record_button_projection(
-                    gate=gate,
-                    projected=projected,
-                )
-        return projected
-
-    def _read_post_pick_checkpoint(
-        self,
-    ) -> tuple[Path, dict[str, Any], str]:
-        path = self._output_dir / "state_checkpoints" / "state_checkpoint_1.json"
-        root = path.parent.resolve()
-        if path.is_symlink() or path.resolve().parent != root or not path.is_file():
-            raise RuntimeError("this run's state_checkpoint_1.json is unavailable")
-        raw = path.read_bytes()
-        payload = json.loads(raw.decode("utf-8"))
-        if (
-            not isinstance(payload, dict)
-            or payload.get("kind") != "robot_motion_checkpoint"
-            or payload.get("not_simulator_restore") is not True
-            or payload.get("checkpoint_name") != "state_checkpoint_1"
-        ):
-            raise RuntimeError("state_checkpoint_1 robot-motion schema is invalid")
-        expected_binding = self._expected_checkpoint_run_binding()
-        if (
-            expected_binding is not None
-            and payload.get("run_binding") != expected_binding
-        ):
-            raise RuntimeError("state_checkpoint_1 does not belong to this run")
-        held, press = self._validated_handoff_hands(
-            held_hand=str(payload.get("held_hand")),
-            press_hand=str(payload.get("press_hand")),
-        )
-        if not str(payload.get("object_name", "")):
-            raise RuntimeError("state_checkpoint_1 object binding is missing")
-        payload["held_hand"], payload["press_hand"] = held, press
-        return path, payload, hashlib.sha256(raw).hexdigest()
-
-    def _load_post_pick_checkpoint(self) -> tuple[Path, dict[str, Any]]:
-        path, payload, _sha256 = self._read_post_pick_checkpoint()
-        return path, payload
-
-    def _assert_prepress_checkpoint_bound(self) -> tuple[Path, dict[str, Any]]:
-        context = self._prepress_context
-        if not isinstance(context, dict):
-            raise RuntimeError("inspect_post_pick_state must run first")
-        path, checkpoint, sha256 = self._read_post_pick_checkpoint()
-        if str(path) != context.get("checkpoint_path") or sha256 != context.get(
-            "checkpoint_sha256"
-        ):
-            raise RuntimeError("bound state_checkpoint_1 changed during pre-press")
-        return path, checkpoint
-
-    def _prepress_stability_snapshot(self) -> dict[str, Any]:
-        context = self._prepress_context
-        if not isinstance(context, dict):
-            raise RuntimeError("inspect_post_pick_state must run first")
-        held, press = context["held_hand"], context["press_hand"]
-        radio, table = self._resolve_handoff_targets()
-        robot = self._robot()
-        if robot is None or self._last_observation is None:
-            raise RuntimeError("current robot observation is unavailable")
-        link = robot.eef_links[held]
-        press_link = robot.eef_links[press]
-        eef_pos, eef_quat = self._object_pose(link)
-        press_eef_pos, press_eef_quat = self._object_pose(press_link)
-        radio_pos, radio_quat = self._object_pose(radio)
-        rel_pos, rel_quat = self._relative_pose(
-            eef_pos, eef_quat, radio_pos, radio_quat
-        )
-        expected = context["checkpoint"]["poses"]["object_pose_in_held_eef"]
-        expected_pos = np.asarray(expected["position"], dtype=np.float64)
-        expected_quat = np.asarray(expected["quat_xyzw"], dtype=np.float64)
-        radio_bottom, _ = self._object_vertical_bounds(radio)
-        _, table_top = self._object_vertical_bounds(table)
-        opening = self._validated_selected_gripper_opening(
-            observation=self._last_observation, hand=held
-        )
-        held_attachment = self._attachment_matches(held, radio)
-        press_attachment = self._attachment_matches(press, radio)
-        held_contact = self._hand_target_contact_report(held, radio_pos)
-        press_contact = self._hand_target_contact_report(press, radio_pos)
-        result = {
-            "relative_position_m": rel_pos.tolist(),
-            "relative_quat_xyzw": rel_quat.tolist(),
-            "relative_drift_m": float(np.linalg.norm(rel_pos - expected_pos)),
-            "angular_drift_rad": _quaternion_angle_rad(rel_quat, expected_quat),
-            "radio_position_world": radio_pos.tolist(),
-            "radio_quat_xyzw": radio_quat.tolist(),
-            "held_eef_position_world": eef_pos.tolist(),
-            "held_eef_quat_xyzw": eef_quat.tolist(),
-            "press_eef_position_world": press_eef_pos.tolist(),
-            "press_eef_quat_xyzw": press_eef_quat.tolist(),
-            "radio_height_m": float(radio_pos[2]),
-            "air_gap_m": float(radio_bottom - table_top),
-            "held_gripper_opening_m": float(opening),
-            "held_attachment": list(held_attachment),
-            "held_contact_count": int(held_contact["target_contact_count"]),
-            "held_two_finger_contact": bool(held_contact["target_two_finger_contact"]),
-            "press_attachment": list(press_attachment),
-            "press_contact_count": int(press_contact["target_contact_count"]),
-        }
-        result["stable"] = bool(
-            result["relative_drift_m"] <= HANDOFF_RELATIVE_DRIFT_MAX_M
-            and result["angular_drift_rad"] <= HANDOFF_RELATIVE_ANGULAR_DRIFT_MAX_RAD
-            and result["air_gap_m"] >= HANDOFF_SUPPORT_GAP_MIN_M
-            and opening < HANDOFF_GRIPPER_OPENING_MAX
-            and (any(held_attachment) or held_contact["target_two_finger_contact"])
-            and not any(press_attachment)
-            and press_contact["target_contact_count"] == 0
-        )
-        return result
-
-    @staticmethod
-    def _prepress_search_rotations(
-        _stability: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        angle = float(np.deg2rad(15.0))
-        candidates = []
-        for axis_name, axis in (
-            ("local_x", np.array([1.0, 0.0, 0.0])),
-            ("local_y", np.array([0.0, 1.0, 0.0])),
-            ("local_z", np.array([0.0, 0.0, 1.0])),
-        ):
-            for sign in (-1.0, 1.0):
-                candidates.append(
-                    {
-                        "label": (
-                            f"{axis_name}_{'plus' if sign > 0 else 'minus'}_15deg"
-                        ),
-                        "tool": "rotate_wrist",
-                        "role": "held",
-                        "relative_axis_angle": [
-                            *axis.tolist(),
-                            sign * angle,
-                        ],
-                        "frame": "eef",
-                        "plan_only": True,
-                    }
-                )
-        return candidates
-
-    def inspect_post_pick_state(
-        self, checkpoint_name: str = "state_checkpoint_1"
-    ) -> dict[str, Any]:
-        if checkpoint_name != "state_checkpoint_1":
-            raise ValueError("pre-press must bind state_checkpoint_1")
-        if (
-            self._handoff_state != _HANDOFF_PAUSED
-            or self._action_source != "curobo"
-            or self._vla_actions_enabled is not False
-            or not self._paused_runtime_path.is_file()
-        ):
-            raise RuntimeError("pre-press requires a formally finalized PAUSED handoff")
-        paused_runtime = json.loads(
-            self._paused_runtime_path.read_text(encoding="utf-8")
-        )
-        if (
-            not isinstance(paused_runtime, dict)
-            or paused_runtime.get("handoff_state") != _HANDOFF_PAUSED
-            or paused_runtime.get("action_source") != "curobo"
-            or paused_runtime.get("vla_actions_enabled") is not False
-            or paused_runtime.get("vla_action_gate_confirmed") is not True
-            or paused_runtime.get("lifecycle_finalized") is not True
-        ):
-            raise RuntimeError("paused_runtime.json is not formally finalized")
-        path, checkpoint, checkpoint_sha256 = self._read_post_pick_checkpoint()
-        self._refresh_observation_without_step()
-        self._prepress_context = {
-            "checkpoint_path": str(path),
-            "checkpoint_sha256": checkpoint_sha256,
-            "checkpoint": checkpoint,
-            "held_hand": checkpoint["held_hand"],
-            "press_hand": checkpoint["press_hand"],
-            "object_name": checkpoint["object_name"],
-            "bound_env_step": int(self._env_steps),
-        }
-        self._prepress_gate = self._prepress_projection = None
-        self._prepress_geometry = self._prepress_motion = None
-        self._prepress_plan_certificate = None
-        stability = self._prepress_stability_snapshot()
-        transform_context = {
-            "convention": (
-                "T_A_B maps coordinates from frame B into frame A; matrices "
-                "are row-major homogeneous 4x4 transforms"
-            ),
-            "T_world_held_current": pose_matrix_xyzw(
-                stability["held_eef_position_world"],
-                stability["held_eef_quat_xyzw"],
-            ).tolist(),
-            "T_world_press_current": pose_matrix_xyzw(
-                stability["press_eef_position_world"],
-                stability["press_eef_quat_xyzw"],
-            ).tolist(),
-            "T_world_radio_current": pose_matrix_xyzw(
-                stability["radio_position_world"],
-                stability["radio_quat_xyzw"],
-            ).tolist(),
-            "T_held_radio_current": pose_matrix_xyzw(
-                stability["relative_position_m"],
-                stability["relative_quat_xyzw"],
-            ).tolist(),
-            "candidate_generation": (
-                "The runtime applies T_held_radio_current internally to derive "
-                "held-EEF candidates from button/radio geometry goals; callers "
-                "must not submit a literal held EEF pose."
-            ),
-            "radio_pose_prior": {
-                "scope": "turning_on_radio radio object only",
-                "local_button_center_m": list(RADIO_LOCAL_BUTTON_CENTER_M),
-                "local_button_face_outward_normal": list(
-                    RADIO_LOCAL_BUTTON_FACE_NORMAL
-                ),
-                "local_back_face_outward_normal": [
-                    -value for value in RADIO_LOCAL_BUTTON_FACE_NORMAL
-                ],
-                "local_upright_axis": list(RADIO_LOCAL_UP_AXIS),
-                "use": (
-                    "coarse back-to-front reveal only; a fresh positive "
-                    "button gate must refine and validate the final pose"
-                ),
-            },
-        }
-        return {
-            "_finish": False,
-            "primitive_success": bool(stability["stable"]),
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "stop_reason": "post_pick_state_inspected"
-            if stability["stable"]
-            else "post_pick_state_unstable",
-            "checkpoint_path": str(path),
-            "checkpoint_sha256": self._prepress_context["checkpoint_sha256"],
-            "held_hand": checkpoint["held_hand"],
-            "press_hand": checkpoint["press_hand"],
-            "object_name": checkpoint["object_name"],
-            "press_approach_axis_local": [0.0, 0.0, 1.0],
-            "search_rotate_wrist_candidates": self._prepress_search_rotations(
-                stability
-            ),
-            "handoff_state": self._handoff_state,
-            "action_source": self._action_source,
-            "vla_actions_enabled": bool(self._vla_actions_enabled),
-            "paused_runtime_path": str(self._paused_runtime_path),
-            "stability": _wire_safe(stability),
-            "transform_context": _wire_safe(transform_context),
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def declare_button_visibility(
-        self,
-        camera: str,
-        frame_id: str,
-        button_visible: bool,
-        positive_signature: dict[str, bool] | None = None,
-        negative_case: str | None = None,
-        bbox_xyxy: Any | None = None,
-        center_uv: Any | None = None,
-    ) -> dict[str, Any]:
-        self._assert_prepress_checkpoint_bound()
-        requested_camera = str(camera)
-        resolved_camera = self._resolve_post_pick_camera(requested_camera)
-        frame = self._frame_cache.get_current(resolved_camera, str(frame_id))
-        if int(frame.step_index) != int(self._env_steps):
-            raise RuntimeError(
-                "button declaration frame is not from the current env step"
-            )
-        declaration = validate_button_declaration(
-            button_visible=bool(button_visible),
-            positive_signature=positive_signature,
-            negative_case=negative_case,
-            bbox_xyxy=bbox_xyxy,
-            center_uv=center_uv,
-            image_width=frame.intrinsics.width,
-            image_height=frame.intrinsics.height,
-        )
-        gate = {
-            **declaration,
+            raise RuntimeError("projection point or surface normal is invalid")
+        normal /= norm
+        camera_origin = np.asarray(frame.camera_to_world[:3, 3], dtype=np.float64)
+        if float(np.dot(normal, camera_origin - point)) < 0.0:
+            normal = -normal
+        receipt = {
+            "run_nonce": self._run_nonce,
+            "attempt_nonce": self._attempt_nonce,
+            "env_step": int(self._env_steps),
             "camera": requested_camera,
             "resolved_camera": resolved_camera,
             "frame_id": frame.frame_id,
             "capture_group_id": frame.capture_group_id,
-            "capture_step": int(frame.step_index),
-            "env_step": int(self._env_steps),
+            "world_point": point.tolist(),
+            "camera_facing_normal": normal.tolist(),
+            "confidence": float(metrics.get("confidence", 0.0)),
         }
-        if declaration["face_class"] == BUTTON_FACE_CLASS:
-            gate["gate_id"] = gate_token(gate)
-        gate["motion_policy"] = {
-            "direct_back_to_front": bool(
-                declaration["face_class"] == CLEAR_SLOTTED_BACK_FACE_CLASS
-            ),
-            "button_visible_micro_adjust": bool(
-                declaration["face_class"] == BUTTON_FACE_CLASS
-            ),
-            "other_views_bounded_search_only": bool(
-                declaration["face_class"]
-                not in {BUTTON_FACE_CLASS, CLEAR_SLOTTED_BACK_FACE_CLASS}
-            ),
-        }
-        self._prepress_gate = gate
-        self._prepress_projection = self._prepress_geometry = None
-        self._prepress_plan_certificate = None
+        receipt["projection_id"] = (
+            "projection_"
+            + hashlib.sha256(_canonical_json_bytes(receipt)).hexdigest()[:24]
+        )
+        self._projection_receipts[receipt["projection_id"]] = receipt
         return {
-            "_finish": False,
-            "primitive_success": True,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "stop_reason": "button_visible"
-            if gate["button_visible"]
-            else "button_not_visible",
-            **_wire_safe(gate),
-            "total_env_steps": int(self._env_steps),
+            **projected,
+            "camera": requested_camera,
+            "frame_id": frame.frame_id,
+            "capture_group_id": frame.capture_group_id,
+            "world_point": receipt["world_point"],
+            "camera_facing_normal": receipt["camera_facing_normal"],
+            "confidence": receipt["confidence"],
+            "projection_id": receipt["projection_id"],
         }
 
-    def project_button(self, gate_id: str, depth_window_px: int = 7) -> dict[str, Any]:
-        self._assert_prepress_checkpoint_bound()
-        gate = self._prepress_gate
-        if (
-            not isinstance(gate, dict)
-            or not gate.get("button_visible")
-            or gate.get("face_class") != BUTTON_FACE_CLASS
-        ):
-            raise RuntimeError("a current VISIBLE button gate is required")
-        if gate.get("gate_id") != gate_id or gate.get("env_step") != self._env_steps:
-            raise RuntimeError("button gate is stale or does not match gate_id")
-        frame = self._frame_cache.get_current(gate["resolved_camera"], gate["frame_id"])
-        if int(frame.step_index) != int(self._env_steps):
-            raise RuntimeError(
-                "button projection frame is not from the current env step"
+    def _planner_public_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        public = self._planner_result_with_accounting(result)
+        public["capability"] = self._sanitized_capability_summary()
+        public["task_success"] = bool(self._official_success_latched)
+        public["official_success_source"] = 'info["done"]["success"]'
+        if self._official_success_latched:
+            if not isinstance(self._official_success_receipt, dict):
+                raise RuntimeError(
+                    "official success is latched without its immutable receipt"
+                )
+            public["official_success_receipt"] = _wire_safe(
+                self._official_success_receipt
             )
-        if frame.capture_group_id != gate.get("capture_group_id"):
-            raise RuntimeError("button gate capture group changed")
-        u, v = gate["center_uv"]
-        projected = self._pixel_to_world_raw(
-            gate["resolved_camera"],
-            gate["frame_id"],
-            u,
-            v,
-            depth_window_px,
-            "world",
-        )
-        projected["camera"] = gate["camera"]
-        projected["resolved_camera"] = gate["resolved_camera"]
-        return self._record_button_projection(gate=gate, projected=projected)
+        return public
 
-    def evaluate_prepress_geometry(
+    def finalize_paused_runtime(self, vla_status: dict[str, Any]) -> dict[str, Any]:
+        """Confirm external VLA disable and transfer ownership to the planner."""
+
+        if self._official_success_latched or _raw_success(self._last_info):
+            receipt = self._latch_official_success(self._last_info)
+            self._latest_successful_held_rotate_receipt = None
+            self._latest_successful_held_rotate_attachment = None
+            self._latest_successful_held_rotate_public_frame_ids = set()
+            self._held_rotate_target_surface_review = None
+            self._awaiting_opposite_surface_review = None
+            self._completed_opposite_surface_cycles = []
+            self._clear_active_vla_invocation_state()
+            return {
+                "controller_state": self._controller_state,
+                "vla_actions_enabled": False,
+                "lifecycle_finalized": True,
+                "task_success": True,
+                "official_success_source": 'info["done"]["success"]',
+                "official_success_receipt": _wire_safe(receipt),
+            }
+        try:
+            if (
+                not isinstance(vla_status, dict)
+                or vla_status.get("actions_enabled") is not False
+            ):
+                raise RuntimeError("VLA action disable confirmation is missing")
+            health = vla_status.get("healthz")
+            if (
+                not isinstance(health, dict)
+                or health.get("actions_enabled") is not False
+            ):
+                raise RuntimeError("VLA health did not confirm actions_enabled=false")
+            transition = self._switch_controller(_CONTROLLER_PLANNER)
+        except Exception:
+            self._clear_active_vla_invocation_state()
+            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+            raise
+        self._vla_actions_enabled = False
+        finalized_candidate = self._finalize_rotate_pi0_candidate()
+        self._clear_active_vla_invocation_state(clear_candidate=False)
+        return {
+            "controller_state": self._controller_state,
+            "controller_transition": transition,
+            "vla_actions_enabled": False,
+            "lifecycle_finalized": True,
+            "task_success": False,
+            "official_success_source": 'info["done"]["success"]',
+            "env_pid": os.getpid(),
+            "vla_pid": health.get("pid"),
+            "vla_endpoint": vla_status.get("endpoint"),
+            "capability": self._sanitized_capability_summary(),
+            "opposite_surface_review_pending": bool(
+                isinstance(finalized_candidate, dict)
+            ),
+        }
+
+    def _revalidate_analytic_selection(
         self,
-        projection_id: str,
-        max_line_distance_m: float = 0.010,
-        max_opposition_angle_deg: float = 15.0,
-        min_axial_standoff_m: float = 0.03,
-        max_axial_standoff_m: float = 0.06,
+        *,
+        requested_hand: str,
+        expected_hand: str,
+        visual_hand_check: Any,
+    ) -> tuple[str, str, dict[str, Any]]:
+        """Repeat explicit hand authorization at the action boundary."""
+
+        resolved = self._authorize_analytic_hand(requested_hand, visual_hand_check)
+        hand, _source, _evidence = resolved
+        if hand != expected_hand:
+            raise RuntimeError("analytic hand selection changed before execution")
+        return resolved
+
+    def _assert_attachment_snapshot_unchanged(
+        self,
+        before: dict[str, Any],
+        *,
+        context: str,
     ) -> dict[str, Any]:
-        self._assert_prepress_checkpoint_bound()
+        """Reject before the first action if either attachment identity changed."""
+
+        after = self._attachment_fingerprint_snapshot()
         if (
-            float(max_line_distance_m) > PREPRESS_LINE_DISTANCE_MAX_M
-            or float(max_opposition_angle_deg) > PREPRESS_OPPOSITION_ANGLE_MAX_DEG
-            or float(min_axial_standoff_m) < PREPRESS_AXIAL_STANDOFF_MIN_M
-            or float(max_axial_standoff_m) > PREPRESS_AXIAL_STANDOFF_MAX_M
+            before.get("available") is not True
+            or after.get("available") is not True
+            or list(after.get("hands", [])) != list(before.get("hands", []))
+            or dict(after.get("fingerprints", {}))
+            != dict(before.get("fingerprints", {}))
         ):
-            raise ValueError("pre-press geometry thresholds may only be tightened")
-        projection = getattr(self, "_prepress_projection", None)
-        context = self._prepress_context
-        if not isinstance(projection, dict) or not isinstance(context, dict):
-            raise RuntimeError("a current button projection is required")
-        if (
-            projection.get("projection_id") != projection_id
-            or projection.get("env_step") != self._env_steps
-        ):
-            raise RuntimeError(
-                "button projection is stale or does not match projection_id"
+            raise RuntimeError(f"attachment identity changed during {context}")
+        return after
+
+    def _attachment_postcondition_receipt(
+        self,
+        *,
+        primitive: str,
+        selected_hand: str,
+        before: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Verify task-neutral attachment isolation after one analytic primitive."""
+
+        after = self._attachment_fingerprint_snapshot()
+        other_hand = "right" if selected_hand == "left" else "left"
+        before_fingerprints = dict(before.get("fingerprints", {}))
+        after_fingerprints = dict(after.get("fingerprints", {}))
+        selected_before = before_fingerprints.get(selected_hand)
+        selected_after = after_fingerprints.get(selected_hand)
+        inactive_before = before_fingerprints.get(other_hand)
+        inactive_after = after_fingerprints.get(other_hand)
+        before_hands = set(before.get("hands", []))
+        after_hands = set(after.get("hands", []))
+        selected_present_before = selected_hand in before_hands
+        selected_present_after = selected_hand in after_hands
+        inactive_present_before = other_hand in before_hands
+        inactive_present_after = other_hand in after_hands
+        checks: dict[str, bool] = {
+            "feedback_available": bool(
+                before.get("available", False) and after.get("available", False)
+            ),
+            "inactive_attachment_unchanged": bool(
+                inactive_present_after == inactive_present_before
+                and inactive_after == inactive_before
+            ),
+        }
+        if primitive in {"move_to", "rotate_wrist"}:
+            checks["selected_attachment_unchanged"] = bool(
+                selected_present_after == selected_present_before
+                and selected_after == selected_before
             )
-        pose = self._require_planner().backend.get_eef_pose(context["press_hand"])
-        if pose is None:
-            raise RuntimeError("press-hand EEF pose is unavailable")
-        press_position, press_quat = pose
-        press_direction = quat_rotate_xyzw(press_quat, [0.0, 0.0, 1.0])
-        geometry = evaluate_geometry(
-            button_center_world=projection["button_center_world"],
-            button_normal_world=projection["button_normal_world"],
-            press_eef_position_world=press_position,
-            press_direction_world=press_direction,
-            max_line_distance_m=max_line_distance_m,
-            max_opposition_angle_deg=max_opposition_angle_deg,
-            min_axial_standoff_m=min_axial_standoff_m,
-            max_axial_standoff_m=max_axial_standoff_m,
-        )
-        geometry.update(
+        elif primitive == "press":
+            checks["selected_hand_attachment_free_before"] = not selected_present_before
+            checks["selected_hand_attachment_free_after"] = not selected_present_after
+        elif primitive == "open":
+            checks["selected_hand_attachment_cleared"] = not selected_present_after
+        elif primitive == "close":
+            checks["selected_attachment_not_replaced"] = bool(
+                not selected_present_before
+                or (selected_present_after and selected_after == selected_before)
+            )
+        else:
+            raise ValueError(f"unsupported analytic primitive {primitive!r}")
+        passed = all(checks.values())
+        return self._seal_attempt_receipt(
             {
-                "projection_id": projection_id,
-                "env_step": int(self._env_steps),
-                "press_hand": context["press_hand"],
-                "press_eef_pose_world": {
-                    "position": np.asarray(press_position).tolist(),
-                    "quat_xyzw": np.asarray(press_quat).tolist(),
-                },
+                "kind": "analytic_attachment_postcondition",
+                "primitive": primitive,
+                "selected_hand": selected_hand,
+                "inactive_hand": other_hand,
+                "started_env_step": int(before.get("env_step", self._env_steps)),
+                "completed_env_step": int(self._env_steps),
+                "checks": checks,
+                "passed": passed,
+                "before_fingerprints": before_fingerprints,
+                "after_fingerprints": after_fingerprints,
             }
         )
-        stability = self._prepress_stability_snapshot()
-        geometry["radio_held_stability"] = stability
-        geometry["geometry_pass"] = bool(
-            geometry["geometry_pass"] and stability["stable"]
-        )
-        motion = self._prepress_motion
-        if (
-            geometry["geometry_pass"]
-            and isinstance(motion, dict)
-            and motion.get("end_env_step") == self._env_steps
-            and motion.get("three_view_observed_by_vlm") is True
-        ):
-            motion["visual_review_verdict"] = (
-                "passed_by_post_motion_button_gate_and_geometry"
-            )
-            motion["visual_review_pass"] = True
-            self._persist_prepress_motion_record(motion)
-        self._prepress_geometry = geometry
-        return {
-            "_finish": False,
-            "primitive_success": bool(geometry["geometry_pass"]),
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "stop_reason": "prepress_geometry_aligned"
-            if geometry["geometry_pass"]
-            else "prepress_geometry_not_aligned",
-            "geometry": _wire_safe(geometry),
-            "total_env_steps": int(self._env_steps),
-        }
 
-    def _capture_prepress_views(
-        self, *, round_index: int
-    ) -> tuple[dict[str, str], str | None]:
-        context = self._prepress_context or {}
-        review_dir = (
-            self._output_dir / "visual_review" / "prepress" / f"round_{round_index:03d}"
+    def _navigation_attachment_postcondition_receipt(
+        self,
+        *,
+        before: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Verify that base navigation preserved both attachment identities."""
+
+        after = self._attachment_fingerprint_snapshot()
+        before_fingerprints = dict(before.get("fingerprints", {}))
+        after_fingerprints = dict(after.get("fingerprints", {}))
+        checks = {
+            "feedback_available": bool(
+                before.get("available", False) and after.get("available", False)
+            ),
+            "attachment_hands_unchanged": list(after.get("hands", []))
+            == list(before.get("hands", [])),
+            "attachment_fingerprints_unchanged": after_fingerprints
+            == before_fingerprints,
+        }
+        return self._seal_attempt_receipt(
+            {
+                "kind": "navigation_attachment_postcondition",
+                "primitive": "navigate_to",
+                "started_env_step": int(before.get("env_step", self._env_steps)),
+                "completed_env_step": int(self._env_steps),
+                "checks": checks,
+                "passed": all(checks.values()),
+                "before_fingerprints": before_fingerprints,
+                "after_fingerprints": after_fingerprints,
+            }
         )
-        paths: dict[str, str] = {}
-        groups: set[str] = set()
-        for label, camera in (
-            ("head", "head"),
-            ("held_wrist", f"{context.get('held_hand')}_wrist"),
-            ("press_wrist", f"{context.get('press_hand')}_wrist"),
-        ):
-            observed = self.observe(camera)
-            image = observed.get("_image_bytes")
-            if not isinstance(image, bytes):
-                raise RuntimeError(f"pre-press review missing {camera} PNG")
-            group = (observed.get("capture_group") or {}).get("id")
-            frame_id = observed.get("frame_id")
-            frame = self._frame_cache.get_current(camera, str(frame_id))
-            if int(frame.step_index) != int(self._env_steps):
-                raise RuntimeError(
-                    f"pre-press review {camera} is not from the current env step"
-                )
-            if not isinstance(group, str) or not group:
-                raise RuntimeError(f"pre-press review {camera} omitted capture group")
-            groups.add(group)
-            target = review_dir / f"{label}.png"
-            _write_bytes_atomic(target, image)
-            paths[label] = str(target)
-        if len(groups) != 1:
-            raise RuntimeError(
-                "pre-press three-view review is not capture synchronized"
-            )
-        return paths, next(iter(groups))
 
     @staticmethod
-    def _persist_prepress_motion_record(motion: dict[str, Any]) -> None:
-        trace_path = Path(str(motion.get("trace_path", "")))
-        if not trace_path.is_file():
-            return
-        try:
-            payload = json.loads(trace_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        if not isinstance(payload, dict):
-            return
-        payload["motion"] = _wire_safe(motion)
-        _write_json_atomic(trace_path, payload)
+    def _public_navigation_isolation(value: Any) -> dict[str, Any]:
+        """Whitelist base-isolation evidence without target or path geometry."""
 
-    def _prepress_gate_binding(
-        self, *, allow_expired: bool = False
-    ) -> dict[str, Any] | None:
-        gate = self._prepress_gate
-        if not isinstance(gate, dict) or gate.get("env_step") != self._env_steps:
-            return None
-        binding = {
-            key: gate.get(key)
-            for key in (
-                "face_class",
-                "button_visible",
-                "frame_id",
-                "capture_group_id",
-                "camera",
-                "resolved_camera",
-                "env_step",
-                "gate_id",
-            )
+        if not isinstance(value, dict):
+            return {
+                "available": False,
+                "ok": False,
+                "stop_reason": "navigation_isolation_feedback_unavailable",
+            }
+        public: dict[str, Any] = {}
+        for field in ("available", "ok"):
+            if isinstance(value.get(field), bool):
+                public[field] = value[field]
+        if value.get("mode") == "base_only":
+            public["mode"] = "base_only"
+        if isinstance(value.get("checks_performed"), int) and not isinstance(
+            value.get("checks_performed"), bool
+        ):
+            public["checks_performed"] = int(value["checks_performed"])
+        if isinstance(value.get("reason"), str):
+            public["reason"] = value["reason"]
+
+        check_names = {
+            "base_z_locked",
+            "base_roll_pitch_locked",
+            "trunk_locked",
+            "left_arm_locked",
+            "right_arm_locked",
+            "left_gripper_command_locked",
+            "right_gripper_command_locked",
+            "left_attachment_identity_unchanged",
+            "right_attachment_identity_unchanged",
         }
-        resolved_camera = binding.get("resolved_camera")
-        frame_id = binding.get("frame_id")
-        capture_group_id = binding.get("capture_group_id")
-        if not (resolved_camera and frame_id and capture_group_id):
-            return None
-        try:
-            current = (
-                self._frame_cache.latest(str(resolved_camera))
-                if allow_expired
-                else self._frame_cache.get_current(str(resolved_camera), str(frame_id))
-            )
-        except CameraGeometryError:
-            return None
-        if (
-            int(current.step_index) != int(self._env_steps)
-            or current.frame_id != frame_id
-            or current.capture_group_id != capture_group_id
-        ):
-            return None
-        projection = self._prepress_projection
-        if (
-            isinstance(projection, dict)
-            and projection.get("env_step") == self._env_steps
-            and projection.get("gate_id") == gate.get("gate_id")
-            and projection.get("frame_id") == gate.get("frame_id")
-            and projection.get("capture_group_id") == capture_group_id
-        ):
-            binding["projection_id"] = projection.get("projection_id")
-        return binding
+        checks = value.get("checks")
+        if isinstance(checks, dict):
+            public["checks"] = {
+                key: checks[key]
+                for key in check_names
+                if isinstance(checks.get(key), bool)
+            }
 
-    def _prepress_plan_signature(
+        scalar_groups = {
+            "max_observed": {
+                "base_z_drift_m",
+                "base_roll_pitch_drift_rad",
+                "trunk_drift_rad",
+                "left_arm_drift_rad",
+                "right_arm_drift_rad",
+                "left_gripper_command_drift",
+                "right_gripper_command_drift",
+            },
+            "thresholds": {
+                "base_z_m",
+                "base_roll_pitch_rad",
+                "articulation_rad",
+                "gripper_command",
+            },
+        }
+        for group_name, allowed_fields in scalar_groups.items():
+            group = value.get(group_name)
+            if not isinstance(group, dict):
+                continue
+            sanitized_group: dict[str, float] = {}
+            for field in allowed_fields:
+                item = group.get(field)
+                if isinstance(item, (int, float)) and not isinstance(item, bool):
+                    numeric = float(item)
+                    if np.isfinite(numeric):
+                        sanitized_group[field] = numeric
+            public[group_name] = sanitized_group
+
+        public.setdefault("available", False)
+        public.setdefault("ok", False)
+        if public["available"] is not True:
+            public.setdefault("reason", "navigation_isolation_feedback_unavailable")
+        return _wire_safe(public)
+
+    def _analytic_public_result(
         self,
+        result: dict[str, Any],
         *,
-        role: str,
-        target: np.ndarray,
-        quaternion: np.ndarray,
-        gate_binding: dict[str, Any] | None,
-        goal_binding: dict[str, Any] | None = None,
-    ) -> str:
-        context = self._prepress_context or {}
-        payload = {
-            "checkpoint_sha256": context.get("checkpoint_sha256"),
-            "env_step": int(self._env_steps),
-            "role": role,
-            "target_xyz": np.asarray(target, dtype=np.float64).tolist(),
-            "target_quat_xyzw": np.asarray(quaternion, dtype=np.float64).tolist(),
-            "gate_binding": gate_binding,
-            "goal_binding": goal_binding,
-        }
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-
-    def _prepress_move_to_candidate(
-        self,
-        target_xyz: Any,
-        target_quat_xyzw: Any,
-        plan_only: bool = False,
-        timeout_s: float = 90.0,
-        role: str = "held",
-        *,
-        goal_binding: dict[str, Any] | None = None,
-        candidate_metadata: dict[str, Any] | None = None,
-        press_observation_rotation: bool = False,
+        primitive: str,
+        requested_hand: str,
+        resolved_hand: str,
+        hand_selection_source: str,
+        visual_hand_evidence: dict[str, Any],
+        attachment_before: dict[str, Any],
     ) -> dict[str, Any]:
-        """Plan one resolved EEF candidate while closing the held gripper."""
+        """Attach common selection and isolation evidence to a planner result."""
 
-        self._assert_prepress_checkpoint_bound()
-        context = self._prepress_context
-        assert isinstance(context, dict)
-        if role not in {"held", "press"}:
-            raise ValueError("pre-press role must be 'held' or 'press'")
-        if press_observation_rotation and role != "press":
-            raise ValueError(
-                "press_observation_rotation is valid only for role='press'"
-            )
-        if press_observation_rotation and goal_binding is not None:
-            raise ValueError(
-                "press observation rotation cannot carry a button goal binding"
-            )
-        if self._base_controller_mode != "position":
-            raise RuntimeError("pre-press motion requires position-base controllers")
-        target = np.asarray(target_xyz, dtype=np.float64).reshape(3)
-        quat = np.asarray(target_quat_xyzw, dtype=np.float64).reshape(4)
-        if (
-            not np.isfinite(target).all()
-            or not np.isfinite(quat).all()
-            or np.linalg.norm(quat) <= 1e-9
+        attachment_receipt = self._attachment_postcondition_receipt(
+            primitive=primitive,
+            selected_hand=resolved_hand,
+            before=attachment_before,
+        )
+        result = dict(result)
+        metrics = result.get("metrics")
+        metrics = dict(metrics) if isinstance(metrics, dict) else {}
+        single_arm_isolation = metrics.get("single_arm_isolation")
+        whole_body_execution = metrics.get("whole_body_execution")
+        uses_whole_body = (
+            primitive in {"move_to", "rotate_wrist", "press"}
+            and metrics.get("motion_scope") == "whole_body"
+        )
+        if not isinstance(single_arm_isolation, dict) and not uses_whole_body:
+            single_arm_isolation = {
+                "available": False,
+                "ok": False,
+                "selected_hand": resolved_hand,
+                "mode": (
+                    "gripper_only" if primitive in {"open", "close"} else "arm_motion"
+                ),
+                "stop_reason": "single_arm_isolation_feedback_unavailable",
+            }
+        if isinstance(single_arm_isolation, dict):
+            metrics["single_arm_isolation"] = single_arm_isolation
+        if uses_whole_body and isinstance(whole_body_execution, dict):
+            metrics["whole_body_execution"] = whole_body_execution
+        metrics["attachment_isolation"] = attachment_receipt
+        result["metrics"] = metrics
+        if uses_whole_body and result.get("primitive_success") is True:
+            if (
+                not isinstance(whole_body_execution, dict)
+                or whole_body_execution.get("available") is not True
+                or whole_body_execution.get("ok") is not True
+            ):
+                result["primitive_success"] = False
+                result["stop_reason"] = (
+                    "whole_body_execution_feedback_unavailable"
+                    if not isinstance(whole_body_execution, dict)
+                    or whole_body_execution.get("available") is not True
+                    else "whole_body_execution_violation"
+                )
+        elif (
+            not isinstance(single_arm_isolation, dict)
+            or single_arm_isolation.get("available") is not True
+            or single_arm_isolation.get("ok") is not True
         ):
-            raise ValueError("pre-press target pose is invalid")
-        quat /= np.linalg.norm(quat)
-        preflight_stability = self._prepress_stability_snapshot()
-        if not preflight_stability["stable"]:
-            raise RuntimeError("radio is not stably held before pre-press move_to")
-        held, press = context["held_hand"], context["press_hand"]
-        active = held if role == "held" else press
-        locked = press if role == "held" else held
-        gate = self._prepress_gate
-        face_class = (
-            gate.get("face_class")
-            if isinstance(gate, dict) and gate.get("env_step") == self._env_steps
-            else None
-        )
-        gate_binding = self._prepress_gate_binding(
-            allow_expired=goal_binding is not None
-        )
-        if press_observation_rotation:
-            # Acquiring a press-wrist view must not depend on the very button
-            # gate/projection that the observation rotation is intended to
-            # make possible.  The motion remains bound to the exact role,
-            # target pose, checkpoint, env step, and certified trajectory.
-            face_class = None
-            gate_binding = None
-        if face_class is not None and gate_binding is None:
-            return {
-                "_finish": False,
-                "primitive_success": False,
-                "task_success": bool(_raw_success(self._last_info)),
-                "official_success_source": 'info["done"]["success"]',
-                "stop_reason": "visual_gate_stale_before_motion",
-                "held_hand": held,
-                "press_hand": press,
-                "active_role": role,
-                "active_hand": active,
-                "total_env_steps": int(self._env_steps),
-            }
-        if role == "press" and not press_observation_rotation:
-            projection = self._prepress_projection
-            if not (
-                face_class == BUTTON_FACE_CLASS
-                and isinstance(gate_binding, dict)
-                and isinstance(projection, dict)
-                and projection.get("env_step") == self._env_steps
-                and projection.get("gate_id") == gate.get("gate_id")
-                and projection.get("frame_id") == gate.get("frame_id")
-                and projection.get("capture_group_id") == gate.get("capture_group_id")
-            ):
-                return {
-                    "_finish": False,
-                    "primitive_success": False,
-                    "task_success": bool(_raw_success(self._last_info)),
-                    "official_success_source": 'info["done"]["success"]',
-                    "stop_reason": "press_staging_requires_fresh_button_projection",
-                    "held_hand": held,
-                    "press_hand": press,
-                    "active_role": role,
-                    "active_hand": active,
-                    "total_env_steps": int(self._env_steps),
-                }
-        direct_alignment = None
-        if role == "held" and face_class == CLEAR_SLOTTED_BACK_FACE_CLASS:
-            if bool(getattr(self, "_prepress_coarse_flip_used", False)):
-                return {
-                    "_finish": False,
-                    "primitive_success": False,
-                    "task_success": bool(_raw_success(self._last_info)),
-                    "official_success_source": 'info["done"]["success"]',
-                    "stop_reason": "coarse_back_to_front_flip_already_used",
-                    "held_hand": held,
-                    "press_hand": press,
-                    "active_role": role,
-                    "active_hand": active,
-                    "total_env_steps": int(self._env_steps),
-                }
-            world_held = pose_matrix_xyzw(
-                preflight_stability["held_eef_position_world"],
-                preflight_stability["held_eef_quat_xyzw"],
+            result["primitive_success"] = False
+            result["stop_reason"] = (
+                "single_arm_isolation_feedback_unavailable"
+                if not isinstance(single_arm_isolation, dict)
+                or single_arm_isolation.get("available") is not True
+                else "single_arm_isolation_violation"
             )
-            world_radio = pose_matrix_xyzw(
-                preflight_stability["radio_position_world"],
-                preflight_stability["radio_quat_xyzw"],
-            )
-            held_to_radio = np.linalg.inv(world_held) @ world_radio
-            direct_alignment = direct_back_to_front_alignment(
-                target_held_pose=pose_matrix_xyzw(target, quat),
-                held_to_radio_transform=held_to_radio,
-                press_eef_position_world=preflight_stability[
-                    "press_eef_position_world"
-                ],
-            )
-        if goal_binding is None:
-            authorization = authorize_prepress_motion(
-                role=role,
-                current_xyz=preflight_stability[f"{role}_eef_position_world"],
-                current_quat_xyzw=preflight_stability[f"{role}_eef_quat_xyzw"],
-                target_xyz=target,
-                target_quat_xyzw=quat,
-                face_class=face_class,
-                direct_back_alignment=direct_alignment,
-                press_observation_rotation=press_observation_rotation,
-            )
-        else:
-            current_xyz = np.asarray(
-                preflight_stability[f"{role}_eef_position_world"],
-                dtype=np.float64,
-            )
-            authorization = {
-                "allowed": True,
-                "policy": "button_goal_candidate",
-                "role": role,
-                "face_class": face_class or "BUTTON_GOAL",
-                "translation_m": float(np.linalg.norm(target - current_xyz)),
-                "rotation_rad": _quaternion_angle_rad(
-                    preflight_stability[f"{role}_eef_quat_xyzw"], quat
-                ),
-                "z_increase_m": float(target[2] - current_xyz[2]),
-                "requires_plan_only_first": True,
-                "goal_binding": _wire_safe(goal_binding),
-                "candidate_id": (candidate_metadata or {}).get("candidate_id"),
-            }
-        if not authorization["allowed"]:
-            return {
-                "_finish": False,
-                "primitive_success": False,
-                "task_success": bool(_raw_success(self._last_info)),
-                "official_success_source": 'info["done"]["success"]',
-                "stop_reason": "search_motion_too_large_for_visual_gate",
-                "held_hand": held,
-                "press_hand": press,
-                "active_role": role,
-                "active_hand": active,
-                "target_pose": {
-                    "position": target.tolist(),
-                    "quat_xyzw": quat.tolist(),
-                },
-                "motion_authorization": _wire_safe(authorization),
-                "total_env_steps": int(self._env_steps),
-            }
-        plan_signature = self._prepress_plan_signature(
-            role=role,
-            target=target,
-            quaternion=quat,
-            gate_binding=gate_binding,
-            goal_binding=goal_binding,
-        )
-        certificate: dict[str, Any] | None = None
-        if not plan_only:
-            certificate = getattr(self, "_prepress_plan_certificate", None)
-            self._prepress_plan_certificate = None
-            if (
-                not isinstance(certificate, dict)
-                or certificate.get("signature") != plan_signature
-            ):
-                return {
-                    "_finish": False,
-                    "primitive_success": False,
-                    "task_success": bool(_raw_success(self._last_info)),
-                    "official_success_source": 'info["done"]["success"]',
-                    "stop_reason": "matching_plan_only_certificate_required",
-                    "held_hand": held,
-                    "press_hand": press,
-                    "active_role": role,
-                    "active_hand": active,
-                    "target_pose": {
-                        "position": target.tolist(),
-                        "quat_xyzw": quat.tolist(),
-                    },
-                    "motion_authorization": _wire_safe(authorization),
-                    "total_env_steps": int(self._env_steps),
-                }
-            if authorization.get("policy") == "direct_back_to_front":
-                self._prepress_coarse_flip_used = True
-        planner = self._require_planner()
-        backend = planner.backend
-        radio, _table = self._resolve_handoff_targets()
-        root = getattr(radio, "root_link", None)
-        if root is None:
-            raise RuntimeError("radio root link is unavailable for attached collision")
-        reported_attached = backend.get_attached_object(held)
-        target_root = str(getattr(root, "prim_path", "")).rstrip("/")
-        expected_attachment_link = EEF_LINK_BY_HAND[held]
-        if reported_attached is not None:
-            reported_keys = (
-                set(reported_attached) if isinstance(reported_attached, dict) else set()
-            )
-            reported_root = (
-                reported_attached.get(expected_attachment_link)
-                if isinstance(reported_attached, dict)
-                else None
-            )
-            reported_root_path = str(getattr(reported_root, "prim_path", "")).rstrip(
-                "/"
-            )
-            if reported_keys != {expected_attachment_link} or not (
-                reported_root is root or reported_root_path == target_root
-            ):
-                raise RuntimeError(
-                    "radio attachment is not anchored exclusively to held EEF"
-                )
-        attached = {expected_attachment_link: root}
-        if plan_only:
-            plan = backend.plan_prepress_arm_trajectory(
-                hand=active,
-                target_xyz=target,
-                target_quat_xyzw=quat,
-                timeout_s=float(timeout_s),
-                attached_obj=attached,
-            )
-            if not plan.get("ok"):
-                return {
-                    "_finish": False,
-                    "primitive_success": False,
-                    "task_success": bool(_raw_success(self._last_info)),
-                    "official_success_source": 'info["done"]["success"]',
-                    "stop_reason": str(plan.get("stop_reason", "curobo_plan_failed")),
-                    "held_hand": held,
-                    "press_hand": press,
-                    "active_role": role,
-                    "active_hand": active,
-                    "target_pose": {
-                        "position": target.tolist(),
-                        "quat_xyzw": quat.tolist(),
-                    },
-                    "motion_authorization": _wire_safe(authorization),
-                    "planner_metrics": _wire_safe(plan.get("metrics", {})),
-                    "total_env_steps": int(self._env_steps),
-                }
-            q_path = np.asarray(plan.get("joint_trajectory"), dtype=np.float64)
-        else:
-            assert isinstance(certificate, dict)
-            q_path = np.asarray(certificate.get("_joint_trajectory"), dtype=np.float64)
-        robot = self._robot()
-        if robot is None or q_path.ndim != 2:
-            raise RuntimeError("pre-press cuRobo trajectory is invalid")
-        initial_q = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(-1)
-        if q_path.shape[1] != initial_q.size or not np.isfinite(q_path).all():
-            raise RuntimeError("pre-press cuRobo trajectory q layout is invalid")
-        if not plan_only:
-            assert isinstance(certificate, dict)
-            certified_start = np.asarray(
-                certificate.get("_start_joint_positions"), dtype=np.float64
-            ).reshape(-1)
-            trajectory_digest = hashlib.sha256(
-                np.ascontiguousarray(q_path).tobytes()
-            ).hexdigest()
-            if (
-                certified_start.shape != initial_q.shape
-                or not np.allclose(certified_start, initial_q, atol=1e-6, rtol=0.0)
-                or certificate.get("trajectory_sha256") != trajectory_digest
-            ):
-                raise RuntimeError(
-                    "certified pre-press trajectory or start state changed"
-                )
-        arm_idx = getattr(robot, "arm_control_idx", {}) or {}
-        base_lock_indices = list(
-            np.asarray(_numpy_tree(getattr(robot, "base_idx", [])), dtype=int).reshape(
-                -1
-            )
-        )
-        trunk_lock_indices = list(
-            np.asarray(
-                _numpy_tree(getattr(robot, "trunk_control_idx", [])), dtype=int
-            ).reshape(-1)
-        )
-        inactive_arm_indices = list(
-            np.asarray(_numpy_tree(arm_idx.get(locked, [])), dtype=int).reshape(-1)
-        )
-        if len(base_lock_indices) != 6:
-            raise RuntimeError("pre-press requires all six virtual base joints locked")
-        if len(trunk_lock_indices) != 4:
-            raise RuntimeError("pre-press requires all four trunk joints locked")
-        if len(inactive_arm_indices) != 7:
-            raise RuntimeError(
-                "pre-press requires all seven inactive arm joints locked"
-            )
-        raw_locked_indices = (
-            base_lock_indices + trunk_lock_indices + inactive_arm_indices
-        )
-        if (
-            len(set(raw_locked_indices)) != len(raw_locked_indices)
-            or min(raw_locked_indices, default=-1) < 0
-            or max(raw_locked_indices, default=-1) >= initial_q.size
-        ):
-            raise RuntimeError("pre-press locked joint indices are invalid")
-        locked_indices = sorted(raw_locked_indices)
-        planned_locked_drift = float(
-            np.max(np.abs(q_path[:, locked_indices] - initial_q[locked_indices]))
-        )
-        if planned_locked_drift > 1e-6:
-            raise RuntimeError(
-                "pre-press plan changed locked base, trunk, or inactive arm"
-            )
-        generator = backend._generator(kind="prepress_arm", hand=active)
-        collision = backend._check_q_trajectory_collisions(
-            generator, q_path, attached_obj=attached
-        )
-        if not collision.get("available") or collision.get("colliding", True):
-            raise RuntimeError(
-                "pre-press full attached-object path is not collision-free"
-            )
-        self._assert_prepress_checkpoint_bound()
-        self._prepress_round = int(getattr(self, "_prepress_round", 0)) + 1
-        round_index = self._prepress_round
-        trace_path = (
-            self._output_dir
-            / "state_checkpoints"
-            / f"prepress_motion_round_{round_index:03d}_trace.json"
-        )
-        video_path = (
-            self._output_dir / f"curobo_prepress_round_{round_index:03d}_episode.mp4"
-        )
-        if plan_only:
-            refreshed_gate_binding = self._prepress_gate_binding(
-                allow_expired=goal_binding is not None
-            )
-            if gate_binding is not None and refreshed_gate_binding != gate_binding:
-                self._prepress_plan_certificate = None
-                return {
-                    "_finish": False,
-                    "primitive_success": False,
-                    "task_success": bool(_raw_success(self._last_info)),
-                    "official_success_source": 'info["done"]["success"]',
-                    "stop_reason": "visual_gate_expired_during_plan_only",
-                    "active_role": role,
-                    "active_hand": active,
-                    "target_pose": {
-                        "position": target.tolist(),
-                        "quat_xyzw": quat.tolist(),
-                    },
-                    "total_env_steps": int(self._env_steps),
-                }
-            trajectory_digest = hashlib.sha256(
-                np.ascontiguousarray(q_path).tobytes()
-            ).hexdigest()
-            self._prepress_plan_certificate = {
-                "signature": plan_signature,
-                "env_step": int(self._env_steps),
-                "role": role,
-                "target_pose": {
-                    "position": target.tolist(),
-                    "quat_xyzw": quat.tolist(),
-                },
-                "gate_binding": gate_binding,
-                "goal_binding": deepcopy(goal_binding),
-                "selected_candidate": deepcopy(candidate_metadata),
-                "trajectory_sha256": trajectory_digest,
-                "collision_report": _wire_safe(collision),
-                "_joint_trajectory": q_path.copy(),
-                "_start_joint_positions": initial_q.copy(),
-            }
-            public_certificate = {
-                key: value
-                for key, value in self._prepress_plan_certificate.items()
-                if not key.startswith("_")
-            }
-            return {
-                "_finish": False,
-                "primitive_success": True,
-                "task_success": bool(_raw_success(self._last_info)),
-                "official_success_source": 'info["done"]["success"]',
-                "stop_reason": "prepress_plan_certified",
-                "plan_only": True,
-                "active_role": role,
-                "active_hand": active,
-                "locked_hand": locked,
-                "waypoints": int(len(q_path)),
-                "target_pose": {
-                    "position": target.tolist(),
-                    "quat_xyzw": quat.tolist(),
-                },
-                "motion_authorization": _wire_safe(authorization),
-                "plan_certificate": _wire_safe(public_certificate),
-                "button_goal": _wire_safe(goal_binding),
-                "selected_candidate": _wire_safe(candidate_metadata),
-                "cuRobo_collision_report": _wire_safe(collision),
-                "total_env_steps": int(self._env_steps),
-            }
-        self._gripper_latch[held] = -1.0
-        self.start_video_segment(video_path)
-        trace: list[dict[str, Any]] = []
-        start_step = int(self._env_steps)
-        stop_reason: str | None = None
-        deadline = time.monotonic() + float(timeout_s)
-        for index, waypoint in enumerate(q_path, start=1):
-            if time.monotonic() >= deadline:
-                stop_reason = "timeout"
-                break
-            action = np.asarray(
-                backend.joint_target_to_action(waypoint, hand=None), dtype=np.float32
-            ).reshape(23)
-            action[ENV_ACTION_SEGMENTS[f"{held}_gripper"]] = -1.0
-            action[ENV_ACTION_SEGMENTS[f"{press}_gripper"]] = float(
-                self._gripper_latch[press]
-            )
-            step_obs, _reward, term, trunc, infos = self._env._direct_process.step_env(
-                __import__("torch").as_tensor(action).reshape(1, 23), need_obs=True
-            )
-            self._env_steps += 1
-            self._last_info = _numpy_tree(infos[0])
-            observation = _single_observation(self._env._wrap_obs(step_obs))
-            self._last_observation = observation
-            self._record_rgbd_frames(step_obs, observation)
-            self._append_video(observation)
-            sample = {
-                "waypoint": index,
-                "env_step": int(self._env_steps),
-                "held_gripper_command": -1.0,
-                "official_task_success": bool(_raw_success(self._last_info)),
-            }
-            trace.append(sample)
-            _write_json_atomic(trace_path, trace)
-            if _scalar_bool(term) or _scalar_bool(trunc) or _raw_done(self._last_info):
-                stop_reason = "episode_stopped"
-            if stop_reason is not None:
-                break
-        self._finalize_video_segment()
-        self._video_sealed = True
-        visual_paths, capture_group = self._capture_prepress_views(
-            round_index=round_index
-        )
-        self._assert_prepress_checkpoint_bound()
-        final_stability = self._prepress_stability_snapshot()
-        final_q = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(1, -1)
-        actual_locked_drift = float(
-            np.max(np.abs(final_q[0, locked_indices] - initial_q[locked_indices]))
-        )
-        endpoint_collision = backend._check_q_trajectory_collisions(
-            generator, final_q, attached_obj=attached
-        )
-        final_pose = backend.get_eef_pose(active)
-        position_error = (
-            float(np.linalg.norm(np.asarray(final_pose[0]) - target))
-            if final_pose
-            else float("inf")
-        )
-        orientation_error = (
-            _quaternion_angle_rad(final_pose[1], quat) if final_pose else float("inf")
-        )
-        success = bool(
-            stop_reason is None
-            and position_error <= 0.02
-            and orientation_error <= 0.087
-            and final_stability["stable"]
-            and actual_locked_drift <= 0.02
-            and endpoint_collision.get("available") is True
-            and endpoint_collision.get("colliding") is False
-        )
-        if stop_reason is None and not final_stability["stable"]:
-            stop_reason = "endpoint_radio_hold_or_press_clear_failed"
-        if stop_reason is None and actual_locked_drift > 0.02:
-            stop_reason = "locked_chain_drift"
-        if stop_reason is None and (
-            not endpoint_collision.get("available")
-            or endpoint_collision.get("colliding", True)
-        ):
-            stop_reason = "endpoint_collision"
-        if stop_reason is None and not success:
-            stop_reason = "active_eef_target_not_reached"
-        motion = {
-            "motion_id": f"prepress_motion_{round_index:03d}",
-            "round": round_index,
-            "primitive_success": bool(success),
-            "stop_reason": f"{role}_hand_pose_reached" if success else stop_reason,
-            "held_hand": held,
-            "press_hand": press,
-            "active_role": role,
-            "active_hand": active,
-            "locked_hand": locked,
-            "target_pose": {"position": target.tolist(), "quat_xyzw": quat.tolist()},
-            "button_goal": _wire_safe(goal_binding),
-            "selected_candidate": _wire_safe(candidate_metadata),
-            "motion_authorization": _wire_safe(authorization),
-            "start_env_step": start_step,
-            "end_env_step": int(self._env_steps),
-            "executed_steps": len(trace),
-            "position_error_m": position_error,
-            "orientation_error_rad": orientation_error,
-            "planned_locked_drift_rad": planned_locked_drift,
-            "actual_locked_drift": actual_locked_drift,
-            "collision_report": collision,
-            "endpoint_collision_report": endpoint_collision,
-            "trace_path": str(trace_path),
-            "video_path": str(video_path),
-            "visual_review_paths": visual_paths,
-            "capture_group_id": capture_group,
-            "public_visual_review": {},
-            "three_view_observed_by_vlm": False,
-            "visual_review_pass": False,
-            "visual_review_verdict": "pending_post_motion_button_gate",
-            "final_stability": final_stability,
-            "next_search_rotate_wrist_candidates": self._prepress_search_rotations(
-                final_stability
-            ),
-        }
-        self._prepress_motion = motion
-        self._prepress_plan_certificate = None
-        self._prepress_gate = self._prepress_projection = self._prepress_geometry = None
-        _write_json_atomic(trace_path, {"motion": motion, "waypoints": trace})
-        return {
-            "_finish": False,
-            "primitive_success": bool(success),
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "stop_reason": motion["stop_reason"],
-            **_wire_safe(motion),
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def prepress_move_to(
-        self,
-        button_goal: dict[str, Any],
-        plan_only: bool = False,
-        timeout_s: float = 90.0,
-        role: str = "held",
-    ) -> dict[str, Any]:
-        """Resolve a button-space goal, search EEF candidates, then move once."""
-
-        self._assert_prepress_checkpoint_bound()
-        if role not in {"held", "press"}:
-            raise ValueError("pre-press role must be 'held' or 'press'")
-        if not isinstance(button_goal, dict):
-            raise ValueError("button_goal must be a dictionary")
-        expected_kind = "held_button_alignment" if role == "held" else "press_staging"
-        if button_goal.get("kind") != expected_kind:
-            raise ValueError(
-                f"role={role!r} requires button_goal.kind={expected_kind!r}"
-            )
-        canonical_goal = json.loads(
-            json.dumps(button_goal, sort_keys=True, separators=(",", ":"))
-        )
-        if role == "held":
-            numeric_defaults = {
-                "side_view_tolerance_deg": 15.0,
-                "face_toward_tolerance_deg": 30.0,
-                "position_slack_m": 0.04,
-                "minimum_table_clearance_m": 0.12,
-            }
-            if (
-                canonical_goal.get("head_view") != "side"
-                or canonical_goal.get("face_toward") != "press"
-            ):
-                raise ValueError(
-                    "held_button_alignment requires head_view='side' and "
-                    "face_toward='press'"
-                )
-            for name, default in numeric_defaults.items():
-                canonical_goal.setdefault(name, default)
-            canonical_goal.setdefault("candidate_budget", 12)
-            if "toward_robot_m" not in canonical_goal:
-                raise ValueError("held_button_alignment requires toward_robot_m")
-            numeric_bounds = {
-                "toward_robot_m": (0.0, 0.30),
-                "side_view_tolerance_deg": (1e-9, 30.0),
-                "face_toward_tolerance_deg": (1e-9, 45.0),
-                "position_slack_m": (0.0, 0.10),
-                "minimum_table_clearance_m": (0.08, 0.25),
-            }
-            for name, (lower, upper) in numeric_bounds.items():
-                value = canonical_goal.get(name)
-                if isinstance(value, bool):
-                    raise ValueError(f"button_goal.{name} must be numeric")
-                number = float(value)
-                if not np.isfinite(number) or not lower <= number <= upper:
-                    raise ValueError(
-                        f"button_goal.{name} must be in [{lower}, {upper}]"
-                    )
-                canonical_goal[name] = number
-        else:
-            canonical_goal.setdefault("standoff_m", 0.055)
-            canonical_goal.setdefault("candidate_budget", 8)
-            projection_id = canonical_goal.get("projection_id")
-            if not isinstance(projection_id, str) or not projection_id.strip():
-                raise ValueError("press_staging requires projection_id")
-            alignment_phase = canonical_goal.get("alignment_phase", "final")
-            if alignment_phase not in {"final", "observation"}:
-                raise ValueError(
-                    "button_goal.alignment_phase must be final or observation"
-                )
-            standoff = canonical_goal.get("standoff_m")
-            if isinstance(standoff, bool):
-                raise ValueError("button_goal.standoff_m must be numeric")
-            standoff = float(standoff)
-            standoff_max = (
-                PREPRESS_AXIAL_STANDOFF_MAX_M
-                if alignment_phase == "final"
-                else PRESS_STAGING_AXIAL_STANDOFF_MAX_M
-            )
-            if (
-                not np.isfinite(standoff)
-                or not PREPRESS_AXIAL_STANDOFF_MIN_M <= standoff <= standoff_max
-            ):
-                raise ValueError(
-                    "button_goal.standoff_m must be in "
-                    f"[0.03, {standoff_max:.2f}] for {alignment_phase} alignment"
-                )
-            canonical_goal["alignment_phase"] = alignment_phase
-            canonical_goal["standoff_m"] = standoff
-        budget = canonical_goal.get("candidate_budget")
-        max_budget = 32 if role == "held" else 16
-        if isinstance(budget, bool) or not isinstance(budget, int):
-            raise ValueError("button_goal.candidate_budget must be an integer")
-        if not 1 <= budget <= max_budget:
-            raise ValueError(
-                f"button_goal.candidate_budget must be in [1, {max_budget}]"
-            )
-        goal_digest = hashlib.sha256(
-            json.dumps(canonical_goal, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-
-        if not plan_only:
-            certificate = getattr(self, "_prepress_plan_certificate", None)
-            if not isinstance(certificate, dict):
-                return {
-                    "_finish": False,
-                    "primitive_success": False,
-                    "task_success": bool(_raw_success(self._last_info)),
-                    "official_success_source": 'info["done"]["success"]',
-                    "stop_reason": "matching_button_goal_plan_required",
-                    "active_role": role,
-                    "total_env_steps": int(self._env_steps),
-                }
-            goal_binding = certificate.get("goal_binding")
-            candidate = certificate.get("selected_candidate")
-            target_pose = certificate.get("target_pose")
-            if (
-                not isinstance(goal_binding, dict)
-                or goal_binding.get("goal_digest") != goal_digest
-                or goal_binding.get("role") != role
-                or not isinstance(candidate, dict)
-                or not isinstance(target_pose, dict)
-            ):
-                self._prepress_plan_certificate = None
-                return {
-                    "_finish": False,
-                    "primitive_success": False,
-                    "task_success": bool(_raw_success(self._last_info)),
-                    "official_success_source": 'info["done"]["success"]',
-                    "stop_reason": "button_goal_changed_after_plan_only",
-                    "active_role": role,
-                    "total_env_steps": int(self._env_steps),
-                }
-            return self._prepress_move_to_candidate(
-                role=role,
-                target_xyz=target_pose["position"],
-                target_quat_xyzw=target_pose["quat_xyzw"],
-                plan_only=False,
-                timeout_s=timeout_s,
-                goal_binding=goal_binding,
-                candidate_metadata=candidate,
-            )
-
-        self._prepress_plan_certificate = None
-        context = self._prepress_context
-        assert isinstance(context, dict)
-        stability = self._prepress_stability_snapshot()
-        if not stability["stable"]:
-            raise RuntimeError("radio is not stably held before button-goal planning")
-        held, press = context["held_hand"], context["press_hand"]
-        alignment_phase = canonical_goal.get("alignment_phase", "joint")
-        if role == "held" and alignment_phase == "normal_refine":
-            frame = self._frame_cache.latest("head")
-            if int(frame.step_index) != int(self._env_steps):
-                raise RuntimeError(
-                    "normal_refine requires a fresh current head observation"
-                )
-            gate = {
-                "camera": "head",
-                "resolved_camera": "head",
-                "frame_id": frame.frame_id,
-                "capture_group_id": frame.capture_group_id,
-                "env_step": int(self._env_steps),
-                "gate_id": hashlib.sha256(
-                    f"normal_refine:{frame.frame_id}:{self._env_steps}".encode()
-                ).hexdigest()[:24],
-                "face_class": "MODEL_PRIOR_BUTTON_FACE",
-                "button_visible": False,
-                "provenance": "radio_local_button_model_after_position_first",
-            }
-            projection = None
-        else:
-            gate = self._prepress_gate
-            if not isinstance(gate, dict) or gate.get("env_step") != self._env_steps:
-                raise RuntimeError("a current button visual gate is required")
-            frame = self._frame_cache.get_current(
-                str(gate["resolved_camera"]), str(gate["frame_id"])
-            )
-            projection = self._prepress_projection
-        attempts: list[dict[str, Any]] = []
-
-        if role == "held":
-            if gate.get("camera") != "head" or gate.get("resolved_camera") != "head":
-                raise RuntimeError("held button alignment requires a fresh head gate")
-            if alignment_phase == "normal_refine":
-                radio_rotation = pose_matrix_xyzw(
-                    [0.0, 0.0, 0.0], stability["radio_quat_xyzw"]
-                )[:3, :3]
-                button_center = (
-                    np.asarray(stability["radio_position_world"], dtype=np.float64)
-                    + radio_rotation
-                    @ np.asarray(RADIO_LOCAL_BUTTON_CENTER_M, dtype=np.float64)
-                ).tolist()
-                button_normal = (
-                    radio_rotation
-                    @ np.asarray(RADIO_LOCAL_BUTTON_FACE_NORMAL, dtype=np.float64)
-                ).tolist()
-                geometry_source = "radio_local_button_prior_normal_refine"
-            elif gate.get("face_class") == BUTTON_FACE_CLASS:
-                if not (
-                    isinstance(projection, dict)
-                    and projection.get("env_step") == self._env_steps
-                    and projection.get("gate_id") == gate.get("gate_id")
-                    and projection.get("frame_id") == gate.get("frame_id")
-                    and projection.get("capture_group_id")
-                    == gate.get("capture_group_id")
-                ):
-                    raise RuntimeError(
-                        "visible-button alignment requires a fresh head projection"
-                    )
-                button_center = projection["button_center_world"]
-                button_normal = projection["button_normal_world"]
-                geometry_source = "fresh_head_button_projection"
-            elif gate.get("face_class") == CLEAR_SLOTTED_BACK_FACE_CLASS:
-                radio_rotation = pose_matrix_xyzw(
-                    [0.0, 0.0, 0.0], stability["radio_quat_xyzw"]
-                )[:3, :3]
-                button_center = (
-                    np.asarray(stability["radio_position_world"], dtype=np.float64)
-                    + radio_rotation
-                    @ np.asarray(RADIO_LOCAL_BUTTON_CENTER_M, dtype=np.float64)
-                ).tolist()
-                button_normal = (
-                    radio_rotation
-                    @ np.asarray(RADIO_LOCAL_BUTTON_FACE_NORMAL, dtype=np.float64)
-                ).tolist()
-                geometry_source = "clear_slotted_opposite_face_prior"
-            else:
-                raise RuntimeError(
-                    "held button alignment requires BUTTON_FACE or clear slotted back face"
-                )
-
-            robot = self._robot()
-            if robot is None:
-                raise RuntimeError("robot pose is unavailable for toward_robot goal")
-            robot_position, _robot_quat = self._object_pose(robot)
-            button_center_array = np.asarray(button_center, dtype=np.float64)
-            chest_direction = (
-                np.asarray(robot_position, dtype=np.float64) - button_center_array
-            )
-            chest_direction[2] = 0.0
-            chest_norm = float(np.linalg.norm(chest_direction))
-            if chest_norm <= 1e-9:
-                raise RuntimeError("button is coincident with robot XY reference")
-            chest_direction /= chest_norm
-            head_axis = frame.camera_to_world[:3, :3] @ np.asarray(
-                [0.0, 0.0, -1.0], dtype=np.float64
-            )
-            head_target_uv = canonical_goal.get("head_target_uv")
-            if head_target_uv is None:
-                translation_direction = chest_direction
-                translation_m = float(canonical_goal["toward_robot_m"])
-                nominal_button = (
-                    button_center_array + translation_m * translation_direction
-                )
-                translation_source = "toward_robot"
-            else:
-                if gate.get("face_class") != BUTTON_FACE_CLASS:
-                    raise RuntimeError(
-                        "head_target_uv requires a directly visible button projection"
-                    )
-                u, v = (float(head_target_uv[0]), float(head_target_uv[1]))
-                if not (0.0 <= u < frame.intrinsics.width) or not (
-                    0.0 <= v < frame.intrinsics.height
-                ):
-                    raise RuntimeError("head_target_uv is outside the head image")
-                world_to_camera = np.linalg.inv(frame.camera_to_world)
-                current_button_camera = transform_point(
-                    world_to_camera, button_center_array
-                )
-                depth_m = -float(current_button_camera[2])
-                target_button_camera = camera_point_from_pixel(
-                    frame.intrinsics,
-                    u=int(round(u)),
-                    v=int(round(v)),
-                    depth_m=depth_m,
-                )
-                if frame.correction_profile is not None:
-                    target_button_camera = frame.correction_profile.apply_camera_point(
-                        target_button_camera
-                    )
-                nominal_button = transform_point(
-                    frame.camera_to_world, target_button_camera
-                )
-                pixel_translation = nominal_button - button_center_array
-                translation_m = float(np.linalg.norm(pixel_translation))
-                if translation_m <= 1e-9:
-                    translation_direction = chest_direction
-                    translation_m = 0.0
-                else:
-                    translation_direction = pixel_translation / translation_m
-                translation_source = "head_button_center_pixel"
-            to_press = (
-                np.asarray(stability["press_eef_position_world"], dtype=np.float64)
-                - nominal_button
-            )
-            to_press_norm = float(np.linalg.norm(to_press))
-            if to_press_norm <= 1e-9:
-                raise RuntimeError("button goal is coincident with press EEF")
-            to_press /= to_press_norm
-            side_normal = to_press - np.dot(to_press, head_axis) * head_axis
-            side_norm = float(np.linalg.norm(side_normal))
-            if side_norm <= 1e-9:
-                fallback = np.asarray(button_normal, dtype=np.float64)
-                side_normal = fallback - np.dot(fallback, head_axis) * head_axis
-                side_norm = float(np.linalg.norm(side_normal))
-            if side_norm <= 1e-9:
-                for basis in np.eye(3):
-                    side_normal = basis - np.dot(basis, head_axis) * head_axis
-                    side_norm = float(np.linalg.norm(side_normal))
-                    if side_norm > 1e-9:
-                        break
-            side_normal /= side_norm
-            if np.dot(side_normal, to_press) < 0.0:
-                side_normal = -side_normal
-            slack = float(canonical_goal.get("position_slack_m", 0.04))
-            budget = int(canonical_goal.get("candidate_budget", 12))
-            clearance_lift = max(
-                0.0,
-                float(canonical_goal.get("minimum_table_clearance_m", 0.12))
-                - float(stability["air_gap_m"]),
-            )
-            lateral = np.asarray(
-                [-translation_direction[1], translation_direction[0], 0.0],
-                dtype=np.float64,
-            )
-            lateral_norm = float(np.linalg.norm(lateral))
-            if lateral_norm <= 1e-9:
-                lateral = np.asarray(
-                    [-chest_direction[1], chest_direction[0], 0.0],
-                    dtype=np.float64,
-                )
-                lateral_norm = float(np.linalg.norm(lateral))
-            lateral /= max(lateral_norm, 1e-9)
-            if head_target_uv is None:
-                position_options = [
-                    np.asarray([0.0, 0.0, clearance_lift]),
-                    slack * lateral + np.asarray([0.0, 0.0, clearance_lift]),
-                    -slack * lateral + np.asarray([0.0, 0.0, clearance_lift]),
-                    np.asarray([0.0, 0.0, clearance_lift + slack]),
-                    np.asarray([0.0, 0.0, max(0.0, clearance_lift - slack)]),
-                ]
-            else:
-                radius_px = float(canonical_goal.get("head_target_radius_px", 60.0))
-                diagonal_px = radius_px / np.sqrt(2.0)
-                pixel_offsets = [
-                    (0.0, 0.0),
-                    (-radius_px, 0.0),
-                    (radius_px, 0.0),
-                    (0.0, -radius_px),
-                    (0.0, radius_px),
-                    (-diagonal_px, -diagonal_px),
-                    (-diagonal_px, diagonal_px),
-                    (diagonal_px, -diagonal_px),
-                    (diagonal_px, diagonal_px),
-                ]
-                position_options = []
-                for du, dv in pixel_offsets:
-                    sample_u = int(round(float(head_target_uv[0]) + du))
-                    sample_v = int(round(float(head_target_uv[1]) + dv))
-                    if not (0 <= sample_u < frame.intrinsics.width) or not (
-                        0 <= sample_v < frame.intrinsics.height
-                    ):
-                        continue
-                    sample_camera = camera_point_from_pixel(
-                        frame.intrinsics,
-                        u=sample_u,
-                        v=sample_v,
-                        depth_m=depth_m,
-                    )
-                    if frame.correction_profile is not None:
-                        sample_camera = frame.correction_profile.apply_camera_point(
-                            sample_camera
-                        )
-                    sample_world = transform_point(frame.camera_to_world, sample_camera)
-                    position_options.append(
-                        sample_world
-                        - nominal_button
-                        + np.asarray([0.0, 0.0, clearance_lift])
-                    )
-                if not position_options:
-                    raise RuntimeError(
-                        "head_target_uv neighborhood is outside the image"
-                    )
-            alignment_phase = canonical_goal.get("alignment_phase", "joint")
-            roll_options = (
-                [0.0]
-                if alignment_phase == "position_first"
-                else [0.0, -30.0, 30.0, -60.0, 60.0, -90.0, 90.0, 180.0]
-            )
-            roll_count = min(
-                len(roll_options),
-                8 if alignment_phase == "normal_refine" else 3,
-                budget,
-            )
-            position_count = max(1, min(len(position_options), budget // roll_count))
-            while position_count * roll_count > budget:
-                position_count -= 1
-            internal_goal = {
-                "chest_direction_world": translation_direction.tolist(),
-                "chest_translation_m": translation_m,
-                "position_perturbations_world_m": [
-                    value.tolist() for value in position_options[:position_count]
-                ],
-                "orientation_perturbations_world_axis_angle": [
-                    [*side_normal.tolist(), float(np.deg2rad(value))]
-                    for value in roll_options[:roll_count]
-                ],
-                "normal_blend_factors": [1.0],
-                "orientation_goal": (
-                    "preserve_current"
-                    if alignment_phase == "position_first"
-                    else "side_to_press"
-                ),
-                "max_position_perturbation_m": max(
-                    float(np.linalg.norm(value)) for value in position_options
-                ),
-                "max_orientation_perturbation_rad": float(np.pi),
-                "max_face_to_press_angle_deg": float(
-                    canonical_goal.get("face_toward_tolerance_deg", 30.0)
-                ),
-                "max_press_approach_opposition_angle_deg": 180.0,
-                "target_head_side_angle_deg": 90.0,
-                "max_head_side_error_deg": float(
-                    canonical_goal.get("side_view_tolerance_deg", 15.0)
-                ),
-                "chest_translation_tolerance_m": (
-                    max(
-                        0.005,
-                        max(float(np.linalg.norm(value)) for value in position_options)
-                        + 0.005,
-                    )
-                    if head_target_uv is not None
-                    else 0.005
-                ),
-                "max_candidates": budget,
-            }
-            generated = generate_button_goal_pose_candidates(
-                world_held_transform=pose_matrix_xyzw(
-                    stability["held_eef_position_world"],
-                    stability["held_eef_quat_xyzw"],
-                ),
-                world_radio_transform=pose_matrix_xyzw(
-                    stability["radio_position_world"],
-                    stability["radio_quat_xyzw"],
-                ),
-                held_to_radio_transform=pose_matrix_xyzw(
-                    stability["relative_position_m"],
-                    stability["relative_quat_xyzw"],
-                ),
-                button_center_world=button_center,
-                button_normal_world=button_normal,
-                world_press_transform=pose_matrix_xyzw(
-                    stability["press_eef_position_world"],
-                    stability["press_eef_quat_xyzw"],
-                ),
-                goal=internal_goal,
-                head_optical_axis_world=head_axis,
-            )
-            candidates = [
-                {
-                    **candidate,
-                    "target_pose": candidate["target_held_eef_pose"],
-                    "head_target_uv": head_target_uv,
-                    "head_target_radius_px": canonical_goal.get(
-                        "head_target_radius_px"
-                    ),
-                    "alignment_phase": alignment_phase,
-                    "translation_source": translation_source,
-                }
-                for candidate in generated["candidates"]
-                if candidate["eligible"]
-            ][:budget]
-        else:
-            if not (
-                gate.get("face_class") == BUTTON_FACE_CLASS
-                and isinstance(projection, dict)
-                and projection.get("projection_id")
-                == canonical_goal.get("projection_id")
-                and projection.get("env_step") == self._env_steps
-                and projection.get("gate_id") == gate.get("gate_id")
-                and projection.get("camera") == "press_wrist"
-                and projection.get("resolved_camera") == f"{press}_wrist"
-            ):
-                raise RuntimeError(
-                    "press staging requires a fresh dynamic press-wrist button projection"
-                )
-            budget = int(canonical_goal.get("candidate_budget", 8))
-            world_press = pose_matrix_xyzw(
-                stability["press_eef_position_world"],
-                stability["press_eef_quat_xyzw"],
-            )
-            alignment_phase = canonical_goal.get("alignment_phase", "final")
-            generated = generate_press_staging_pose_candidates(
-                button_center_world=projection["button_center_world"],
-                button_normal_world=projection["button_normal_world"],
-                world_press_transform=world_press,
-                standoff_m=float(canonical_goal.get("standoff_m", 0.055)),
-                max_candidates=budget,
-                alignment_phase=alignment_phase,
-                eef_to_camera_transform=(
-                    np.linalg.inv(world_press) @ frame.camera_to_world
-                    if alignment_phase == "observation"
+        if attachment_receipt.get("passed") is not True:
+            result["primitive_success"] = False
+            result["stop_reason"] = "attachment_isolation_violation"
+        public = self._planner_public_result(result)
+        public.update(
+            {
+                "requested_hand": requested_hand,
+                "resolved_hand": resolved_hand,
+                "hand_selection_source": hand_selection_source,
+                "visual_hand_evidence": visual_hand_evidence,
+                "single_arm_isolation": (
+                    single_arm_isolation
+                    if isinstance(single_arm_isolation, dict)
                     else None
                 ),
-            )
-            geometry_source = (
-                "fresh_press_wrist_projection_camera_centered_observation"
-                if alignment_phase == "observation"
-                else "fresh_press_wrist_button_projection"
-            )
-            candidates = [
-                {
-                    **candidate,
-                    "target_pose": candidate["target_press_eef_pose"],
-                }
-                for candidate in generated["candidates"]
-                if candidate["eligible"]
-            ][:budget]
+                "whole_body_execution": (
+                    whole_body_execution
+                    if uses_whole_body and isinstance(whole_body_execution, dict)
+                    else None
+                ),
+            }
+        )
+        return public
 
-        grasp_binding = {
-            "radio_pose_world": stability["radio_position_world"],
-            "radio_quat_xyzw": stability["radio_quat_xyzw"],
-            "held_to_radio_position": stability["relative_position_m"],
-            "held_to_radio_quat_xyzw": stability["relative_quat_xyzw"],
-        }
-        goal_binding = {
-            "resolver_version": 1,
-            "role": role,
-            "goal": canonical_goal,
-            "goal_digest": goal_digest,
-            "geometry_source": geometry_source,
-            "gate_id": gate.get("gate_id"),
-            "projection_id": (
-                projection.get("projection_id")
-                if isinstance(projection, dict)
-                else None
-            ),
-            "frame_id": gate.get("frame_id"),
-            "capture_group_id": gate.get("capture_group_id"),
-            "env_step": int(self._env_steps),
-            "grasp_transform_sha256": hashlib.sha256(
-                json.dumps(
-                    grasp_binding, sort_keys=True, separators=(",", ":")
-                ).encode()
-            ).hexdigest(),
-        }
-        deadline = time.monotonic() + float(timeout_s)
-        for candidate in candidates:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.0:
-                attempts.append(
-                    {
-                        "candidate_id": candidate["candidate_id"],
-                        "primitive_success": False,
-                        "stop_reason": "candidate_search_timeout",
-                    }
-                )
-                break
-            target_pose = candidate["target_pose"]
-            result = self._prepress_move_to_candidate(
-                role=role,
-                target_xyz=target_pose["position"],
-                target_quat_xyzw=target_pose["quat_xyzw"],
-                plan_only=True,
-                timeout_s=remaining,
-                goal_binding=goal_binding,
-                candidate_metadata=candidate,
-            )
-            attempts.append(
-                {
-                    "candidate_id": candidate["candidate_id"],
-                    "primitive_success": bool(result.get("primitive_success")),
-                    "stop_reason": result.get("stop_reason"),
-                    "planner_metrics": result.get("planner_metrics"),
-                }
-            )
-            if result.get("primitive_success"):
-                certificate = self._prepress_plan_certificate
-                if isinstance(certificate, dict):
-                    certificate["candidate_attempts"] = deepcopy(attempts)
-                result.update(
-                    {
-                        "button_goal": _wire_safe(canonical_goal),
-                        "goal_binding": _wire_safe(goal_binding),
-                        "candidate_attempts": _wire_safe(attempts),
-                        "selected_candidate": _wire_safe(candidate),
-                    }
-                )
-                return result
-
-        self._prepress_plan_certificate = None
-        return {
-            "_finish": False,
-            "primitive_success": False,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "stop_reason": "button_goal_unreachable",
-            "active_role": role,
-            "held_hand": held,
-            "press_hand": press,
-            "button_goal": _wire_safe(canonical_goal),
-            "goal_binding": _wire_safe(goal_binding),
-            "candidate_count": len(candidates),
-            "candidate_attempts": _wire_safe(attempts),
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def prepress_rotate_wrist(
+    def _motion_target(
         self,
-        target_quat_xyzw: Any | None = None,
-        relative_axis_angle: Any | None = None,
-        frame: str = "eef",
-        plan_only: bool = False,
-        timeout_s: float = 90.0,
-        role: str = "held",
-    ) -> dict[str, Any]:
-        """Rotate one dynamic role through the dedicated pre-press planner."""
-
-        self._assert_prepress_checkpoint_bound()
-        if role not in {"held", "press"}:
-            raise ValueError("pre-press role must be 'held' or 'press'")
-        if (target_quat_xyzw is None) == (relative_axis_angle is None):
+        *,
+        hand: str,
+        target: dict[str, Any],
+        max_travel_m: float,
+    ) -> tuple[np.ndarray, str | None]:
+        if not isinstance(target, dict):
+            raise ValueError("target must be an object")
+        target = dict(target)
+        allowed = {"projection_id", "standoff_m", "delta_xyz", "frame"}
+        unknown = set(target).difference(allowed)
+        if unknown:
+            raise ValueError(f"target contains unsupported fields: {sorted(unknown)}")
+        projection_id = target.get("projection_id")
+        delta_xyz = target.get("delta_xyz")
+        if (projection_id is None) == (delta_xyz is None):
             raise ValueError(
-                "rotate_wrist requires exactly one of target_quat_xyzw or "
-                "relative_axis_angle"
+                "target requires exactly one of projection_id or delta_xyz"
             )
-        if frame not in {"world", "eef"}:
-            raise ValueError("frame must be 'world' or 'eef'")
-        if not isinstance(plan_only, bool):
-            raise ValueError("plan_only must be boolean")
-        current = self._prepress_stability_snapshot()
-        position_key = f"{role}_eef_position_world"
-        quat_key = f"{role}_eef_quat_xyzw"
-        position = np.asarray(current[position_key], dtype=np.float64).reshape(3)
-        current_quat = np.asarray(current[quat_key], dtype=np.float64).reshape(4)
-        current_quat /= max(float(np.linalg.norm(current_quat)), 1e-12)
-        if target_quat_xyzw is not None:
-            target_quat = np.asarray(target_quat_xyzw, dtype=np.float64).reshape(4)
-            if (
-                not np.isfinite(target_quat).all()
-                or float(np.linalg.norm(target_quat)) <= 1e-9
-            ):
-                raise ValueError("target_quat_xyzw is invalid")
-            target_quat /= np.linalg.norm(target_quat)
+        max_travel = float(max_travel_m)
+        if not np.isfinite(max_travel) or max_travel <= 0.0:
+            raise ValueError("max_travel_m must be finite and positive")
+        current = self._require_planner().backend.get_eef_pose(hand)
+        if current is None:
+            raise RuntimeError("current EEF pose is unavailable")
+        current_position = np.asarray(current[0], dtype=np.float64).reshape(3)
+        if projection_id is not None:
+            if not isinstance(projection_id, str) or not projection_id.strip():
+                raise ValueError("target.projection_id must be a non-empty string")
+            if "frame" in target or "delta_xyz" in target:
+                raise ValueError("projection targets cannot contain delta_xyz or frame")
+            receipt = self._projection_receipts.get(str(projection_id))
+            if not self._projection_receipt_is_fresh(receipt):
+                raise RuntimeError("fresh projection receipt is required")
+            if str(projection_id) in self._consumed_projection_receipts:
+                raise RuntimeError("projection receipt has already been consumed")
+            point = np.asarray(receipt["world_point"], dtype=np.float64).reshape(3)
+            normal = np.asarray(
+                receipt["camera_facing_normal"], dtype=np.float64
+            ).reshape(3)
+            standoff = float(target.get("standoff_m", 0.0))
+            if not np.isfinite(standoff) or standoff < 0.0:
+                raise ValueError("target.standoff_m must be finite and non-negative")
+            resolved = point + normal * standoff
+            receipt_id = str(projection_id)
         else:
-            command = np.asarray(relative_axis_angle, dtype=np.float64).reshape(4)
-            axis, angle = command[:3], float(command[3])
-            axis_norm = float(np.linalg.norm(axis))
-            if not np.isfinite(command).all() or axis_norm <= 1e-9:
-                raise ValueError("relative_axis_angle is invalid")
-            if role == "press" and abs(angle) > float(np.pi) + 1e-9:
+            if "standoff_m" in target or "projection_id" in target:
                 raise ValueError(
-                    "press observation rotation angle must not exceed pi radians"
+                    "relative targets cannot contain projection_id or standoff_m"
                 )
-            axis /= axis_norm
-            half = 0.5 * angle
-            delta = np.r_[axis * np.sin(half), np.cos(half)]
-            target_quat = (
-                quat_multiply_xyzw(delta, current_quat)
-                if frame == "world"
-                else quat_multiply_xyzw(current_quat, delta)
-            )
-        result = self._prepress_move_to_candidate(
-            role=role,
-            target_xyz=position.tolist(),
-            target_quat_xyzw=target_quat.tolist(),
-            plan_only=plan_only,
-            timeout_s=timeout_s,
-            press_observation_rotation=role == "press",
-        )
-        result["rotation_request"] = {
-            "role": role,
-            "target_quat_xyzw": target_quat.tolist(),
-            "relative_axis_angle": (
-                None
-                if relative_axis_angle is None
-                else np.asarray(relative_axis_angle, dtype=np.float64).tolist()
-            ),
-            "frame": frame,
-        }
-        return result
-
-    def save_prepress_checkpoint(
-        self,
-        checkpoint_name: str = "state_checkpoint_2",
-        stage: str = "pre_press_alignment",
-        visual_review: bool = True,
-        user_review_override: bool = False,
-        review_note: str | None = None,
-    ) -> dict[str, Any]:
-        """Atomically save checkpoint2 only after the complete current gate chain."""
-
-        if checkpoint_name != "state_checkpoint_2" or stage != "pre_press_alignment":
-            raise ValueError("pre-press finalizer only writes state_checkpoint_2")
-        if visual_review is not True:
-            raise ValueError("state_checkpoint_2 requires visual review")
-        path1, checkpoint1 = self._assert_prepress_checkpoint_bound()
-        sha1 = _sha256_file(path1)
-        context, gate, projection = (
-            self._prepress_context,
-            self._prepress_gate,
-            self._prepress_projection,
-        )
-        geometry, motion = self._prepress_geometry, self._prepress_motion
-        current_step = int(self._env_steps)
-        if user_review_override:
-            if not isinstance(review_note, str) or not review_note.strip():
-                raise ValueError(
-                    "user_review_override requires a non-empty review_note"
-                )
-            if not all(
-                isinstance(value, dict)
-                for value in (context, gate, projection, geometry)
-            ):
-                raise RuntimeError(
-                    "user-reviewed pre-press gate, projection, and geometry are incomplete"
-                )
-            assert isinstance(context, dict)
-            assert isinstance(gate, dict)
-            assert isinstance(projection, dict)
-            assert isinstance(geometry, dict)
-            frame = self._frame_cache.get_current(
-                gate["resolved_camera"], gate["frame_id"]
-            )
-            image_height, image_width = frame.rgb.shape[:2]
-            center = np.asarray(gate.get("center_uv"), dtype=np.float64).reshape(2)
-            image_center = np.asarray(
-                [(image_width - 1) / 2.0, (image_height - 1) / 2.0],
-                dtype=np.float64,
-            )
-            radial_error_px = float(np.linalg.norm(center - image_center))
-            relaxed_center_limit_px = 0.15 * float(min(image_width, image_height))
-            measured = geometry.get("geometry", geometry)
-            relaxed_geometry_pass = bool(
-                0.03 - 1e-9
-                <= float(measured.get("axial_standoff_m", -np.inf))
-                <= 0.12 + 1e-9
-            )
-            if not (
-                gate.get("button_visible") is True
-                and gate.get("face_class") == BUTTON_FACE_CLASS
-                and gate.get("env_step") == current_step
-                and projection.get("gate_id") == gate.get("gate_id")
-                and projection.get("env_step") == current_step
-                and geometry.get("projection_id") == projection.get("projection_id")
-                and geometry.get("env_step") == current_step
-                and relaxed_geometry_pass
-            ):
-                raise RuntimeError(
-                    "user-reviewed pre-press evidence is stale or outside relaxed bounds"
-                )
-            stability = self._prepress_stability_snapshot()
-            if not stability["stable"] or int(stability["press_contact_count"]) != 0:
-                raise RuntimeError(
-                    "user-reviewed checkpoint requires stable held radio and zero press contact"
-                )
-            visual_paths = self._checkpoint_visual_evidence(
-                checkpoint_name=checkpoint_name,
-                held_hand=context["held_hand"],
-                press_hand=context["press_hand"],
-            )
-            payload = self._robot_state_checkpoint_payload(
-                checkpoint_name=checkpoint_name,
-                stage=stage,
-                held_hand=context["held_hand"],
-                press_hand=context["press_hand"],
-                object_name=context["object_name"],
-                require_current_grasp=True,
-                validation_evidence={"prepress_stability": stability},
-            )
-            payload["prepress"] = {
-                "source_checkpoint_path": str(path1),
-                "source_checkpoint_sha256": sha1,
-                "button_gate": gate,
-                "button_projection": projection,
-                "geometry": geometry,
-                "motion": motion,
-                "user_review_override": {
-                    "accepted": True,
-                    "review_note": review_note.strip(),
-                    "radial_error_px": radial_error_px,
-                    "center_limit_px": relaxed_center_limit_px,
-                    "line_distance_limit_m": None,
-                    "line_distance_policy": "not_enforced_by_user_visual_override",
-                    "radial_center_policy": "not_enforced_by_user_visual_override",
-                    "visual_contact_policy": (
-                        "fully_closed_press_fingertips_near_red_button_center_"
-                        "and_inside_black_disk"
-                    ),
-                    "opposition_angle_limit_deg": None,
-                    "opposition_angle_policy": ("not_enforced_by_user_visual_override"),
-                    "relaxed_geometry_pass": relaxed_geometry_pass,
-                    "strict_geometry_pass": bool(measured.get("geometry_pass", False)),
-                },
-            }
-            payload["visual_evidence"] = visual_paths
-            path2 = self._output_dir / "state_checkpoints" / f"{checkpoint_name}.json"
-            _write_json_atomic(path2, payload)
-            if _sha256_file(path1) != sha1:
-                path2.unlink(missing_ok=True)
-                raise RuntimeError("state_checkpoint_1 changed during checkpoint2 save")
-            return {
-                "_finish": False,
-                "primitive_success": True,
-                "task_success": bool(_raw_success(self._last_info)),
-                "official_success_source": 'info["done"]["success"]',
-                "stop_reason": "saved_user_reviewed_prepress_checkpoint",
-                "state_checkpoint_1_path": str(path1),
-                "state_checkpoint_1_sha256": sha1,
-                "state_checkpoint_2_path": str(path2),
-                "state_checkpoint_2_sha256": _sha256_file(path2),
-                "held_hand": checkpoint1["held_hand"],
-                "press_hand": checkpoint1["press_hand"],
-                "object_name": checkpoint1["object_name"],
-                "visual_review": visual_paths,
-                "geometry": _wire_safe(geometry),
-                "user_review_override": payload["prepress"]["user_review_override"],
-                "total_env_steps": current_step,
-            }
-        if not all(
-            isinstance(value, dict)
-            for value in (context, gate, projection, geometry, motion)
-        ):
+            frame = str(target.get("frame", ""))
+            if frame not in {"world", "eef"}:
+                raise ValueError("target.frame must be 'world' or 'eef'")
+            delta = np.asarray(delta_xyz, dtype=np.float64).reshape(-1)
+            if delta.shape != (3,) or not np.isfinite(delta).all():
+                raise ValueError("target.delta_xyz must contain three finite values")
+            if frame == "eef":
+                delta = _quat_rotate_vector_xyzw(current[1], delta)
+            resolved = current_position + delta
+            receipt_id = None
+        travel = float(np.linalg.norm(resolved - current_position))
+        if not np.isfinite(travel) or travel > max_travel + 1e-9:
             raise RuntimeError(
-                "pre-press gate, projection, geometry, motion, and review are incomplete"
+                f"resolved motion travel {travel:.6f} exceeds max_travel_m "
+                f"{max_travel:.6f}"
             )
-        assert (
-            isinstance(context, dict)
-            and isinstance(gate, dict)
-            and isinstance(projection, dict)
-        )
-        assert isinstance(geometry, dict) and isinstance(motion, dict)
-        if not (
-            gate.get("button_visible") is True
-            and gate.get("face_class") == BUTTON_FACE_CLASS
-            and gate.get("env_step") == current_step
-            and projection.get("gate_id") == gate.get("gate_id")
-            and projection.get("env_step") == current_step
-            and geometry.get("projection_id") == projection.get("projection_id")
-            and geometry.get("env_step") == current_step
-            and geometry.get("geometry_pass") is True
-            and motion.get("primitive_success") is True
-            and motion.get("end_env_step") == current_step
-            and motion.get("three_view_observed_by_vlm") is True
-            and motion.get("visual_review_pass") is True
-        ):
-            raise RuntimeError(
-                "latest pre-press evidence chain did not pass at current env step"
-            )
-        stability = self._prepress_stability_snapshot()
-        if not stability["stable"]:
-            raise RuntimeError("radio is not stably held at checkpoint2 finalization")
-        payload = self._robot_state_checkpoint_payload(
-            checkpoint_name=checkpoint_name,
-            stage=stage,
-            held_hand=context["held_hand"],
-            press_hand=context["press_hand"],
-            object_name=context["object_name"],
-            require_current_grasp=True,
-            validation_evidence={"prepress_stability": stability},
-        )
-        payload["prepress"] = {
-            "source_checkpoint_path": str(path1),
-            "source_checkpoint_sha256": sha1,
-            "button_gate": gate,
-            "button_projection": projection,
-            "geometry": geometry,
-            "motion": motion,
-        }
-        payload["visual_evidence"] = dict(motion["visual_review_paths"])
-        path2 = self._output_dir / "state_checkpoints" / f"{checkpoint_name}.json"
-        _write_json_atomic(path2, payload)
-        if _sha256_file(path1) != sha1:
-            path2.unlink(missing_ok=True)
-            raise RuntimeError("state_checkpoint_1 changed during checkpoint2 save")
-        return {
-            "_finish": False,
-            "primitive_success": True,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "stop_reason": "saved_prepress_checkpoint",
-            "state_checkpoint_1_path": str(path1),
-            "state_checkpoint_1_sha256": sha1,
-            "state_checkpoint_2_path": str(path2),
-            "state_checkpoint_2_sha256": _sha256_file(path2),
-            "held_hand": checkpoint1["held_hand"],
-            "press_hand": checkpoint1["press_hand"],
-            "object_name": checkpoint1["object_name"],
-            "visual_review": motion["visual_review_paths"],
-            "video_path": motion["video_path"],
-            "trace_path": motion["trace_path"],
-            "geometry": _wire_safe(geometry),
-            "total_env_steps": current_step,
-        }
+        return resolved, receipt_id
 
     def navigate_to(
         self,
-        hand: str,
-        target_xyz: Any,
-        frame: str = "world",
-        standoff_m: float = 0.85,
-        timeout_s: float = 90.0,
+        *,
+        projection_id: str | None = None,
+        navigation_visual_check: Any = None,
+        relative_motion: Any = None,
+        standoff_m: float | None = None,
+        max_travel_m: float | None = None,
+        timeout_s: float = 300.0,
     ) -> dict[str, Any]:
-        result = self._require_planner().navigate_to(
-            hand=hand,
-            target_xyz=target_xyz,
-            frame=frame,
-            standoff_m=standoff_m,
-            timeout_s=timeout_s,
+        """Navigate toward a projection or execute one explicit relative motion."""
+
+        projection_mode = relative_motion is None
+        navigation_visual_evidence: dict[str, Any] | None = None
+        target_xyz: np.ndarray | None = None
+        normalized_motion: dict[str, Any] | None = None
+        if projection_mode:
+            if not isinstance(projection_id, str) or not projection_id.strip():
+                raise ValueError("projection_id must be a non-empty string")
+            projection_id = projection_id.strip()
+            standoff, max_travel, timeout = self._validated_navigation_parameters(
+                standoff_m=0.85 if standoff_m is None else standoff_m,
+                max_travel_m=1.0 if max_travel_m is None else max_travel_m,
+                timeout_s=timeout_s,
+            )
+            projection_receipt = self._projection_receipts.get(projection_id)
+            if not self._projection_receipt_is_fresh(projection_receipt):
+                raise RuntimeError("fresh projection receipt is required")
+            if projection_id in self._consumed_projection_receipts:
+                raise RuntimeError("projection receipt has already been consumed")
+            navigation_visual_evidence = self._navigation_visual_authorization(
+                projection_receipt=projection_receipt,
+                navigation_visual_check=navigation_visual_check,
+            )
+            target_xyz = np.asarray(
+                projection_receipt.get("world_point"), dtype=np.float64
+            ).reshape(-1)
+            if target_xyz.shape != (3,) or not np.isfinite(target_xyz).all():
+                raise RuntimeError("navigation projection point is invalid")
+        else:
+            if any(
+                value is not None
+                for value in (
+                    projection_id,
+                    navigation_visual_check,
+                    standoff_m,
+                    max_travel_m,
+                )
+            ):
+                raise ValueError(
+                    "relative_motion is mutually exclusive with projection "
+                    "navigation arguments"
+                )
+            normalized_motion = validate_relative_navigation_motion(relative_motion)
+            timeout = self._validated_navigation_timeout(timeout_s)
+        attachment_before = self._attachment_fingerprint_snapshot()
+        if attachment_before.get("available") is not True:
+            raise RuntimeError(
+                "attachment identity conflict"
+                if attachment_before.get("identity_conflict") is True
+                else "attachment feedback is unavailable"
+            )
+
+        self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+        self._switch_controller(_CONTROLLER_PLANNER)
+
+        if projection_mode:
+            projection_receipt = self._projection_receipts.get(projection_id)
+            if not self._projection_receipt_is_fresh(projection_receipt):
+                raise RuntimeError(
+                    "navigation projection changed during controller transfer"
+                )
+            if projection_id in self._consumed_projection_receipts:
+                raise RuntimeError(
+                    "navigation projection was consumed during controller transfer"
+                )
+            revalidated_target_xyz = np.asarray(
+                projection_receipt.get("world_point"), dtype=np.float64
+            ).reshape(-1)
+            if (
+                revalidated_target_xyz.shape != (3,)
+                or not np.isfinite(revalidated_target_xyz).all()
+                or target_xyz is None
+                or not np.array_equal(revalidated_target_xyz, target_xyz)
+            ):
+                raise RuntimeError(
+                    "navigation projection point changed during controller transfer"
+                )
+            target_xyz = revalidated_target_xyz
+            navigation_visual_evidence = self._navigation_visual_authorization(
+                projection_receipt=projection_receipt,
+                navigation_visual_check=navigation_visual_check,
+            )
+        self._assert_attachment_snapshot_unchanged(
+            attachment_before,
+            context="navigate_to controller transfer",
         )
-        return self._planner_result_with_accounting(result)
+
+        before_env_steps = int(self._env_steps)
+        try:
+            planner = self._require_planner()
+            if projection_mode:
+                result = planner.navigate_to(
+                    target_xyz=target_xyz,
+                    standoff_m=standoff,
+                    max_travel_m=max_travel,
+                    timeout_s=timeout,
+                )
+            else:
+                result = planner.navigate_to(
+                    relative_motion=normalized_motion,
+                    timeout_s=timeout,
+                )
+        finally:
+            if projection_mode and int(self._env_steps) > before_env_steps:
+                assert isinstance(projection_id, str)
+                self._consumed_projection_receipts.add(projection_id)
+
+        attachment_isolation = self._navigation_attachment_postcondition_receipt(
+            before=attachment_before,
+        )
+        planner_result = dict(result)
+        planner_metrics = planner_result.get("metrics")
+        planner_metrics = (
+            dict(planner_metrics) if isinstance(planner_metrics, dict) else {}
+        )
+        navigation_isolation = self._public_navigation_isolation(
+            planner_metrics.get("navigation_isolation")
+        )
+        action_executed = int(self._env_steps) > before_env_steps
+        public_metrics: dict[str, Any] = {
+            "navigation_isolation": navigation_isolation,
+            "attachment_isolation": attachment_isolation,
+        }
+        for field in (
+            "final_position_error_m",
+            "final_yaw_error_rad",
+            "elapsed_s",
+        ):
+            value = planner_metrics.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                value = float(value)
+                if np.isfinite(value):
+                    public_metrics[field] = value
+        result = {
+            "primitive_success": bool(planner_result.get("primitive_success", False)),
+            "stop_reason": str(planner_result.get("stop_reason", "error")),
+            "recoverable": bool(planner_result.get("recoverable", False)),
+            "metrics": public_metrics,
+        }
+        official_success = bool(self._official_success_latched)
+        if not official_success and navigation_isolation.get("available") is not True:
+            if action_executed or result["primitive_success"]:
+                result["primitive_success"] = False
+                result["stop_reason"] = "navigation_isolation_feedback_unavailable"
+        elif not official_success and navigation_isolation.get("ok") is not True:
+            result["primitive_success"] = False
+            result["stop_reason"] = "navigation_isolation_violation"
+        if not official_success and attachment_isolation.get("passed") is not True:
+            result["primitive_success"] = False
+            result["stop_reason"] = "attachment_isolation_violation"
+
+        public = self._planner_public_result(result)
+        public.update(
+            {
+                "navigation_isolation": navigation_isolation,
+                "attachment_isolation": attachment_isolation,
+            }
+        )
+        if projection_mode:
+            public.update(
+                {
+                    "requested_projection_id": projection_id,
+                    "navigation_visual_evidence": self._public_visual_receipt(
+                        navigation_visual_evidence
+                    ),
+                }
+            )
+        else:
+            public["requested_relative_motion"] = dict(normalized_motion or {})
+        public["_finish"] = bool(public["task_success"])
+        return public
 
     def move_to(
         self,
+        *,
         hand: str,
-        target_xyz: Any,
-        frame: str = "world",
-        target_quat_xyzw: Any | None = None,
-        plan_only: bool = False,
+        target: dict[str, Any],
+        visual_hand_check: Any,
         position_tolerance_m: float = 0.02,
-        orientation_tolerance_rad: float = 0.087,
-        timeout_s: float = 45.0,
+        max_travel_m: float = 0.25,
+        timeout_s: float = 240.0,
     ) -> dict[str, Any]:
+        requested_hand = str(hand)
+        hand, selection_source, visual_hand_evidence = self._authorize_analytic_hand(
+            requested_hand, visual_hand_check
+        )
+        attachment_before = self._attachment_fingerprint_snapshot()
+        tolerance = float(position_tolerance_m)
+        if not np.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError("position_tolerance_m must be finite and positive")
+        target, receipt_id = self._motion_target(
+            hand=hand,
+            target=target,
+            max_travel_m=max_travel_m,
+        )
+        timeout = float(timeout_s)
+        if not np.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("timeout_s must be finite and positive")
+        self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+        self._switch_controller(_CONTROLLER_PLANNER)
+        hand, selection_source, visual_hand_evidence = (
+            self._revalidate_analytic_selection(
+                requested_hand=requested_hand,
+                expected_hand=hand,
+                visual_hand_check=visual_hand_check,
+            )
+        )
+        self._assert_attachment_snapshot_unchanged(
+            attachment_before,
+            context="move_to controller transfer",
+        )
+        before_env_steps = int(self._env_steps)
         result = self._require_planner().move_to(
             hand=hand,
-            target_xyz=target_xyz,
-            frame=frame,
-            target_quat_xyzw=target_quat_xyzw,
-            plan_only=plan_only,
-            position_tolerance_m=position_tolerance_m,
-            orientation_tolerance_rad=orientation_tolerance_rad,
-            timeout_s=timeout_s,
+            target_xyz=target,
+            position_tolerance_m=tolerance,
+            timeout_s=timeout,
         )
-        return self._planner_result_with_accounting(result)
-
-    def pick(
-        self,
-        hand: str,
-        target_xyz: Any,
-        approach_vector: Any | None = None,
-        grasp_quat_xyzw: Any | None = None,
-        pregrasp_offset_m: float = 0.08,
-        lift_m: float = 0.08,
-        timeout_s: float = 90.0,
-    ) -> dict[str, Any]:
-        result = self._require_planner().pick(
-            hand=hand,
-            target_xyz=target_xyz,
-            approach_vector=approach_vector,
-            grasp_quat_xyzw=grasp_quat_xyzw,
-            pregrasp_offset_m=pregrasp_offset_m,
-            lift_m=lift_m,
-            timeout_s=timeout_s,
+        if receipt_id is not None and int(self._env_steps) > before_env_steps:
+            self._consumed_projection_receipts.add(receipt_id)
+        return self._analytic_public_result(
+            result,
+            primitive="move_to",
+            requested_hand=requested_hand,
+            resolved_hand=hand,
+            hand_selection_source=selection_source,
+            visual_hand_evidence=visual_hand_evidence,
+            attachment_before=attachment_before,
         )
-        return self._planner_result_with_accounting(result)
 
     def rotate_wrist(
         self,
+        *,
         hand: str,
-        target_quat_xyzw: Any | None = None,
-        relative_axis_angle: Any | None = None,
-        frame: str = "world",
-        timeout_s: float = 45.0,
+        relative_axis_angle: Any,
+        frame: str = "eef",
+        visual_hand_check: Any,
     ) -> dict[str, Any]:
-        result = self._require_planner().rotate_wrist(
-            hand=hand,
-            target_quat_xyzw=target_quat_xyzw,
-            relative_axis_angle=relative_axis_angle,
-            frame=frame,
-            timeout_s=timeout_s,
+        requested_hand = str(hand)
+        hand, selection_source, visual_hand_evidence = self._authorize_analytic_hand(
+            requested_hand, visual_hand_check
         )
-        return self._planner_result_with_accounting(result)
+        if frame not in {"world", "eef"}:
+            raise ValueError("frame must be world or eef")
+        orientation = np.asarray(relative_axis_angle, dtype=np.float64).reshape(-1)
+        if orientation.shape != (4,) or not np.isfinite(orientation).all():
+            raise ValueError("relative_axis_angle must contain four finite values")
+        if (
+            abs(float(orientation[3])) > 1e-12
+            and float(np.linalg.norm(orientation[:3])) <= 1e-12
+        ):
+            raise ValueError("relative axis must be nonzero for a nonzero angle")
+        rotate_start_env_step = int(self._env_steps)
+        before_facts = self._attachment_runtime_facts()
+        attachment_before = self._attachment_fingerprint_snapshot(before_facts)
+        before_attachment = before_facts.get("attached_objects", {}).get(hand)
+        before_attachment_fingerprint = self._attachment_lineage_fingerprint(
+            before_attachment,
+            hand=hand,
+        )
+        surface_review_enabled = (
+            self._active_task_spec().surface_review_policy is not None
+        )
+        selected_attachment_present = bool(
+            before_facts.get("available") is True and before_attachment is not None
+        )
+        if selected_attachment_present and surface_review_enabled:
+            completed = list(getattr(self, "_completed_opposite_surface_cycles", []))
+            has_unfinished_chain = any(
+                (
+                    getattr(self, "_latest_successful_held_rotate_receipt", None)
+                    is not None,
+                    getattr(self, "_held_rotate_target_surface_review", None)
+                    is not None,
+                    getattr(self, "_active_rotate_pi0_candidate", None) is not None,
+                    getattr(self, "_awaiting_opposite_surface_review", None)
+                    is not None,
+                )
+            )
+            preserve_completed = bool(
+                completed
+                and not has_unfinished_chain
+                and int(completed[-1].get("env_step", -1)) == rotate_start_env_step
+                and completed[-1].get("resolved_hand") == hand
+                and completed[-1].get("attachment_fingerprint")
+                == before_attachment_fingerprint
+            )
+            self._invalidate_pi0_visual_regression_chain(
+                reset_completed=not preserve_completed
+            )
+        elif surface_review_enabled:
+            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+        try:
+            self._switch_controller(_CONTROLLER_PLANNER)
+            hand, selection_source, visual_hand_evidence = (
+                self._revalidate_analytic_selection(
+                    requested_hand=requested_hand,
+                    expected_hand=hand,
+                    visual_hand_check=visual_hand_check,
+                )
+            )
+            self._assert_attachment_snapshot_unchanged(
+                attachment_before,
+                context="rotate_wrist controller transfer",
+            )
+            result = self._require_planner().rotate_wrist(
+                hand=hand,
+                target_quat_xyzw=None,
+                relative_axis_angle=orientation.tolist(),
+                frame=frame,
+                timeout_s=ROTATE_WRIST_RUNTIME_TIMEOUT_S,
+            )
+        except Exception:
+            if surface_review_enabled:
+                self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+            raise
+        public = self._analytic_public_result(
+            result,
+            primitive="rotate_wrist",
+            requested_hand=requested_hand,
+            resolved_hand=hand,
+            hand_selection_source=selection_source,
+            visual_hand_evidence=visual_hand_evidence,
+            attachment_before=attachment_before,
+        )
+        metrics = public.get("metrics")
+        public["metrics"] = dict(metrics) if isinstance(metrics, dict) else {}
+        public["metrics"]["runtime_timeout_s"] = ROTATE_WRIST_RUNTIME_TIMEOUT_S
+        if (
+            surface_review_enabled
+            and selected_attachment_present
+            and public.get("primitive_success") is True
+            and not (self._official_success_latched or _raw_success(self._last_info))
+        ):
+            after_facts = self._attachment_runtime_facts()
+            after_attachment = after_facts.get("attached_objects", {}).get(hand)
+            matches, identity = _attachment_identity_status(
+                after_attachment,
+                before_attachment,
+                hand=hand,
+            )
+            after_attachment_fingerprint = self._attachment_lineage_fingerprint(
+                after_attachment,
+                hand=hand,
+            )
+            if (
+                before_facts.get("available") is True
+                and hand in before_facts.get("hands", [])
+                and after_facts.get("available") is True
+                and hand in after_facts.get("hands", [])
+                and matches
+                and before_attachment_fingerprint is not None
+                and after_attachment_fingerprint == before_attachment_fingerprint
+            ):
+                receipt = self._seal_attempt_receipt(
+                    {
+                        "kind": "successful_attached_hand_rotate",
+                        "rotation_start_env_step": rotate_start_env_step,
+                        "started_env_step": rotate_start_env_step,
+                        "completed_env_step": int(self._env_steps),
+                        "env_step": int(self._env_steps),
+                        "requested_hand": requested_hand,
+                        "resolved_hand": hand,
+                        "hand_selection_source": selection_source,
+                        "attachment_identity": _wire_safe(identity),
+                        "attachment_fingerprint": after_attachment_fingerprint,
+                    }
+                )
+                self._latest_successful_held_rotate_receipt = receipt
+                self._latest_successful_held_rotate_attachment = after_attachment
+                self._latest_successful_held_rotate_public_frame_ids = set(
+                    getattr(self, "_public_observed_frame_ids", set())
+                )
+                public["attached_rotate_receipt"] = receipt
+            else:
+                self._completed_opposite_surface_cycles = []
+        elif selected_attachment_present and surface_review_enabled:
+            self._completed_opposite_surface_cycles = []
+        return public
+
+    def _set_gripper(
+        self,
+        *,
+        hand: str,
+        opening: float,
+        timeout_s: float,
+        visual_hand_check: Any,
+        release_visual_check: Any = None,
+    ) -> dict[str, Any]:
+        requested_hand = str(hand)
+        hand, selection_source, visual_hand_evidence = self._authorize_analytic_hand(
+            requested_hand, visual_hand_check
+        )
+        facts = self._attachment_runtime_facts()
+        attachment_before = self._attachment_fingerprint_snapshot(facts)
+        timeout = float(timeout_s)
+        if not np.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("timeout_s must be finite and positive")
+        expected_attachment = facts.get("attached_objects", {}).get(hand)
+        selected_attachment_present = expected_attachment is not None
+        closing_attached = bool(selected_attachment_present and float(opening) < 0.5)
+        release_visual_evidence = None
+        selected_attachment_fingerprint = dict(
+            attachment_before.get("fingerprints", {})
+        ).get(hand)
+        if (
+            float(opening) >= 0.5
+            and selected_attachment_present
+            and self._active_task_spec().release_visual_policy is not None
+        ):
+            release_visual_evidence = self._release_visual_authorization(
+                selected_hand=hand,
+                expected_attachment_fingerprint=selected_attachment_fingerprint,
+                release_visual_check=release_visual_check,
+            )
+        self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+        self._switch_controller(_CONTROLLER_PLANNER)
+        hand, selection_source, visual_hand_evidence = (
+            self._revalidate_analytic_selection(
+                requested_hand=requested_hand,
+                expected_hand=hand,
+                visual_hand_check=visual_hand_check,
+            )
+        )
+        self._assert_attachment_snapshot_unchanged(
+            attachment_before,
+            context="gripper controller transfer",
+        )
+        result = self._require_planner()._gripper_command(
+            hand,
+            opening=float(opening),
+            timeout_s=timeout,
+            hold_steps_required=(
+                _HELD_ATTACHMENT_CONFIRMATION_STEPS if closing_attached else 1
+            ),
+            expected_attachment=expected_attachment if closing_attached else None,
+            require_attachment=closing_attached,
+        )
+        receipts = getattr(self, "_held_closure_receipts", None)
+        if not isinstance(receipts, dict):
+            receipts = {}
+            self._held_closure_receipts = receipts
+        if bool(result.get("primitive_success", False)):
+            if closing_attached:
+                metrics = result.get("metrics", {})
+                endpoint_steps = int(metrics.get("attachment_endpoint_held_steps", 0))
+                close_latch = float(self._gripper_latch.get(hand, 1.0))
+                if (
+                    endpoint_steps >= _HELD_ATTACHMENT_CONFIRMATION_STEPS
+                    and close_latch <= _HELD_CLOSE_LATCH_MAX
+                ):
+                    receipts[hand] = {
+                        "schema_version": 1,
+                        "run_nonce": self._run_nonce,
+                        "attempt_nonce": self._attempt_nonce,
+                        "attempt_index": int(self._attempt_index),
+                        "hand": hand,
+                        "expected_attachment": expected_attachment,
+                        "confirmed_env_step": int(self._env_steps),
+                        "close_latch": close_latch,
+                        "attachment_endpoint_held_steps": endpoint_steps,
+                    }
+                else:
+                    receipts.pop(hand, None)
+            elif float(opening) >= 0.5:
+                receipts.pop(hand, None)
+        public = self._analytic_public_result(
+            result,
+            primitive="close" if float(opening) < 0.5 else "open",
+            requested_hand=requested_hand,
+            resolved_hand=hand,
+            hand_selection_source=selection_source,
+            visual_hand_evidence=visual_hand_evidence,
+            attachment_before=attachment_before,
+        )
+        if release_visual_evidence is not None:
+            public["release_visual_evidence"] = release_visual_evidence
+        return public
+
+    def close(
+        self,
+        *,
+        hand: str,
+        visual_hand_check: Any,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        return self._set_gripper(
+            hand=hand,
+            opening=0.0,
+            timeout_s=timeout_s,
+            visual_hand_check=visual_hand_check,
+        )
+
+    def open(
+        self,
+        *,
+        hand: str,
+        visual_hand_check: Any,
+        release_visual_check: Any = None,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        return self._set_gripper(
+            hand=hand,
+            opening=1.0,
+            timeout_s=timeout_s,
+            visual_hand_check=visual_hand_check,
+            release_visual_check=release_visual_check,
+        )
 
     def press(
         self,
+        *,
         hand: str,
-        target_xyz: Any,
-        press_direction: Any | None = None,
-        approach_distance_m: float = 0.04,
-        press_depth_m: float = 0.012,
-        timeout_s: float = 60.0,
-    ) -> dict[str, Any]:
-        result = self._require_planner().press(
-            hand=hand,
-            target_xyz=target_xyz,
-            press_direction=press_direction,
-            approach_distance_m=approach_distance_m,
-            press_depth_m=press_depth_m,
-            timeout_s=timeout_s,
-        )
-        return self._planner_result_with_accounting(result)
-
-    def post_pick_close_press_gripper(self, timeout_s: float = 30.0) -> dict[str, Any]:
-        """Close the dynamic press gripper before any stage-3 press motion."""
-
-        _path, checkpoint = self._assert_prepress_checkpoint_bound()
-        hand = checkpoint["press_hand"]
-        if _raw_success(self._last_info):
-            raise RuntimeError("press gripper close must precede official task success")
-        stability_before = self._prepress_stability_snapshot()
-        if not stability_before["stable"]:
-            raise RuntimeError("radio is not stably held before press-gripper close")
-        planner = self._require_planner()
-        result = planner._gripper_command(
-            hand,
-            opening=0.0,
-            timeout_s=float(timeout_s),
-        )
-        opening = self._physical_gripper_opening(hand)
-        latch = float(self._gripper_latch[hand])
-        stability_after = self._prepress_stability_snapshot()
-        closed = bool(
-            result.get("primitive_success")
-            and latch <= -0.99
-            and opening <= 0.003
-            and stability_after["stable"]
-        )
-        # Closing advances physics, so every prior camera/depth binding is stale.
-        self._prepress_gate = self._prepress_projection = None
-        self._prepress_geometry = None
-        self._prepress_plan_certificate = None
-        return {
-            "_finish": False,
-            "primitive_success": closed,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "stop_reason": (
-                "press_gripper_closed"
-                if closed
-                else result.get("stop_reason", "press_gripper_close_not_confirmed")
-            ),
-            "press_hand": hand,
-            "press_gripper_command": latch,
-            "press_gripper_opening_m": float(opening),
-            "planner_result": _wire_safe(result),
-            "radio_held_stability_before": _wire_safe(stability_before),
-            "radio_held_stability_after": _wire_safe(stability_after),
-            "fresh_press_wrist_projection_required": True,
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def post_pick_direct_align(
-        self,
-        *,
         projection_id: str,
-        standoff_m: float = 0.04,
-        max_travel_m: float = 0.075,
-        timeout_s: float = 180.0,
-    ) -> dict[str, Any]:
-        """Align the closed press hand to a fresh button projection without contact."""
-
-        _path, checkpoint = self._assert_prepress_checkpoint_bound()
-        hand = checkpoint["press_hand"]
-        projection = self._prepress_projection
-        if not isinstance(projection, dict):
-            raise RuntimeError("fresh press-wrist projection is required")
-        if (
-            projection.get("projection_id") != projection_id
-            or projection.get("env_step") != int(self._env_steps)
-            or projection.get("camera") != "press_wrist"
-        ):
-            raise RuntimeError(
-                "direct alignment projection is stale or not press-wrist bound"
-            )
-        standoff = float(standoff_m)
-        travel_limit = float(max_travel_m)
-        if not 0.03 <= standoff <= 0.06:
-            raise ValueError("standoff_m must lie within [0.03, 0.06]")
-        if not 0.01 <= travel_limit <= 0.08:
-            raise ValueError("max_travel_m must lie within [0.01, 0.08]")
-        opening = self._physical_gripper_opening(hand)
-        latch = float(self._gripper_latch[hand])
-        if latch > -0.99 or opening > 0.003:
-            raise RuntimeError("press-hand gripper is not confirmed fully closed")
-        stability_before = self._prepress_stability_snapshot()
-        if (
-            not stability_before["stable"]
-            or int(stability_before["press_contact_count"]) != 0
-        ):
-            raise RuntimeError(
-                "direct alignment requires stable radio and zero press-hand contact"
-            )
-        planner = self._require_planner()
-        current = planner.backend.get_eef_pose(hand)
-        if current is None:
-            raise RuntimeError("press-hand EEF pose is unavailable")
-        generated = generate_press_staging_pose_candidates(
-            button_center_world=projection["button_center_world"],
-            button_normal_world=projection["button_normal_world"],
-            world_press_transform=pose_matrix_xyzw(current[0], current[1]),
-            standoff_m=standoff,
-            max_candidates=8,
-            alignment_phase="final",
-        )
-        candidates = [
-            candidate
-            for candidate in generated["candidates"]
-            if candidate.get("eligible") is True
-        ]
-        if not candidates:
-            raise RuntimeError("no eligible direct press-alignment candidate")
-        selected = min(
-            candidates,
-            key=lambda candidate: _quaternion_angle_rad(
-                current[1], candidate["target_press_eef_pose"]["quat_xyzw"]
-            ),
-        )
-        target_pose = selected["target_press_eef_pose"]
-        target = np.asarray(target_pose["position"], dtype=np.float64).reshape(3)
-        start = np.asarray(current[0], dtype=np.float64).reshape(3)
-        delta = target - start
-        travel = float(np.linalg.norm(delta))
-        if not np.isfinite(travel) or travel > travel_limit + 1e-9:
-            raise RuntimeError(
-                f"direct alignment travel {travel:.6f} m exceeds limit "
-                f"{travel_limit:.6f} m"
-            )
-        direction = delta / max(travel, 1e-12)
-        button = np.asarray(
-            projection["button_center_world"], dtype=np.float64
-        ).reshape(3)
-        result = planner._guarded_incremental_move(
-            hand=hand,
-            target_xyz=target,
-            target_quat_xyzw=target_pose["quat_xyzw"],
-            direction=direction,
-            allow_expected_contact=False,
-            position_tolerance_m=0.003,
-            timeout_s=float(timeout_s),
-            require_expected_contact=False,
-            contact_target_xyz=button,
-            terminal_hold_steps_required=4,
-            stop_on_expected_contact=False,
-            ignore_collision_checks=True,
-        )
-        return {
-            **self._planner_result_with_accounting(result),
-            "_finish": False,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "press_hand": hand,
-            "projection_id": projection_id,
-            "standoff_m": standoff,
-            "direct_travel_m": travel,
-            "selected_candidate": _wire_safe(selected),
-            "collision_checks_skipped": True,
-            "collision_skip_scope": "curobo_precheck_and_runtime_world+self_reports",
-            "press_gripper_command": latch,
-            "press_gripper_opening_m": float(opening),
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def post_pick_direct_press(
-        self,
-        *,
-        projection_id: str,
-        press_depth_m: float = 0.012,
-        max_travel_m: float = 0.075,
-        timeout_s: float = 180.0,
-    ) -> dict[str, Any]:
-        """Directly press from a fresh wrist projection with collision gates off."""
-
-        _path, checkpoint = self._assert_prepress_checkpoint_bound()
-        hand = checkpoint["press_hand"]
-        projection = self._prepress_projection
-        geometry = self._prepress_geometry
-        if not isinstance(projection, dict) or not isinstance(geometry, dict):
-            raise RuntimeError("fresh press-wrist projection and geometry are required")
-        if (
-            projection.get("projection_id") != projection_id
-            or projection.get("env_step") != int(self._env_steps)
-            or geometry.get("projection_id") != projection_id
-            or geometry.get("env_step") != int(self._env_steps)
-            or projection.get("camera") != "press_wrist"
-        ):
-            raise RuntimeError(
-                "direct press projection is stale or not press-wrist bound"
-            )
-        checkpoint2_path = (
-            self._output_dir / "state_checkpoints" / "state_checkpoint_2.json"
-        )
-        if not checkpoint2_path.is_file():
-            raise RuntimeError("state_checkpoint_2 must be saved before direct press")
-        checkpoint2 = json.loads(checkpoint2_path.read_text(encoding="utf-8"))
-        checkpoint2_projection = (
-            checkpoint2.get("prepress", {}).get("button_projection", {})
-            if isinstance(checkpoint2, dict)
-            else {}
-        )
-        if checkpoint2_projection.get("projection_id") != projection_id:
-            raise RuntimeError(
-                "state_checkpoint_2 is not bound to the fresh projection"
-            )
-        press_depth = float(press_depth_m)
-        travel_limit = float(max_travel_m)
-        if not 0.004 <= press_depth <= 0.03:
-            raise ValueError("press_depth_m must lie within [0.004, 0.03]")
-        if not 0.03 <= travel_limit <= 0.08:
-            raise ValueError("max_travel_m must lie within [0.03, 0.08]")
-        opening = self._physical_gripper_opening(hand)
-        latch = float(self._gripper_latch[hand])
-        if latch > -0.99 or opening > 0.003:
-            raise RuntimeError("press-hand gripper is not confirmed fully closed")
-        stability_before = self._prepress_stability_snapshot()
-        if not stability_before["stable"]:
-            raise RuntimeError("radio is not stably held before direct press")
-        button = np.asarray(
-            projection["button_center_world"], dtype=np.float64
-        ).reshape(3)
-        outward = np.asarray(
-            projection["button_normal_world"], dtype=np.float64
-        ).reshape(3)
-        outward_norm = float(np.linalg.norm(outward))
-        if not np.isfinite(outward).all() or outward_norm < 1e-9:
-            raise RuntimeError("fresh button normal is invalid")
-        outward /= outward_norm
-        direction = -outward
-        planner = self._require_planner()
-        current = planner.backend.get_eef_pose(hand)
-        if current is None:
-            raise RuntimeError("press-hand EEF pose is unavailable")
-        target = (
-            button - direction * PRESS_EEF_TO_CONTACT_OFFSET_M + direction * press_depth
-        )
-        travel = float(
-            np.linalg.norm(target - np.asarray(current[0], dtype=np.float64))
-        )
-        if not np.isfinite(travel) or travel > travel_limit + 1e-9:
-            raise RuntimeError(
-                f"direct press travel {travel:.6f} m exceeds limit {travel_limit:.6f} m"
-            )
-        result = planner._guarded_incremental_move(
-            hand=hand,
-            target_xyz=target,
-            target_quat_xyzw=current[1],
-            direction=direction,
-            allow_expected_contact=True,
-            position_tolerance_m=0.012,
-            timeout_s=float(timeout_s),
-            require_expected_contact=True,
-            contact_target_xyz=button,
-            terminal_hold_steps_required=4,
-            stop_on_expected_contact=False,
-            eef_to_contact_vector=direction * PRESS_EEF_TO_CONTACT_OFFSET_M,
-            ignore_collision_checks=True,
-        )
-        return {
-            **self._planner_result_with_accounting(result),
-            "_finish": False,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "press_hand": hand,
-            "projection_id": projection_id,
-            "button_center_world": button.tolist(),
-            "button_normal_world": outward.tolist(),
-            "press_direction_world": direction.tolist(),
-            "press_depth_m": press_depth,
-            "direct_travel_m": travel,
-            "collision_checks_skipped": True,
-            "collision_skip_scope": "curobo_precheck_and_runtime_world+self_reports",
-            "radio_held_stability_before": _wire_safe(stability_before),
-            "press_gripper_command": latch,
-            "press_gripper_opening_m": float(opening),
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def post_pick_direct_advance(
-        self,
-        *,
-        projection_id: str,
-        advance_m: float = 0.03,
-        timeout_s: float = 180.0,
-    ) -> dict[str, Any]:
-        """Advance the closed press hand along its live camera-reviewed axis."""
-
-        _path, checkpoint = self._assert_prepress_checkpoint_bound()
-        hand = checkpoint["press_hand"]
-        projection = self._prepress_projection
-        if not isinstance(projection, dict):
-            raise RuntimeError("fresh press-wrist projection is required")
-        if (
-            projection.get("projection_id") != projection_id
-            or projection.get("env_step") != int(self._env_steps)
-            or projection.get("camera") != "press_wrist"
-        ):
-            raise RuntimeError(
-                "direct advance projection is stale or not press-wrist bound"
-            )
-        checkpoint2_path = (
-            self._output_dir / "state_checkpoints" / "state_checkpoint_2.json"
-        )
-        if not checkpoint2_path.is_file():
-            raise RuntimeError("state_checkpoint_2 must be saved before direct advance")
-        checkpoint2 = json.loads(checkpoint2_path.read_text(encoding="utf-8"))
-        checkpoint2_projection = checkpoint2.get("prepress", {}).get(
-            "button_projection", {}
-        )
-        if checkpoint2_projection.get("projection_id") != projection_id:
-            raise RuntimeError(
-                "state_checkpoint_2 is not bound to the fresh projection"
-            )
-        advance = float(advance_m)
-        if not 0.004 <= advance <= 0.10:
-            raise ValueError("advance_m must lie within [0.004, 0.10]")
-        opening = self._physical_gripper_opening(hand)
-        latch = float(self._gripper_latch[hand])
-        if latch > -0.99 or opening > 0.003:
-            raise RuntimeError("press-hand gripper is not confirmed fully closed")
-        stability_before = self._prepress_stability_snapshot()
-        if not stability_before["stable"]:
-            raise RuntimeError("radio is not stably held before direct advance")
-        outward = np.asarray(
-            projection["button_normal_world"], dtype=np.float64
-        ).reshape(3)
-        outward_norm = float(np.linalg.norm(outward))
-        if not np.isfinite(outward).all() or outward_norm < 1e-9:
-            raise RuntimeError("fresh button normal is invalid")
-        outward /= outward_norm
-        button = np.asarray(
-            projection["button_center_world"], dtype=np.float64
-        ).reshape(3)
-        planner = self._require_planner()
-        current = planner.backend.get_eef_pose(hand)
-        if current is None:
-            raise RuntimeError("press-hand EEF pose is unavailable")
-        direction = np.asarray(
-            quat_rotate_xyzw(current[1], [0.0, 0.0, 1.0]), dtype=np.float64
-        ).reshape(3)
-        direction_norm = float(np.linalg.norm(direction))
-        if not np.isfinite(direction).all() or direction_norm < 1e-9:
-            raise RuntimeError("press-hand live approach axis is invalid")
-        direction /= direction_norm
-        target = np.asarray(current[0], dtype=np.float64) + direction * advance
-        result = planner._guarded_incremental_move(
-            hand=hand,
-            target_xyz=target,
-            target_quat_xyzw=current[1],
-            direction=direction,
-            allow_expected_contact=True,
-            position_tolerance_m=0.012,
-            timeout_s=float(timeout_s),
-            require_expected_contact=True,
-            contact_target_xyz=button,
-            terminal_hold_steps_required=4,
-            stop_on_expected_contact=False,
-            eef_to_contact_vector=direction * PRESS_EEF_TO_CONTACT_OFFSET_M,
-            ignore_collision_checks=True,
-        )
-        return {
-            **self._planner_result_with_accounting(result),
-            "_finish": False,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "press_hand": hand,
-            "projection_id": projection_id,
-            "button_center_world": button.tolist(),
-            "button_normal_world": outward.tolist(),
-            "press_direction_world": direction.tolist(),
-            "press_direction_source": "live_press_eef_local_positive_z",
-            "relative_advance_m": advance,
-            "collision_checks_skipped": True,
-            "collision_skip_scope": "curobo_precheck_and_runtime_world+self_reports",
-            "radio_held_stability_before": _wire_safe(stability_before),
-            "press_gripper_command": latch,
-            "press_gripper_opening_m": float(opening),
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def post_pick_recenter_held_button(
-        self,
-        *,
-        target_finger_standoff_m: float = 0.04,
-        max_held_travel_m: float = 0.08,
-        timeout_s: float = 240.0,
-    ) -> dict[str, Any]:
-        """Translate the held radio so its red marker lies on the press axis."""
-
-        _path, checkpoint = self._assert_prepress_checkpoint_bound()
-        held, press = checkpoint["held_hand"], checkpoint["press_hand"]
-        standoff = float(target_finger_standoff_m)
-        travel_limit = float(max_held_travel_m)
-        if not 0.03 <= standoff <= 0.07:
-            raise ValueError("target_finger_standoff_m must lie within [0.03, 0.07]")
-        if not 0.02 <= travel_limit <= 0.10:
-            raise ValueError("max_held_travel_m must lie within [0.02, 0.10]")
-        press_opening = self._physical_gripper_opening(press)
-        press_latch = float(self._gripper_latch[press])
-        if press_latch > -0.99 or press_opening > 0.003:
-            raise RuntimeError("press-hand gripper is not confirmed fully closed")
-        stability_before = self._prepress_stability_snapshot()
-        if (
-            not stability_before["stable"]
-            or int(stability_before["press_contact_count"]) != 0
-        ):
-            raise RuntimeError(
-                "held-button recenter requires stable radio and zero press contact"
-            )
-        geometry_before = self._live_toggle_geometry(press)
-        selected = min(
-            geometry_before["fingers"],
-            key=lambda finger: finger["center_distance_to_marker_m"],
-        )
-        marker = np.asarray(
-            geometry_before["marker_position_world"], dtype=np.float64
-        ).reshape(3)
-        finger = np.asarray(selected["position_world"], dtype=np.float64).reshape(3)
-        planner = self._require_planner()
-        press_pose = planner.backend.get_eef_pose(press)
-        held_pose = planner.backend.get_eef_pose(held)
-        if press_pose is None or held_pose is None:
-            raise RuntimeError("held or press EEF pose is unavailable")
-        press_axis = np.asarray(
-            quat_rotate_xyzw(press_pose[1], [0.0, 0.0, 1.0]), dtype=np.float64
-        ).reshape(3)
-        press_axis /= max(float(np.linalg.norm(press_axis)), 1e-12)
-        desired_marker = finger + press_axis * standoff
-        translation = desired_marker - marker
-        travel = float(np.linalg.norm(translation))
-        if not np.isfinite(travel) or travel > travel_limit + 1e-9:
-            raise RuntimeError(
-                f"held-button recenter travel {travel:.6f} m exceeds limit "
-                f"{travel_limit:.6f} m"
-            )
-        held_start = np.asarray(held_pose[0], dtype=np.float64).reshape(3)
-        attached_obj = planner.backend.get_attached_object(held)
-        plan = planner.backend.plan_guarded_ik_step(
-            hand=held,
-            target_xyz=held_start + translation,
-            target_quat_xyzw=held_pose[1],
-            timeout_s=float(timeout_s),
-            attached_obj=attached_obj,
-            contact_target_xyz=marker,
-            ignore_collision_checks=True,
-            full_solution=True,
-        )
-        if not plan.get("ok") or plan.get("joint_trajectory") is None:
-            raise RuntimeError(
-                f"held-button recenter IK failed: {plan.get('stop_reason', 'unknown')}"
-            )
-        result = planner._execute_actions(
-            None,
-            hand=held,
-            target_xyz=held_start + translation,
-            target_quat_xyzw=np.asarray(held_pose[1], dtype=np.float64),
-            position_tolerance_m=0.004,
-            orientation_tolerance_rad=0.087,
-            timeout_s=float(timeout_s),
-            require_pose=True,
-            hold_steps_required=4,
-            joint_trajectory=plan["joint_trajectory"],
-            ignore_collision_checks=True,
-        )
-        # Any motion invalidates every prior camera/depth binding.
-        self._prepress_gate = self._prepress_projection = None
-        self._prepress_geometry = None
-        self._prepress_plan_certificate = None
-        stability_after = self._prepress_stability_snapshot()
-        geometry_after = self._live_toggle_geometry(press)
-        selected_after = min(
-            geometry_after["fingers"],
-            key=lambda item: item["center_distance_to_marker_m"],
-        )
-        marker_after = np.asarray(
-            geometry_after["marker_position_world"], dtype=np.float64
-        ).reshape(3)
-        finger_after = np.asarray(
-            selected_after["position_world"], dtype=np.float64
-        ).reshape(3)
-        offset_after = marker_after - finger_after
-        axial_after = float(np.dot(offset_after, press_axis))
-        lateral_after = float(np.linalg.norm(offset_after - press_axis * axial_after))
-        return {
-            **self._planner_result_with_accounting(result),
-            "_finish": False,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "held_hand": held,
-            "press_hand": press,
-            "selected_press_finger": {
-                key: _wire_safe(value)
-                for key, value in selected_after.items()
-                if key != "link"
-            },
-            "press_axis_world": press_axis.tolist(),
-            "desired_marker_world": desired_marker.tolist(),
-            "held_translation_world": translation.tolist(),
-            "held_travel_m": travel,
-            "marker_to_press_axis_lateral_error_m": lateral_after,
-            "marker_axial_standoff_from_finger_m": axial_after,
-            "target_finger_standoff_m": standoff,
-            "collision_checks_skipped": True,
-            "press_gripper_command": press_latch,
-            "press_gripper_opening_m": float(press_opening),
-            "radio_held_stability_before": _wire_safe(stability_before),
-            "radio_held_stability_after": _wire_safe(stability_after),
-            "fresh_press_wrist_projection_required": True,
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def _live_toggle_geometry(self, hand: str) -> dict[str, Any]:
-        """Return the live toggle marker and press-finger geometry."""
-
-        from omnigibson.object_states.toggle import ToggledOn
-
-        radio, _table = self._resolve_handoff_targets()
-        toggle = getattr(radio, "states", {}).get(ToggledOn)
-        if toggle is None or toggle.visual_marker is None:
-            raise RuntimeError("radio ToggledOn visual marker is unavailable")
-        marker_position, _marker_quat = toggle.visual_marker.get_position_orientation()
-        marker = np.asarray(_numpy_tree(marker_position), dtype=np.float64).reshape(3)
-        marker_radius = float(
-            np.min(
-                np.asarray(
-                    _numpy_tree(
-                        toggle.visual_marker.extent * toggle.visual_marker.scale
-                    ),
-                    dtype=np.float64,
-                )
-            )
-        )
-        robot = self._robot()
-        if robot is None:
-            raise RuntimeError("robot is unavailable for toggle geometry")
-        finger_map = getattr(robot, "finger_links", {}) or {}
-        links = finger_map.get(hand, []) if isinstance(finger_map, dict) else []
-        if not links:
-            raise RuntimeError(f"{hand} finger links are unavailable")
-        fingers = []
-        for index, link in enumerate(links):
-            position, _quat = self._object_pose(link)
-            position = np.asarray(position, dtype=np.float64).reshape(3)
-            fingers.append(
-                {
-                    "index": index,
-                    "name": str(getattr(link, "name", f"{hand}_finger_{index}")),
-                    "prim_path": str(getattr(link, "prim_path", "")),
-                    "position_world": position,
-                    "center_distance_to_marker_m": float(
-                        np.linalg.norm(position - marker)
-                    ),
-                    "link": link,
-                }
-            )
-        contact_objects = getattr(type(toggle), "_finger_contact_objs", set()) or set()
-        return {
-            "radio": radio,
-            "toggle": toggle,
-            "marker_position_world": marker,
-            "marker_radius_m": marker_radius,
-            "fingers": fingers,
-            "radio_in_global_finger_contact_set": radio in contact_objects,
-        }
-
-    def inspect_toggle_geometry(self) -> dict[str, Any]:
-        """Inspect the exact physical trigger geometry for the held radio."""
-
-        _path, checkpoint = self._assert_prepress_checkpoint_bound()
-        hand = checkpoint["press_hand"]
-        geometry = self._live_toggle_geometry(hand)
-        toggle = geometry["toggle"]
-        fingers = [
-            {key: _wire_safe(value) for key, value in finger.items() if key != "link"}
-            for finger in geometry["fingers"]
-        ]
-        return {
-            "_finish": False,
-            "primitive_success": True,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "press_hand": hand,
-            "toggled_on": bool(toggle.get_value()),
-            "robot_can_toggle_steps": int(toggle.robot_can_toggle_steps),
-            "required_toggle_steps": 5,
-            "marker_position_world": geometry["marker_position_world"].tolist(),
-            "marker_radius_m": float(geometry["marker_radius_m"]),
-            "radio_in_global_finger_contact_set": bool(
-                geometry["radio_in_global_finger_contact_set"]
-            ),
-            "press_fingers": fingers,
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def post_pick_direct_finger_toggle(
-        self,
-        *,
-        projection_id: str,
-        penetration_m: float = 0.008,
-        max_travel_m: float = 0.15,
+        travel_m: float,
+        visual_hand_check: Any,
         timeout_s: float = 300.0,
     ) -> dict[str, Any]:
-        """Move the nearest closed press finger through the exact toggle marker."""
-
-        _path, checkpoint = self._assert_prepress_checkpoint_bound()
-        hand = checkpoint["press_hand"]
-        projection = self._prepress_projection
-        if not isinstance(projection, dict) or (
-            projection.get("projection_id") != projection_id
-            or projection.get("env_step") != int(self._env_steps)
-            or projection.get("camera") != "press_wrist"
-        ):
-            raise RuntimeError("fresh press-wrist projection is required")
-        checkpoint2_path = (
-            self._output_dir / "state_checkpoints" / "state_checkpoint_2.json"
+        requested_hand = str(hand)
+        hand, selection_source, visual_hand_evidence = self._authorize_analytic_hand(
+            requested_hand, visual_hand_check
         )
-        if not checkpoint2_path.is_file():
-            raise RuntimeError("state_checkpoint_2 must be saved before toggle press")
-        checkpoint2 = json.loads(checkpoint2_path.read_text(encoding="utf-8"))
-        checkpoint2_projection = checkpoint2.get("prepress", {}).get(
-            "button_projection", {}
-        )
-        if checkpoint2_projection.get("projection_id") != projection_id:
+        attachment_before = self._attachment_fingerprint_snapshot()
+        if hand in attachment_before["hands"]:
+            raise RuntimeError("press requires an attachment-free selected hand")
+        if not isinstance(projection_id, str) or not projection_id.strip():
+            raise ValueError("projection_id must be a non-empty string")
+        travel = float(travel_m)
+        if not np.isfinite(travel) or travel <= 0.0:
+            raise ValueError("travel_m must be finite and positive")
+        timeout = float(timeout_s)
+        if not np.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("timeout_s must be finite and positive")
+        receipt = self._projection_receipts.get(str(projection_id))
+        if not self._projection_receipt_is_fresh(receipt):
+            raise RuntimeError("fresh projection receipt is required")
+        if str(projection_id) in self._consumed_projection_receipts:
+            raise RuntimeError("projection receipt has already been consumed")
+        if not self._press_gripper_is_strictly_closed(hand):
             raise RuntimeError(
-                "state_checkpoint_2 is not bound to the fresh projection"
+                "press requires physical opening <= 0.003 m and actual close "
+                "latch <= -0.99 on the selected gripper"
             )
-        penetration = float(penetration_m)
-        travel_limit = float(max_travel_m)
-        if not 0.0 <= penetration <= 0.03:
-            raise ValueError("penetration_m must lie within [0.0, 0.03]")
-        if not 0.02 <= travel_limit <= 0.20:
-            raise ValueError("max_travel_m must lie within [0.02, 0.20]")
-        opening = self._physical_gripper_opening(hand)
-        latch = float(self._gripper_latch[hand])
-        if latch > -0.99 or opening > 0.003:
-            raise RuntimeError("press-hand gripper is not confirmed fully closed")
-        stability_before = self._prepress_stability_snapshot()
-        if not stability_before["stable"]:
-            raise RuntimeError("radio is not stably held before toggle press")
-        geometry_before = self._live_toggle_geometry(hand)
-        selected = min(
-            geometry_before["fingers"],
-            key=lambda finger: finger["center_distance_to_marker_m"],
+        self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+        self._switch_controller(_CONTROLLER_PLANNER)
+        hand, selection_source, visual_hand_evidence = (
+            self._revalidate_analytic_selection(
+                requested_hand=requested_hand,
+                expected_hand=hand,
+                visual_hand_check=visual_hand_check,
+            )
         )
-        marker = np.asarray(
-            geometry_before["marker_position_world"], dtype=np.float64
-        ).reshape(3)
-        finger_position = np.asarray(
-            selected["position_world"], dtype=np.float64
-        ).reshape(3)
-        planner = self._require_planner()
-        current = planner.backend.get_eef_pose(hand)
-        if current is None:
-            raise RuntimeError("press-hand EEF pose is unavailable")
-        current_eef = np.asarray(current[0], dtype=np.float64).reshape(3)
-        press_axis = np.asarray(
-            quat_rotate_xyzw(current[1], [0.0, 0.0, 1.0]), dtype=np.float64
-        ).reshape(3)
-        press_axis /= max(float(np.linalg.norm(press_axis)), 1e-12)
-        target_finger = marker + press_axis * penetration
-        translation = target_finger - finger_position
-        travel = float(np.linalg.norm(translation))
-        if not np.isfinite(travel) or travel > travel_limit + 1e-9:
+        switched_facts = self._assert_attachment_snapshot_unchanged(
+            attachment_before,
+            context="press controller transfer",
+        )
+        if hand in switched_facts["hands"]:
             raise RuntimeError(
-                f"finger-to-toggle travel {travel:.6f} m exceeds limit "
-                f"{travel_limit:.6f} m"
+                "press selected hand gained an attachment before execution"
             )
-        eef_to_finger = finger_position - current_eef
-        plan = planner.backend.plan_guarded_ik_step(
+        if not self._press_gripper_is_strictly_closed(hand):
+            raise RuntimeError(
+                "press selected gripper closure changed before execution"
+            )
+        point = np.asarray(receipt["world_point"], dtype=np.float64).reshape(3)
+        outward = np.asarray(receipt["camera_facing_normal"], dtype=np.float64).reshape(
+            3
+        )
+        self._consumed_projection_receipts.add(str(projection_id))
+        result = self._require_planner().press(
             hand=hand,
-            target_xyz=current_eef + translation,
-            target_quat_xyzw=current[1],
-            timeout_s=float(timeout_s),
-            contact_target_xyz=marker,
-            ignore_collision_checks=True,
-            full_solution=True,
+            target_xyz=point,
+            press_direction=-outward,
+            travel_m=travel,
+            timeout_s=timeout,
         )
-        if not plan.get("ok"):
-            raise RuntimeError(
-                f"full finger-center IK failed: {plan.get('stop_reason', 'unknown')}"
-            )
-        q_path = plan.get("joint_trajectory")
-        if q_path is None:
-            raise RuntimeError("full finger-center IK omitted a joint trajectory")
-        result = planner._execute_actions(
-            None,
-            hand=hand,
-            target_xyz=current_eef + translation,
-            target_quat_xyzw=np.asarray(current[1], dtype=np.float64),
-            position_tolerance_m=0.003,
-            orientation_tolerance_rad=0.087,
-            timeout_s=float(timeout_s),
-            require_pose=True,
-            hold_steps_required=8,
-            contact_target_xyz=marker,
-            allow_expected_contact=True,
-            allow_guarded_goal_world_collision=True,
-            stop_on_expected_contact=False,
-            joint_trajectory=q_path,
-            eef_to_contact_vector=eef_to_finger,
-            ignore_collision_checks=True,
+        return self._analytic_public_result(
+            result,
+            primitive="press",
+            requested_hand=requested_hand,
+            resolved_hand=hand,
+            hand_selection_source=selection_source,
+            visual_hand_evidence=visual_hand_evidence,
+            attachment_before=attachment_before,
         )
-        held_frames = 0
-        hold_action = np.asarray(
-            planner.backend.hold_action(hand), dtype=np.float32
-        ).reshape(23)
-        hold_action[ENV_ACTION_SEGMENTS[f"{hand}_gripper"]] = -1.0
-        while held_frames < 12 and not _raw_success(self._last_info):
-            self.planner_step(hold_action.reshape(1, 23))
-            held_frames += 1
-        geometry_after = self._live_toggle_geometry(hand)
-        toggle_after = geometry_after["toggle"]
-        return {
-            **self._planner_result_with_accounting(result),
-            "_finish": False,
-            "primitive_success": bool(_raw_success(self._last_info)),
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "press_hand": hand,
-            "projection_id": projection_id,
-            "selected_finger": {
-                key: _wire_safe(value)
-                for key, value in selected.items()
-                if key != "link"
-            },
-            "marker_position_world": marker.tolist(),
-            "marker_radius_m": float(geometry_before["marker_radius_m"]),
-            "eef_to_finger_vector_world": eef_to_finger.tolist(),
-            "penetration_m": penetration,
-            "direct_travel_m": travel,
-            "guarded_center_target": True,
-            "post_contact_hold_frames": held_frames,
-            "toggled_on": bool(toggle_after.get_value()),
-            "robot_can_toggle_steps": int(toggle_after.robot_can_toggle_steps),
-            "radio_in_global_finger_contact_set": bool(
-                geometry_after["radio_in_global_finger_contact_set"]
-            ),
-            "collision_checks_skipped": True,
-            "press_gripper_command": latch,
-            "press_gripper_opening_m": float(opening),
-            "total_env_steps": int(self._env_steps),
-        }
 
-    def post_pick_visual_servo_align(
-        self,
-        *,
-        projection_id: str,
-        desired_uv: Any,
-        max_travel_m: float = 0.12,
-        timeout_s: float = 240.0,
-    ) -> dict[str, Any]:
-        """Translate the closed press hand so the button reaches a wrist pixel."""
-
-        _path, checkpoint = self._assert_prepress_checkpoint_bound()
-        hand = checkpoint["press_hand"]
-        projection = self._prepress_projection
-        gate = self._prepress_gate
-        if not isinstance(projection, dict) or not isinstance(gate, dict):
-            raise RuntimeError("fresh press-wrist gate and projection are required")
-        if (
-            projection.get("projection_id") != projection_id
-            or projection.get("env_step") != int(self._env_steps)
-            or projection.get("camera") != "press_wrist"
-            or projection.get("frame_id") != gate.get("frame_id")
-        ):
-            raise RuntimeError(
-                "visual-servo projection is stale or not press-wrist bound"
-            )
-        uv = np.asarray(desired_uv, dtype=np.float64).reshape(2)
-        frame = self._frame_cache.get_current(
-            projection["resolved_camera"], projection["frame_id"]
-        )
-        if (
-            not np.isfinite(uv).all()
-            or not 0.0 <= uv[0] < frame.intrinsics.width
-            or not 0.0 <= uv[1] < frame.intrinsics.height
-        ):
-            raise ValueError("desired_uv is outside the press-wrist image")
-        travel_limit = float(max_travel_m)
-        if not 0.01 <= travel_limit <= 0.15:
-            raise ValueError("max_travel_m must lie within [0.01, 0.15]")
-        opening = self._physical_gripper_opening(hand)
-        latch = float(self._gripper_latch[hand])
-        if latch > -0.99 or opening > 0.003:
-            raise RuntimeError("press-hand gripper is not confirmed fully closed")
-        stability_before = self._prepress_stability_snapshot()
-        if (
-            not stability_before["stable"]
-            or int(stability_before["press_contact_count"]) != 0
-        ):
-            raise RuntimeError(
-                "visual servo requires stable radio and zero press-hand contact"
-            )
-        button = np.asarray(
-            projection["button_center_world"], dtype=np.float64
-        ).reshape(3)
-        world_to_camera = np.linalg.inv(frame.camera_to_world)
-        button_camera = transform_point(world_to_camera, button)
-        depth_m = -float(button_camera[2])
-        if not np.isfinite(depth_m) or depth_m <= 0.0:
-            raise RuntimeError("projected button is not in front of the wrist camera")
-        desired_camera = camera_point_from_pixel(
-            frame.intrinsics,
-            u=int(round(float(uv[0]))),
-            v=int(round(float(uv[1]))),
-            depth_m=depth_m,
-        )
-        if frame.correction_profile is not None:
-            desired_camera = frame.correction_profile.apply_camera_point(desired_camera)
-        desired_sample_world = transform_point(frame.camera_to_world, desired_camera)
-        camera_translation = button - desired_sample_world
-        travel = float(np.linalg.norm(camera_translation))
-        if not np.isfinite(travel) or travel > travel_limit + 1e-9:
-            raise RuntimeError(
-                f"visual-servo travel {travel:.6f} m exceeds limit {travel_limit:.6f} m"
-            )
-        planner = self._require_planner()
-        current = planner.backend.get_eef_pose(hand)
-        if current is None:
-            raise RuntimeError("press-hand EEF pose is unavailable")
-        direction = camera_translation / max(travel, 1e-12)
-        target = np.asarray(current[0], dtype=np.float64) + camera_translation
-        result = planner._guarded_incremental_move(
-            hand=hand,
-            target_xyz=target,
-            target_quat_xyzw=current[1],
-            direction=direction,
-            allow_expected_contact=False,
-            position_tolerance_m=0.003,
-            timeout_s=float(timeout_s),
-            require_expected_contact=False,
-            contact_target_xyz=button,
-            terminal_hold_steps_required=4,
-            stop_on_expected_contact=False,
-            ignore_collision_checks=True,
-        )
-        return {
-            **self._planner_result_with_accounting(result),
-            "_finish": False,
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "press_hand": hand,
-            "projection_id": projection_id,
-            "source_uv": _wire_safe(gate.get("center_uv")),
-            "desired_uv": uv.tolist(),
-            "button_depth_m": depth_m,
-            "camera_translation_world": camera_translation.tolist(),
-            "direct_travel_m": travel,
-            "collision_checks_skipped": True,
-            "collision_skip_scope": "curobo_precheck_and_runtime_world+self_reports",
-            "press_gripper_command": latch,
-            "press_gripper_opening_m": float(opening),
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def post_success_hold_frames(self, frames: int = 4) -> dict[str, Any]:
-        """Advance a bounded number of stationary frames after official success."""
-
-        if isinstance(frames, bool) or not 1 <= int(frames) <= 16:
-            raise ValueError("frames must be an integer in [1, 16]")
-        if not _raw_success(self._last_info):
-            raise RuntimeError("post-success hold requires official task success")
-        start_env_step = int(self._env_steps)
-        action, action_source = self._post_success_stationary_action()
-        action = np.asarray(action, dtype=np.float32).reshape(23)
-        if not np.isfinite(action).all():
-            raise RuntimeError("post-success hold action must be finite")
-        action_sha256 = hashlib.sha256(action.tobytes()).hexdigest()
-        self._post_success_cleanup_active = True
-        self._done = False
-        executed = 0
-        try:
-            for _ in range(int(frames)):
-                self.planner_step(action.reshape(1, 23))
-                executed += 1
-        finally:
-            self._post_success_cleanup_active = False
-            self._done = bool(_raw_success(self._last_info))
-        return {
-            "_finish": False,
-            "primitive_success": executed == int(frames),
-            "task_success": bool(_raw_success(self._last_info)),
-            "official_success_source": 'info["done"]["success"]',
-            "stop_reason": "post_success_frames_held",
-            "requested_frames": int(frames),
-            "executed_frames": executed,
-            "start_env_step": start_env_step,
-            "end_env_step": int(self._env_steps),
-            "hold_action_source": action_source,
-            "hold_action_sha256": action_sha256,
-            "total_env_steps": int(self._env_steps),
-        }
-
-    def post_success_retreat_and_open(
-        self,
-        *,
-        hand: str,
-        retreat_direction: Any,
-        retreat_m: float = 0.05,
-        opening: float = 1.0,
-        timeout_s: float = 60.0,
-    ) -> dict[str, Any]:
-        """Retreat the dynamic press hand first, then open its gripper."""
-
-        _path, checkpoint, _sha256 = self._read_post_pick_checkpoint()
-        if hand != checkpoint["press_hand"]:
-            raise ValueError("cleanup hand must match dynamic press_hand")
-        if not _raw_success(self._last_info):
-            raise RuntimeError("post-success cleanup requires official task success")
-        direction = np.asarray(retreat_direction, dtype=np.float64).reshape(3)
-        norm = float(np.linalg.norm(direction))
-        if not np.isfinite(direction).all() or norm < 1e-9:
-            raise ValueError("retreat_direction must be one finite non-zero vector")
-        direction /= norm
-        distance = float(retreat_m)
-        if not 0.01 <= distance <= 0.10:
-            raise ValueError("retreat_m must lie within [0.01, 0.10]")
-        planner = self._require_planner()
-        current = planner.backend.get_eef_pose(hand)
-        if current is None:
-            raise RuntimeError("cannot read press EEF pose for post-success retreat")
-        target = np.asarray(current[0], dtype=np.float64) + direction * distance
-        toggle_geometry = self._live_toggle_geometry(hand)
-        marker = np.asarray(
-            toggle_geometry["marker_position_world"], dtype=np.float64
-        ).reshape(3)
-        selected_finger = min(
-            toggle_geometry["fingers"],
-            key=lambda item: item["center_distance_to_marker_m"],
-        )
-        finger_position = np.asarray(
-            selected_finger["position_world"], dtype=np.float64
-        ).reshape(3)
-        eef_to_finger = finger_position - np.asarray(
-            current[0], dtype=np.float64
-        ).reshape(3)
-        marker_to_finger = finger_position - marker
-        marker_to_finger /= max(float(np.linalg.norm(marker_to_finger)), 1e-12)
-        contact_surface_target = marker + marker_to_finger * float(
-            toggle_geometry["marker_radius_m"]
-        )
-        self._post_success_cleanup_active = True
-        self._done = False
-        try:
-            retreat = planner._guarded_incremental_move(
-                hand=hand,
-                target_xyz=target,
-                target_quat_xyzw=current[1],
-                direction=direction,
-                allow_expected_contact=True,
-                position_tolerance_m=0.006,
-                timeout_s=float(timeout_s),
-                require_expected_contact=False,
-                contact_target_xyz=contact_surface_target,
-                terminal_hold_steps_required=2,
-                stop_on_expected_contact=False,
-                eef_to_contact_vector=eef_to_finger,
-                allowed_contact_distance_m=0.04,
-            )
-            if not retreat.get("primitive_success"):
-                return {
-                    **retreat,
-                    "task_success": bool(_raw_success(self._last_info)),
-                    "cleanup_stage": "retreat",
-                    "total_env_steps": int(self._env_steps),
-                }
-            opened = planner.release(
-                hand=hand,
-                opening=float(opening),
-                retreat_vector=None,
-                retreat_m=0.0,
-                timeout_s=min(30.0, float(timeout_s)),
-            )
-            return {
-                "_finish": False,
-                "primitive_success": bool(opened.get("primitive_success")),
-                "task_success": bool(_raw_success(self._last_info)),
-                "official_success_source": 'info["done"]["success"]',
-                "stop_reason": (
-                    "post_success_retreated_and_opened"
-                    if opened.get("primitive_success")
-                    else opened.get("stop_reason", "gripper_open_failed")
-                ),
-                "retreat": _wire_safe(retreat),
-                "gripper_open": _wire_safe(opened),
-                "retreat_direction": direction.tolist(),
-                "retreat_m": distance,
-                "initial_toggle_marker_world": marker.tolist(),
-                "initial_toggle_contact_surface_world": (
-                    contact_surface_target.tolist()
-                ),
-                "total_env_steps": int(self._env_steps),
-            }
-        finally:
-            self._post_success_cleanup_active = False
-            self._done = bool(_raw_success(self._last_info))
-
-    def release(
-        self,
-        hand: str,
-        opening: float = 1.0,
-        retreat_vector: Any | None = None,
-        retreat_m: float = 0.03,
-        timeout_s: float = 30.0,
-    ) -> dict[str, Any]:
-        result = self._require_planner().release(
-            hand=hand,
-            opening=opening,
-            retreat_vector=retreat_vector,
-            retreat_m=retreat_m,
-            timeout_s=timeout_s,
-        )
-        return self._planner_result_with_accounting(result)
-
-    def close(self) -> None:
-        try:
-            self._finalize_video_segment()
-        finally:
-            self._env.close()
+    def shutdown(self) -> None:
+        # The process owns exactly one attempt. OmniGibson / Kit teardown has
+        # repeatedly segfaulted inside Replicator plugin destruction after all
+        # task artifacts were already complete. Seal Python-owned artifacts
+        # here; main() closes the RPC server, fsyncs receipts, and uses
+        # os._exit(0), letting the OS release the GPU context without invoking
+        # the broken native destructor chain.
+        self._finalize_video_segment()
 
 
 _INITIAL_PPID = os.getppid()
@@ -8679,18 +6119,6 @@ def _start_parent_watchdog(
                         and failed_runtime.get("lifecycle_finalized") is True
                     ):
                         continue
-                if (
-                    env._handoff_state == _HANDOFF_PAUSED
-                    and env._paused_runtime_path.is_file()
-                ):
-                    try:
-                        paused = json.loads(
-                            env._paused_runtime_path.read_text(encoding="utf-8")
-                        )
-                    except Exception:
-                        paused = {}
-                    if paused.get("lifecycle_finalized") is True:
-                        continue
                 shutdown_event.set()
                 threading.Thread(target=server.shutdown, daemon=True).start()
                 return
@@ -8718,18 +6146,9 @@ class _MainThreadDispatcher:
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method.startswith("env."):
             env_method = method.removeprefix("env.")
-            mode = getattr(self._env, "_control_mode", None)
-            allowed = _SHARED_ENV_RPC_METHODS | _ENV_RPC_METHODS_BY_MODE.get(
-                mode, frozenset()
-            )
-            if env_method not in allowed:
+            if env_method not in _ENV_RPC_METHODS:
                 raise ValueError(f"unknown BEHAVIOR env RPC method: {method!r}")
-            if env_method in STAGE3_PRESS_TOOL_NAMES and not bool(
-                getattr(self._env, "_stage3_press_enabled", False)
-            ):
-                raise ValueError(
-                    f"BEHAVIOR stage-3 RPC is not enabled for this run: {method!r}"
-                )
+            self._env._assert_rpc_lifecycle(env_method)
             return getattr(self._env, env_method)(*args, **kwargs)
         if method == "shutdown":
             self._shutdown_event.set()
@@ -8764,22 +6183,59 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--activity-instance-dir", required=True)
     parser.add_argument("--scene-model", required=True)
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--public-seed", type=int, required=True)
+    parser.add_argument("--attempt-index", type=int, required=True)
+    parser.add_argument(
+        "--expected-run-nonce",
+        default=os.environ.get("RPENT_BEHAVIOR_EXPECTED_RUN_NONCE"),
+    )
+    parser.add_argument(
+        "--controller-mode",
+        choices=("hybrid", "pi0_nav_pick_only"),
+        default="hybrid",
+    )
     parser.add_argument("--max-episode-steps", type=int, required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--config-path")
-    parser.add_argument("--control-mode", choices=CONTROL_MODES, required=True)
-    parser.add_argument("--behavior-stage3-press", action="store_true")
     parser.add_argument("--transport-host", default="127.0.0.1")
     parser.add_argument("--transport-port", type=int, default=0)
-    parser.add_argument(
-        "--controller-switch-smoke",
-        action="store_true",
-        help=(
-            "Run one real velocity-to-position controller reload, eight-step "
-            "current-target hold, and cuRobo warmup, then exit without RPC/VLA."
-        ),
-    )
     return parser.parse_args()
+
+
+def _flush_shutdown_artifacts(output_dir: Path) -> None:
+    """Durably flush the sealed attempt before bypassing native destructors."""
+
+    receipt = {
+        "schema_version": 1,
+        "status": "sealed",
+        "exit_strategy": "controlled_fast_exit_without_native_destructor",
+        "pid": os.getpid(),
+        "video_path": str(output_dir / "episode.mp4"),
+        "action_trace_path": str(output_dir / "behavior_action_trace.jsonl"),
+        "sealed_at_unix_s": time.time(),
+    }
+    _write_json_atomic(output_dir / "env_shutdown_receipt.json", receipt)
+    for path in (
+        output_dir / "episode.mp4",
+        output_dir / "episode_meta.json",
+        output_dir / "video_meta.json",
+        output_dir / "behavior_action_trace.jsonl",
+        output_dir / "env_shutdown_receipt.json",
+    ):
+        if not path.is_file():
+            continue
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    descriptor = os.open(output_dir, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 
 def main() -> None:
@@ -8794,6 +6250,10 @@ def main() -> None:
         "activity_instance_id": args.activity_instance_id,
         "activity_instance_dir": str(Path(args.activity_instance_dir).resolve()),
         "scene_model": args.scene_model,
+        "public_seed": args.public_seed,
+        "attempt_index": args.attempt_index,
+        "expected_run_nonce": args.expected_run_nonce,
+        "controller_mode": args.controller_mode,
         "seed": args.seed,
         "max_episode_steps": args.max_episode_steps,
     }
@@ -8801,24 +6261,7 @@ def main() -> None:
         cfg=_load_env_config(args),
         meta=meta,
         output_dir=output_dir,
-        control_mode=args.control_mode,
-        stage3_press_enabled=args.behavior_stage3_press,
     )
-    if args.controller_switch_smoke:
-        try:
-            result = env.run_controller_switch_smoke()
-            print(
-                json.dumps(
-                    {
-                        "event": "controller_switch_smoke_complete",
-                        "result_path": result["result_path"],
-                    }
-                ),
-                flush=True,
-            )
-        finally:
-            env.close()
-        return
     shutdown_event = threading.Event()
     dispatcher = _MainThreadDispatcher(env, shutdown_event)
     server = SocketRpcServer(
@@ -8843,11 +6286,28 @@ def main() -> None:
         dispatcher.run()
     finally:
         try:
-            env.close()
+            env.shutdown()
         finally:
             server.shutdown()
             server.server_close()
+    _flush_shutdown_artifacts(output_dir)
 
 
 if __name__ == "__main__":
-    main()
+    exit_code = 0
+    try:
+        main()
+    except BaseException:
+        traceback.print_exc()
+        exit_code = 1
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            # OmniGibson / Kit native module destructors have repeatedly
+            # segfaulted after a fully sealed graceful shutdown. This process
+            # owns one attempt, so bypass Python/native teardown only after
+            # main() has sealed Python-owned artifacts and closed the socket
+            # server, without entering the broken native destructor chain.
+            os._exit(exit_code)

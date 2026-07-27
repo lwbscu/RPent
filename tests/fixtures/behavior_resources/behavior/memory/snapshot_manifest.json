@@ -1,0 +1,37 @@
+{
+  "entrypoint": "MEMORY.md",
+  "environment": "behavior",
+  "files": {
+    "MEMORY.md": {
+      "sha256": "731c74a96d6c2fbcdc20d17cb93f8d86fc4f1cebed7ed5f8ccb71e3ec5e0c117",
+      "size_bytes": 321
+    },
+    "README.md": {
+      "sha256": "74801b3ca6860e08807a54a7b3d91b92e6d4d6142032df7600cb99c622c7b440",
+      "size_bytes": 88
+    },
+    "picking_up_trash/explore_experience.md": {
+      "sha256": "ddee37f49c9bf182a091a10bb1202689eba62e23fb7ae9efbd1629d190e4b10f",
+      "size_bytes": 128
+    },
+    "picking_up_trash/target_prior.md": {
+      "sha256": "707cd1d0c7ef34a5e5460bbaa127891267abc994cbf0c5980ea7cc8300a9cf32",
+      "size_bytes": 99
+    },
+    "turning_on_radio/control_face_target_lock.md": {
+      "sha256": "752f2e8e82c0285327385ecf640420e7bb6c0a85c9db5c20b4af21bb4251f61b",
+      "size_bytes": 111
+    },
+    "turning_on_radio/explore_experience.md": {
+      "sha256": "a1107fc205743ca3906f36701c2f6fb35fbba6368faa053e57f350c581fa5e72",
+      "size_bytes": 93
+    },
+    "turning_on_radio/target_prior.md": {
+      "sha256": "f35073cba6f79de30d63fef133c88b59e3b4aef19ce0e6e89b173d154b1b9f56",
+      "size_bytes": 92
+    }
+  },
+  "kind": "reviewed_behavior_memory_snapshot",
+  "schema_version": 1,
+  "snapshot_sha256": "f6834a104e8772c162342a90edd8623125fd3a4e1b66e5931dac603a89fdfc5b"
+}

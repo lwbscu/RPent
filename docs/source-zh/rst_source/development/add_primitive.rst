@@ -1,4 +1,4 @@
-添加 action primitive
+添加 Action Primitive
 =====================
 
 RPent 中的 *action primitive* 就是把一次 tool 调用变成 environment 可
@@ -72,7 +72,7 @@ primitive-driver 方法、调用后一次状态 dump。差异只在 *方法内�
       self.add_tool("open_drawer", OPEN_DRAWER_SPEC,
                     lambda **kw: self._step("open_drawer", **kw))
 
-到这里, ``api``、``claude_code``、``codex`` 三种 cerebrum 都能调它 ——
+到这里, ``api``、``claude_code``、``codex`` 三种 planner 都能调它 ——
 不需要改别的。
 
 添加一个 VLA (或其他基于模型的 primitive)
@@ -81,19 +81,22 @@ primitive-driver 方法、调用后一次状态 dump。差异只在 *方法内�
 基于模型的 primitive 要多一些脚手架, 因为模型跑在自己的进程。套路:
 
 1. **写一个 ``vla_server.py``。** 只持有模型权重和 CUDA 上下文。
-   暴露 ``vla_load`` / ``vla_infer`` / ``vla_reset``:
+   继承 :class:`rpent.utils.rpc.RpcFacade`, 通过 ``_dispatch`` 暴露
+   模型方法 (如 ``predict``):
 
-   - 观测是扁平的 ``image + state`` 时走 **HTTP** (LIBERO / Pi0.5
-     模式)。
-   - 观测是带历史堆叠的嵌套 numpy dict 时走 **socket RPC** (RoboCasa /
-     RLDX-1 模式)。
+   - 默认走 **HTTP** (JSON over ``POST /call``), 适合扁平的
+     ``image + state`` 载荷 (LIBERO / Pi0.5 模式)。
+   - 观测是带历史堆叠的嵌套 numpy dict 时切到 **socket RPC**
+     (``--transport socket``, 避免 JSON 重编码开销)。
 
-   server 开始监听时, 在 stdout 上输出一条 ``transport_ready`` JSON
-   事件; ``rpent/cli/main.py`` 会阻塞等这个事件。
+   ``RpcFacade.serve`` 负责 transport 绑定、``healthz``、``shutdown``、
+   感知父进程死亡 —— 你只写模型相关的方法。
 
-2. **写一个 model client。** 一个小类, 提供 ``predict(obs)`` (HTTP) 或
-   ``vla_infer(obs)`` (socket), toolkit 会和 env client 一起持有它。
-   可以参考 ``rpent.utils.vla_client.VLAClient`` 这个 LIBERO 用例。
+2. **写一个 model client。** 一个小类, 包装一个
+   :class:`rpent.utils.rpc.RpcClient`
+   (:class:`HttpRpcClient` 或 :class:`SocketRpcClient`),
+   暴露模型的业务 API。可以参考 ``rpent.utils.vla_client.VLAClient``
+   这个 LIBERO 用例。
 
 3. **在 primitive-driver 上加一个方法。** 在 env 的 primitive-driver
    类里调 model client, 把返回的 chunk 转给 env, 并返回一个日志 dict:
@@ -120,8 +123,9 @@ primitive-driver 方法、调用后一次状态 dump。差异只在 *方法内�
               video_path=video_path,
           )
 
-   ``rpent/cli/main.py`` 会传入 ``{"env": MyRobotEnvClient(...),
-   "model": MyModelClient(...)}``。
+   然后 env 的 ``_init_runtime`` 会构造 ``primitives_kwargs`` 为
+   ``{"env": MyRobotEnvClient(...), "model": MyModelClient(...)}``, 由
+   toolkit 构造器转发给 primitive driver。
 
 跨 run 复用同一个 vla_server
 ----------------------------
@@ -130,7 +134,7 @@ primitive-driver 方法、调用后一次状态 dump。差异只在 *方法内�
 
 .. code-block:: bash
 
-   rpent --vla-endpoint http://vla-host:8000 ...
+   rpent --env libero --vla-endpoint http://vla-host:8000 ...
 
 把你的 ``vla_server`` 设计成 **task 无关**——用一个显式的 ``vla_reset``
 RPC 清 per-episode 状态——这样一个进程就能安全服务很多次连续 run。

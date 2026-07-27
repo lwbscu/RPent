@@ -2,44 +2,36 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
 
+from robots.behavior.schemas import (
+    ROTATE_WRIST_RUNTIME_TIMEOUT_S,
+    validate_relative_navigation_motion,
+)
 from rpent.utils.rpc import RpcClient
 
 _TIMEOUT_S = {
     "default": 30.0,
     "env.reset": 1800.0,
-    "env.chunk_step": 1800.0,
-    "env.pi0_chunk_step": 1800.0,
-    "env.pi0_navigate_to_chunk_step": 1800.0,
     "env.pi0_nav_pick_chunk_step": 1800.0,
+    "env.prepare_vla_invocation": 120.0,
+    "env.guard_tool_call": 30.0,
     "env.save_robot_state_checkpoint": 120.0,
-    "env.restore_robot_state_checkpoint": 1800.0,
     "env.finalize_paused_runtime": 120.0,
     "env.current_observation": 120.0,
-    "env.inspect_post_pick_state": 120.0,
     "env.observe": 120.0,
-    "env.declare_button_visibility": 120.0,
-    "env.project_button": 120.0,
-    "env.evaluate_prepress_geometry": 120.0,
-    "env.prepress_move_to": 1800.0,
-    "env.prepress_rotate_wrist": 1800.0,
-    "env.save_prepress_checkpoint": 120.0,
     "env.pixel_to_world": 120.0,
-    "env.navigate_to": 1800.0,
     "env.move_to": 1800.0,
-    "env.pick": 1800.0,
+    "env.navigate_to": 1800.0,
     "env.rotate_wrist": 1800.0,
+    "env.close": 120.0,
+    "env.open": 120.0,
     "env.press": 1800.0,
-    "env.release": 1800.0,
-    "env.post_pick_close_press_gripper": 120.0,
-    "env.inspect_toggle_geometry": 120.0,
-    "env.post_pick_recenter_held_button": 1800.0,
-    "env.post_pick_direct_finger_toggle": 1800.0,
-    "env.post_success_hold_frames": 120.0,
 }
+_SUCCESS_CLEANUP_RPC_METHODS = frozenset({"env.finalize_paused_runtime"})
 
 
 class BehaviorEnvClient:
@@ -55,7 +47,9 @@ class BehaviorEnvClient:
         self.episode_done = False
         self.total_env_steps = 0
         self.vla_endpoint: str | None = None
-        server_meta = self._client.call(
+        self._official_success_latched = False
+        self._official_success_receipt: dict[str, Any] | None = None
+        server_meta = self._rpc_call(
             "env.get_env_meta",
             timeout_s=_TIMEOUT_S["default"],
         )
@@ -71,83 +65,136 @@ class BehaviorEnvClient:
         self.server_meta = dict(server_meta)
 
     def reset(self) -> tuple[dict[str, Any], Any]:
-        ret = self._client.call("env.reset", timeout_s=_TIMEOUT_S["env.reset"])
-        self.episode_done = False
+        """Runtime-only initialization for the current fresh episode."""
+
+        ret = self._rpc_call("env.reset", timeout_s=_TIMEOUT_S["env.reset"])
+        if not self._official_success_latched:
+            self.episode_done = False
         self.total_env_steps = 0
         return ret
+
+    @staticmethod
+    def _raw_success(info: Any) -> bool:
+        done = info.get("done") if isinstance(info, dict) else None
+        value = done.get("success") if isinstance(done, dict) else None
+        return isinstance(value, (bool, np.bool_)) and bool(value)
+
+    @staticmethod
+    def _receipt_from_info(info: Any) -> dict[str, Any] | None:
+        runtime = info.get("_rpent") if isinstance(info, dict) else None
+        if not isinstance(runtime, dict):
+            return None
+        receipt = runtime.get("official_success_receipt")
+        if isinstance(receipt, dict):
+            return deepcopy(receipt)
+        monitor = runtime.get("pi0_nav_pick_monitor")
+        receipt = (
+            monitor.get("official_success_receipt")
+            if isinstance(monitor, dict)
+            else None
+        )
+        return deepcopy(receipt) if isinstance(receipt, dict) else None
+
+    @staticmethod
+    def _valid_success_receipt(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        raw_done = value.get("raw_done")
+        if (
+            value.get("source") != 'info["done"]["success"]'
+            or not isinstance(raw_done, dict)
+            or raw_done.get("success") is not True
+            or not isinstance(value.get("receipt_sha256"), str)
+            or not value["receipt_sha256"]
+        ):
+            return None
+        return deepcopy(value)
+
+    def _latch_success_response(self, ret: Any) -> None:
+        info: Any = None
+        direct_receipt: Any = None
+        if isinstance(ret, (tuple, list)) and len(ret) == 5:
+            info = ret[4]
+        elif isinstance(ret, (tuple, list)) and len(ret) == 2:
+            info = ret[1]
+        elif isinstance(ret, dict):
+            info = ret if isinstance(ret.get("done"), dict) else ret.get("info")
+            direct_receipt = ret.get("official_success_receipt")
+        receipt = self._valid_success_receipt(direct_receipt)
+        if receipt is None:
+            receipt = self._valid_success_receipt(self._receipt_from_info(info))
+        raw_success = self._raw_success(info)
+        if receipt is not None:
+            if self._official_success_receipt is None:
+                self._official_success_receipt = receipt
+            elif self._official_success_receipt != receipt:
+                raise RuntimeError(
+                    "env official success receipt changed after the first latch"
+                )
+        if raw_success or receipt is not None:
+            self._official_success_latched = True
+            self.episode_done = True
+
+    def _rpc_call(
+        self,
+        method: str,
+        *,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        timeout_s: float | None = None,
+    ) -> Any:
+        if bool(getattr(self, "_official_success_latched", False)) and (
+            method not in _SUCCESS_CLEANUP_RPC_METHODS
+        ):
+            raise RuntimeError(
+                "raw task success is terminal; RPC rejected before transport"
+            )
+        ret = self._client.call(
+            method,
+            args=args,
+            kwargs=kwargs,
+            timeout_s=timeout_s,
+        )
+        self._latch_success_response(ret)
+        return ret
+
+    def prepare_vla_invocation(
+        self,
+        *,
+        invocation_id: str,
+        call_index: int,
+        vla_status: dict[str, Any] | None,
+        current_object_visual_check: dict[str, Any] | None = None,
+        baseline_internal_authorization: bool = False,
+    ) -> dict[str, Any]:
+        return self._planner_call(
+            "prepare_vla_invocation",
+            invocation_id=invocation_id,
+            call_index=call_index,
+            vla_status=vla_status,
+            current_object_visual_check=current_object_visual_check,
+            baseline_internal_authorization=baseline_internal_authorization,
+        )
+
+    def guard_tool_call(
+        self, *, name: str, input_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._planner_call(
+            "guard_tool_call",
+            name=name,
+            input_dict=input_dict,
+        )
 
     def _track_step_result(self, ret: tuple[Any, Any, Any, Any, Any]) -> None:
         _, _, term, trunc, info = ret
         if np.asarray(term).any() or np.asarray(trunc).any():
             self.episode_done = True
         if isinstance(info, dict):
-            if bool((info.get("done") or {}).get("success")):
-                self.episode_done = True
             rpent = info.get("_rpent")
             if isinstance(rpent, dict) and "total_env_steps" in rpent:
                 self.total_env_steps = int(rpent["total_env_steps"])
-
-    def chunk_step(self, actions) -> tuple[Any, Any, Any, Any, Any]:
-        assert not self.episode_done, "env.chunk_step called after episode done"
-        # The local agent and remote BEHAVIOR runtime may use incompatible
-        # NumPy major versions. Keep ndarray pickle internals off this boundary.
-        wire_actions = np.asarray(actions, dtype=np.float32).tolist()
-        ret = self._client.call(
-            "env.chunk_step",
-            args=(wire_actions,),
-            timeout_s=_TIMEOUT_S["env.chunk_step"],
-        )
-        self._track_step_result(ret)
-        return ret
-
-    def pi0_chunk_step(
-        self,
-        actions,
-        *,
-        hand: str,
-        gripper_closed_threshold: float = 0.045,
-        required_closed_steps: int = 3,
-        stop_on_candidate: bool = False,
-    ) -> tuple[Any, Any, Any, Any, Any]:
-        assert not self.episode_done, "env.pi0_chunk_step called after episode done"
-        wire_actions = np.asarray(actions, dtype=np.float32).tolist()
-        ret = self._client.call(
-            "env.pi0_chunk_step",
-            args=(wire_actions,),
-            kwargs={
-                "hand": hand,
-                "gripper_closed_threshold": gripper_closed_threshold,
-                "required_closed_steps": required_closed_steps,
-                "stop_on_candidate": stop_on_candidate,
-            },
-            timeout_s=_TIMEOUT_S["env.pi0_chunk_step"],
-        )
-        self._track_step_result(ret)
-        return ret
-
-    def pi0_navigate_to_chunk_step(
-        self,
-        actions,
-        *,
-        segment_index: int,
-        chunk_index: int,
-    ) -> tuple[Any, Any, Any, Any, Any]:
-        """Execute one bounded, base-only Pi0 visual-navigation chunk."""
-        assert not self.episode_done, (
-            "env.pi0_navigate_to_chunk_step called after episode done"
-        )
-        wire_actions = np.asarray(actions, dtype=np.float32).tolist()
-        ret = self._client.call(
-            "env.pi0_navigate_to_chunk_step",
-            args=(wire_actions,),
-            kwargs={
-                "segment_index": int(segment_index),
-                "chunk_index": int(chunk_index),
-            },
-            timeout_s=_TIMEOUT_S["env.pi0_navigate_to_chunk_step"],
-        )
-        self._track_step_result(ret)
-        return ret
+            if isinstance(rpent, dict) and "global_env_steps" in rpent:
+                self.total_env_steps = int(rpent["global_env_steps"])
 
     def pi0_nav_pick_chunk_step(
         self,
@@ -155,15 +202,14 @@ class BehaviorEnvClient:
         *,
         chunk_index: int,
     ) -> tuple[Any, Any, Any, Any, Any]:
-        assert not self.episode_done, (
-            "env.pi0_nav_pick_chunk_step called after episode done"
-        )
+        if self.episode_done:
+            raise RuntimeError("env.pi0_nav_pick_chunk_step called after episode done")
         action_array = np.asarray(actions, dtype=np.float32)
         if action_array.shape != (32, 23):
             raise ValueError(
                 f"pi0_nav_pick requires one complete [32,23] chunk, got {action_array.shape}"
             )
-        ret = self._client.call(
+        ret = self._rpc_call(
             "env.pi0_nav_pick_chunk_step",
             args=(action_array.tolist(),),
             kwargs={"chunk_index": int(chunk_index)},
@@ -175,50 +221,19 @@ class BehaviorEnvClient:
     def save_robot_state_checkpoint(
         self,
         *,
-        checkpoint_name: str,
-        stage: str,
-        held_hand: str,
-        press_hand: str,
-        object_name: str,
-        require_current_grasp: bool = True,
-        visual_review: bool = True,
+        semantic_label: str | None = None,
+        terminal_failure: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        return self._planner_call(
-            "save_robot_state_checkpoint",
-            checkpoint_name=checkpoint_name,
-            stage=stage,
-            held_hand=held_hand,
-            press_hand=press_hand,
-            object_name=object_name,
-            require_current_grasp=require_current_grasp,
-            visual_review=visual_review,
-        )
-
-    def restore_robot_state_checkpoint(
-        self,
-        *,
-        checkpoint_name: str,
-        checkpoint_path: str | None = None,
-        mode: str = "plan_and_execute",
-        keep_held_gripper_closed: bool = True,
-        require_object_still_held: bool = True,
-        timeout_s: float = 180.0,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "restore_robot_state_checkpoint",
-            checkpoint_name=checkpoint_name,
-            checkpoint_path=checkpoint_path,
-            mode=mode,
-            keep_held_gripper_closed=keep_held_gripper_closed,
-            require_object_still_held=require_object_still_held,
-            timeout_s=timeout_s,
-        )
+        kwargs = {} if semantic_label is None else {"semantic_label": semantic_label}
+        if terminal_failure is not None:
+            kwargs["terminal_failure"] = dict(terminal_failure)
+        return self._planner_call("save_robot_state_checkpoint", **kwargs)
 
     def finalize_paused_runtime(self, vla_status: dict[str, Any]) -> dict[str, Any]:
         payload = dict(vla_status)
         if self.vla_endpoint:
             payload.setdefault("endpoint", self.vla_endpoint)
-        ret = self._client.call(
+        ret = self._rpc_call(
             "env.finalize_paused_runtime",
             args=(payload,),
             timeout_s=_TIMEOUT_S["env.finalize_paused_runtime"],
@@ -229,7 +244,7 @@ class BehaviorEnvClient:
 
     def current_observation(self) -> tuple[dict[str, Any], Any]:
         """Refresh synchronized sensors without resetting or advancing physics."""
-        ret = self._client.call(
+        ret = self._rpc_call(
             "env.current_observation",
             timeout_s=_TIMEOUT_S["env.current_observation"],
         )
@@ -240,35 +255,41 @@ class BehaviorEnvClient:
             rpent = info.get("_rpent")
             if isinstance(rpent, dict) and "total_env_steps" in rpent:
                 self.total_env_steps = int(rpent["total_env_steps"])
-            if bool((info.get("done") or {}).get("success")):
-                self.episode_done = True
         return observation, info
 
-    def inspect_post_pick_state(
-        self,
-        *,
-        checkpoint_name: str = "state_checkpoint_1",
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "inspect_post_pick_state",
-            checkpoint_name=checkpoint_name,
-        )
-
     def get_env_meta(self) -> dict[str, Any]:
-        return self._client.call("env.get_env_meta", timeout_s=_TIMEOUT_S["default"])
+        return self._rpc_call("env.get_env_meta", timeout_s=_TIMEOUT_S["default"])
 
-    def _planner_call(self, method: str, **kwargs: Any) -> dict[str, Any]:
+    def _planner_call(
+        self,
+        method: str,
+        *,
+        _runtime_deadline_s: float | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         rpc_timeout_s = _TIMEOUT_S.get(f"env.{method}", _TIMEOUT_S["default"])
         requested_timeout = kwargs.get("timeout_s")
-        if requested_timeout is not None:
+        if _runtime_deadline_s is not None and requested_timeout is not None:
+            raise ValueError(
+                "runtime deadline and public primitive timeout are mutually exclusive"
+            )
+        primitive_deadline_s = (
+            _runtime_deadline_s
+            if _runtime_deadline_s is not None
+            else requested_timeout
+        )
+        if primitive_deadline_s is not None:
             # The primitive owns the hard deadline.  Keep a bounded transport
             # grace period for serializing its structured timeout result rather
             # than leaving every planner RPC blocked for the global 30 minutes.
+            primitive_deadline_s = float(primitive_deadline_s)
+            if not np.isfinite(primitive_deadline_s) or primitive_deadline_s <= 0.0:
+                raise ValueError("runtime deadline must be finite and positive")
             rpc_timeout_s = min(
                 rpc_timeout_s,
-                max(30.0, float(requested_timeout) + 60.0),
+                max(30.0, primitive_deadline_s + 60.0),
             )
-        ret = self._client.call(
+        ret = self._rpc_call(
             f"env.{method}",
             kwargs=kwargs,
             timeout_s=rpc_timeout_s,
@@ -277,155 +298,247 @@ class BehaviorEnvClient:
             raise RuntimeError(f"env.{method} returned non-dict result: {type(ret)!r}")
         if "total_env_steps" in ret:
             self.total_env_steps = int(ret["total_env_steps"])
-        if bool(ret.get("task_success", False)):
-            self.episode_done = True
+        if "global_env_steps" in ret:
+            self.total_env_steps = int(ret["global_env_steps"])
         return ret
 
-    def observe(self, *, camera: str) -> dict[str, Any]:
-        return self._planner_call("observe", camera=camera)
-
-    def declare_button_visibility(
+    def observe(
         self,
         *,
         camera: str,
-        frame_id: str,
-        button_visible: bool,
-        positive_signature: dict[str, bool] | None = None,
-        negative_case: str | None = None,
-        bbox_xyxy: list[float] | None = None,
-        center_uv: list[float] | None = None,
+        frame_review: dict[str, Any] | None = None,
+        depth_probe: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._planner_call(
-            "declare_button_visibility",
-            camera=camera,
-            frame_id=frame_id,
-            button_visible=button_visible,
-            positive_signature=positive_signature,
-            negative_case=negative_case,
-            bbox_xyxy=bbox_xyxy,
-            center_uv=center_uv,
-        )
+        if camera not in {"head", "left_wrist", "right_wrist"}:
+            raise ValueError("camera must be head, left_wrist, or right_wrist")
+        if frame_review is not None and depth_probe is not None:
+            raise ValueError("frame_review and depth_probe are mutually exclusive")
+        kwargs: dict[str, Any] = {"camera": camera}
+        if frame_review is not None:
+            kwargs["frame_review"] = frame_review
+        if depth_probe is not None:
+            kwargs["depth_probe"] = depth_probe
+        return self._planner_call("observe", **kwargs)
 
-    def project_button(
+    @staticmethod
+    def _validated_analytic_hand(hand: str) -> str:
+        if not isinstance(hand, str) or hand not in {"left", "right"}:
+            raise ValueError("hand must be 'left' or 'right'")
+        return hand
+
+    def move_to(
         self,
         *,
-        gate_id: str,
-        depth_window_px: int = 7,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "project_button",
-            gate_id=gate_id,
-            depth_window_px=depth_window_px,
-        )
-
-    def evaluate_prepress_geometry(
-        self,
-        *,
-        projection_id: str,
-        max_line_distance_m: float = 0.010,
-        max_opposition_angle_deg: float = 15.0,
-        min_axial_standoff_m: float = 0.03,
-        max_axial_standoff_m: float = 0.06,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "evaluate_prepress_geometry",
-            projection_id=projection_id,
-            max_line_distance_m=max_line_distance_m,
-            max_opposition_angle_deg=max_opposition_angle_deg,
-            min_axial_standoff_m=min_axial_standoff_m,
-            max_axial_standoff_m=max_axial_standoff_m,
-        )
-
-    def prepress_move_to(
-        self,
-        *,
-        role: str = "held",
-        button_goal: dict[str, Any],
-        plan_only: bool = False,
-        timeout_s: float = 90.0,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "prepress_move_to",
-            role=role,
-            button_goal=button_goal,
-            plan_only=plan_only,
-            timeout_s=timeout_s,
-        )
-
-    def prepress_rotate_wrist(
-        self,
-        *,
-        role: str = "held",
-        target_quat_xyzw: list[float] | None = None,
-        relative_axis_angle: list[float] | None = None,
-        frame: str = "eef",
-        plan_only: bool = False,
-        timeout_s: float = 90.0,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "prepress_rotate_wrist",
-            role=role,
-            target_quat_xyzw=target_quat_xyzw,
-            relative_axis_angle=relative_axis_angle,
-            frame=frame,
-            plan_only=plan_only,
-            timeout_s=timeout_s,
-        )
-
-    def save_prepress_checkpoint(
-        self,
-        *,
-        checkpoint_name: str = "state_checkpoint_2",
-        stage: str = "pre_press_alignment",
-        visual_review: bool = True,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "save_prepress_checkpoint",
-            checkpoint_name=checkpoint_name,
-            stage=stage,
-            visual_review=visual_review,
-        )
-
-    def post_pick_close_press_gripper(
-        self, *, timeout_s: float = 30.0
-    ) -> dict[str, Any]:
-        return self._planner_call("post_pick_close_press_gripper", timeout_s=timeout_s)
-
-    def inspect_toggle_geometry(self) -> dict[str, Any]:
-        return self._planner_call("inspect_toggle_geometry")
-
-    def post_pick_recenter_held_button(
-        self,
-        *,
-        target_finger_standoff_m: float = 0.04,
-        max_held_travel_m: float = 0.08,
+        hand: str,
+        target: dict[str, Any],
+        visual_hand_check: dict[str, Any],
+        position_tolerance_m: float = 0.02,
+        max_travel_m: float = 0.25,
         timeout_s: float = 240.0,
     ) -> dict[str, Any]:
+        hand = self._validated_analytic_hand(hand)
         return self._planner_call(
-            "post_pick_recenter_held_button",
-            target_finger_standoff_m=target_finger_standoff_m,
-            max_held_travel_m=max_held_travel_m,
-            timeout_s=timeout_s,
-        )
-
-    def post_pick_direct_finger_toggle(
-        self,
-        *,
-        projection_id: str,
-        penetration_m: float = 0.008,
-        max_travel_m: float = 0.15,
-        timeout_s: float = 300.0,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "post_pick_direct_finger_toggle",
-            projection_id=projection_id,
-            penetration_m=penetration_m,
+            "move_to",
+            hand=hand,
+            target=target,
+            visual_hand_check=visual_hand_check,
+            position_tolerance_m=position_tolerance_m,
             max_travel_m=max_travel_m,
             timeout_s=timeout_s,
         )
 
-    def post_success_hold_frames(self, *, frames: int = 4) -> dict[str, Any]:
-        return self._planner_call("post_success_hold_frames", frames=frames)
+    @staticmethod
+    def _validated_navigation_visual_check(
+        navigation_visual_check: Any,
+    ) -> dict[str, str]:
+        if not isinstance(navigation_visual_check, dict):
+            raise ValueError("navigation_visual_check must be an object")
+        required = {"camera", "frame_id", "assessment"}
+        if set(navigation_visual_check) != required:
+            raise ValueError(
+                "navigation_visual_check requires exactly camera, frame_id, "
+                "and assessment"
+            )
+        if navigation_visual_check["camera"] != "head":
+            raise ValueError("navigation_visual_check.camera must be 'head'")
+        frame_id = navigation_visual_check["frame_id"]
+        if not isinstance(frame_id, str) or not frame_id.strip():
+            raise ValueError(
+                "navigation_visual_check.frame_id must be a non-empty string"
+            )
+        if (
+            navigation_visual_check["assessment"]
+            != "navigation_target_visually_confirmed"
+        ):
+            raise ValueError(
+                "navigation_visual_check.assessment must be "
+                "'navigation_target_visually_confirmed'"
+            )
+        return {
+            "camera": "head",
+            "frame_id": frame_id.strip(),
+            "assessment": "navigation_target_visually_confirmed",
+        }
+
+    @staticmethod
+    def _validated_navigation_number(
+        name: str,
+        value: Any,
+        *,
+        minimum: float,
+        maximum: float | None = None,
+        minimum_inclusive: bool = True,
+    ) -> float:
+        if isinstance(value, bool) or not isinstance(
+            value, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(f"{name} must be a finite number")
+        number = float(value)
+        lower_ok = number >= minimum if minimum_inclusive else number > minimum
+        upper_ok = maximum is None or number <= maximum
+        if not np.isfinite(number) or not lower_ok or not upper_ok:
+            bounds = (
+                f"[{minimum},{maximum}]"
+                if minimum_inclusive
+                else f"({minimum},{maximum}]"
+            )
+            raise ValueError(f"{name} must be finite and within {bounds}")
+        return number
+
+    def navigate_to(
+        self,
+        *,
+        projection_id: str | None = None,
+        navigation_visual_check: dict[str, Any] | None = None,
+        relative_motion: dict[str, Any] | None = None,
+        standoff_m: float | None = None,
+        max_travel_m: float | None = None,
+        timeout_s: float = 300.0,
+    ) -> dict[str, Any]:
+        if relative_motion is None:
+            if not isinstance(projection_id, str) or not projection_id.strip():
+                raise ValueError("projection_id must be a non-empty string")
+            if navigation_visual_check is None:
+                raise ValueError(
+                    "navigation_visual_check is required for projection navigation"
+                )
+            payload = {
+                "projection_id": projection_id.strip(),
+                "navigation_visual_check": (
+                    self._validated_navigation_visual_check(
+                        navigation_visual_check
+                    )
+                ),
+                "standoff_m": self._validated_navigation_number(
+                    "standoff_m",
+                    0.85 if standoff_m is None else standoff_m,
+                    minimum=0.45,
+                    maximum=1.50,
+                ),
+                "max_travel_m": self._validated_navigation_number(
+                    "max_travel_m",
+                    1.0 if max_travel_m is None else max_travel_m,
+                    minimum=0.0,
+                    maximum=1.50,
+                    minimum_inclusive=False,
+                ),
+            }
+        else:
+            if any(
+                value is not None
+                for value in (
+                    projection_id,
+                    navigation_visual_check,
+                    standoff_m,
+                    max_travel_m,
+                )
+            ):
+                raise ValueError(
+                    "relative_motion is mutually exclusive with projection "
+                    "navigation arguments"
+                )
+            payload = {
+                "relative_motion": validate_relative_navigation_motion(
+                    relative_motion
+                )
+            }
+        payload["timeout_s"] = self._validated_navigation_number(
+            "timeout_s",
+            timeout_s,
+            minimum=0.0,
+            minimum_inclusive=False,
+        )
+        return self._planner_call("navigate_to", **payload)
+
+    def rotate_wrist(
+        self,
+        *,
+        hand: str,
+        relative_axis_angle: list[float],
+        visual_hand_check: dict[str, Any],
+        frame: str = "eef",
+    ) -> dict[str, Any]:
+        hand = self._validated_analytic_hand(hand)
+        return self._planner_call(
+            "rotate_wrist",
+            _runtime_deadline_s=ROTATE_WRIST_RUNTIME_TIMEOUT_S,
+            hand=hand,
+            relative_axis_angle=relative_axis_angle,
+            frame=frame,
+            visual_hand_check=visual_hand_check,
+        )
+
+    def close(
+        self,
+        *,
+        hand: str,
+        visual_hand_check: dict[str, Any],
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        hand = self._validated_analytic_hand(hand)
+        return self._planner_call(
+            "close",
+            hand=hand,
+            visual_hand_check=visual_hand_check,
+            timeout_s=timeout_s,
+        )
+
+    def open(
+        self,
+        *,
+        hand: str,
+        visual_hand_check: dict[str, Any],
+        release_visual_check: dict[str, Any] | None = None,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        hand = self._validated_analytic_hand(hand)
+        kwargs: dict[str, Any] = {
+            "hand": hand,
+            "visual_hand_check": visual_hand_check,
+            "timeout_s": timeout_s,
+        }
+        if release_visual_check is not None:
+            kwargs["release_visual_check"] = release_visual_check
+        return self._planner_call("open", **kwargs)
+
+    def press(
+        self,
+        *,
+        hand: str,
+        visual_hand_check: dict[str, Any],
+        projection_id: str,
+        travel_m: float,
+        timeout_s: float = 300.0,
+    ) -> dict[str, Any]:
+        hand = self._validated_analytic_hand(hand)
+        return self._planner_call(
+            "press",
+            hand=hand,
+            visual_hand_check=visual_hand_check,
+            projection_id=projection_id,
+            travel_m=travel_m,
+            timeout_s=timeout_s,
+        )
 
     def pixel_to_world(
         self,
@@ -435,8 +548,9 @@ class BehaviorEnvClient:
         u: int,
         v: int,
         depth_window_px: int = 7,
-        output_frame: str = "world",
     ) -> dict[str, Any]:
+        if camera not in {"head", "left_wrist", "right_wrist"}:
+            raise ValueError("camera must be head, left_wrist, or right_wrist")
         return self._planner_call(
             "pixel_to_world",
             camera=camera,
@@ -444,134 +558,8 @@ class BehaviorEnvClient:
             u=u,
             v=v,
             depth_window_px=depth_window_px,
-            output_frame=output_frame,
         )
 
-    def navigate_to(
-        self,
-        *,
-        hand: str,
-        target_xyz: list[float],
-        frame: str = "world",
-        standoff_m: float = 0.85,
-        timeout_s: float = 90,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "navigate_to",
-            hand=hand,
-            target_xyz=target_xyz,
-            frame=frame,
-            standoff_m=standoff_m,
-            timeout_s=timeout_s,
-        )
-
-    def move_to(
-        self,
-        *,
-        hand: str,
-        target_xyz: list[float],
-        frame: str = "world",
-        target_quat_xyzw: list[float] | None = None,
-        plan_only: bool = False,
-        position_tolerance_m: float = 0.02,
-        orientation_tolerance_rad: float = 0.087,
-        timeout_s: float = 45,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "move_to",
-            hand=hand,
-            target_xyz=target_xyz,
-            frame=frame,
-            target_quat_xyzw=target_quat_xyzw,
-            plan_only=plan_only,
-            position_tolerance_m=position_tolerance_m,
-            orientation_tolerance_rad=orientation_tolerance_rad,
-            timeout_s=timeout_s,
-        )
-
-    def pick(
-        self,
-        *,
-        hand: str,
-        target_xyz: list[float],
-        approach_vector: list[float] | None = None,
-        grasp_quat_xyzw: list[float] | None = None,
-        pregrasp_offset_m: float = 0.08,
-        lift_m: float = 0.08,
-        timeout_s: float = 90,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "pick",
-            hand=hand,
-            target_xyz=target_xyz,
-            approach_vector=approach_vector,
-            grasp_quat_xyzw=grasp_quat_xyzw,
-            pregrasp_offset_m=pregrasp_offset_m,
-            lift_m=lift_m,
-            timeout_s=timeout_s,
-        )
-
-    def rotate_wrist(
-        self,
-        *,
-        hand: str,
-        target_quat_xyzw: list[float] | None = None,
-        relative_axis_angle: list[float] | None = None,
-        frame: str = "world",
-        timeout_s: float = 45,
-    ) -> dict[str, Any]:
-        if (target_quat_xyzw is None) == (relative_axis_angle is None):
-            raise ValueError(
-                "rotate_wrist requires exactly one of target_quat_xyzw or "
-                "relative_axis_angle"
-            )
-        return self._planner_call(
-            "rotate_wrist",
-            hand=hand,
-            target_quat_xyzw=target_quat_xyzw,
-            relative_axis_angle=relative_axis_angle,
-            frame=frame,
-            timeout_s=timeout_s,
-        )
-
-    def press(
-        self,
-        *,
-        hand: str,
-        target_xyz: list[float],
-        press_direction: list[float] | None = None,
-        approach_distance_m: float = 0.04,
-        press_depth_m: float = 0.012,
-        timeout_s: float = 60,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "press",
-            hand=hand,
-            target_xyz=target_xyz,
-            press_direction=press_direction,
-            approach_distance_m=approach_distance_m,
-            press_depth_m=press_depth_m,
-            timeout_s=timeout_s,
-        )
-
-    def release(
-        self,
-        *,
-        hand: str,
-        opening: float = 1.0,
-        retreat_vector: list[float] | None = None,
-        retreat_m: float = 0.03,
-        timeout_s: float = 30,
-    ) -> dict[str, Any]:
-        return self._planner_call(
-            "release",
-            hand=hand,
-            opening=opening,
-            retreat_vector=retreat_vector,
-            retreat_m=retreat_m,
-            timeout_s=timeout_s,
-        )
-
-    def close(self) -> None:
+    def close_transport(self) -> None:
         """Close only the client transport; runtime ownership stays with provider."""
         self._client.close()

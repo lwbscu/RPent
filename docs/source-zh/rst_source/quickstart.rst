@@ -8,47 +8,39 @@
 1. 配置 API key 与 checkpoint
 ------------------------------
 
-导出你要用的 LLM 提供商的 API key, 以及 VLA checkpoint 的路径:
+导出 Anthropic 密钥, 以及 VLA 与 SAM3 checkpoint 的路径:
 
 .. code-block:: bash
 
-   # LLM API keys (供 `api` cerebrum 通过 pydantic-ai 使用)
+   # Anthropic 密钥; 使用官方端点时无需 export base url。
    export ANTHROPIC_BASE_URL=https://xxx
    export ANTHROPIC_API_KEY=sk-xxx
-   export OPENAI_BASE_URL=https://xxx
-   export OPENAI_API_KEY=sk-xxx
 
    # VLA checkpoint —— 从下面地址下载
-   # https://huggingface.co/datasets/RLinf/rlinf-pi05-libero-130-fullshot-sft
+   # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-130-fullshot-SFT
    export PI05_CHECKPOINT_PATH=/path/to/rlinf-pi05-libero-130-fullshot-sft
+   # SAM 3.0 checkpoint —— 从以下任一地址下载
+   # https://huggingface.co/facebook/sam3
+   # https://modelscope.cn/models/facebook/sam3
+   export SAM3_CHECKPOINT_PATH=/path/to/sam3/sam3.pt
    export LIBERO_TYPE=pro
    export CUDA_VISIBLE_DEVICES=0
-
-你只需要为实际使用的 provider 设置对应的 key。例如, 只用
-``--cerebrum claude_code`` 时, 可以不配置 ``OPENAI_*``。
 
 2. 跑一个 LIBERO 任务
 ---------------------
 
-用 ``api`` cerebrum + Anthropic 模型, 上限 8192 tokens, 跑单个 LIBERO PRO
-任务 (``libero_object_swap``, 任务 ``2``, 种子 ``0``):
+用 ``claude_code`` planner 跑单个 LIBERO PRO 任务
+(``libero_object_swap``, 任务 ``2``, 种子 ``0``):
 
 .. code-block:: bash
 
-   rpent --suite libero_object_swap --task 2 --seed 0 \
-     --cerebrum api --model anthropic:claude-opus-4-8 --max-tokens 8192
+   rpent --env libero --suite libero_object_swap --task 2 --seed 0 \
+     --planner claude_code --model claude-opus-4-8
 
-**模型 id 规约。** ``api`` cerebrum 下, ``--model`` 需要带 provider
-前缀; ``claude_code`` / ``codex`` 下, 直接写裸模型名:
+其他 planner (``api``、``codex``) 与模型提供商的配置见
+:doc:`usage/configure_planner`。
 
-- OpenAI 兼容 chat 接口 —— ``--model openai-chat:glm-5.2``
-- OpenAI Responses 接口 —— ``--model openai:gpt-5.5``
-- ``claude_code`` / ``codex`` —— 不加前缀, 如
-  ``--model claude-opus-4-8``
-
-完整的 brain 切换指南见 :doc:`usage/configure_planner`。
-
-3. 用 dashboard 观察运行
+1. 用 dashboard 观察运行
 ------------------------
 
 加上 ``--dashboard`` 会打开浏览器监控页面。它会先展示一个 launcher
@@ -58,22 +50,8 @@
 
 .. code-block:: bash
 
-   rpent --dashboard --dashboard-language zh-cn \
-     --suite libero_goal_task --task 1 --seed 0 --cerebrum claude_code
-
-4. RoboCasa
------------
-
-RoboCasa 有自己的入口和一次性安装脚本:
-
-.. code-block:: bash
-
-   bash scripts/setup_robocasa.sh                                # 一次性安装
-   bash scripts/run_robocasa.sh PickPlaceCounterToCabinet 0 0    # <task> <gpu> <seed>
-
-完整的 RoboCasa365 + RLDX-1 流程见 `docs/SETUP_ROBOCASA.zh.md
-<https://github.com/RLinf/RPent/blob/main/docs/SETUP_ROBOCASA.zh.md>`_,
-而 :doc:`usage/robocasa` 说明 RoboCasa toolkit 对 agent 暴露了什么。
+   rpent --env libero --dashboard --dashboard-language zh-cn \
+     --suite libero_goal_task --task 1 --seed 0 --planner claude_code
 
 关键 CLI 选项
 -------------
@@ -87,6 +65,9 @@ RoboCasa 有自己的入口和一次性安装脚本:
    * - Flag
      - 默认值
      - 说明
+   * - ``--env``
+     - 必填
+     - 环境后端。当前支持 ``libero``。
    * - ``--suite``
      - 必填
      - 任务套件, 如 ``libero_object_task``、``libero_spatial_swap``
@@ -96,7 +77,7 @@ RoboCasa 有自己的入口和一次性安装脚本:
    * - ``--seed``
      - ``0``
      - 随机种子
-   * - ``--cerebrum``
+   * - ``--planner``
      - ``api``
      - Reasoning brain: ``api`` | ``claude_code`` | ``codex``
    * - ``--model``
@@ -109,6 +90,9 @@ RoboCasa 有自己的入口和一次性安装脚本:
    * - ``--max-tokens``
      - ``8192``
      - LLM 每次回复的最大 token 数
+   * - ``--no-images``
+     - 关
+     - 纯文本模式: 不向模型发送图片字节 (用于不支持图片输入的模型)
    * - ``--max-episode-steps``
      - ``10000``
      - Env 最大 step 数
@@ -117,30 +101,38 @@ RoboCasa 有自己的入口和一次性安装脚本:
      - LIBERO 变体: ``standard`` | ``pro`` | ``plus``
    * - ``--cuda-device``
      - 继承
-     - 暴露给 env / vla server 的 GPU 设备
+     - 暴露给 env / VLA / SAM3 server 的 GPU 设备
    * - ``--dashboard``
      - 关
      - 为本次运行启动本地 dashboard
    * - ``--dashboard-language``
      - ``en``
      - Dashboard UI 语言: ``en`` | ``zh-cn``
+   * - ``--env-endpoint``
+     - —(自动 spawn)
+     - 已在运行的 env_server 的 ``[protocol://]host:port``
+       (``protocol=http|socket``, 默认 ``http``). 留空则本地起一个。
    * - ``--vla-endpoint``
-     - —
-     - 复用已在运行的 vla_server, 而不是启动新实例
-   * - ``--no-driver``
-     - 关
-     - 连接到已在运行的 env_server / vla_server
+     - —(自动 spawn)
+     - 已在运行的 vla_server 的 ``[protocol://]host:port``
+       (协议规则同 ``env_server``)。留空则本地起一个。
+   * - ``--sam3-endpoint``
+     - —(自动 spawn)
+     - 已在运行的 RPent SAM3 服务的 ``[protocol://]host:port``
+       (协议规则同 ``env_server``)。留空则本地起一个。
 
 跑起来后应该看到什么
 --------------------
 
 一次成功的运行:
 
-1. env server 起来后打印 ``env server ready at 127.0.0.1:<port>``。
+1. env_server、vla_server 和 sam3_server 就绪后，会在各自的服务日志中
+   打印一行 ``RPC server listening on http://127.0.0.1:<port>``；
+   主进程确认三个服务就绪后再进入 agent loop。
 2. 每一轮 agent 的 reasoning 会输出到终端 (或 stream 到 dashboard)。
 3. 当 LLM 调用 ``finish(success=True)`` 时结束; 或者触达
    ``--max-turns`` / ``--max-episode-steps`` 时结束。
 4. 写出 ``<output_dir>/transcript_*.json`` (完整 turn-by-turn 记录) 和
    ``<output_dir>/episode.mp4`` (渲染出的 rollout)。
 
-出问题时, 参考 :doc:`installation` 页底部提到的三份日志文件。
+出问题时, 参考 :doc:`installation` 页底部提到的服务与 agent 日志文件。

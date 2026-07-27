@@ -28,6 +28,29 @@ CAMERA_ALIASES: dict[str, str] = {
     "right_wrist": "right_wrist",
 }
 
+# Reviewed from the installed official R1Pro USD fixed joints. Matrices use the
+# convention ``T_parent_from_child`` and are identical for left and right
+# wrists. They include the complete Kit camera rotation, not only the camera
+# origin translation documented in the compact robot-size prior.
+_R1PRO_PALM_FROM_WRIST_CAMERA = np.array(
+    [
+        [-0.000005366182582, 0.906315917838610, 0.422600824707622, 0.0505100],
+        [-0.999993452647063, -0.001534108272274, 0.003277373157896, 0.0028934],
+        [0.003618650882752, -0.422598040203889, 0.906309992100728, 0.0051317],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+_R1PRO_GRIP_FROM_WRIST_CAMERA = np.array(
+    [
+        [0.000005366182582, -0.906315917838610, -0.422600824707622, -0.0505100],
+        [-0.999993452647063, -0.001534108272274, 0.003277373157896, 0.0028934],
+        [-0.003618650882752, 0.422598040203889, -0.906309992100728, -0.0651317],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
 
 def canonical_camera(camera: str) -> str:
     """Return the canonical BEHAVIOR camera name."""
@@ -437,14 +460,20 @@ class RgbdFrame:
 
 
 def _normalize_depth(depth: Any) -> np.ndarray:
+    """Normalize one metric optical-axis depth image without guessing its unit.
+
+    Production BEHAVIOR captures bind this array to OmniGibson's
+    ``depth_linear`` / ``distance_to_image_plane`` modality, whose declared
+    unit is metres.  Silently inferring millimetres from scene-dependent values
+    would turn a unit or modality wiring error into plausible-but-wrong
+    geometry, so this boundary only normalizes shape and numeric dtype.
+    """
+
     array = _as_array(depth, dtype=np.float64)
     if array.ndim == 3 and array.shape[-1] == 1:
         array = array[..., 0]
     if array.ndim != 2:
         raise CameraGeometryError(f"depth must be HxW, got {array.shape}")
-    finite = array[np.isfinite(array) & (array > 0)]
-    if finite.size and np.nanmedian(finite) > 20.0:
-        array = array / 1000.0
     return array.astype(np.float64, copy=False)
 
 
@@ -499,6 +528,9 @@ def _depth_png_bytes(depth_m: Any) -> tuple[bytes, dict[str, Any]]:
     return _png_bytes(visual), {
         "format": "png",
         "mapping": "inverse_linear_percentile_2_98",
+        "source_modality": "depth_linear",
+        "measurement": "distance_to_image_plane",
+        "unit": "m",
         "near_m": float(near_m),
         "far_m": float(far_m),
         "invalid_color_rgb": [255, 0, 255],
@@ -528,6 +560,7 @@ def _cluster_depth(
     u: int,
     v: int,
     depth_window_px: int,
+    require_selected_pixel_depth: bool = False,
 ) -> dict[str, Any]:
     radius = max(0, int(depth_window_px) // 2)
     if u < 0 or v < 0 or u >= frame.intrinsics.width or v >= frame.intrinsics.height:
@@ -542,6 +575,13 @@ def _cluster_depth(
     ):
         raise CameraGeometryError(
             "pixel window touches image border; refusing edge projection"
+        )
+    selected_depth = float(frame.depth_m[v, u])
+    if require_selected_pixel_depth and (
+        not math.isfinite(selected_depth) or selected_depth <= 0.0
+    ):
+        raise CameraGeometryError(
+            "selected center pixel has no finite positive metric depth"
         )
     crop = frame.depth_m[v - radius : v + radius + 1, u - radius : u + radius + 1]
     valid = _valid_depth_values(crop)
@@ -569,6 +609,12 @@ def _cluster_depth(
     # object boundary. Refuse it instead of averaging foreground/background.
     if cluster.size < max(3, int(math.ceil(valid.size * 0.60))):
         raise CameraGeometryError("depth window has no stable foreground cluster")
+    if require_selected_pixel_depth and (
+        abs(selected_depth - center_median) > center_scale
+    ):
+        raise CameraGeometryError(
+            "selected center pixel does not belong to the stable depth cluster"
+        )
     cluster_median = float(np.median(cluster))
     cluster_mad = float(np.median(np.abs(cluster - cluster_median)))
     if cluster_median <= 0 or not math.isfinite(cluster_median):
@@ -624,6 +670,7 @@ def robust_depth_sample(
         u=_to_int_pixel("u", u),
         v=_to_int_pixel("v", v),
         depth_window_px=int(window_px),
+        require_selected_pixel_depth=True,
     )
 
 
@@ -662,6 +709,154 @@ def transform_point(transform: Any, point: Any) -> np.ndarray:
     p = _as_array(point, dtype=np.float64).reshape(3)
     out = matrix @ np.array([p[0], p[1], p[2], 1.0], dtype=np.float64)
     return out[:3] / out[3]
+
+
+def validated_rigid_transform(value: Any, *, name: str) -> np.ndarray:
+    """Return one finite proper SE(3) transform or fail closed.
+
+    Runtime hand-distance receipts bind complete live link transforms.  Merely
+    accepting a finite 4x4 array would also accept scale, shear, reflection, or
+    a malformed homogeneous row and could make an apparently precise distance
+    geometrically meaningless.
+    """
+
+    matrix = _homogeneous(value)
+    if not np.allclose(
+        matrix[3],
+        np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+        atol=1e-7,
+        rtol=0.0,
+    ):
+        raise CameraGeometryError(f"{name} homogeneous last row is invalid")
+    rotation = matrix[:3, :3]
+    if not np.allclose(
+        rotation.T @ rotation,
+        np.eye(3, dtype=np.float64),
+        atol=1e-5,
+        rtol=0.0,
+    ):
+        raise CameraGeometryError(f"{name} rotation is not orthonormal")
+    determinant = float(np.linalg.det(rotation))
+    if not math.isfinite(determinant) or not math.isclose(
+        determinant, 1.0, abs_tol=1e-5
+    ):
+        raise CameraGeometryError(f"{name} rotation is not proper")
+    return matrix
+
+
+def rigid_transform_residual(
+    observed: Any,
+    expected: Any,
+) -> dict[str, float]:
+    """Return translation and rotation residuals between two SE(3) transforms."""
+
+    actual = validated_rigid_transform(observed, name="observed transform")
+    reference = validated_rigid_transform(expected, name="expected transform")
+    translation_error_m = float(np.linalg.norm(actual[:3, 3] - reference[:3, 3]))
+    rotation_delta = reference[:3, :3].T @ actual[:3, :3]
+    trace = float(np.trace(rotation_delta))
+    cosine = min(1.0, max(-1.0, (trace - 1.0) * 0.5))
+    rotation_error_rad = float(math.acos(cosine))
+    return {
+        "translation_error_m": translation_error_m,
+        "rotation_error_rad": rotation_error_rad,
+        "rotation_error_deg": math.degrees(rotation_error_rad),
+    }
+
+
+def r1pro_wrist_camera_reference_transforms() -> dict[str, np.ndarray]:
+    """Return reviewed full R1Pro palm/grip-from-wrist-camera transforms."""
+
+    return {
+        "palm_from_camera": validated_rigid_transform(
+            _R1PRO_PALM_FROM_WRIST_CAMERA.copy(),
+            name="reviewed R1Pro palm-from-camera transform",
+        ),
+        "grip_point_from_camera": validated_rigid_transform(
+            _R1PRO_GRIP_FROM_WRIST_CAMERA.copy(),
+            name="reviewed R1Pro grip-from-camera transform",
+        ),
+    }
+
+
+def frame_bound_hand_distance_report(
+    frame: RgbdFrame,
+    *,
+    raw_target_point_camera_xyz_m: Any,
+    hand_reference_transforms_world: dict[str, Any],
+) -> dict[str, Any]:
+    """Measure one frame-bound RGB-D point against captured R1Pro references.
+
+    The input point is the raw USD camera point produced by pinhole
+    back-projection.  The frame's reviewed correction profile is applied
+    exactly as it is for :func:`backproject_pixel_to_world`, then the effective
+    point is transformed to world.  Distances are computed in world against
+    link transforms captured with this RGB-D group; corrected and raw camera
+    coordinates are never mixed.
+    """
+
+    raw_point = _as_array(raw_target_point_camera_xyz_m, dtype=np.float64).reshape(3)
+    if not np.isfinite(raw_point).all():
+        raise CameraGeometryError("target camera point contains NaN or infinity")
+    effective_point = frame.correction_profile.apply_camera_point(raw_point)
+    if not np.isfinite(effective_point).all():
+        raise CameraGeometryError(
+            "corrected target camera point contains NaN or infinity"
+        )
+    target_world = transform_point(frame.camera_to_world, effective_point)
+    if not np.isfinite(target_world).all():
+        raise CameraGeometryError("target world point contains NaN or infinity")
+
+    if not isinstance(hand_reference_transforms_world, dict):
+        raise CameraGeometryError("hand reference transforms must be an object")
+    if set(hand_reference_transforms_world) != {
+        "palm",
+        "grip_point",
+        "finger_roots",
+    }:
+        raise CameraGeometryError(
+            "hand reference transforms require palm, grip_point, and finger_roots"
+        )
+    finger_roots = hand_reference_transforms_world["finger_roots"]
+    if not isinstance(finger_roots, (list, tuple)) or len(finger_roots) != 2:
+        raise CameraGeometryError(
+            "hand reference transforms require exactly two finger roots"
+        )
+
+    palm = validated_rigid_transform(
+        hand_reference_transforms_world["palm"],
+        name="palm world transform",
+    )
+    grip_point = validated_rigid_transform(
+        hand_reference_transforms_world["grip_point"],
+        name="grip-point world transform",
+    )
+    fingers = [
+        validated_rigid_transform(
+            transform,
+            name=f"finger-root-{index + 1} world transform",
+        )
+        for index, transform in enumerate(finger_roots)
+    ]
+
+    def distance_to(transform: np.ndarray) -> float:
+        distance = float(np.linalg.norm(target_world - transform[:3, 3]))
+        if not math.isfinite(distance) or distance < 0.0:
+            raise CameraGeometryError("hand reference distance is invalid")
+        return distance
+
+    finger_distances = [distance_to(transform) for transform in fingers]
+    return {
+        "target_point_camera_xyz_m": effective_point.astype(float).tolist(),
+        # This remains internal to the simulator response construction.  The
+        # public contract exposes the frame-bound camera point and distances,
+        # not an extra unreviewed world-space motion target.
+        "target_point_world_xyz_m": target_world.astype(float).tolist(),
+        "target_to_palm_m": distance_to(palm),
+        "target_to_grip_point_m": distance_to(grip_point),
+        "target_to_finger_roots_m": min(finger_distances),
+        "target_to_finger_roots_individual_m": finger_distances,
+    }
 
 
 def project_world_to_pixel(
@@ -1002,9 +1197,13 @@ __all__ = [
     "correction_profile_to_json",
     "evaluate_camera_correction_profile",
     "fit_camera_correction_profile",
+    "frame_bound_hand_distance_report",
     "load_camera_correction_profiles",
     "pixel_from_camera_point",
     "project_world_to_pixel",
+    "r1pro_wrist_camera_reference_transforms",
+    "rigid_transform_residual",
     "robust_depth_sample",
     "transform_point",
+    "validated_rigid_transform",
 ]

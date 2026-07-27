@@ -1,0 +1,31 @@
+{
+  "allowed_consumers": [
+    "explore",
+    "formal_eval"
+  ],
+  "kind": "reviewed_behavior_recipe_promotion",
+  "official_success_checked": true,
+  "official_success_source": "info[\"done\"][\"success\"]",
+  "payload_sha256": {
+    "recipe": "0ec775dd2bcc3d14248ed8e0813a131866b37fc7918c95801bf4692da38fa353",
+    "task_memory": "d130ae47fda67792ab035109b95d3c3cc4979cbe94b47366f1c172e2c9bdea0a"
+  },
+  "provenance_class": "canonical_public_explore",
+  "recipe_id": "control_access",
+  "review_status": "accepted",
+  "schema_version": 1,
+  "source_evidence": [
+    {
+      "kind": "canonical_publication_validation",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "validation": "canonical_publication_validated"
+    },
+    {
+      "kind": "official_success_receipt",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "validation": "raw_info_done_success_true"
+    }
+  ],
+  "task": "turning_on_radio",
+  "task_success": true
+}

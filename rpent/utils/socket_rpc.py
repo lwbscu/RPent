@@ -8,10 +8,8 @@ frames (length-prefixed, one frame per request/response).
 Both processes are spawned by the same user on the same host, so we use
 pickle rather than a more defensive codec.
 """
-
 from __future__ import annotations
 
-import logging
 import pickle
 import socket
 import socketserver
@@ -21,11 +19,11 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+
 DEFAULT_CONNECT_TIMEOUT_S = 10.0
 DEFAULT_REQUEST_TIMEOUT_S = 30.0
 
 _LEN_PREFIX = struct.Struct(">I")
-logger = logging.getLogger(__name__)
 
 
 def _read_exact(reader, n: int) -> bytes:
@@ -47,10 +45,6 @@ def _read_frame(reader) -> Any:
 
 def _write_frame(writer, obj: Any) -> None:
     body = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-    _write_serialized_frame(writer, body)
-
-
-def _write_serialized_frame(writer, body: bytes) -> None:
     writer.write(_LEN_PREFIX.pack(len(body)) + body)
     writer.flush()
 
@@ -124,7 +118,6 @@ class _RequestHandler(socketserver.StreamRequestHandler):
         try:
             payload = _read_frame(self.rfile)
         except Exception:
-            logger.exception("failed to read RPC request")
             return
         req_id = None
         try:
@@ -136,7 +129,6 @@ class _RequestHandler(socketserver.StreamRequestHandler):
             response: dict = {"id": req_id, "ok": True, "result": result}
         except Exception as exc:
             import traceback as _tb
-
             response = {
                 "id": req_id,
                 "ok": False,
@@ -144,19 +136,9 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 "traceback": _tb.format_exc(),
             }
         try:
-            body = pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception as exc:
-            logger.exception("failed to serialize RPC response for %s", req_id)
-            fallback = {
-                "id": req_id,
-                "ok": False,
-                "error": f"response serialization failed: {type(exc).__name__}: {exc}",
-            }
-            body = pickle.dumps(fallback, protocol=pickle.HIGHEST_PROTOCOL)
-        try:
-            _write_serialized_frame(self.wfile, body)
+            _write_frame(self.wfile, response)
         except Exception:
-            logger.exception("failed to write RPC response for %s", req_id)
+            pass
 
 
 class SocketRpcServer(socketserver.ThreadingTCPServer):
@@ -175,5 +157,7 @@ class SocketRpcServer(socketserver.ThreadingTCPServer):
         self._dispatch_lock = threading.Lock()
 
     def dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
+        if method == "healthz":
+            return {"status": "ok"}
         with self._dispatch_lock:
             return self._dispatch(method, args, kwargs)

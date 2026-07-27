@@ -3,73 +3,50 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
 
+from robots.behavior.task_specs import (
+    BehaviorTaskSpec,
+    ReleaseVisualPolicy,
+    get_task_spec,
+)
+
 ACTION_DIM = 23
 DEFAULT_ACTION_CHUNK = 32
+# Runtime-owned hard deadline. It is deliberately absent from the public tool
+# schema so the planner cannot shorten or extend CuRobo execution.
+ROTATE_WRIST_RUNTIME_TIMEOUT_S = 30.0
 CAMERA_KEYS = ("main", "left_wrist", "right_wrist")
-FULL_TASK_VLA_MODE = "full_task_vla"
-PLANNER_TOOLS_MODE = "planner_tools"
-PI0_PICK_VLA_MODE = "pi0_pick_vla"
-HYBRID_VLM_PI0_MODE = "hybrid_vlm_pi0"
-PI0_NAV_PICK_VLA_MODE = "pi0_nav_pick_vla"
-TEMP_STATE_CHECKPOINT_PATTERN = r"^tmp_state_checkpoint_[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"
-CONTROL_MODES = (
-    FULL_TASK_VLA_MODE,
-    PLANNER_TOOLS_MODE,
-    PI0_PICK_VLA_MODE,
-    HYBRID_VLM_PI0_MODE,
-    PI0_NAV_PICK_VLA_MODE,
-)
-VLA_CONTROL_MODES = (
-    FULL_TASK_VLA_MODE,
-    PI0_PICK_VLA_MODE,
-    HYBRID_VLM_PI0_MODE,
-    PI0_NAV_PICK_VLA_MODE,
-)
-PLANNER_TOOL_NAMES = (
+_PUBLIC_TOOL_CONTRACT_V1 = (
+    "pi0_nav_pick",
     "observe",
     "pixel_to_world",
-    "navigate_to",
     "move_to",
-    "pick",
     "rotate_wrist",
+    "close",
+    "open",
     "press",
-    "release",
-)
-ROBOT_STATE_CHECKPOINT_TOOL_NAMES = (
     "save_robot_state_checkpoint",
-    "restore_robot_state_checkpoint",
 )
-POST_PICK_TOOL_NAMES = (
-    "inspect_post_pick_state",
-    "observe",
-    "declare_button_visibility",
-    "pixel_to_world",
-    "evaluate_prepress_geometry",
-    "move_to",
-    "rotate_wrist",
-    *ROBOT_STATE_CHECKPOINT_TOOL_NAMES,
-)
-STAGE3_PRESS_TOOL_NAMES = (
-    "post_pick_close_press_gripper",
-    "inspect_toggle_geometry",
-    "post_pick_recenter_held_button",
-    "post_pick_direct_finger_toggle",
-    "post_success_hold_frames",
-)
-HYBRID_TOOL_NAMES = (
-    "observe",
-    "pixel_to_world",
-    "pi0_navigate_to",
-    "move_to",
-    "pi0_pick",
-    "rotate_wrist",
-    "press",
-    "release",
-    *ROBOT_STATE_CHECKPOINT_TOOL_NAMES,
+PUBLIC_TOOL_CONTRACTS: dict[int, tuple[str, ...]] = {
+    1: _PUBLIC_TOOL_CONTRACT_V1,
+    2: _PUBLIC_TOOL_CONTRACT_V1 + ("navigate_to",),
+}
+CURRENT_PUBLIC_TOOL_CONTRACT_VERSION = 2
+BEHAVIOR_TOOL_NAMES = PUBLIC_TOOL_CONTRACTS[CURRENT_PUBLIC_TOOL_CONTRACT_VERSION]
+if tuple(PUBLIC_TOOL_CONTRACTS) != (1, 2):
+    raise ValueError("BEHAVIOR public tool contract versions must be contiguous")
+if PUBLIC_TOOL_CONTRACTS[2][:-1] != PUBLIC_TOOL_CONTRACTS[1]:
+    raise ValueError("BEHAVIOR public tool contract v2 must preserve the v1 prefix")
+if len(BEHAVIOR_TOOL_NAMES) != 10 or len(set(BEHAVIOR_TOOL_NAMES)) != 10:
+    raise ValueError("the current BEHAVIOR toolkit must expose 10 unique primitives")
+FRAME_REVIEW_ASSESSMENTS = (
+    "target_bearing_surface_confirmed",
+    "opposite_surface_confirmed",
+    "side_or_indeterminate",
 )
 
 # Pi0.5 compacts raw R1Pro proprio in this order. In particular, both arms
@@ -215,150 +192,41 @@ VLA_WIRE_SCHEMA: dict[str, Any] = {
     },
 }
 
-RUN_FULL_TASK_SPEC: dict[str, Any] = {
-    "name": "run_full_task",
-    "description": (
-        "Run the current BEHAVIOR task end to end with the configured Pi0.5 "
-        "policy. Takes no input. success exactly mirrors official task_success "
-        "from the raw environment info.done.success field."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    },
-}
-
-PI0_PICK_SPEC: dict[str, Any] = {
-    "name": "pi0_pick",
-    "description": (
-        "Run a local Pi0.5/VLA grasp loop from the current BEHAVIOR observation. "
-        "Each iteration predicts and executes one validated [T,23] whole-body "
-        "action chunk. The PI0 env path monitors actual selected-gripper "
-        "proprio at every simulator step. By default a closure candidate is recorded "
-        "but does not stop the loop unless a configured local validator accepts the "
-        "grasp. An explicit visual-review pause may instead run a bounded number of "
-        "post-candidate chunks before returning without claiming success. "
-        "Otherwise the loop remains bounded by its local chunk limit, an "
-        "official environment stop, the episode horizon, or an error. "
-        "Closure alone is not pick success: primitive_success requires a "
-        "configured local grasp validator and the result always requires MP4 "
-        "visual verification. It never implies official task_success."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "hand": {
-                "type": "string",
-                "enum": ["left", "right"],
-                "description": (
-                    "Hand whose gripper closure triggers a local grasp candidate."
-                ),
-            },
-            "instruction": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Local VLA grasp instruction for the current observation.",
-            },
-            "max_chunks": {
-                "type": "integer",
-                "default": 24,
-                "minimum": 1,
-            },
-            "gripper_closed_threshold": {
-                "type": "number",
-                "default": 0.045,
-                "minimum": 0.0,
-                "description": (
-                    "Maximum selected-hand compact gripper opening recorded as "
-                    "a local grasp candidate. Closure alone neither stops the "
-                    "loop nor establishes success."
-                ),
-            },
-            "required_closed_chunks": {
-                "type": "integer",
-                "default": 1,
-                "minimum": 1,
-                "description": "Consecutive completed chunks satisfying closure.",
-            },
-            "stop_on_closure_candidate": {
-                "type": "boolean",
-                "default": False,
-                "description": (
-                    "After the first closure candidate, execute the configured "
-                    "number of post-candidate chunks and then pause for visual "
-                    "review. This never establishes primitive or task success."
-                ),
-            },
-            "post_candidate_chunks": {
-                "type": "integer",
-                "default": 4,
-                "minimum": 0,
-                "description": (
-                    "Complete action chunks to execute after the first closure "
-                    "candidate before pausing. max_chunks remains the total cap."
-                ),
-            },
-        },
-        "required": ["hand", "instruction"],
-        "additionalProperties": False,
-    },
-}
-
-PI0_NAVIGATE_TO_SPEC: dict[str, Any] = {
-    "name": "pi0_navigate_to",
-    "description": (
-        "Run one short Pi0.5/VLA visual-navigation segment in the current "
-        "BEHAVIOR episode. Each model prediction is truncated to its first "
-        "eight actions. The normalized base output is adapted to bounded local "
-        "position deltas while the predicted trunk and both arm segments are "
-        "executed so whole-body visual/proprio state advances. Both grippers "
-        "remain locked to their current latches, so this tool cannot grasp. "
-        "The segment pauses after at most four chunks and returns synchronized "
-        "head and wrist images for visual review. A normal visual pause is not "
-        "primitive or task success. Only task_success mirrors official "
-        "info.done.success; object grasping is exclusively pi0_pick."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "instruction": {
-                "type": "string",
-                "minLength": 1,
-                "description": (
-                    "The original exact BEHAVIOR task language, passed to the "
-                    "VLA unchanged for every short navigation segment."
-                ),
-            },
-            "max_chunks": {
-                "type": "integer",
-                "default": 4,
-                "minimum": 1,
-                "maximum": 4,
-                "description": (
-                    "Model-prediction chunks in this visual segment. Each "
-                    "chunk executes no more than its first eight actions."
-                ),
-            },
-        },
-        "required": ["instruction"],
-        "additionalProperties": False,
-    },
-}
-
-
 PI0_NAV_PICK_SPEC: dict[str, Any] = {
     "name": "pi0_nav_pick",
     "description": (
-        "Run one continuous Pi0.5/VLA navigation-to-grasp loop in the current "
-        "BEHAVIOR episode. Every model prediction and env RPC input is exactly "
-        "one complete [32,23] action chunk; this primitive never truncates or "
-        "delegates to pi0_navigate_to or pi0_pick. The env-side fail-closed "
-        "validator dynamically selects the actually held hand and may stop "
-        "inside a chunk only after atomically saving the post-pick checkpoint "
-        "and handing off a paused runtime. primitive_success and "
-        "local_grasp_success mirror only that local validator. task_success "
-        "independently mirrors the official info.done.success bit."
+        "Invoke a Pi0.5/VLA skill supporting navigation, grasping, and "
+        "pressing using up to the LLM-requested number of [32,23] action chunks. "
+        "chunks is a positive requested work bound with no fixed maximum, not a "
+        "per-tool quota. Without raw official success or an allowed terminal "
+        "exception, an admitted invocation executes exactly the requested number "
+        "of complete 32-action chunks. Raw info.done.success stops physical task "
+        "execution at the successful environment step, including mid-chunk, seals "
+        "an immutable official-success receipt, and permits no later action, "
+        "prediction, public-tool call, observation, capability read, or other "
+        "task RPC. Only no-action VLA disable/health, environment "
+        "freeze/finalize, transport shutdown, and artifact sealing remain "
+        "allowlisted. That "
+        "receipt-bound partial chunk is a normal successful terminal outcome and "
+        "is not counted as a complete chunk. Attachment, held-object, and "
+        "multiple-attachment observations alone never shorten the requested work. "
+        "Other early returns require a real environment termination/truncation or "
+        "a fail-closed runtime safety/infrastructure error. "
+        "When one or more objects are already attached, cite exactly one fresh "
+        "public observe "
+        "frame in current_object_visual_check before this invocation; this replaces "
+        "any unconditional held-object rejection. "
+        "If the head-camera view does not show either hand clearly, or a hand is "
+        "visibly far from the image center, the skill may use pose correction to "
+        "re-center the relevant hand before continuing. "
+        "Two consecutive complete runtime-accepted regressions—successful "
+        "selected-attached-hand "
+        "rotate, fresh target-surface review, this skill executing at least one "
+        "complete chunk and handing control back, then a distinct fresh "
+        "opposite-surface review—disable only pi0_nav_pick for the remainder of "
+        "the current attempt; all other public tools remain available. "
+        "primitive_success reports only local skill execution; task_success "
+        "independently reports the official info.done.success bit."
     ),
     "input_schema": {
         "type": "object",
@@ -368,150 +236,44 @@ PI0_NAV_PICK_SPEC: dict[str, Any] = {
                 "minLength": 1,
                 "description": (
                     "Exact VLA task language used unchanged for every complete "
-                    "navigation-and-grasp action chunk."
+                    "action chunk, whether for navigation, grasping, or pressing."
                 ),
             },
-        },
-        "required": ["instruction"],
-        "additionalProperties": False,
-    },
-}
-
-
-SAVE_ROBOT_STATE_CHECKPOINT_SPEC: dict[str, Any] = {
-    "name": "save_robot_state_checkpoint",
-    "description": (
-        "Save state_checkpoint_1 or a bounded temporary robot-control checkpoint. "
-        "The checkpoint records robot/EEF/gripper, held-object, intended press "
-        "hand, validation, and visual evidence. It never dumps or serializes "
-        "simulator state, scene state, or BEHAVIOR task predicates. Local "
-        "primitive success and official task_success remain independent."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "checkpoint_name": {
-                "oneOf": [
-                    {"const": "state_checkpoint_1"},
-                    {"type": "string", "pattern": TEMP_STATE_CHECKPOINT_PATTERN},
-                ],
-                "default": "state_checkpoint_1",
+            "chunks": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Positive upper bound on [32,23] Pi0 action chunks selected by "
+                    "the LLM. In the absence of official success or an allowed "
+                    "terminal exception, exactly this many complete chunks execute."
+                ),
             },
-            "stage": {
-                "type": "string",
-                "minLength": 1,
-                "default": "post_pi0_nav_pick",
-            },
-            "held_hand": {
-                "type": "string",
-                "enum": ["left", "right"],
-            },
-            "press_hand": {
-                "type": "string",
-                "enum": ["left", "right"],
-            },
-            "object_name": {
-                "type": "string",
-                "minLength": 1,
-                "default": "radio",
-            },
-            "require_current_grasp": {
-                "type": "boolean",
-                "default": True,
-            },
-            "visual_review": {
-                "type": "boolean",
-                "default": True,
+            "current_object_visual_check": {
+                "type": "object",
+                "description": (
+                    "Required whenever runtime reports one or more current "
+                    "attachments. It binds this invocation to one fresh public "
+                    "observe frame that the LLM used to review the current "
+                    "task-object configuration."
+                ),
+                "properties": {
+                    "camera": {
+                        "type": "string",
+                        "enum": ["head", "left_wrist", "right_wrist"],
+                    },
+                    "frame_id": {"type": "string", "minLength": 1},
+                    "assessment": {
+                        "type": "string",
+                        "const": "current_task_object_configuration_reviewed",
+                    },
+                },
+                "required": ["camera", "frame_id", "assessment"],
+                "additionalProperties": False,
             },
         },
-        "required": ["held_hand", "press_hand"],
+        "required": ["instruction", "chunks"],
         "additionalProperties": False,
     },
-}
-
-
-RESTORE_ROBOT_STATE_CHECKPOINT_SPEC: dict[str, Any] = {
-    "name": "restore_robot_state_checkpoint",
-    "description": (
-        "Plan and execute a cuRobo motion back to an explicit robot-control "
-        "checkpoint without reset, scene restore, or simulator-state loading. "
-        "The held gripper stays closed throughout execution. Object drift, "
-        "drop, held-object mismatch, or unexpected press contact stops the "
-        "motion fail-closed. primitive_success never implies official "
-        "task_success."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "checkpoint_name": {
-                "oneOf": [
-                    {"enum": ["state_checkpoint_1", "state_checkpoint_2"]},
-                    {"type": "string", "pattern": TEMP_STATE_CHECKPOINT_PATTERN},
-                ],
-                "default": "state_checkpoint_1",
-            },
-            "checkpoint_path": {
-                "type": ["string", "null"],
-                "default": None,
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["plan_and_execute"],
-                "default": "plan_and_execute",
-            },
-            "keep_held_gripper_closed": {
-                "type": "boolean",
-                "default": True,
-            },
-            "require_object_still_held": {
-                "type": "boolean",
-                "default": True,
-            },
-            "timeout_s": {
-                "type": "number",
-                "default": 90,
-                "exclusiveMinimum": 0,
-            },
-        },
-        "required": [],
-        "additionalProperties": False,
-    },
-}
-
-
-_HAND_SCHEMA: dict[str, Any] = {
-    "type": "string",
-    "enum": ["left", "right"],
-    "description": "Which R1Pro hand/arm should execute the primitive.",
-}
-
-_XYZ_SCHEMA: dict[str, Any] = {
-    "type": "array",
-    "items": {"type": "number"},
-    "minItems": 3,
-    "maxItems": 3,
-    "description": "Target position as [x, y, z] in the selected frame.",
-}
-
-_QUAT_SCHEMA: dict[str, Any] = {
-    "type": ["array", "null"],
-    "items": {"type": "number"},
-    "minItems": 4,
-    "maxItems": 4,
-    "description": "Quaternion [x, y, z, w].",
-}
-
-_VECTOR_SCHEMA: dict[str, Any] = {
-    "type": ["array", "null"],
-    "items": {"type": "number"},
-    "minItems": 3,
-    "maxItems": 3,
-}
-
-_FRAME_SCHEMA: dict[str, Any] = {
-    "type": "string",
-    "default": "world",
-    "description": "Coordinate frame understood by the BEHAVIOR env server.",
 }
 
 
@@ -538,565 +300,341 @@ def _planner_spec(
     return spec
 
 
-INSPECT_POST_PICK_STATE_SPEC: dict[str, Any] = _planner_spec(
-    "inspect_post_pick_state",
-    (
-        "Bind the post-pick phase to a real robot-motion checkpoint and inspect "
-        "the current held-object state without advancing physics. The env reads "
-        "held_hand and press_hand dynamically from the checkpoint and returns "
-        "current held/radio transforms and task radio-face priors. Callers submit "
-        "button geometry goals; the runtime alone derives held-EEF candidates."
-    ),
-    {
-        "checkpoint_name": {
-            "type": "string",
-            "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
-            "default": "state_checkpoint_1",
-        },
-    },
-)
-
-_POST_PICK_CAMERA_SCHEMA: dict[str, Any] = {
+_CAMERA_ROLE_SCHEMA: dict[str, Any] = {
     "type": "string",
-    "enum": ["head", "held_wrist", "press_wrist"],
+    "enum": ["head", "left_wrist", "right_wrist"],
     "description": (
-        "Dynamic post-pick camera role. held_wrist and press_wrist are resolved "
-        "from state_checkpoint_1; literal left/right is not accepted."
+        "Current public physical camera. Wrist names identify the robot's "
+        "anatomical left and right hands."
     ),
 }
 
-POST_PICK_OBSERVE_SPEC: dict[str, Any] = _planner_spec(
+_ANALYTIC_HAND_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "enum": ["left", "right"],
+    "description": (
+        "Robot anatomical hand selected for this analytic primitive. Every hand "
+        "selection requires a fresh LLM visual_hand_check."
+    ),
+}
+
+_VISUAL_HAND_CHECK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "LLM visual confirmation required for every analytic primitive hand. "
+        "The LLM must inspect the RGB content of a fresh head observe call from "
+        "the current episode. left/right mean the robot's anatomical sides, never "
+        "the left or right side of the image. selected_hand must equal hand."
+    ),
+    "properties": {
+        "camera": {
+            "type": "string",
+            "const": "head",
+        },
+        "frame_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Fresh frame_id returned by the cited public observe call.",
+        },
+        "selected_hand": {
+            "type": "string",
+            "enum": ["left", "right"],
+            "description": "Physical hand selected by the LLM from the cited frame.",
+        },
+        "assessment": {
+            "type": "string",
+            "const": "selected_hand_visually_confirmed",
+        },
+    },
+    "required": ["camera", "frame_id", "selected_hand", "assessment"],
+    "additionalProperties": False,
+}
+
+_RELEASE_VISUAL_CHECK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Optional task-specific visual release evidence. Runtime decides when this "
+        "evidence is required. It is bound to a fresh public head observation and "
+        "must identify the same anatomical hand selected by the open call."
+    ),
+    "properties": {
+        "camera": {
+            "type": "string",
+            "const": "head",
+        },
+        "frame_id": {
+            "type": "string",
+            "minLength": 1,
+        },
+        "selected_hand": {
+            "type": "string",
+            "enum": ["left", "right"],
+        },
+        "assessment": {
+            "type": "string",
+            "const": "attached_object_fully_inside_receptacle_opening",
+        },
+    },
+    "required": ["camera", "frame_id", "selected_hand", "assessment"],
+    "additionalProperties": False,
+}
+
+
+def _bind_visual_checks_to_hand(
+    spec: dict[str, Any],
+    *,
+    include_release_visual_check: bool = False,
+) -> None:
+    """Require every visual hand declaration to match the requested hand."""
+
+    def branch(hand: str) -> dict[str, Any]:
+        properties: dict[str, Any] = {
+            "hand": {"const": hand},
+            "visual_hand_check": {
+                "properties": {
+                    "selected_hand": {"const": hand},
+                },
+            },
+        }
+        if include_release_visual_check:
+            properties["release_visual_check"] = {
+                "properties": {
+                    "selected_hand": {"const": hand},
+                },
+            }
+        return {"properties": properties}
+
+    spec["input_schema"]["allOf"] = [
+        {
+            "oneOf": [
+                branch("left"),
+                branch("right"),
+            ]
+        }
+    ]
+
+
+OBSERVE_SPEC: dict[str, Any] = _planner_spec(
     "observe",
     (
-        "Capture one synchronized BEHAVIOR RGB-D frame from head or a dynamic "
-        "checkpoint wrist role without advancing physics."
-    ),
-    {"camera": _POST_PICK_CAMERA_SCHEMA},
-    required=["camera"],
-)
-
-POST_PICK_PIXEL_TO_WORLD_SPEC: dict[str, Any] = _planner_spec(
-    "pixel_to_world",
-    (
-        "Convert a pixel from a fresh head/held-wrist/press-wrist frame into a "
-        "3D point using the env-side depth and calibrated intrinsics."
+        "Capture one fresh synchronized public RGB-D observation, or submit an LLM "
+        "review or selected-pixel depth probe for a previously returned current "
+        "frame, without advancing physics. Omit frame_review and depth_probe to "
+        "capture. After inspecting that returned RGB, call observe again with the "
+        "same camera and exactly one of frame_review or depth_probe; this read-only "
+        "follow-up does not capture or refresh an image. Runtime verifies frame "
+        "provenance and freshness, not the semantic truth of an LLM assessment. "
+        "A frame review must consume the immediately preceding, same-camera capture "
+        "exactly once. "
+        "Two consecutive complete runtime-accepted selected-attached-hand "
+        "rotate/Pi0/fresh-opposite-surface regression cycles disable only "
+        "pi0_nav_pick for the remainder of the current attempt; all other public "
+        "tools remain available."
     ),
     {
-        "camera": _POST_PICK_CAMERA_SCHEMA,
-        "frame_id": {"type": "string"},
+        "camera": _CAMERA_ROLE_SCHEMA,
+        "frame_review": {
+            "type": "object",
+            "description": (
+                "Optional LLM assessment of a fresh frame returned by an earlier "
+                "observe call. Include it only after inspecting that RGB; otherwise "
+                "omit it to capture a new observation."
+            ),
+            "properties": {
+                "frame_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Fresh frame_id returned by the earlier observe call."
+                    ),
+                },
+                "assessment": {
+                    "type": "string",
+                    "enum": list(FRAME_REVIEW_ASSESSMENTS),
+                    "description": (
+                        "Task-surface assessment made by the LLM from the cited "
+                        "frame under the selected task-specific visual prior."
+                    ),
+                },
+            },
+            "required": ["frame_id", "assessment"],
+            "additionalProperties": False,
+        },
+        "depth_probe": {
+            "type": "object",
+            "description": (
+                "Optional read-only metric-depth probe at one pixel selected by the "
+                "LLM after inspecting the immediately preceding fresh RGB frame. "
+                "The runtime measures the selected pixel; it does not verify that "
+                "the pixel semantically belongs to the claimed target."
+            ),
+            "properties": {
+                "frame_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Fresh frame_id returned by the immediately preceding "
+                        "same-camera observe call."
+                    ),
+                },
+                "u": {
+                    "type": "integer",
+                    "description": "LLM-selected RGB pixel column coordinate.",
+                },
+                "v": {
+                    "type": "integer",
+                    "description": "LLM-selected RGB pixel row coordinate.",
+                },
+                "depth_window_px": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 31,
+                    "description": "Local depth sampling window size.",
+                },
+                "assessment": {
+                    "type": "string",
+                    "const": "target_point_visually_confirmed",
+                    "description": (
+                        "LLM confirmation that it selected the intended visible "
+                        "target point in the cited RGB frame."
+                    ),
+                },
+            },
+            "required": [
+                "frame_id",
+                "u",
+                "v",
+                "depth_window_px",
+                "assessment",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    required=["camera"],
+)
+OBSERVE_SPEC["input_schema"]["allOf"] = [
+    {"not": {"required": ["frame_review", "depth_probe"]}}
+]
+
+PIXEL_TO_WORLD_SPEC: dict[str, Any] = _planner_spec(
+    "pixel_to_world",
+    (
+        "Back-project one pixel from a fresh public RGB-D frame. Returns a world "
+        "point, camera-facing surface normal, confidence, and frame-bound projection_id."
+    ),
+    {
+        "camera": _CAMERA_ROLE_SCHEMA,
+        "frame_id": {"type": "string", "minLength": 1},
         "u": {"type": "integer", "description": "Pixel column coordinate."},
         "v": {"type": "integer", "description": "Pixel row coordinate."},
-        "depth_window_px": {"type": "integer", "default": 7, "minimum": 1},
-        "output_frame": {"type": "string", "default": "world"},
+        "depth_window_px": {
+            "type": "integer",
+            "default": 7,
+            "minimum": 1,
+            "maximum": 31,
+        },
     },
     required=["camera", "frame_id", "u", "v"],
 )
 
-DECLARE_BUTTON_VISIBILITY_SPEC: dict[str, Any] = _planner_spec(
-    "declare_button_visibility",
-    (
-        "Apply the hard visual gate to one fresh radio frame. A negative "
-        "declaration must classify clear_slotted_back_face, side_port, or "
-        "ambiguous and omit coordinates. A positive declaration requires the "
-        "complete black-disk, white-ring, red-center signature plus bbox and center."
+_NAVIGATION_VISUAL_CHECK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "LLM confirmation that a fresh public head frame depicts the intended "
+        "base-navigation target. The frame_id must bind to projection_id at runtime."
     ),
-    {
+    "properties": {
         "camera": {
             "type": "string",
-            "enum": ["head", "held_wrist", "press_wrist"],
+            "const": "head",
         },
-        "frame_id": {"type": "string", "minLength": 1},
-        "button_visible": {"type": "boolean"},
-        "positive_signature": {
-            "type": ["object", "null"],
-            "default": None,
-            "properties": {
-                "red_front_face": {"type": "boolean"},
-                "black_round_or_oval_disk": {"type": "boolean"},
-                "white_outer_ring": {"type": "boolean"},
-                "red_center_bump": {"type": "boolean"},
-            },
-            "required": [
-                "red_front_face",
-                "black_round_or_oval_disk",
-                "white_outer_ring",
-                "red_center_bump",
-            ],
-            "additionalProperties": False,
-        },
-        "negative_case": {
-            "type": ["string", "null"],
-            "enum": [
-                "clear_slotted_back_face",
-                "side_port",
-                "ambiguous",
-                None,
-            ],
-            "default": None,
-        },
-        "bbox_xyxy": {
-            "type": ["array", "null"],
-            "items": {"type": "number"},
-            "minItems": 4,
-            "maxItems": 4,
-            "default": None,
-        },
-        "center_uv": {
-            "type": ["array", "null"],
-            "items": {"type": "number"},
-            "minItems": 2,
-            "maxItems": 2,
-            "default": None,
-        },
-    },
-    required=["camera", "frame_id", "button_visible"],
-    one_of=[
-        {
-            "required": ["negative_case"],
-            "properties": {
-                "button_visible": {"const": False},
-                "positive_signature": {"type": "null"},
-                "negative_case": {
-                    "type": "string",
-                    "enum": [
-                        "clear_slotted_back_face",
-                        "side_port",
-                        "ambiguous",
-                    ],
-                },
-                "bbox_xyxy": {"type": "null"},
-                "center_uv": {"type": "null"},
-            },
-        },
-        {
-            "required": ["positive_signature", "bbox_xyxy", "center_uv"],
-            "properties": {
-                "button_visible": {"const": True},
-                "positive_signature": {"type": "object"},
-                "negative_case": {"type": "null"},
-                "bbox_xyxy": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "minItems": 4,
-                    "maxItems": 4,
-                },
-                "center_uv": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2,
-                },
-            },
-        },
-    ],
-)
-
-PROJECT_BUTTON_SPEC: dict[str, Any] = _planner_spec(
-    "project_button",
-    (
-        "Depth-project the center authorized by a successful button visibility "
-        "gate. The env binds gate_id to its exact fresh frame and rejects stale "
-        "or NOT_VISIBLE gates."
-    ),
-    {
-        "gate_id": {"type": "string", "minLength": 1},
-        "depth_window_px": {"type": "integer", "default": 7, "minimum": 1},
-    },
-    required=["gate_id"],
-)
-
-EVALUATE_PREPRESS_GEOMETRY_SPEC: dict[str, Any] = _planner_spec(
-    "evaluate_prepress_geometry",
-    (
-        "Evaluate the projected button against the dynamically selected press "
-        "hand approach line. This computes line distance, outward-normal "
-        "opposition angle and axial standoff for the current state; it neither "
-        "returns an EEF target nor moves or presses."
-    ),
-    {
-        "projection_id": {"type": "string", "minLength": 1},
-        "max_line_distance_m": {
-            "type": "number",
-            "default": 0.010,
-            "exclusiveMinimum": 0.0,
-            "maximum": 0.010,
-        },
-        "max_opposition_angle_deg": {
-            "type": "number",
-            "default": 15.0,
-            "exclusiveMinimum": 0.0,
-            "maximum": 15.0,
-        },
-        "min_axial_standoff_m": {
-            "type": "number",
-            "default": 0.03,
-            "minimum": 0.03,
-            "maximum": 0.06,
-        },
-        "max_axial_standoff_m": {
-            "type": "number",
-            "default": 0.06,
-            "exclusiveMinimum": 0.03,
-            "maximum": 0.06,
-        },
-    },
-    required=["projection_id"],
-)
-
-PREPRESS_MOVE_TO_SPEC: dict[str, Any] = _planner_spec(
-    "move_to",
-    (
-        "Plan and optionally execute one CuRobo motion selected from runtime-"
-        "generated EEF candidates for a button-space goal. "
-        "This is the dedicated post-pick move_to, not the generic planner tool: "
-        "left/right hand and literal EEF xyz/quaternion arguments are not "
-        "accepted. For held_button_alignment, the env turns a desired button "
-        "translation/view/face relation into radio poses, derives held EEF "
-        "candidates through the live grasp transform, and lets CuRobo select a "
-        "reachable collision-free trajectory. For press_staging, the env derives "
-        "non-contact press EEF candidates from a fresh press-wrist projection. "
-        "The held gripper is forced closed at every waypoint regardless of which "
-        "role moves. "
-        "Held-object stability and three-view evidence are checked at trajectory end. "
-        "Execution requires a matching one-use plan_only certificate for the "
-        "exact current gate, projection, role, checkpoint, env step, button goal, "
-        "selected candidate, and trajectory."
-    ),
-    {
-        "role": {
+        "frame_id": {
             "type": "string",
-            "enum": ["held", "press"],
-            "default": "held",
-            "description": (
-                "Dynamic checkpoint role to move. This never accepts a hard-coded "
-                "left or right hand."
-            ),
+            "minLength": 1,
         },
-        "button_goal": {
-            "type": "object",
-            "oneOf": [
-                {
-                    "required": [
-                        "kind",
-                        "toward_robot_m",
-                        "head_view",
-                        "face_toward",
-                    ],
-                    "properties": {
-                        "kind": {"const": "held_button_alignment"},
-                        "alignment_phase": {
-                            "type": "string",
-                            "enum": ["joint", "position_first", "normal_refine"],
-                            "default": "joint",
-                            "description": (
-                                "position_first preserves the current radio "
-                                "orientation while centering the button; "
-                                "normal_refine adjusts the button normal after "
-                                "the position move; joint keeps legacy combined "
-                                "alignment behavior."
-                            ),
-                        },
-                        "toward_robot_m": {
-                            "type": "number",
-                            "minimum": 0.0,
-                            "maximum": 0.30,
-                        },
-                        "head_view": {"const": "side"},
-                        "face_toward": {"const": "press"},
-                        "side_view_tolerance_deg": {
-                            "type": "number",
-                            "default": 15.0,
-                            "exclusiveMinimum": 0.0,
-                            "maximum": 30.0,
-                        },
-                        "face_toward_tolerance_deg": {
-                            "type": "number",
-                            "default": 30.0,
-                            "exclusiveMinimum": 0.0,
-                            "maximum": 45.0,
-                        },
-                        "position_slack_m": {
-                            "type": "number",
-                            "default": 0.04,
-                            "minimum": 0.0,
-                            "maximum": 0.10,
-                        },
-                        "head_target_uv": {
-                            "type": ["array", "null"],
-                            "items": {"type": "number"},
-                            "minItems": 2,
-                            "maxItems": 2,
-                            "default": None,
-                            "description": (
-                                "Optional button-center pixel goal in the fresh "
-                                "head frame. The runtime preserves the projected "
-                                "button depth, constructs a desired button-space "
-                                "translation, and only then derives held EEF "
-                                "candidates from the live grasp transform."
-                            ),
-                        },
-                        "head_target_radius_px": {
-                            "type": "number",
-                            "default": 60.0,
-                            "minimum": 0.0,
-                            "maximum": 160.0,
-                            "description": (
-                                "Allowed circular image-space neighborhood around "
-                                "head_target_uv. The runtime samples button-center "
-                                "positions in this region and CuRobo selects a "
-                                "reachable collision-free candidate."
-                            ),
-                        },
-                        "minimum_table_clearance_m": {
-                            "type": "number",
-                            "default": 0.12,
-                            "minimum": 0.08,
-                            "maximum": 0.25,
-                            "description": (
-                                "Minimum radio-to-table air gap enforced while "
-                                "constructing the button goal. XY may change so "
-                                "CuRobo can find a feasible raised trajectory."
-                            ),
-                        },
-                        "candidate_budget": {
-                            "type": "integer",
-                            "default": 12,
-                            "minimum": 1,
-                            "maximum": 32,
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-                {
-                    "required": ["kind", "projection_id"],
-                    "properties": {
-                        "kind": {"const": "press_staging"},
-                        "projection_id": {"type": "string", "minLength": 1},
-                        "alignment_phase": {
-                            "type": "string",
-                            "enum": ["final", "observation"],
-                            "default": "final",
-                            "description": (
-                                "final aligns the press EEF at 0.03--0.06 m; "
-                                "observation aligns the real wrist-camera "
-                                "optical axis at a farther non-contact pose."
-                            ),
-                        },
-                        "standoff_m": {
-                            "type": "number",
-                            "default": 0.055,
-                            "minimum": 0.03,
-                            "maximum": 0.25,
-                            "description": (
-                                "Button-normal standoff. final accepts only "
-                                "0.03--0.06 m. After a certified close-pose "
-                                "planning failure, observation may use up to "
-                                "0.25 m and does not authorize state 2."
-                            ),
-                        },
-                        "candidate_budget": {
-                            "type": "integer",
-                            "default": 8,
-                            "minimum": 1,
-                            "maximum": 16,
-                        },
-                    },
-                    "additionalProperties": False,
-                },
-            ],
-        },
-        "plan_only": {"type": "boolean", "default": False},
-        "timeout_s": {
-            "type": "number",
-            "default": 90.0,
-            "exclusiveMinimum": 0.0,
-        },
-    },
-    required=["role", "button_goal"],
-    one_of=[
-        {
-            "properties": {
-                "role": {"const": "held"},
-                "button_goal": {
-                    "properties": {"kind": {"const": "held_button_alignment"}}
-                },
-            }
-        },
-        {
-            "properties": {
-                "role": {"const": "press"},
-                "button_goal": {"properties": {"kind": {"const": "press_staging"}}},
-            }
-        },
-    ],
-)
-
-PREPRESS_ROTATE_WRIST_SPEC: dict[str, Any] = _planner_spec(
-    "rotate_wrist",
-    (
-        "Plan and optionally execute a wrist-only orientation change for the "
-        "selected dynamic role bound by inspect_post_pick_state. No literal "
-        "hand argument is accepted. The selected EEF position is retained, the "
-        "radio remains attached to the held role for collision checking, and "
-        "the held gripper is forced closed throughout every executed trajectory."
-    ),
-    {
-        "role": {
+        "assessment": {
             "type": "string",
-            "enum": ["held", "press"],
-            "default": "held",
-            "description": "Dynamic checkpoint role whose wrist is rotated.",
-        },
-        "target_quat_xyzw": _QUAT_SCHEMA,
-        "relative_axis_angle": {
-            "type": ["array", "null"],
-            "items": {"type": "number"},
-            "minItems": 4,
-            "maxItems": 4,
-            "description": "[axis_x, axis_y, axis_z, angle_rad].",
-        },
-        "frame": {
-            "type": "string",
-            "enum": ["world", "eef"],
-            "default": "eef",
-        },
-        "plan_only": {"type": "boolean", "default": False},
-        "timeout_s": {
-            "type": "number",
-            "default": 90.0,
-            "exclusiveMinimum": 0.0,
+            "const": "navigation_target_visually_confirmed",
         },
     },
-    one_of=[
-        {
-            "required": ["target_quat_xyzw"],
-            "properties": {
-                "target_quat_xyzw": {"type": "array"},
-                "relative_axis_angle": {"type": "null"},
-            },
-        },
-        {
-            "required": ["relative_axis_angle"],
-            "properties": {
-                "target_quat_xyzw": {"type": "null"},
-                "relative_axis_angle": {"type": "array"},
-            },
-        },
-    ],
-)
-
-POST_PICK_SAVE_ROBOT_STATE_CHECKPOINT_SPEC: dict[str, Any] = {
-    "name": "save_robot_state_checkpoint",
-    "description": (
-        "Save persistent state_checkpoint_2 or a bounded tmp_state_checkpoint_* "
-        "robot-motion checkpoint. Existing files are never overwritten. "
-        "state_checkpoint_2 is committed only through the current button, "
-        "geometry, motion, and three-view pre-press evidence gate. This never "
-        "serializes or restores simulator state."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "checkpoint_name": {
-                "oneOf": [
-                    {"const": "state_checkpoint_2"},
-                    {"type": "string", "pattern": TEMP_STATE_CHECKPOINT_PATTERN},
-                ],
-                "default": "state_checkpoint_2",
-            },
-            "stage": {
-                "enum": ["pre_press_alignment", "temporary_restore_point"],
-                "default": "pre_press_alignment",
-            },
-            "visual_review": {"const": True, "default": True},
-        },
-        "required": ["checkpoint_name", "stage"],
-        "additionalProperties": False,
-    },
+    "required": ["camera", "frame_id", "assessment"],
+    "additionalProperties": False,
 }
 
-POST_PICK_RESTORE_ROBOT_STATE_CHECKPOINT_SPEC: dict[str, Any] = {
-    **RESTORE_ROBOT_STATE_CHECKPOINT_SPEC,
+_RELATIVE_NAVIGATION_MOTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
     "description": (
-        "Plan and execute a CuRobo robot-motion restore to this run's exact "
-        "state_checkpoint_1, state_checkpoint_2, or tmp_state_checkpoint_* "
-        "JSON. This is never a reset, teleport, simulator snapshot load, or "
-        "scene restore."
+        "One base-relative motion. Translation follows the robot body's heading "
+        "at call start; rotation turns the base and the body together in place."
     ),
-    "input_schema": {
-        **RESTORE_ROBOT_STATE_CHECKPOINT_SPEC["input_schema"],
-        "properties": {
-            **RESTORE_ROBOT_STATE_CHECKPOINT_SPEC["input_schema"]["properties"],
-            "checkpoint_name": {
-                "oneOf": [
-                    {"enum": ["state_checkpoint_1", "state_checkpoint_2"]},
-                    {"type": "string", "pattern": TEMP_STATE_CHECKPOINT_PATTERN},
-                ],
-                "default": "state_checkpoint_1",
-            },
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": ["translation", "rotation"],
+        },
+        "direction": {
+            "type": "string",
+            "enum": ["forward", "backward", "left", "right"],
+        },
+        "distance_m": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "maximum": 1.5,
+        },
+        "angle_deg": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "maximum": 180.0,
         },
     },
+    "oneOf": [
+        {
+            "properties": {
+                "kind": {"const": "translation"},
+                "direction": {"enum": ["forward", "backward"]},
+            },
+            "required": ["kind", "direction", "distance_m"],
+            "not": {"required": ["angle_deg"]},
+        },
+        {
+            "properties": {
+                "kind": {"const": "rotation"},
+                "direction": {"enum": ["left", "right"]},
+            },
+            "required": ["kind", "direction", "angle_deg"],
+            "not": {"required": ["distance_m"]},
+        },
+    ],
+    "additionalProperties": False,
 }
 
-POST_PICK_CLOSE_PRESS_GRIPPER_SPEC = _planner_spec(
-    "post_pick_close_press_gripper",
-    "Fully close the dynamic press-hand gripper before stage-3 contact.",
+NAVIGATE_TO_SPEC: dict[str, Any] = _planner_spec(
+    "navigate_to",
+    (
+        "Move only the robot base while holding trunk, both arms, both grippers, "
+        "and both attachment identities fixed relative to the base, so the body "
+        "moves and rotates together with it. Use either a fresh head-camera "
+        "projection, or one explicit relative translation (forward/backward) or "
+        "in-place rotation (left/right). The two modes are mutually exclusive."
+    ),
     {
-        "timeout_s": {
-            "type": "number",
-            "default": 30.0,
-            "exclusiveMinimum": 0.0,
-        }
-    },
-)
-
-INSPECT_TOGGLE_GEOMETRY_SPEC = _planner_spec(
-    "inspect_toggle_geometry",
-    "Read live radio toggle-marker and dynamic press-finger geometry.",
-    {},
-)
-
-POST_PICK_RECENTER_HELD_BUTTON_SPEC = _planner_spec(
-    "post_pick_recenter_held_button",
-    "Recenter the held radio button relative to the stationary closed fingertip.",
-    {
-        "target_finger_standoff_m": {
-            "type": "number",
-            "default": 0.04,
-            "minimum": 0.03,
-            "maximum": 0.07,
+        "projection_id": {
+            "type": "string",
+            "minLength": 1,
         },
-        "max_held_travel_m": {
+        "navigation_visual_check": _NAVIGATION_VISUAL_CHECK_SCHEMA,
+        "relative_motion": _RELATIVE_NAVIGATION_MOTION_SCHEMA,
+        "standoff_m": {
             "type": "number",
-            "default": 0.08,
-            "minimum": 0.02,
-            "maximum": 0.10,
-        },
-        "timeout_s": {
-            "type": "number",
-            "default": 240.0,
-            "exclusiveMinimum": 0.0,
-        },
-    },
-)
-
-POST_PICK_DIRECT_FINGER_TOGGLE_SPEC = _planner_spec(
-    "post_pick_direct_finger_toggle",
-    "Move the nearest fully closed fingertip through the live toggle marker.",
-    {
-        "projection_id": {"type": "string", "minLength": 1},
-        "penetration_m": {
-            "type": "number",
-            "default": 0.008,
-            "minimum": 0.0,
-            "maximum": 0.03,
+            "default": 0.85,
+            "minimum": 0.45,
+            "maximum": 1.50,
         },
         "max_travel_m": {
             "type": "number",
-            "default": 0.15,
-            "minimum": 0.02,
-            "maximum": 0.20,
+            "default": 1.0,
+            "exclusiveMinimum": 0.0,
+            "maximum": 1.50,
         },
         "timeout_s": {
             "type": "number",
@@ -1104,311 +642,410 @@ POST_PICK_DIRECT_FINGER_TOGGLE_SPEC = _planner_spec(
             "exclusiveMinimum": 0.0,
         },
     },
-    required=["projection_id"],
+    one_of=[
+        {
+            "required": ["projection_id", "navigation_visual_check"],
+            "not": {"required": ["relative_motion"]},
+        },
+        {
+            "required": ["relative_motion"],
+            "not": {
+                "anyOf": [
+                    {"required": ["projection_id"]},
+                    {"required": ["navigation_visual_check"]},
+                    {"required": ["standoff_m"]},
+                    {"required": ["max_travel_m"]},
+                ]
+            },
+        },
+    ],
 )
 
-POST_SUCCESS_HOLD_FRAMES_SPEC = _planner_spec(
-    "post_success_hold_frames",
-    "Hold still for bounded render synchronization after raw task success.",
-    {
-        "frames": {
-            "type": "integer",
-            "default": 4,
-            "minimum": 1,
-            "maximum": 16,
-        }
-    },
-)
 
-SAVE_PREPRESS_CHECKPOINT_SPEC: dict[str, Any] = _planner_spec(
-    "save_prepress_checkpoint",
-    (
-        "Save state_checkpoint_2 only after the env has accepted the button hard "
-        "gate and pre-press geometry. This is a robot-motion checkpoint, never a "
-        "simulator snapshot, and does not press the button."
-    ),
-    {
-        "checkpoint_name": {
+def validate_relative_navigation_motion(value: Any) -> dict[str, Any]:
+    """Validate and normalize one explicit base-relative navigation motion."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("relative_motion must be an object")
+    motion = dict(value)
+    kind = motion.get("kind")
+    direction = motion.get("direction")
+    if kind == "translation":
+        expected = {"kind", "direction", "distance_m"}
+        allowed_directions = {"forward", "backward"}
+        amount_name = "distance_m"
+        maximum = 1.5
+    elif kind == "rotation":
+        expected = {"kind", "direction", "angle_deg"}
+        allowed_directions = {"left", "right"}
+        amount_name = "angle_deg"
+        maximum = 180.0
+    else:
+        raise ValueError("relative_motion.kind must be translation or rotation")
+    if set(motion) != expected:
+        raise ValueError(
+            f"relative_motion.{kind} requires exactly {sorted(expected)}"
+        )
+    if direction not in allowed_directions:
+        raise ValueError(
+            f"relative_motion.direction is invalid for {kind}"
+        )
+    amount = motion[amount_name]
+    if isinstance(amount, bool) or not isinstance(
+        amount, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError(f"relative_motion.{amount_name} must be a finite number")
+    amount = float(amount)
+    if not np.isfinite(amount) or amount <= 0.0 or amount > maximum:
+        raise ValueError(
+            f"relative_motion.{amount_name} must be within (0,{maximum}]"
+        )
+    return {
+        "kind": str(kind),
+        "direction": str(direction),
+        amount_name: amount,
+    }
+
+_MOVE_TARGET_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "projection_id": {"type": "string", "minLength": 1},
+        "standoff_m": {"type": "number", "minimum": 0.0},
+        "delta_xyz": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 3,
+            "maxItems": 3,
+        },
+        "frame": {
             "type": "string",
-            "const": "state_checkpoint_2",
-            "default": "state_checkpoint_2",
+            "enum": ["world", "eef"],
         },
-        "stage": {
-            "type": "string",
-            "const": "pre_press_alignment",
-            "default": "pre_press_alignment",
-        },
-        "visual_review": {"type": "boolean", "default": True},
     },
-)
-
-
-PLANNER_TOOL_SPECS: dict[str, dict[str, Any]] = {
-    "observe": _planner_spec(
-        "observe",
-        (
-            "Capture one synchronized BEHAVIOR RGB-D frame from the selected "
-            "camera. Returns RGB, frame_id, image size, and camera metadata."
-        ),
+    "oneOf": [
         {
-            "camera": {
-                "type": "string",
-                "enum": ["head", "left_wrist", "right_wrist"],
-                "description": "Camera to observe.",
+            "required": ["projection_id"],
+            "not": {
+                "anyOf": [
+                    {"required": ["delta_xyz"]},
+                    {"required": ["frame"]},
+                ]
             },
         },
-        required=["camera"],
-    ),
-    "pixel_to_world": _planner_spec(
-        "pixel_to_world",
-        (
-            "Convert a pixel from a previously observed frame into a 3D point "
-            "using the env-side depth frame and calibrated camera intrinsics."
-        ),
         {
-            "camera": {
-                "type": "string",
-                "enum": ["head", "left_wrist", "right_wrist"],
-            },
-            "frame_id": {"type": "string"},
-            "u": {
-                "type": "integer",
-                "description": "Pixel column coordinate.",
-            },
-            "v": {
-                "type": "integer",
-                "description": "Pixel row coordinate.",
-            },
-            "depth_window_px": {
-                "type": "integer",
-                "default": 7,
-                "minimum": 1,
-            },
-            "output_frame": {
-                "type": "string",
-                "default": "world",
+            "required": ["delta_xyz", "frame"],
+            "not": {
+                "anyOf": [
+                    {"required": ["projection_id"]},
+                    {"required": ["standoff_m"]},
+                ]
             },
         },
-        required=["camera", "frame_id", "u", "v"],
-    ),
-    "navigate_to": _planner_spec(
-        "navigate_to",
-        (
-            "Move the mobile base to a collision-free stand-off pose near a "
-            "target, ensuring the named hand has a feasible collision-free IK "
-            "solution after arrival. Requires a fresh observe afterwards."
-        ),
-        {
-            "hand": _HAND_SCHEMA,
-            "target_xyz": _XYZ_SCHEMA,
-            "frame": _FRAME_SCHEMA,
-            "standoff_m": {"type": "number", "default": 0.85, "minimum": 0.0},
-            "timeout_s": {"type": "number", "default": 90, "minimum": 0.0},
-        },
-        required=["hand", "target_xyz"],
-    ),
-    "move_to": _planner_spec(
-        "move_to",
-        (
-            "Plan and optionally execute a collision-aware cuRobo arm motion "
-            "for the selected R1Pro hand. Primitive success never implies "
-            "official BEHAVIOR task success."
-        ),
-        {
-            "hand": _HAND_SCHEMA,
-            "target_xyz": _XYZ_SCHEMA,
-            "frame": _FRAME_SCHEMA,
-            "target_quat_xyzw": _QUAT_SCHEMA,
-            "plan_only": {"type": "boolean", "default": False},
-            "position_tolerance_m": {
-                "type": "number",
-                "default": 0.02,
-                "minimum": 0.0,
-            },
-            "orientation_tolerance_rad": {
-                "type": "number",
-                "default": 0.087,
-                "minimum": 0.0,
-            },
-            "timeout_s": {"type": "number", "default": 45, "minimum": 0.0},
-        },
-        required=["hand", "target_xyz"],
-    ),
-    "pick": _planner_spec(
-        "pick",
-        (
-            "Execute a guarded grasp with the chosen hand from a depth-derived "
-            "target point, using cuRobo to reach pre-grasp and guarded contact "
-            "for the final approach."
-        ),
-        {
-            "hand": _HAND_SCHEMA,
-            "target_xyz": _XYZ_SCHEMA,
-            "approach_vector": _VECTOR_SCHEMA,
-            "grasp_quat_xyzw": _QUAT_SCHEMA,
-            "pregrasp_offset_m": {
-                "type": "number",
-                "default": 0.08,
-                "minimum": 0.0,
-            },
-            "lift_m": {"type": "number", "default": 0.08, "minimum": 0.0},
-            "timeout_s": {"type": "number", "default": 90, "minimum": 0.0},
-        },
-        required=["hand", "target_xyz"],
-    ),
-    "rotate_wrist": _planner_spec(
-        "rotate_wrist",
-        (
-            "Rotate the selected wrist to an absolute quaternion or by a "
-            "relative axis-angle command. Provide exactly one rotation form."
-        ),
-        {
-            "hand": _HAND_SCHEMA,
-            "target_quat_xyzw": _QUAT_SCHEMA,
-            "relative_axis_angle": {
-                "type": ["array", "null"],
-                "items": {"type": "number"},
-                "minItems": 4,
-                "maxItems": 4,
-                "description": "[axis_x, axis_y, axis_z, angle_rad].",
-            },
-            "frame": {
-                "type": "string",
-                "enum": ["world", "eef"],
-                "default": "world",
-            },
-            "timeout_s": {"type": "number", "default": 45, "minimum": 0.0},
-        },
-        required=["hand"],
-        one_of=[
-            {
-                "required": ["target_quat_xyzw"],
-                "properties": {
-                    "target_quat_xyzw": {"type": "array"},
-                    "relative_axis_angle": {"type": "null"},
-                },
-            },
-            {
-                "required": ["relative_axis_angle"],
-                "properties": {
-                    "target_quat_xyzw": {"type": "null"},
-                    "relative_axis_angle": {"type": "array"},
-                },
-            },
-        ],
-    ),
-    "press": _planner_spec(
-        "press",
-        (
-            "Approach and press a target with guarded contact checks. Any "
-            "unexpected contact before the target neighborhood aborts."
-        ),
-        {
-            "hand": _HAND_SCHEMA,
-            "target_xyz": _XYZ_SCHEMA,
-            "press_direction": _VECTOR_SCHEMA,
-            "approach_distance_m": {
-                "type": "number",
-                "default": 0.04,
-                "minimum": 0.0,
-            },
-            "press_depth_m": {
-                "type": "number",
-                "default": 0.012,
-                "minimum": 0.0,
-            },
-            "timeout_s": {"type": "number", "default": 60, "minimum": 0.0},
-        },
-        required=["hand", "target_xyz"],
-    ),
-    "release": _planner_spec(
-        "release",
-        (
-            "Open the selected gripper and optionally retreat along a vector. "
-            "Returns primitive status and official task_success separately."
-        ),
-        {
-            "hand": _HAND_SCHEMA,
-            "opening": {"type": "number", "default": 1.0, "minimum": 0.0},
-            "retreat_vector": _VECTOR_SCHEMA,
-            "retreat_m": {"type": "number", "default": 0.03, "minimum": 0.0},
-            "timeout_s": {"type": "number", "default": 30, "minimum": 0.0},
-        },
-        required=["hand"],
-    ),
+    ],
+    "additionalProperties": False,
 }
 
+MOVE_TO_SPEC: dict[str, Any] = _planner_spec(
+    "move_to",
+    (
+        "Execute one R1Pro whole-body 21-DOF CuRobo joint motion using either a "
+        "fresh projection or a relative translation. hand selects only the target "
+        "EEF; it does not select an isolated arm-only embodiment. The planner may "
+        "coordinate the base, trunk, and both arms, and includes objects held by "
+        "either hand in collision checking."
+    ),
+    {
+        "hand": _ANALYTIC_HAND_SCHEMA,
+        "visual_hand_check": _VISUAL_HAND_CHECK_SCHEMA,
+        "target": _MOVE_TARGET_SCHEMA,
+        "position_tolerance_m": {
+            "type": "number",
+            "default": 0.02,
+            "exclusiveMinimum": 0.0,
+        },
+        "max_travel_m": {
+            "type": "number",
+            "default": 0.25,
+            "exclusiveMinimum": 0.0,
+        },
+        "timeout_s": {
+            "type": "number",
+            "default": 240.0,
+            "exclusiveMinimum": 0.0,
+        },
+    },
+    required=["hand", "visual_hand_check", "target"],
+)
+_bind_visual_checks_to_hand(MOVE_TO_SPEC)
 
-if tuple(PLANNER_TOOL_SPECS) != PLANNER_TOOL_NAMES:
-    raise ValueError("planner tool schema order must match PLANNER_TOOL_NAMES")
+ROTATE_WRIST_SPEC: dict[str, Any] = _planner_spec(
+    "rotate_wrist",
+    (
+        "Execute one R1Pro whole-body 21-DOF CuRobo joint motion that changes the "
+        "target EEF orientation while approximately preserving its position. hand "
+        "selects only the target EEF; the planner may coordinate the base, trunk, "
+        "and both arms and includes objects held by either hand in collision "
+        "checking. Every selected hand must cite one "
+        "fresh head observe frame in visual_hand_check. "
+        "left/right mean the robot's anatomical sides, not image sides. "
+        "Planning and execution use a runtime-owned 30-second hard deadline; "
+        "no caller timeout or step budget is accepted."
+    ),
+    {
+        "hand": _ANALYTIC_HAND_SCHEMA,
+        "visual_hand_check": _VISUAL_HAND_CHECK_SCHEMA,
+        "relative_axis_angle": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 4,
+            "maxItems": 4,
+            "description": (
+                "Relative rotation [axis_x, axis_y, axis_z, angle_rad], using "
+                "the right-hand rule. The axis is expressed in frame."
+            ),
+        },
+        "frame": {
+            "type": "string",
+            "enum": ["world", "eef"],
+            "default": "eef",
+            "description": (
+                "Axis frame for relative_axis_angle only; eef is usually easiest "
+                "for an object-relative wrist adjustment."
+            ),
+        },
+    },
+    required=["hand", "visual_hand_check", "relative_axis_angle"],
+)
+_bind_visual_checks_to_hand(ROTATE_WRIST_SPEC)
+
+
+def _gripper_spec(
+    name: str,
+    verb: str,
+    *,
+    release_visual_policy: ReleaseVisualPolicy | None = None,
+) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "hand": _ANALYTIC_HAND_SCHEMA,
+        "visual_hand_check": _VISUAL_HAND_CHECK_SCHEMA,
+        "timeout_s": {
+            "type": "number",
+            "default": 30.0,
+            "exclusiveMinimum": 0.0,
+        },
+    }
+    if release_visual_policy is not None:
+        release_visual_check = deepcopy(_RELEASE_VISUAL_CHECK_SCHEMA)
+        release_visual_check["properties"]["camera"]["const"] = (
+            release_visual_policy.camera
+        )
+        release_visual_check["properties"]["assessment"]["const"] = (
+            release_visual_policy.assessment
+        )
+        properties["release_visual_check"] = release_visual_check
+    spec = _planner_spec(
+        name,
+        (
+            f"{verb} only the gripper on a visually confirmed anatomical hand. "
+            "The other gripper, both arms, base, and trunk remain isolated."
+        ),
+        properties,
+        required=["hand", "visual_hand_check"],
+    )
+    _bind_visual_checks_to_hand(
+        spec,
+        include_release_visual_check=release_visual_policy is not None,
+    )
+    return spec
+
+
+CLOSE_SPEC: dict[str, Any] = _gripper_spec("close", "Close")
+OPEN_SPEC: dict[str, Any] = _gripper_spec("open", "Open")
+
+PRESS_SPEC: dict[str, Any] = _planner_spec(
+    "press",
+    (
+        "Execute a press against a fresh projected target using R1Pro whole-body "
+        "21-DOF CuRobo joint planning. hand selects only the target EEF; the planner "
+        "may coordinate the base, trunk, and both arms and includes objects held by "
+        "either hand in collision checking."
+    ),
+    {
+        "hand": _ANALYTIC_HAND_SCHEMA,
+        "visual_hand_check": _VISUAL_HAND_CHECK_SCHEMA,
+        "projection_id": {"type": "string", "minLength": 1},
+        "travel_m": {
+            "type": "number",
+            "default": 0.03,
+            "exclusiveMinimum": 0.0,
+        },
+        "timeout_s": {
+            "type": "number",
+            "default": 300.0,
+            "exclusiveMinimum": 0.0,
+        },
+    },
+    required=["hand", "visual_hand_check", "projection_id", "travel_m"],
+)
+_bind_visual_checks_to_hand(PRESS_SPEC)
+
+SAVE_ROBOT_STATE_CHECKPOINT_SPEC: dict[str, Any] = {
+    "name": "save_robot_state_checkpoint",
+    "description": (
+        "Capture synchronized public RGB-D as a read-only visual anchor for LLM "
+        "review. It never stores simulator state or authorizes physical action. "
+        "When a terminal_failure declaration is bound to a fresh observed frame, "
+        "the runtime seals the current attempt as failed and stops further actions."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "semantic_label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Optional human-readable purpose for this visual anchor.",
+            },
+            "terminal_failure": {
+                "type": "object",
+                "description": (
+                    "Optional condition-5 declaration made only after visually "
+                    "verifying the task-relevant radio is lying flat. The cited "
+                    "fresh frame is runtime-validated and the attempt ends with "
+                    "task_success=false."
+                ),
+                "properties": {
+                    "condition": {
+                        "type": "string",
+                        "enum": ["radio_tipped_flat"],
+                    },
+                    "cause": {
+                        "type": "string",
+                        "enum": [
+                            "knocked_over_by_robot_hand",
+                            "dropped_out_of_gripper",
+                        ],
+                    },
+                    "camera": _CAMERA_ROLE_SCHEMA,
+                    "frame_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "Frame ID from the fresh observe result that visually "
+                            "established the terminal failure."
+                        ),
+                    },
+                },
+                "required": ["condition", "cause", "camera", "frame_id"],
+                "additionalProperties": False,
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
 
 PUBLIC_PRIMITIVE_ENTRYPOINTS: dict[str, str] = {
-    "run_full_task": "BehaviorPrimitives.run_full_task",
-    **{name: f"BehaviorPrimitives.{name}" for name in PLANNER_TOOL_NAMES},
-    "pi0_pick": "BehaviorPrimitives.pi0_pick",
-    "pi0_navigate_to": "BehaviorPrimitives.pi0_navigate_to",
     "pi0_nav_pick": "BehaviorPrimitives.pi0_nav_pick",
-    **{
-        name: f"BehaviorPrimitives.{name}"
-        for name in POST_PICK_TOOL_NAMES
-        if name not in PLANNER_TOOL_NAMES
-        and name not in ROBOT_STATE_CHECKPOINT_TOOL_NAMES
-    },
-    "save_robot_state_checkpoint": ("BehaviorPrimitives.save_robot_state_checkpoint"),
-    "restore_robot_state_checkpoint": (
-        "BehaviorPrimitives.restore_robot_state_checkpoint"
-    ),
+    "observe": "BehaviorPrimitives.observe",
+    "pixel_to_world": "BehaviorPrimitives.pixel_to_world",
+    "move_to": "BehaviorPrimitives.move_to",
+    "rotate_wrist": "BehaviorPrimitives.rotate_wrist",
+    "close": "BehaviorPrimitives.close",
+    "open": "BehaviorPrimitives.open",
+    "press": "BehaviorPrimitives.press",
+    "save_robot_state_checkpoint": "BehaviorPrimitives.save_robot_state_checkpoint",
+    "navigate_to": "BehaviorPrimitives.navigate_to",
 }
+if tuple(PUBLIC_PRIMITIVE_ENTRYPOINTS) != BEHAVIOR_TOOL_NAMES:
+    raise ValueError("public primitive entrypoints must match BEHAVIOR_TOOL_NAMES")
+
+
+def behavior_tool_specs_for_task(
+    task: str | BehaviorTaskSpec,
+) -> dict[str, dict[str, Any]]:
+    """Return the fixed tool surface with task-scoped optional contracts."""
+
+    task_spec = get_task_spec(task) if isinstance(task, str) else task
+    specs = {
+        "pi0_nav_pick": deepcopy(PI0_NAV_PICK_SPEC),
+        "observe": deepcopy(OBSERVE_SPEC),
+        "pixel_to_world": deepcopy(PIXEL_TO_WORLD_SPEC),
+        "move_to": deepcopy(MOVE_TO_SPEC),
+        "rotate_wrist": deepcopy(ROTATE_WRIST_SPEC),
+        "close": deepcopy(CLOSE_SPEC),
+        "open": deepcopy(OPEN_SPEC),
+        "press": deepcopy(PRESS_SPEC),
+        "save_robot_state_checkpoint": deepcopy(SAVE_ROBOT_STATE_CHECKPOINT_SPEC),
+        "navigate_to": deepcopy(NAVIGATE_TO_SPEC),
+    }
+    if task_spec.release_visual_policy is not None:
+        specs["open"] = _gripper_spec(
+            "open",
+            "Open",
+            release_visual_policy=task_spec.release_visual_policy,
+        )
+    if task_spec.surface_review_policy is None:
+        observe = specs["observe"]
+        observe["description"] = (
+            "Capture one fresh synchronized public RGB-D observation, or submit "
+            "one LLM-selected depth_probe for the immediately preceding current "
+            "same-camera frame, without advancing physics. Omit depth_probe to "
+            "capture a fresh frame."
+        )
+        observe["input_schema"]["properties"].pop("frame_review", None)
+        pi0 = specs["pi0_nav_pick"]
+        pi0["description"] = pi0["description"].replace(
+            "Two consecutive complete runtime-accepted regressions—successful "
+            "selected-attached-hand rotate, fresh target-surface review, this skill "
+            "executing "
+            "at least one complete chunk and handing control back, then a distinct "
+            "fresh opposite-surface review—disable only pi0_nav_pick for the "
+            "remainder of the current attempt; all other public tools remain "
+            "available. ",
+            "",
+        )
+    if task_spec.terminal_failure_policy is None:
+        checkpoint = specs["save_robot_state_checkpoint"]
+        checkpoint["description"] = (
+            "Capture synchronized public RGB-D as a read-only visual anchor for "
+            "LLM review. It never stores simulator state, authorizes physical "
+            "action, or declares a task terminal condition."
+        )
+        checkpoint["input_schema"]["properties"].pop("terminal_failure", None)
+    if tuple(specs) != BEHAVIOR_TOOL_NAMES:
+        raise RuntimeError("task-scoped public primitive schema order mismatch")
+    return specs
 
 
 __all__ = [
     "ACTION_DIM",
+    "BEHAVIOR_TOOL_NAMES",
     "CAMERA_KEYS",
-    "CONTROL_MODES",
+    "CLOSE_SPEC",
+    "CURRENT_PUBLIC_TOOL_CONTRACT_VERSION",
     "DEFAULT_ACTION_CHUNK",
     "ENV_ACTION_SEGMENTS",
     "ENV_WIRE_SCHEMA",
-    "FULL_TASK_VLA_MODE",
-    "HYBRID_TOOL_NAMES",
-    "HYBRID_VLM_PI0_MODE",
-    "DECLARE_BUTTON_VISIBILITY_SPEC",
-    "EVALUATE_PREPRESS_GEOMETRY_SPEC",
-    "INSPECT_POST_PICK_STATE_SPEC",
-    "POST_PICK_OBSERVE_SPEC",
-    "POST_PICK_PIXEL_TO_WORLD_SPEC",
-    "POST_PICK_RESTORE_ROBOT_STATE_CHECKPOINT_SPEC",
-    "POST_PICK_SAVE_ROBOT_STATE_CHECKPOINT_SPEC",
-    "POST_PICK_CLOSE_PRESS_GRIPPER_SPEC",
-    "INSPECT_TOGGLE_GEOMETRY_SPEC",
-    "POST_PICK_RECENTER_HELD_BUTTON_SPEC",
-    "POST_PICK_DIRECT_FINGER_TOGGLE_SPEC",
-    "POST_SUCCESS_HOLD_FRAMES_SPEC",
-    "PREPRESS_MOVE_TO_SPEC",
-    "PREPRESS_ROTATE_WRIST_SPEC",
-    "PI0_PICK_SPEC",
+    "FRAME_REVIEW_ASSESSMENTS",
+    "MOVE_TO_SPEC",
+    "NAVIGATE_TO_SPEC",
+    "OBSERVE_SPEC",
+    "OPEN_SPEC",
     "PI0_NAV_PICK_SPEC",
-    "PI0_NAV_PICK_VLA_MODE",
-    "PI0_NAVIGATE_TO_SPEC",
-    "PI0_PICK_VLA_MODE",
-    "PLANNER_TOOLS_MODE",
-    "PLANNER_TOOL_NAMES",
-    "PLANNER_TOOL_SPECS",
-    "POST_PICK_TOOL_NAMES",
-    "STAGE3_PRESS_TOOL_NAMES",
+    "PIXEL_TO_WORLD_SPEC",
     "POLICY_STATE_SEGMENTS",
-    "PROJECT_BUTTON_SPEC",
+    "PRESS_SPEC",
     "PUBLIC_PRIMITIVE_ENTRYPOINTS",
+    "PUBLIC_TOOL_CONTRACTS",
     "RAW_PROPRIO_SEGMENTS",
-    "RESTORE_ROBOT_STATE_CHECKPOINT_SPEC",
-    "ROBOT_STATE_CHECKPOINT_TOOL_NAMES",
-    "RUN_FULL_TASK_SPEC",
+    "ROTATE_WRIST_SPEC",
     "SAVE_ROBOT_STATE_CHECKPOINT_SPEC",
-    "SAVE_PREPRESS_CHECKPOINT_SPEC",
-    "TEMP_STATE_CHECKPOINT_PATTERN",
     "VLA_WIRE_SCHEMA",
-    "VLA_CONTROL_MODES",
+    "behavior_tool_specs_for_task",
     "extract_policy_state",
     "segment_ranges",
     "validate_action_chunk",
     "validate_policy_state",
+    "validate_relative_navigation_motion",
 ]

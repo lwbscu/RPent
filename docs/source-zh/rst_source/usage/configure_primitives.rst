@@ -1,4 +1,4 @@
-Action primitives
+Action Primitives
 =================
 
 Planner 决定 *做什么*, 而 **action primitive** 决定 *怎么做*。所谓 primitive
@@ -31,12 +31,12 @@ RPent 内置支持两大类 primitive:
      - Server
    * - LIBERO (仿真)
      - Pi0.5
-     - HTTP ``/predict``
+     - HTTP 或 socket RPC (``--transport``)
      - ``robots/libero/vla_server.py``
    * - RoboCasa (仿真)
      - RLDX-1
      - pickle-framed socket RPC
-     - ``robots/robocasa/vla_server.py``
+     - ``robots/robocasa/vla_server.py`` *(规划中)*
    * - Franka (真机)
      - Pi0.5 或 RLDX-1 (依任务而定)
      - HTTP 或 socket
@@ -46,24 +46,12 @@ RPent 内置支持两大类 primitive:
      - socket RPC
      - ``robots/so101/vla_server.py`` *(规划中)*
 
-传输协议按 obs 形状选择: 扁平的 image+state 载荷用 HTTP (LIBERO/Pi0.5),
-历史堆叠的嵌套 numpy dict 用 socket (RoboCasa/RLDX-1)。设计理由参见
-:doc:`../development/add_robot`。
+VLA server 用同一套 ``predict`` / ``healthz`` 方法, 同时支持 HTTP (JSON)
+与 socket (pickle-framed) 两种传输, 通过 ``--transport {http,socket}``
+选择 (默认 ``http``)。设计理由参见 :doc:`../development/add_robot`。
 
-复用一个已在运行的 VLA server
------------------------------
-
-每一个 VLA server 都设计成 **可跨 run 复用**。用 ``--vla-endpoint``
-指向已在跑的实例, 而不是每次都启动新实例:
-
-.. code-block:: bash
-
-   rpent --vla-endpoint http://localhost:8000 \
-     --suite libero_object_swap --task 2 --seed 0 --cerebrum api \
-     --model anthropic:claude-opus-4-8
-
-跑批量任务时推荐这样做: VLA 权重加载一次, 每次 run 起的 env 都是
-一次性的。
+独立服务、远程 endpoint 与跨 run 模型复用参见
+:doc:`advanced_deployment`。
 
 新增全新的 primitive 家族
 -------------------------

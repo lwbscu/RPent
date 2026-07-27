@@ -1,19 +1,16 @@
 """LIBERO + OpenPI tool implementation."""
-
 from __future__ import annotations
 
-import base64
-import io
 import json
 import os
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 import imageio.v2 as imageio
 import numpy as np
 
 from robots.libero.env_client import LiberoEnvClient
 from rpent.utils.logging import get_logger, get_output_dir
+from rpent.utils.sam3_client import Sam3Client
 from rpent.utils.vla_client import VLAClient
 
 logger = get_logger("libero")
@@ -44,9 +41,11 @@ class LiberoPrimitives:
         self,
         env: LiberoEnvClient,
         model: VLAClient,
+        sam3_client: Sam3Client,
     ):
         self.env = env
         self.model = model
+        self._sam3_client = sam3_client
         self._last_obs = None
         self._last_obs_eef_pos = None
         self._last_obs_eef_z = None
@@ -67,9 +66,8 @@ class LiberoPrimitives:
     def recorded_frame_count(self) -> int:
         return len(self._frames)
 
-    def stop_recording_and_save(
-        self, path: str, fps: int = 20, keep_recording: bool = False
-    ):
+    def stop_recording_and_save(self, path: str, fps: int = 20,
+                                 keep_recording: bool = False):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         n = len(self._frames)
         if n > 0:
@@ -81,7 +79,7 @@ class LiberoPrimitives:
 
     def save_frame_slice(self, start: int, path: str, fps: int = 20):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        frames = list(self._frames[int(start) :])
+        frames = list(self._frames[int(start):])
         n = len(frames)
         if n > 0:
             imageio.mimwrite(path, frames, fps=fps)
@@ -115,10 +113,10 @@ class LiberoPrimitives:
         # runs in a single env.chunk_step RPC; the env owns the per-step
         # loop server-side.
         if not self._recording:
-            chunk_obs, _r, _t, _tr, _i = self.env.chunk_step(actions)
+            chunk_obs,  _r, _t, _tr, _i = self.env.chunk_step(actions)
             obs = chunk_obs[-1] if self.env.return_all_frames else chunk_obs
         else:
-            chunk_obs, _r, _t, _tr, _i = self.env.chunk_step(
+            chunk_obs,  _r, _t, _tr, _i = self.env.chunk_step(
                 actions, return_all_frames=True
             )
             for obs in chunk_obs:
@@ -317,13 +315,11 @@ class LiberoPrimitives:
             cur = self._last_obs_eef_pos
             diff = target - cur
             dist = float(np.linalg.norm(diff))
-            traj.append(
-                {
-                    "step": step,
-                    "eef_pos": [round(float(x), 4) for x in cur],
-                    "dist_to_target_m": round(dist, 4),
-                }
-            )
+            traj.append({
+                "step": step,
+                "eef_pos": [round(float(x), 4) for x in cur],
+                "dist_to_target_m": round(dist, 4),
+            })
             if dist < tol:
                 break
             step_dxyz = np.clip(diff, -step_clip, step_clip)
@@ -337,7 +333,6 @@ class LiberoPrimitives:
                 # gripper-down configs (R[2,2]≈-1) and silently flips the
                 # commanded rotation direction. See feedback_rotate_wrist_yaw_sign.
                 from scipy.spatial.transform import Rotation as _R
-
                 q = self.env.raw_obs()["robot0_eef_quat"]
                 _R_mat = _R.from_quat([q[0], q[1], q[2], q[3]]).as_matrix()
                 cur_yaw = float(np.arctan2(_R_mat[1, 0], _R_mat[0, 0]))
@@ -433,9 +428,7 @@ class LiberoPrimitives:
             "start_yaw": round(start_yaw, 4),
             "target_yaw": round(float(target_yaw), 4),
             "final_yaw": round(final_yaw, 4),
-            "final_err": round(
-                float((target_yaw - final_yaw + np.pi) % (2 * np.pi) - np.pi), 4
-            ),
+            "final_err": round(float((target_yaw - final_yaw + np.pi) % (2 * np.pi) - np.pi), 4),
             "steps_used": len(traj),
             "libero_terminated": self.env.episode_done,
         }
@@ -485,7 +478,8 @@ class LiberoPrimitives:
         raw = self.env.raw_obs()
         start_pitch = _pitch_of(raw["robot0_eef_quat"])
         if target_pitch is None and delta_pitch is None:
-            return {"name": "rotate_pitch", "error": "need target_pitch or delta_pitch"}
+            return {"name": "rotate_pitch",
+                    "error": "need target_pitch or delta_pitch"}
         if target_pitch is None:
             target_pitch = start_pitch + float(delta_pitch)
 
@@ -495,9 +489,9 @@ class LiberoPrimitives:
             cur_pitch = _pitch_of(raw["robot0_eef_quat"])
             err = float(target_pitch - cur_pitch)
             err = (err + np.pi) % (2 * np.pi) - np.pi
-            traj.append(
-                {"step": step, "pitch": round(cur_pitch, 4), "err": round(err, 4)}
-            )
+            traj.append({"step": step,
+                         "pitch": round(cur_pitch, 4),
+                         "err": round(err, 4)})
             if abs(err) < tol:
                 break
             step_dpitch = float(np.clip(err, -step_clip, step_clip))
@@ -517,9 +511,8 @@ class LiberoPrimitives:
             "start_pitch": round(start_pitch, 4),
             "target_pitch": round(float(target_pitch), 4),
             "final_pitch": round(final_pitch, 4),
-            "final_err": round(
-                float((target_pitch - final_pitch + np.pi) % (2 * np.pi) - np.pi), 4
-            ),
+            "final_err": round(float(
+                (target_pitch - final_pitch + np.pi) % (2 * np.pi) - np.pi), 4),
             "steps_used": len(traj),
             "libero_terminated": self.env.episode_done,
         }
@@ -566,35 +559,19 @@ class LiberoPrimitives:
             q = self.env.raw_obs()["robot0_eef_quat"]
             diff = target - cur
             dist = float(np.linalg.norm(diff))
-            p_err = (
-                0.0
-                if target_pitch is None
-                else float((target_pitch - _pitch_of(q) + np.pi) % (2 * np.pi) - np.pi)
-            )
-            y_err = (
-                0.0
-                if target_yaw is None
-                else float((target_yaw - _yaw_of(q) + np.pi) % (2 * np.pi) - np.pi)
-            )
-            traj.append(
-                {
-                    "step": step,
-                    "eef": [round(float(x), 4) for x in cur],
-                    "dist": round(dist, 4),
-                    "p_err": round(p_err, 3),
-                }
-            )
+            p_err = 0.0 if target_pitch is None else \
+                float((target_pitch - _pitch_of(q) + np.pi) % (2 * np.pi) - np.pi)
+            y_err = 0.0 if target_yaw is None else \
+                float((target_yaw - _yaw_of(q) + np.pi) % (2 * np.pi) - np.pi)
+            traj.append({"step": step, "eef": [round(float(x), 4) for x in cur],
+                         "dist": round(dist, 4), "p_err": round(p_err, 3)})
             if dist < tol and abs(p_err) < ori_tol and abs(y_err) < ori_tol:
                 break
             action = np.zeros(7, dtype=np.float32)
             sd = np.clip(diff, -step_clip, step_clip)
             action[:3] = np.clip(sd / action_scale, -1.0, 1.0)
-            action[3] = float(
-                np.clip(np.clip(p_err, -pitch_step, pitch_step) / 0.10, -1.0, 1.0)
-            )
-            action[5] = float(
-                np.clip(np.clip(y_err, -yaw_step, yaw_step) / 0.10, -1.0, 1.0)
-            )
+            action[3] = float(np.clip(np.clip(p_err, -pitch_step, pitch_step) / 0.10, -1.0, 1.0))
+            action[5] = float(np.clip(np.clip(y_err, -yaw_step, yaw_step) / 0.10, -1.0, 1.0))
             action[6] = float(gripper)
             obs, _r, _t, _tr, _i = self.env.step(action)
             self.set_obs(obs)
@@ -710,7 +687,7 @@ class LiberoPrimitives:
             # _vlm_chunk overrides prompt; but we want the ORIGINAL. Bypass.
             self._last_obs.setdefault("extra_view_images", None)
             actions, _ = self.model.predict_action_batch(self._last_obs, mode="eval")
-            chunk_obs, _r, _t, _tr, _i = self.env.chunk_step(actions)
+            chunk_obs,  _r, _t, _tr, _i = self.env.chunk_step(actions)
             obs = chunk_obs[-1] if self.env.return_all_frames else chunk_obs
             self.set_obs(obs)
             chunks_used = c + 1
@@ -726,6 +703,125 @@ class LiberoPrimitives:
             "final_gripper_opening": self._last_obs_gripper,
             "libero_terminated": self.env.episode_done,
         }
+
+    def segment(
+        self,
+        prompt: str = "",
+        camera: str = "agentview",
+        step: int | None = None,
+        point: list[int] | None = None,
+        min_score: float = 0.2,
+    ) -> dict:
+        """Call SAM3 on an existing image artifact without advancing the env.
+
+        This tool deliberately does not render camera views or create wrist/high-res
+        artifacts. Errors are structured so the agent can continue with image
+        inspection and ``back_project``.
+        """
+        nn = _latest_step() if step is None else int(step)
+        if nn is None:
+            return {"error": "no state entries; cannot select segment image"}
+
+        camera = camera or "agentview"
+        prompt = prompt.strip()
+        has_prompt = bool(prompt)
+        has_point = point is not None
+        if has_prompt == has_point:
+            return {"error": "segment needs exactly one of prompt or point"}
+        try:
+            image_path, world_path, artifact_pairs = _select_segment_artifacts(
+                nn, camera
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+        if image_path is None:
+            return {
+                "error": "segment image artifact not found",
+                "step": nn,
+                "camera": camera,
+                "checked_paths": [str(image) for image, _ in artifact_pairs],
+                "fallback": "Read the available image artifact and use back_project.",
+            }
+
+        try:
+            data = self._sam3_client.segment(
+                image_path,
+                text_prompt=prompt if has_prompt else None,
+                point=point,
+                min_score=min_score,
+            )
+        except Exception as e:
+            return {
+                "error": f"segmentation service call failed: {e}",
+                "step": nn,
+                "camera": camera,
+                "image_path": str(image_path),
+                "fallback": "Use manual visual localization and back_project.",
+            }
+
+        out_dir = get_output_dir()
+        segment_path, overlay_candidate_path, segment_index = (
+            _next_segment_artifact_paths(out_dir, nn)
+        )
+        overlay_path = None
+        mask = data.mask
+        if data.found and isinstance(mask, np.ndarray):
+            if world_path is None or not world_path.exists():
+                world_result = {
+                    "world_xyz": None,
+                    "world_error": "world map artifact not found for selected image",
+                    "expected_world_path": str(world_path) if world_path else None,
+                }
+            else:
+                world_result = _mask_to_world(mask, np.load(world_path))
+                world_result["world_path"] = str(world_path)
+            overlay_path = overlay_candidate_path
+            if not _write_segment_overlay(image_path, mask, overlay_path):
+                overlay_path = None
+        else:
+            world_result = {
+                "world_xyz": None,
+                "world_error": data.reason or "segmentation did not find a mask",
+            }
+
+        segment_blob = {
+            "found": data.found,
+            "mode": "text" if has_prompt else "point",
+            "camera": camera,
+            "source_step": nn,
+            "segment_index": segment_index,
+            "image_path": str(image_path),
+            "min_score": min_score,
+            "score": round(float(data.score), 3) if data.score is not None else None,
+            "box": data.box,
+            "mask_shape": list(data.mask_shape) if data.mask_shape else None,
+        }
+        if has_prompt:
+            segment_blob["prompt"] = prompt
+        else:
+            segment_blob["point"] = point
+        if not data.found:
+            segment_blob["error"] = data.reason or "SAM3 found no mask"
+        segment_blob.update(world_result)
+        segment_path.write_text(json.dumps(segment_blob, indent=2, default=str))
+
+        result = {
+            "found": data.found,
+            "step": nn,
+            "camera": camera,
+            "image_path": str(image_path),
+            "segment_path": str(segment_path),
+            "score": segment_blob["score"],
+            "box": segment_blob["box"],
+            "world_xyz": segment_blob["world_xyz"],
+            "world_error": segment_blob.get("world_error"),
+        }
+        if "error" in segment_blob:
+            result["error"] = segment_blob["error"]
+            result["fallback"] = "Use manual visual localization and back_project."
+        if overlay_path is not None and overlay_path.exists():
+            result["overlay_path"] = str(overlay_path)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -836,12 +932,8 @@ def _world_from_depth(depth_metric: np.ndarray, camera_meta: dict) -> np.ndarray
     return (camera_points @ extrinsic.T)[..., :3]
 
 
-def dump_state(
-    primitives: LiberoPrimitives,
-    output_dir: str,
-    step_idx: int,
-    log: dict | None = None,
-) -> dict:
+def dump_state(primitives: LiberoPrimitives, output_dir: str, step_idx: int,
+               log: dict | None = None) -> dict:
     """Dump state snapshot, images, and depth for step *step_idx*.
 
     Writes:
@@ -905,13 +997,8 @@ def dump_state(
         )
         img = np.asarray(img)
         img = np.ascontiguousarray(img[::-1, ::-1])
-        if (
-            img.dtype != np.uint8
-            or img.ndim != 3
-            or img.shape[2] != 3
-            or img.shape[0] < 32
-            or img.shape[1] < 32
-        ):
+        if img.dtype != np.uint8 or img.ndim != 3 or img.shape[2] != 3 \
+                or img.shape[0] < 32 or img.shape[1] < 32:
             raise ValueError(f"bad img shape/dtype: {img.shape} {img.dtype}")
     except Exception:
         # cached_image() is already 180°-flipped (get_libero_image does
@@ -947,13 +1034,11 @@ def dump_state(
                 "col=q[0]/q[2], row=q[1]/q[2], metric_depth=q[2]. "
                 "Back-project a pixel with z=depth_NN[row,col] by computing "
                 "camera_xyz = inv(K) @ [col,row,1] * z, then "
-                "P_world = extrinsic_cam2world @ [camera_xyz,1]."
-            )
+                "P_world = extrinsic_cam2world @ [camera_xyz,1].")
             cam_meta_out["note"] = (
                 "depth_NN.npy is in this camera frame (vertical-flipped raw "
                 "buffer). image_NN.png is rotated 180deg (Pi0 convention) and "
-                "is NOT in the same frame as depth/K."
-            )
+                "is NOT in the same frame as depth/K.")
             with open(os.path.join(output_dir, "camera_meta.json"), "w") as f:
                 json.dump(cam_meta_out, f, indent=2)
 
@@ -990,10 +1075,8 @@ def dump_state(
             # camera_meta.json (NOT the same frame as the 180°-rotated
             # image_NN.png — see camera_meta note).
             d = _metric_depth(d, agentview_meta)[::-1]
-            np.save(
-                os.path.join(depths_dir, f"depth_{step_idx:02d}.npy"),
-                d.astype(np.float32),
-            )
+            np.save(os.path.join(depths_dir, f"depth_{step_idx:02d}.npy"),
+                    d.astype(np.float32))
             world = _world_from_depth(d, agentview_meta).astype(np.float32)
             world_name = f"world_{step_idx:02d}.npy"
             np.save(os.path.join(world_dir, world_name), world)
@@ -1093,7 +1176,9 @@ def dump_state(
             width=1024,
             depth=True,
         )
-        meta_wrist_hi = primitives.env.get_camera_meta("robot0_eye_in_hand", 1024, 1024)
+        meta_wrist_hi = primitives.env.get_camera_meta(
+            "robot0_eye_in_hand", 1024, 1024
+        )
         if meta_wrist_hi is None:
             raise RuntimeError("robot0_eye_in_hand camera metadata missing")
         imageio.imwrite(
@@ -1218,30 +1303,15 @@ TOOLS_SPEC = [
                     "type": "number",
                     "description": "Gripper command: -1 open, +1 close (default -1)",
                 },
-                "tol": {
-                    "type": "number",
-                    "description": "Position tolerance, m (default 0.012)",
-                },
-                "step_clip": {
-                    "type": "number",
-                    "description": "Per-step Δxyz cap before action_scale, m (default 0.025)",
-                },
-                "max_steps": {
-                    "type": "integer",
-                    "description": "Step budget (default 80)",
-                },
-                "action_scale": {
-                    "type": "number",
-                    "description": "OSC action scale (default 0.05)",
-                },
+                "tol": {"type": "number", "description": "Position tolerance, m (default 0.012)"},
+                "step_clip": {"type": "number", "description": "Per-step Δxyz cap before action_scale, m (default 0.025)"},
+                "max_steps": {"type": "integer", "description": "Step budget (default 80)"},
+                "action_scale": {"type": "number", "description": "OSC action scale (default 0.05)"},
                 "target_yaw": {
                     "type": ["number", "null"],
                     "description": "Optional world-frame yaw target in radians",
                 },
-                "yaw_step_clip": {
-                    "type": "number",
-                    "description": "Per-step yaw clip, rad (default 0.10)",
-                },
+                "yaw_step_clip": {"type": "number", "description": "Per-step yaw clip, rad (default 0.10)"},
             },
             "required": ["xyz"],
         },
@@ -1260,18 +1330,9 @@ TOOLS_SPEC = [
                     "type": "string",
                     "description": "Pi0 prompt (e.g. 'pick up the akita black bowl').",
                 },
-                "max_chunks": {
-                    "type": "integer",
-                    "description": "Action-chunk budget (default 24)",
-                },
-                "lift_thresh": {
-                    "type": "number",
-                    "description": "EEF post-descent ascent threshold for success, m (default 0.05)",
-                },
-                "gripper_closed_thresh": {
-                    "type": "number",
-                    "description": "Finger-separation closed threshold (default 0.06)",
-                },
+                "max_chunks": {"type": "integer", "description": "Action-chunk budget (default 24)"},
+                "lift_thresh": {"type": "number", "description": "EEF post-descent ascent threshold for success, m (default 0.05)"},
+                "gripper_closed_thresh": {"type": "number", "description": "Finger-separation closed threshold (default 0.06)"},
             },
             "required": ["prompt"],
         },
@@ -1293,10 +1354,7 @@ TOOLS_SPEC = [
                     "type": "string",
                     "description": "Contact-skill prompt, e.g. 'turn on the stove'.",
                 },
-                "max_chunks": {
-                    "type": "integer",
-                    "description": "Action-chunk budget (default 20)",
-                },
+                "max_chunks": {"type": "integer", "description": "Action-chunk budget (default 20)"},
             },
             "required": ["prompt"],
         },
@@ -1311,10 +1369,7 @@ TOOLS_SPEC = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "max_steps": {
-                    "type": "integer",
-                    "description": "Step budget (default 20)",
-                },
+                "max_steps": {"type": "integer", "description": "Step budget (default 20)"},
             },
         },
     },
@@ -1331,10 +1386,7 @@ TOOLS_SPEC = [
                     "type": "number",
                     "description": "Gripper command: -1 open, +1 close (default -1)",
                 },
-                "steps": {
-                    "type": "integer",
-                    "description": "Number of env steps (default 5)",
-                },
+                "steps": {"type": "integer", "description": "Number of env steps (default 5)"},
             },
         },
     },
@@ -1347,30 +1399,12 @@ TOOLS_SPEC = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "target_yaw": {
-                    "type": ["number", "null"],
-                    "description": "Absolute world-frame yaw target, rad",
-                },
-                "delta_yaw": {
-                    "type": ["number", "null"],
-                    "description": "Relative yaw delta, rad",
-                },
-                "gripper": {
-                    "type": "number",
-                    "description": "Gripper command held during rotation (default +1)",
-                },
-                "max_steps": {
-                    "type": "integer",
-                    "description": "Step budget (default 40)",
-                },
-                "tol": {
-                    "type": "number",
-                    "description": "Yaw tolerance, rad (default 0.02)",
-                },
-                "step_clip": {
-                    "type": "number",
-                    "description": "Per-step yaw clip, rad (default 0.10)",
-                },
+                "target_yaw": {"type": ["number", "null"], "description": "Absolute world-frame yaw target, rad"},
+                "delta_yaw": {"type": ["number", "null"], "description": "Relative yaw delta, rad"},
+                "gripper": {"type": "number", "description": "Gripper command held during rotation (default +1)"},
+                "max_steps": {"type": "integer", "description": "Step budget (default 40)"},
+                "tol": {"type": "number", "description": "Yaw tolerance, rad (default 0.02)"},
+                "step_clip": {"type": "number", "description": "Per-step yaw clip, rad (default 0.10)"},
             },
         },
     },
@@ -1386,30 +1420,12 @@ TOOLS_SPEC = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "target_pitch": {
-                    "type": ["number", "null"],
-                    "description": "Absolute world-frame pitch target, rad",
-                },
-                "delta_pitch": {
-                    "type": ["number", "null"],
-                    "description": "Relative pitch delta, rad",
-                },
-                "gripper": {
-                    "type": "number",
-                    "description": "Gripper command held during rotation (default +1)",
-                },
-                "max_steps": {
-                    "type": "integer",
-                    "description": "Step budget (default 40)",
-                },
-                "tol": {
-                    "type": "number",
-                    "description": "Pitch tolerance, rad (default 0.02)",
-                },
-                "step_clip": {
-                    "type": "number",
-                    "description": "Per-step pitch clip, rad (default 0.10)",
-                },
+                "target_pitch": {"type": ["number", "null"], "description": "Absolute world-frame pitch target, rad"},
+                "delta_pitch": {"type": ["number", "null"], "description": "Relative pitch delta, rad"},
+                "gripper": {"type": "number", "description": "Gripper command held during rotation (default +1)"},
+                "max_steps": {"type": "integer", "description": "Step budget (default 40)"},
+                "tol": {"type": "number", "description": "Pitch tolerance, rad (default 0.02)"},
+                "step_clip": {"type": "number", "description": "Per-step pitch clip, rad (default 0.10)"},
             },
         },
     },
@@ -1432,42 +1448,15 @@ TOOLS_SPEC = [
                     "minItems": 3,
                     "maxItems": 3,
                 },
-                "target_pitch": {
-                    "type": ["number", "null"],
-                    "description": "Absolute pitch target, rad",
-                },
-                "target_yaw": {
-                    "type": ["number", "null"],
-                    "description": "Absolute yaw target, rad",
-                },
-                "gripper": {
-                    "type": "number",
-                    "description": "Gripper command held during the move (default -1)",
-                },
-                "step_clip": {
-                    "type": "number",
-                    "description": "Per-step Δxyz cap, m (default 0.02)",
-                },
-                "pitch_step": {
-                    "type": "number",
-                    "description": "Per-step pitch clip, rad (default 0.08)",
-                },
-                "yaw_step": {
-                    "type": "number",
-                    "description": "Per-step yaw clip, rad (default 0.08)",
-                },
-                "tol": {
-                    "type": "number",
-                    "description": "Position tolerance, m (default 0.012)",
-                },
-                "ori_tol": {
-                    "type": "number",
-                    "description": "Orientation tolerance, rad (default 0.05)",
-                },
-                "max_steps": {
-                    "type": "integer",
-                    "description": "Step budget (default 150)",
-                },
+                "target_pitch": {"type": ["number", "null"], "description": "Absolute pitch target, rad"},
+                "target_yaw": {"type": ["number", "null"], "description": "Absolute yaw target, rad"},
+                "gripper": {"type": "number", "description": "Gripper command held during the move (default -1)"},
+                "step_clip": {"type": "number", "description": "Per-step Δxyz cap, m (default 0.02)"},
+                "pitch_step": {"type": "number", "description": "Per-step pitch clip, rad (default 0.08)"},
+                "yaw_step": {"type": "number", "description": "Per-step yaw clip, rad (default 0.08)"},
+                "tol": {"type": "number", "description": "Position tolerance, m (default 0.012)"},
+                "ori_tol": {"type": "number", "description": "Orientation tolerance, rad (default 0.05)"},
+                "max_steps": {"type": "integer", "description": "Step budget (default 150)"},
             },
             "required": ["xyz"],
         },
@@ -1497,15 +1486,10 @@ TOOLS_SPEC = [
     {
         "name": "segment",
         "description": (
-            "Optional visual segmentation helper. It consumes existing "
-            "run artifacts only and never renders new camera views. Use it "
-            "as a fallback localization aid when a configured segmentation "
-            "service and the requested image artifact already exist. "
-            "If SAM3_SERVER_URL is set, it uses a SAM3-compatible "
-            "protocol (/segment with text_prompt, /segment_point for point "
-            "prompts). Without SAM3_SERVER_URL, it returns a structured "
-            "fallback. world_xyz is produced only when a matching world map "
-            "artifact exists."
+            "SAM3 visual segmentation over an existing run artifact. It never "
+            "renders a new camera view. Provide exactly one text prompt or "
+            "single positive point. A successful top-ranked mask is projected "
+            "through the matching world map to produce world_xyz."
         ),
         "input_schema": {
             "type": "object",
@@ -1526,9 +1510,8 @@ TOOLS_SPEC = [
                 "point": {
                     "type": ["array", "null"],
                     "description": (
-                        "Optional [row, col] point prompt. With "
-                        "SAM3_SERVER_URL this is converted to server "
-                        "[x, y] point_coords for /segment_point."
+                        "Optional single positive point as [row, col]. "
+                        "Mutually exclusive with prompt."
                     ),
                     "items": {"type": "integer"},
                     "minItems": 2,
@@ -1727,7 +1710,9 @@ def view_driver_state(step: int | None = None) -> dict:
         out["image_wrist_path"] = image_wrist_path
     out_dir = get_output_dir()
     image_cam_hi_path = out_dir / "images_cam_hi" / f"image_cam_hi_{nn:02d}.png"
-    image_wrist_hi_path = out_dir / "images_wrist_hi" / f"image_wrist_hi_{nn:02d}.png"
+    image_wrist_hi_path = (
+        out_dir / "images_wrist_hi" / f"image_wrist_hi_{nn:02d}.png"
+    )
     if image_cam_hi_path.exists():
         out["image_cam_hi_path"] = str(image_cam_hi_path)
     if image_wrist_hi_path.exists():
@@ -1774,50 +1759,19 @@ def _select_segment_artifacts(nn: int, camera: str):
 
 
 def _next_segment_artifact_paths(out_dir, nn: int):
+    segments_dir = out_dir / "segments"
+    segments_dir.mkdir(parents=True, exist_ok=True)
     idx = 0
     while True:
-        segment_path = out_dir / f"segment_{nn:02d}_{idx:02d}.json"
-        overlay_path = out_dir / f"segment_overlay_{nn:02d}_{idx:02d}.png"
+        segment_path = segments_dir / f"segment_{nn:02d}_{idx:02d}.json"
+        overlay_path = segments_dir / f"segment_overlay_{nn:02d}_{idx:02d}.png"
         if not segment_path.exists() and not overlay_path.exists():
             return segment_path, overlay_path, idx
         idx += 1
 
 
-def _redact_server_url(url: str) -> str:
-    try:
-        parts = urlsplit(url)
-        netloc = parts.hostname or ""
-        if ":" in netloc and not netloc.startswith("["):
-            netloc = f"[{netloc}]"
-        if parts.port is not None:
-            netloc += f":{parts.port}"
-        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
-    except Exception:
-        return "<redacted>"
-
-
-def _decode_sam3_mask(mask_b64: str, shape) -> np.ndarray:
-    raw = base64.b64decode(mask_b64)
-    shape = tuple(shape)
-    expected = int(np.prod(shape))
-    if expected > 0 and len(raw) == expected:
-        return np.frombuffer(raw, dtype=np.uint8).reshape(shape).astype(bool)
-    try:
-        decoded = imageio.imread(io.BytesIO(raw))
-        if decoded.ndim == 3:
-            decoded = decoded[..., 0]
-        if shape and decoded.shape != shape:
-            return np.asarray(decoded).astype(bool)
-        return np.asarray(decoded).reshape(shape).astype(bool)
-    except Exception as e:
-        raise ValueError(
-            f"could not decode SAM3 mask as raw uint8 or image bytes: {e}"
-        ) from e
-
-
-def _mask_to_world(
-    mask: np.ndarray, world_map: np.ndarray, min_valid: int = 10
-) -> dict:
+def _mask_to_world(mask: np.ndarray, world_map: np.ndarray,
+                   min_valid: int = 10) -> dict:
     if world_map.ndim != 3 or world_map.shape[2] < 3:
         return {
             "world_xyz": None,
@@ -1856,12 +1810,10 @@ def _mask_to_world(
         "mask_resized_to_world_shape": False,
     }
     if pts.shape[0] < min_valid:
-        result.update(
-            {
-                "world_xyz": None,
-                "world_error": f"too few valid depth pixels ({int(pts.shape[0])})",
-            }
-        )
+        result.update({
+            "world_xyz": None,
+            "world_error": f"too few valid depth pixels ({int(pts.shape[0])})",
+        })
         return result
 
     result["world_xyz"] = [
@@ -1888,295 +1840,6 @@ def _write_segment_overlay(image_path, mask: np.ndarray, overlay_path) -> bool:
         return overlay_path.exists()
     except Exception:
         return False
-
-
-def _sam3_segment(
-    server_url: str, image_path, prompt: str, point: list[int] | None, min_score: float
-) -> dict:
-    import httpx
-
-    image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
-    point_coords_sent = None
-    if point is not None:
-        point_coords_sent = [float(point[1]), float(point[0])]
-        response = httpx.post(
-            server_url.rstrip("/") + "/segment_point",
-            json={
-                "image_base64": image_b64,
-                "point_coords": point_coords_sent,
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
-        shape = tuple(data.get("masks_shape", (0, 0, 0)))
-        if not shape or shape[0] == 0:
-            return {
-                "raw_response": data,
-                "error": "sam3 point prompt returned no mask",
-            }
-        try:
-            raw = base64.b64decode(data["masks_base64"])
-            masks = np.frombuffer(
-                raw,
-                dtype=np.dtype(data.get("masks_dtype", "float32")),
-            ).reshape(shape)
-        except Exception as e:
-            return {
-                "raw_response": data,
-                "error": f"could not decode SAM3 point mask: {e}",
-                "point_input": point,
-                "point_coords_sent": point_coords_sent,
-                "point_convention": "input_row_col_to_server_xy",
-            }
-        if masks.ndim == 2:
-            mask = masks > 0.5
-        else:
-            mask = masks[0] > 0.5
-        score = float(data.get("scores", [1.0])[0])
-        if score < min_score:
-            return {
-                "raw_response": data,
-                "error": f"low score {score:.3f} < {min_score}",
-                "score": round(score, 3),
-                "box": None,
-                "mask_shape": list(mask.shape),
-                "point_input": point,
-                "point_coords_sent": point_coords_sent,
-                "point_convention": "input_row_col_to_server_xy",
-            }
-        return {
-            "raw_response": data,
-            "mask": mask,
-            "score": score,
-            "box": None,
-            "mask_shape": list(mask.shape),
-            "point_input": point,
-            "point_coords_sent": point_coords_sent,
-            "point_convention": "input_row_col_to_server_xy",
-        }
-
-    response = httpx.post(
-        server_url.rstrip("/") + "/segment",
-        json={"image_base64": image_b64, "text_prompt": prompt},
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    results = data.get("results", []) if isinstance(data, dict) else []
-    if results:
-        top = results[0]
-    elif isinstance(data, dict) and "mask_base64" in data:
-        top = data
-    else:
-        return {
-            "raw_response": data,
-            "error": f"sam3 found nothing for prompt {prompt!r}",
-        }
-
-    score = float(top.get("score", 0.0))
-    if score < min_score:
-        return {
-            "raw_response": data,
-            "error": f"low score {score:.3f} < {min_score}",
-            "score": round(score, 3),
-            "box": top.get("box"),
-        }
-
-    try:
-        mask = _decode_sam3_mask(top["mask_base64"], top["shape"])
-    except Exception as e:
-        return {
-            "raw_response": data,
-            "error": f"could not decode SAM3 mask: {e}",
-            "score": round(score, 3),
-            "box": top.get("box"),
-        }
-    return {
-        "raw_response": data,
-        "mask": mask,
-        "score": score,
-        "box": top.get("box"),
-        "mask_shape": list(mask.shape),
-    }
-
-
-def _summarize_segment_response(data) -> dict:
-    if not isinstance(data, dict):
-        return {"type": type(data).__name__}
-
-    def summarize_value(key, value):
-        if key in {
-            "mask_base64",
-            "masks_base64",
-            "overlay_base64",
-            "image_base64",
-        }:
-            return (
-                f"<base64 {len(value)} chars>" if isinstance(value, str) else "<base64>"
-            )
-        if isinstance(value, list):
-            if len(value) <= 8 and all(
-                not isinstance(item, (dict, list)) for item in value
-            ):
-                return value
-            return [summarize_value(key, item) for item in value[:3]]
-        if isinstance(value, dict):
-            return {k: summarize_value(k, v) for k, v in value.items()}
-        return value
-
-    return {k: summarize_value(k, v) for k, v in data.items()}
-
-
-def segment(
-    prompt: str = "",
-    camera: str = "agentview",
-    step: int | None = None,
-    point: list[int] | None = None,
-    min_score: float = 0.2,
-) -> dict:
-    """Call an optional segmentation service on an existing image artifact.
-
-    This tool deliberately does not render camera views or create wrist/high-res
-    artifacts. If the requested artifact or service is missing, it returns a
-    structured fallback error so the agent can continue with image inspection
-    and back_project.
-    """
-    nn = _latest_step() if step is None else int(step)
-    if nn is None:
-        return {"error": "no state entries; cannot select segment image"}
-
-    camera = camera or "agentview"
-    if point is None and not prompt:
-        return {"error": "segment needs a prompt or a point"}
-    try:
-        image_path, world_path, artifact_pairs = _select_segment_artifacts(nn, camera)
-    except ValueError as e:
-        return {"error": str(e)}
-    if image_path is None:
-        return {
-            "error": "segment image artifact not found",
-            "step": nn,
-            "camera": camera,
-            "checked_paths": [str(image) for image, _ in artifact_pairs],
-            "fallback": "Read the available image artifact and use back_project.",
-        }
-
-    sam3_server_url = os.environ.get("SAM3_SERVER_URL", "").strip()
-    if not sam3_server_url:
-        return {
-            "error": "segmentation service not configured",
-            "step": nn,
-            "camera": camera,
-            "image_path": str(image_path),
-            "fallback": "Use manual visual localization and back_project.",
-        }
-
-    try:
-        data = _sam3_segment(
-            sam3_server_url,
-            image_path,
-            prompt,
-            point,
-            min_score,
-        )
-        server_protocol = "sam3"
-    except Exception as e:
-        return {
-            "error": f"segmentation service call failed: {e}",
-            "step": nn,
-            "camera": camera,
-            "image_path": str(image_path),
-            "fallback": "Use manual visual localization and back_project.",
-        }
-
-    out_dir = get_output_dir()
-    segment_path, overlay_candidate_path, segment_index = _next_segment_artifact_paths(
-        out_dir, nn
-    )
-    overlay_path = None
-    mask = data.get("mask") if isinstance(data, dict) else None
-    raw_response = data.get("raw_response") if isinstance(data, dict) else data
-    response_summary = _summarize_segment_response(raw_response)
-    if isinstance(mask, np.ndarray):
-        if world_path is None or not world_path.exists():
-            world_result = {
-                "world_xyz": None,
-                "world_error": "world map artifact not found for selected image",
-                "expected_world_path": str(world_path) if world_path else None,
-            }
-        else:
-            world_result = _mask_to_world(mask, np.load(world_path))
-            world_result["world_path"] = str(world_path)
-        overlay_path = overlay_candidate_path
-        if not _write_segment_overlay(image_path, mask, overlay_path):
-            overlay_path = None
-    else:
-        world_result = {
-            "world_xyz": None,
-            "world_error": (
-                data.get("error", "segmentation response did not include a mask")
-                if isinstance(data, dict)
-                else "segmentation response did not include a mask"
-            ),
-        }
-
-    segment_blob = {
-        "prompt": prompt,
-        "camera": camera,
-        "source_step": nn,
-        "segment_index": segment_index,
-        "image_path": str(image_path),
-        "server_protocol": server_protocol,
-        "server_endpoint": _redact_server_url(sam3_server_url),
-        "min_score": min_score,
-        "score": (
-            round(float(data["score"]), 3)
-            if isinstance(data, dict) and "score" in data
-            else None
-        ),
-        "box": data.get("box") if isinstance(data, dict) else None,
-        "mask_shape": data.get("mask_shape") if isinstance(data, dict) else None,
-        "point_input": data.get("point_input") if isinstance(data, dict) else None,
-        "point_coords_sent": (
-            data.get("point_coords_sent") if isinstance(data, dict) else None
-        ),
-        "point_convention": (
-            data.get("point_convention") if isinstance(data, dict) else None
-        ),
-        "response": response_summary,
-    }
-    if isinstance(data, dict) and data.get("error"):
-        segment_blob["error"] = data["error"]
-    segment_blob.update(world_result)
-    segment_path.write_text(json.dumps(segment_blob, indent=2, default=str))
-    overlay_b64 = (
-        raw_response.get("overlay_base64") if isinstance(raw_response, dict) else None
-    )
-    if overlay_path is None and overlay_b64:
-        overlay_path = overlay_candidate_path
-        try:
-            overlay_path.write_bytes(base64.b64decode(overlay_b64))
-        except Exception:
-            overlay_path = None
-
-    result = {
-        "step": nn,
-        "camera": camera,
-        "image_path": str(image_path),
-        "segment_path": str(segment_path),
-        "server_protocol": server_protocol,
-        "score": segment_blob["score"],
-        "box": segment_blob["box"],
-        "world_xyz": segment_blob["world_xyz"],
-        "world_error": segment_blob.get("world_error"),
-        "response": response_summary,
-    }
-    if "error" in segment_blob:
-        result["error"] = segment_blob["error"]
-    if overlay_path is not None and overlay_path.exists():
-        result["overlay_path"] = str(overlay_path)
-    return result
 
 
 def view_camera_meta(camera: str = "agentview", step: int | None = None) -> dict:
@@ -2246,7 +1909,8 @@ def back_project(
     if not source_artifact:
         return {
             "error": (
-                f"{camera} {resolution}-resolution world map not recorded for step {nn}"
+                f"{camera} {resolution}-resolution world map not recorded "
+                f"for step {nn}"
             )
         }
 
@@ -2281,8 +1945,8 @@ def back_project(
                     f"rows [{r0},{r1}] cols [{c0},{c1}]"
                 )
             }
-        window = (
-            world_map[r0:r1, c0:c1].reshape(-1, world_map.shape[2]).astype(np.float64)
+        window = world_map[r0:r1, c0:c1].reshape(-1, world_map.shape[2]).astype(
+            np.float64
         )
         finite = np.isfinite(window).all(axis=1) & (
             np.abs(window[:, :3]).sum(axis=1) > 1e-6
@@ -2329,7 +1993,8 @@ def back_project(
     if row < 0 or row >= height or col < 0 or col >= width:
         return {
             "error": (
-                f"pixel ({row},{col}) out of bounds; {camera} image is {height}x{width}"
+                f"pixel ({row},{col}) out of bounds; {camera} image is "
+                f"{height}x{width}"
             )
         }
 

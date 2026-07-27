@@ -1,0 +1,66 @@
+{
+  "files": [
+    {
+      "path": "memory/MEMORY.md",
+      "sha256": "731c74a96d6c2fbcdc20d17cb93f8d86fc4f1cebed7ed5f8ccb71e3ec5e0c117",
+      "size_bytes": 321
+    },
+    {
+      "path": "memory/README.md",
+      "sha256": "74801b3ca6860e08807a54a7b3d91b92e6d4d6142032df7600cb99c622c7b440",
+      "size_bytes": 88
+    },
+    {
+      "path": "memory/picking_up_trash/explore_experience.md",
+      "sha256": "ddee37f49c9bf182a091a10bb1202689eba62e23fb7ae9efbd1629d190e4b10f",
+      "size_bytes": 128
+    },
+    {
+      "path": "memory/picking_up_trash/target_prior.md",
+      "sha256": "707cd1d0c7ef34a5e5460bbaa127891267abc994cbf0c5980ea7cc8300a9cf32",
+      "size_bytes": 99
+    },
+    {
+      "path": "memory/snapshot_manifest.json",
+      "sha256": "1367e9f96fe439a561f63e20834cbff4d1fec2bdfe6b7fd23706441a970ae838",
+      "size_bytes": 1310
+    },
+    {
+      "path": "memory/turning_on_radio/control_face_target_lock.md",
+      "sha256": "752f2e8e82c0285327385ecf640420e7bb6c0a85c9db5c20b4af21bb4251f61b",
+      "size_bytes": 111
+    },
+    {
+      "path": "memory/turning_on_radio/explore_experience.md",
+      "sha256": "a1107fc205743ca3906f36701c2f6fb35fbba6368faa053e57f350c581fa5e72",
+      "size_bytes": 93
+    },
+    {
+      "path": "memory/turning_on_radio/target_prior.md",
+      "sha256": "f35073cba6f79de30d63fef133c88b59e3b4aef19ce0e6e89b173d154b1b9f56",
+      "size_bytes": 92
+    },
+    {
+      "path": "recipes/catalog_manifest.json",
+      "sha256": "8e74fb0044ae01842c2927f08332c758fe6f946d7f52c80119a02bfa6378990f",
+      "size_bytes": 1366
+    },
+    {
+      "path": "recipes/turning_on_radio/control_access/promotion_receipt.json",
+      "sha256": "266827e927ee24e887961dc7021a8f000dd8a2e1b12f162a718d4a46a92e3091",
+      "size_bytes": 1012
+    },
+    {
+      "path": "recipes/turning_on_radio/control_access/recipe.jsonl",
+      "sha256": "0ec775dd2bcc3d14248ed8e0813a131866b37fc7918c95801bf4692da38fa353",
+      "size_bytes": 304
+    },
+    {
+      "path": "recipes/turning_on_radio/control_access/task_memory.md",
+      "sha256": "d130ae47fda67792ab035109b95d3c3cc4979cbe94b47366f1c172e2c9bdea0a",
+      "size_bytes": 79
+    }
+  ],
+  "schema_version": 1,
+  "subtree": "behavior"
+}

@@ -1,0 +1,39 @@
+{
+  "catalog_sha256": "905265ac33163402386cdee7a6853f10b409fbd45b21be810e253037b1162a85",
+  "entries": [
+    {
+      "allowed_consumers": [
+        "explore",
+        "formal_eval"
+      ],
+      "entry_sha256": "b3cee65e6ecb2f21d87e7a18cd0488c4711df1d5da32968fddf5a6629b96cea4",
+      "files": {
+        "promotion_receipt": {
+          "path": "turning_on_radio/control_access/promotion_receipt.json",
+          "sha256": "266827e927ee24e887961dc7021a8f000dd8a2e1b12f162a718d4a46a92e3091",
+          "size_bytes": 1012
+        },
+        "recipe": {
+          "path": "turning_on_radio/control_access/recipe.jsonl",
+          "sha256": "0ec775dd2bcc3d14248ed8e0813a131866b37fc7918c95801bf4692da38fa353",
+          "size_bytes": 304
+        },
+        "task_memory": {
+          "path": "turning_on_radio/control_access/task_memory.md",
+          "sha256": "d130ae47fda67792ab035109b95d3c3cc4979cbe94b47366f1c172e2c9bdea0a",
+          "size_bytes": 79
+        }
+      },
+      "id": "control_access",
+      "official_success_checked": true,
+      "official_success_source": "info[\"done\"][\"success\"]",
+      "provenance_class": "canonical_public_explore",
+      "review_status": "accepted",
+      "task": "turning_on_radio",
+      "task_success": true
+    }
+  ],
+  "environment": "behavior",
+  "kind": "reviewed_behavior_recipe_catalog",
+  "schema_version": 1
+}

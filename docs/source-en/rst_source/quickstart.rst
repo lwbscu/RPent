@@ -1,4 +1,4 @@
-Quick start
+Quick Start
 ===========
 
 This page ports the ``README.md`` Quick Start into the documentation.
@@ -8,51 +8,40 @@ and ``pip install -e ".[full]"`` completed).
 1. Configure keys and checkpoints
 ---------------------------------
 
-Export the API keys for the LLM provider(s) you want to use as the
-reasoning brain, plus the path to the VLA checkpoint:
+Export your Anthropic key, plus the paths to the VLA and SAM3 checkpoints:
 
 .. code-block:: bash
 
-   # LLM API keys (used by the `api` cerebrum via pydantic-ai)
+   # Anthropic key; no need to export the base url if you use the
+   # official endpoint.
    export ANTHROPIC_BASE_URL=https://xxx
    export ANTHROPIC_API_KEY=sk-xxx
-   export OPENAI_BASE_URL=https://xxx
-   export OPENAI_API_KEY=sk-xxx
 
    # VLA checkpoint — download from
-   # https://huggingface.co/datasets/RLinf/rlinf-pi05-libero-130-fullshot-sft
+   # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-130-fullshot-SFT
    export PI05_CHECKPOINT_PATH=/path/to/rlinf-pi05-libero-130-fullshot-sft
+   # SAM 3.0 checkpoint — download from either
+   # https://huggingface.co/facebook/sam3
+   # https://modelscope.cn/models/facebook/sam3
+   export SAM3_CHECKPOINT_PATH=/path/to/sam3/sam3.pt
    export LIBERO_TYPE=pro
    export CUDA_VISIBLE_DEVICES=0
-
-You only need to set the keys for the providers you actually target.
-For example, if you only run ``--cerebrum claude_code``, you can skip
-``OPENAI_*``.
 
 2. Run one LIBERO task
 ----------------------
 
 Run a single LIBERO PRO task (``libero_object_swap``, task ``2``, seed
-``0``) using the ``api`` cerebrum against an Anthropic model with an
-8192-token cap:
+``0``) using the ``claude_code`` planner:
 
 .. code-block:: bash
 
-   rpent --suite libero_object_swap --task 2 --seed 0 \
-     --cerebrum api --model anthropic:claude-opus-4-8 --max-tokens 8192
+   rpent --env libero --suite libero_object_swap --task 2 --seed 0 \
+     --planner claude_code --model claude-opus-4-8
 
-**Model id conventions.** ``--model`` accepts a provider-prefixed id
-for the ``api`` cerebrum, and a bare id for the ``claude_code`` /
-``codex`` cerebrums:
+See :doc:`usage/configure_planner` to configure other planners
+(``api``, ``codex``) and model providers.
 
-- OpenAI-compatible chat endpoints — ``--model openai-chat:glm-5.2``
-- OpenAI responses endpoints — ``--model openai:gpt-5.5``
-- ``claude_code`` / ``codex`` — no provider prefix, e.g.
-  ``--model claude-opus-4-8``
-
-See :doc:`usage/configure_planner` for the full brain-swapping guide.
-
-3. Watch it run in the dashboard
+1. Watch it run in the dashboard
 --------------------------------
 
 Add ``--dashboard`` to open a browser monitor for the run. It boots a
@@ -62,24 +51,8 @@ replays. Use ``--dashboard-language zh-cn`` for the Chinese UI.
 
 .. code-block:: bash
 
-   rpent --dashboard --dashboard-language zh-cn \
-     --suite libero_goal_task --task 1 --seed 0 --cerebrum claude_code
-
-4. RoboCasa
------------
-
-RoboCasa uses a separate entrypoint and one-time setup:
-
-.. code-block:: bash
-
-   bash scripts/setup_robocasa.sh                                # one-time
-   bash scripts/run_robocasa.sh PickPlaceCounterToCabinet 0 0    # <task> <gpu> <seed>
-
-See `docs/SETUP_ROBOCASA.zh.md
-<https://github.com/RLinf/RPent/blob/main/docs/SETUP_ROBOCASA.zh.md>`_
-for the full RoboCasa365 + RLDX-1 walkthrough, and
-:doc:`usage/robocasa` for what the RoboCasa toolkit
-exposes to the agent.
+   rpent --env libero --dashboard --dashboard-language zh-cn \
+     --suite libero_goal_task --task 1 --seed 0 --planner claude_code
 
 Key CLI options
 ---------------
@@ -93,6 +66,9 @@ The most common flags of ``rpent`` at a glance:
    * - Flag
      - Default
      - Description
+   * - ``--env``
+     - required
+     - Environment backend. Currently ``libero``.
    * - ``--suite``
      - required
      - Task suite, e.g. ``libero_object_task``, ``libero_spatial_swap``
@@ -102,7 +78,7 @@ The most common flags of ``rpent`` at a glance:
    * - ``--seed``
      - ``0``
      - Random seed
-   * - ``--cerebrum``
+   * - ``--planner``
      - ``api``
      - Reasoning brain: ``api`` | ``claude_code`` | ``codex``
    * - ``--model``
@@ -115,6 +91,9 @@ The most common flags of ``rpent`` at a glance:
    * - ``--max-tokens``
      - ``8192``
      - Max tokens per LLM reply
+   * - ``--no-images``
+     - off
+     - Text-only mode: never send image bytes (for models that reject image input)
    * - ``--max-episode-steps``
      - ``10000``
      - Max env steps
@@ -123,32 +102,40 @@ The most common flags of ``rpent`` at a glance:
      - LIBERO variant: ``standard`` | ``pro`` | ``plus``
    * - ``--cuda-device``
      - inherited
-     - GPU device(s) exposed to the env / vla servers
+     - GPU device(s) exposed to the env / VLA / SAM3 servers
    * - ``--dashboard``
      - off
      - Start the local dashboard for this run
    * - ``--dashboard-language``
      - ``en``
      - Dashboard UI language: ``en`` | ``zh-cn``
+   * - ``--env-endpoint``
+     - — (spawn)
+     - ``[protocol://]host:port`` of an existing env_server
+       (``protocol=http|socket``, default ``http``). If unset,
+       one is spawned locally.
    * - ``--vla-endpoint``
-     - —
-     - Reuse an already-running vla_server instead of spawning one
-   * - ``--no-driver``
-     - off
-     - Attach to an existing env_server / vla_server
+     - — (spawn)
+     - ``[protocol://]host:port`` of an existing vla_server (same rules).
+       If unset, one is spawned locally.
+   * - ``--sam3-endpoint``
+     - — (spawn)
+     - ``[protocol://]host:port`` of an existing RPent SAM3 service
+       (``protocol=http|socket``, default ``http``). If unset,
+       one is spawned locally.
 
 What you should see
 -------------------
 
 A successful run:
 
-1. Prints ``env server ready at 127.0.0.1:<port>`` once the driver
-   process is up.
+1. Starts env_server, vla_server, and sam3_server, then waits for their
+   RPC or health endpoints before the agent loop begins.
 2. Prints per-turn agent reasoning (or streams it to the dashboard).
 3. Ends when the LLM calls ``finish(success=True)``, or hits
    ``--max-turns`` / ``--max-episode-steps``.
 4. Writes ``<output_dir>/transcript_*.json`` with the full turn-by-turn
    record and ``<output_dir>/episode.mp4`` with the rendered rollout.
 
-If something goes wrong, inspect the three log files described at the
+If something goes wrong, inspect the service and agent log files described at the
 bottom of :doc:`installation`.

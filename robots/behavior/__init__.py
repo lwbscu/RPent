@@ -5,43 +5,49 @@ from __future__ import annotations
 from typing import Any
 
 from robots.behavior.prompt_bundle import system_prompt, user_prompt
-from rpent.envs.env_spec import EnvSpec
+from robots.behavior.spec import EnvSpec
 from rpent.envs.prompt_bundle import PromptBundle
 
 
 def get_env_spec() -> EnvSpec:
-    """Return BEHAVIOR identity and prompts."""
+    """Return BEHAVIOR identity, prompts, and shared-runner hooks."""
+    from robots.behavior.runtime import (
+        RESOURCE_POLICY,
+        add_cli_args,
+        finalize_run,
+        init_runtime,
+        parse_config,
+        prepare_resources,
+        run_planner,
+    )
+
     return EnvSpec(
         name="behavior",
         prompts=PromptBundle(system=system_prompt, user=user_prompt),
+        add_cli_args=add_cli_args,
+        prepare_resources=prepare_resources,
+        parse_config=parse_config,
+        init_runtime=init_runtime,
+        resource_policy=RESOURCE_POLICY,
+        run_planner=run_planner,
+        finalize_run=finalize_run,
     )
 
 
 def get_toolkit(
     *,
-    control_mode: str = "full_task_vla",
-    primitives_kwargs: dict[str, Any] | None = None,
-    planner_client: Any = None,
+    primitives_kwargs: dict[str, Any],
+    video_path: str | None = None,
     dashboard: Any = None,
-    enable_stage3_press: bool = False,
 ):
-    """Return the selected closed BEHAVIOR control surface."""
+    """Return the single sequential BEHAVIOR toolkit."""
     from robots.behavior.toolkit import BehaviorToolkit
 
     return BehaviorToolkit(
-        control_mode=control_mode,
         primitives_kwargs=primitives_kwargs,
-        planner_client=planner_client,
+        video_path=video_path,
         dashboard=dashboard,
-        enable_stage3_press=enable_stage3_press,
     )
 
 
-def get_runtime_provider():
-    """Return the BEHAVIOR CLI/runtime provider."""
-    from robots.behavior.runtime_provider import BehaviorRuntimeProvider
-
-    return BehaviorRuntimeProvider()
-
-
-__all__ = ["get_env_spec", "get_runtime_provider", "get_toolkit"]
+__all__ = ["get_env_spec", "get_toolkit"]
