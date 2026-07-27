@@ -188,7 +188,24 @@ class State:
         self._metadata: dict[str, Any] = {}
         self._frames_png: dict[str, bytes | None] = dict.fromkeys(frame_kinds)
         self._frame_indices: dict[str, int] = dict.fromkeys(frame_kinds, -1)
+        self._frame_revisions: dict[str, int] = dict.fromkeys(frame_kinds, 0)
         self._frame_idx = -1
+        self._capture_group_id: str | int | None = None
+        self._simulator_step: int | None = None
+        self._last_selected_camera = (
+            "head" if self.environment == "behavior" else frame_kinds[0]
+        )
+        self._control_controller: Any = None
+        self._control_snapshot: dict[str, Any] = {
+            "available": False,
+            "motion_available": False,
+            "observe_available": False,
+            "busy": False,
+            "owner": None,
+            "phase": "idle",
+            "selected_camera": self._last_selected_camera,
+            "unavailable_reason": "controller_not_bound",
+        }
         self._video_generation = 0
         self._sealed_video_generation: int | None = None
         self._sealed_episode_replays: dict[int, dict[str, Any]] = {}
@@ -468,7 +485,276 @@ class State:
             self._frames_png[physical] = bytes(image)
             step = int(env_step) if _is_int(env_step) else -1
             self._frame_indices[physical] = step
+            self._frame_revisions[physical] += 1
+            self._capture_group_id = None
+            self._simulator_step = step if step >= 0 else None
             self._frame_idx += 1
+
+    def on_frame_group(
+        self,
+        frames: Mapping[str, Any],
+        *,
+        capture_group_id: str | int,
+        simulator_step: int,
+    ) -> bool:
+        """Atomically publish one complete, same-step BEHAVIOR capture group."""
+
+        expected = {"head", "left_wrist", "right_wrist"}
+        if (
+            self.environment != "behavior"
+            or set(frames) != expected
+            or not all(isinstance(frames[camera], bytes) for camera in expected)
+            or not isinstance(capture_group_id, (str, int))
+            or isinstance(capture_group_id, bool)
+            or capture_group_id == ""
+            or not _is_int(simulator_step)
+            or int(simulator_step) < 0
+        ):
+            return False
+        with self._lock:
+            if not expected.issubset(self._frames_png):
+                return False
+            if (
+                self._simulator_step is not None
+                and int(simulator_step) < self._simulator_step
+            ):
+                return False
+            if self._capture_group_id == capture_group_id:
+                if self._simulator_step != int(simulator_step):
+                    return False
+                return all(
+                    self._frames_png[camera] == bytes(frames[camera])
+                    for camera in expected
+                )
+            for camera in ("head", "left_wrist", "right_wrist"):
+                self._frames_png[camera] = bytes(frames[camera])
+                self._frame_indices[camera] = int(simulator_step)
+                self._frame_revisions[camera] += 1
+            self._capture_group_id = capture_group_id
+            self._simulator_step = int(simulator_step)
+            self._frame_idx += 1
+            return True
+
+    # -- Dashboard manual-control binding --------------------------------
+
+    def bind_controller(self, controller: Any) -> None:
+        snapshot_callback = getattr(controller, "snapshot", None)
+        if not callable(snapshot_callback):
+            raise TypeError("controller must provide snapshot()")
+        snapshot = snapshot_callback()
+        if not isinstance(snapshot, Mapping):
+            raise TypeError("controller snapshot must be a mapping")
+        with self._lock:
+            if self._control_controller not in (None, controller):
+                raise RuntimeError("a different Dashboard controller is already bound")
+            self._control_controller = controller
+            self._control_snapshot = dict(_json_safe(snapshot))
+
+    def unbind_controller(self, controller: Any = None) -> None:
+        with self._lock:
+            if (
+                controller is not None
+                and self._control_controller is not controller
+            ):
+                return
+            self._control_controller = None
+            selected_camera = self._last_selected_camera
+            self._control_snapshot = {
+                "available": False,
+                "motion_available": False,
+                "observe_available": False,
+                "busy": False,
+                "owner": None,
+                "phase": "idle",
+                "selected_camera": selected_camera,
+                "unavailable_reason": "controller_not_bound",
+            }
+
+    def control_controller(self) -> Any:
+        """Return the binding only; callers must invoke it after this lock exits."""
+
+        with self._lock:
+            return self._control_controller
+
+    def update_control_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        safe = _json_safe(snapshot)
+        if not isinstance(safe, dict):
+            return
+        with self._lock:
+            safe["selected_camera"] = self._last_selected_camera
+            self._control_snapshot = safe
+
+    def control_admission_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "state": self._state,
+                "official_task_success": bool(
+                    self._progress["official_task_success"]
+                ),
+            }
+
+    def set_selected_camera(self, camera: str) -> None:
+        camera = str(camera)
+        if (
+            self.environment == "behavior"
+            and camera not in {"head", "left_wrist", "right_wrist"}
+        ):
+            raise ValueError("invalid BEHAVIOR camera")
+        with self._lock:
+            if camera not in self._frames_png:
+                raise ValueError("camera is not available for this run")
+            self._last_selected_camera = camera
+            self._control_snapshot["selected_camera"] = camera
+
+    def on_manual_command_start(self, command: Mapping[str, Any]) -> int:
+        """Add a manual Timeline row without changing Agent tool accounting."""
+
+        command_id = str(command.get("command_id") or "")
+        if not command_id:
+            raise ValueError("manual command_id is required")
+        target = str(command.get("target") or "")
+        manual_action = str(command.get("action") or "")
+        primitive = (
+            "navigate_to"
+            if target == "chassis"
+            and manual_action
+            in {"forward", "backward", "turn_left", "turn_right"}
+            else manual_action
+        )
+        with self._lock:
+            timeline_id = self._next_timeline_id
+            self._next_timeline_id += 1
+            ordinal = len(self._timeline) + 1
+            item = {
+                "timeline_id": timeline_id,
+                "ordinal": ordinal,
+                "step": ordinal,
+                "env_step": None,
+                "source": "dashboard_manual",
+                "action": primitive,
+                "manual_action": manual_action,
+                "target": target,
+                "command_id": command_id,
+                "lease_id": str(command.get("lease_id") or ""),
+                "sequence": command.get("sequence"),
+                "primitive": primitive,
+                "args": {
+                    "target": target,
+                    "action": manual_action,
+                    "camera": str(command.get("camera") or ""),
+                    "requested_step": self._manual_requested_step(
+                        target, manual_action
+                    ),
+                    "detail": (
+                        "relative jog"
+                        if primitive == "navigate_to"
+                        else None
+                    ),
+                },
+                "result": {},
+                "elapsed_s": 0.0,
+                "primitive_success": None,
+                "stop_reason": None,
+                "capture_group_id": None,
+                "partial_motion": False,
+                "terminated": bool(self._progress["official_task_success"]),
+                "has_action_video": False,
+                "status": "running",
+                "_started_at": time.monotonic(),
+            }
+            self._timeline.append(item)
+            self._timeline_revision += 1
+            return timeline_id
+
+    def on_manual_command_result(
+        self,
+        command: Mapping[str, Any],
+        result: Mapping[str, Any],
+        *,
+        official_success_latched: bool,
+    ) -> None:
+        """Atomically merge a manual receipt, final frames and Timeline result."""
+
+        if not isinstance(result, Mapping):
+            return
+        safe_result = _json_safe(result)
+        if not isinstance(safe_result, dict):
+            safe_result = {}
+        command_id = str(command.get("command_id") or "")
+        frames = result.get("_frames_bytes")
+        capture_group_id = result.get("capture_group_id")
+        simulator_step = result.get(
+            "simulator_step",
+            self._env_step(dict(result)),
+        )
+        with self._lock:
+            frame_group_committed = bool(
+                isinstance(frames, Mapping)
+                and set(frames) == {"head", "left_wrist", "right_wrist"}
+                and self.on_frame_group(
+                    frames,
+                    capture_group_id=capture_group_id,
+                    simulator_step=simulator_step,
+                )
+            )
+            item = next(
+                (
+                    candidate
+                    for candidate in reversed(self._timeline)
+                    if candidate.get("source") == "dashboard_manual"
+                    and candidate.get("command_id") == command_id
+                ),
+                None,
+            )
+            if item is None:
+                return
+            env_step = self._env_step(dict(result))
+            if env_step is not None:
+                item["env_step"] = env_step
+            primitive = result.get("primitive_used") or result.get("primitive")
+            if primitive:
+                item["primitive"] = str(primitive)
+                if item.get("action") != "navigate_to":
+                    item["action"] = str(primitive)
+            item["result"] = safe_result
+            elapsed = result.get("elapsed_s")
+            item["elapsed_s"] = (
+                max(0.0, float(elapsed))
+                if isinstance(elapsed, (int, float))
+                and not isinstance(elapsed, bool)
+                else max(0.0, time.monotonic() - item["_started_at"])
+            )
+            failed = self._tool_failed(dict(result))
+            item["primitive_success"] = not failed
+            item["stop_reason"] = result.get("stop_reason")
+            metrics = result.get("metrics")
+            item["partial_motion"] = bool(
+                result.get("partial_motion")
+                or (
+                    isinstance(metrics, Mapping)
+                    and metrics.get("partial_motion")
+                )
+            )
+            item["capture_group_id"] = (
+                capture_group_id
+                if frame_group_committed
+                and capture_group_id == self._capture_group_id
+                else None
+            )
+            item["status"] = "failed" if failed else "completed"
+            if official_success_latched:
+                self._progress["official_task_success"] = True
+                self._terminated = True
+                self._control_snapshot["available"] = False
+                self._control_snapshot["motion_available"] = False
+                self._control_snapshot["observe_available"] = False
+                self._control_snapshot["success_latched"] = True
+                self._control_snapshot["unavailable_reason"] = (
+                    "official_success_latched"
+                )
+            item["terminated"] = bool(self._progress["official_task_success"])
+            self._update_progress_from_payload_locked(dict(result))
+            self._timeline_revision += 1
 
     def set_metadata(self, metadata: dict[str, Any]) -> None:
         """Attach public run identity and budget metadata."""
@@ -535,7 +821,28 @@ class State:
             for kind in self._frames_png:
                 self._frames_png[kind] = None
                 self._frame_indices[kind] = -1
+                self._frame_revisions[kind] = 0
             self._frame_idx = -1
+            self._capture_group_id = None
+            self._simulator_step = None
+            self._last_selected_camera = (
+                "head"
+                if self.environment == "behavior"
+                else next(iter(self._frames_png))
+            )
+            self._control_snapshot.update(
+                {
+                    "selected_camera": self._last_selected_camera,
+                    "command_id": None,
+                    "lease_id": None,
+                    "target": None,
+                    "action": None,
+                    "phase": "idle",
+                    "error": None,
+                    "stop_reason": None,
+                    "success_latched": False,
+                }
+            )
             self._progress.update(
                 {
                     "attempt_index": int(attempt_index),
@@ -584,6 +891,14 @@ class State:
                     item["elapsed_s"] = max(0.0, now - item["_started_at"])
                     self._timeline_revision += 1
             self._state = "done"
+            self._control_snapshot.update(
+                {
+                    "available": False,
+                    "motion_available": False,
+                    "observe_available": False,
+                    "unavailable_reason": "run_finished",
+                }
+            )
             if self.environment == "behavior":
                 self._terminated = bool(self._progress["official_task_success"])
             elif terminated is not None:
@@ -652,7 +967,12 @@ class State:
                 "episode_replays": self._episode_replays_locked(),
                 "frame_idx": self._frame_idx,
                 "frame_indices": dict(self._frame_indices),
+                "frame_revisions": dict(self._frame_revisions),
                 "frame_kinds": list(self._frames_png),
+                "capture_group_id": self._capture_group_id,
+                "simulator_step": self._simulator_step,
+                "last_selected_camera": self._last_selected_camera,
+                "control": dict(self._control_snapshot),
                 "n_steps": len(self._timeline),
                 "timeline_revision": self._timeline_revision,
                 "progress": dict(self._progress),
@@ -699,7 +1019,12 @@ class State:
                 "episode_replays": self._episode_replays_locked(),
                 "frame_idx": self._frame_idx,
                 "frame_indices": dict(self._frame_indices),
+                "frame_revisions": dict(self._frame_revisions),
                 "frame_kinds": list(self._frames_png),
+                "capture_group_id": self._capture_group_id,
+                "simulator_step": self._simulator_step,
+                "last_selected_camera": self._last_selected_camera,
+                "control": dict(self._control_snapshot),
                 "metadata": dict(self._metadata),
                 "progress": dict(self._progress),
             }
@@ -776,7 +1101,10 @@ class State:
     def _tool_failed(result: dict[str, Any]) -> bool:
         if result.get("primitive_success") is False or result.get("success") is False:
             return True
-        if result.get("error") not in (None, "", False):
+        if (
+            result.get("error") not in (None, "", False)
+            or result.get("capture_error") not in (None, "", False)
+        ):
             return True
         return str(result.get("stop_reason") or "") in {
             "handoff_failed",
@@ -805,6 +1133,18 @@ class State:
 
     def _ingest_frames(self, result: dict[str, Any]) -> None:
         env_step = self._env_step(result)
+        inline = result.get("_frames_bytes")
+        if isinstance(inline, dict) and set(inline) == {
+            "head",
+            "left_wrist",
+            "right_wrist",
+        }:
+            self.on_frame_group(
+                inline,
+                capture_group_id=result.get("capture_group_id"),
+                simulator_step=result.get("simulator_step", env_step),
+            )
+            return
         direct = (
             result.get("_image_bytes")
             if isinstance(result.get("_image_bytes"), bytes)
@@ -826,7 +1166,6 @@ class State:
         if isinstance(camera_image, bytes) and self.environment == "libero":
             self.on_frame("camera", camera_image, env_step=env_step)
 
-        inline = result.get("_frames_bytes")
         if isinstance(inline, dict):
             for camera, image in inline.items():
                 if isinstance(image, bytes):
@@ -866,6 +1205,52 @@ class State:
                 )
                 if physical:
                     self.on_frame(physical, image, env_step=env_step)
+
+    @staticmethod
+    def _manual_requested_step(target: str, action: str) -> dict[str, Any]:
+        if action == "observe":
+            return {"kind": "camera_refresh"}
+        if target == "chassis":
+            if action in {"forward", "backward"}:
+                return {
+                    "kind": "translation",
+                    "meters": 0.05 if action == "forward" else -0.05,
+                }
+            if action in {"turn_left", "turn_right"}:
+                return {
+                    "kind": "rotation",
+                    "degrees": 5.0 if action == "turn_left" else -5.0,
+                }
+            if action in {"up", "down"}:
+                return {
+                    "kind": "torso_vertical",
+                    "meters": 0.03 if action == "up" else -0.03,
+                }
+        if action in {
+            "forward",
+            "backward",
+            "turn_left",
+            "turn_right",
+            "up",
+            "down",
+        }:
+            signs = {
+                "forward": (0.03, 0.0, 0.0),
+                "backward": (-0.03, 0.0, 0.0),
+                "turn_left": (0.0, 0.03, 0.0),
+                "turn_right": (0.0, -0.03, 0.0),
+                "up": (0.0, 0.0, 0.03),
+                "down": (0.0, 0.0, -0.03),
+            }
+            return {"kind": "eef_translation", "delta_m": list(signs[action])}
+        if action in {"rotate_left", "rotate_right"}:
+            return {
+                "kind": "wrist_rotation",
+                "visual_degrees": 5.0 if action == "rotate_left" else -5.0,
+            }
+        if action in {"open", "close"}:
+            return {"kind": "gripper", "opening": 1.0 if action == "open" else 0.0}
+        return {"kind": "unknown"}
 
     def _update_progress_from_payload_locked(self, payload: dict[str, Any]) -> None:
         fields = {

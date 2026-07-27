@@ -18,7 +18,7 @@ import stat
 import subprocess
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -55,7 +55,7 @@ from robots.behavior.source_snapshot import (
     SourceSnapshotBinding,
     validate_source_snapshot,
 )
-from robots.behavior.spec import RunConfig
+from robots.behavior.spec import BEHAVIOR_CONTROL_DRAIN_TIMEOUT_S, RunConfig
 from robots.behavior.task_specs import (
     PICKING_UP_TRASH_TASK_SPEC,
     TURNING_ON_RADIO_TASK_SPEC,
@@ -1272,7 +1272,83 @@ class BehaviorRuntimeResources:
     vla_proc: subprocess.Popen | None = None
     manifest: RunManifest | None = None
     env_rpc_client: Any = None
+    command_arbiter: Any = None
+    success_latch: Any = None
+    dashboard_controller: Any = None
+    dashboard_state: Any = None
     _closed: bool = False
+    _control_closed: bool = False
+    _control_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        init=False,
+        repr=False,
+    )
+
+    def attach_dashboard_control(
+        self,
+        *,
+        toolkit: Any,
+        controller: Any,
+        dashboard_state: Any,
+    ) -> None:
+        """Bind the one runtime-owned manual controller exactly once."""
+
+        with self._control_lock:
+            if self._closed or self._control_closed:
+                raise RuntimeError("BEHAVIOR runtime control is already closed")
+            if self.dashboard_controller is not None:
+                if (
+                    self.dashboard_controller is controller
+                    and self.toolkit is toolkit
+                    and self.dashboard_state is dashboard_state
+                ):
+                    return
+                raise RuntimeError("BEHAVIOR runtime control is already bound")
+            self.toolkit = toolkit
+            self.dashboard_controller = controller
+            self.dashboard_state = dashboard_state
+
+    def quiesce_control(
+        self,
+        *,
+        timeout_s: float = BEHAVIOR_CONTROL_DRAIN_TIMEOUT_S,
+    ) -> None:
+        """Stop admission, drain the current safe step, then unbind control."""
+
+        with self._control_lock:
+            if self._control_closed:
+                return
+            controller = self.dashboard_controller
+            arbiter = self.command_arbiter
+            dashboard = self.dashboard_state
+
+            for owner in (controller, arbiter):
+                quiesce = getattr(owner, "quiesce", None)
+                if callable(quiesce):
+                    quiesce()
+
+            deadline = time.monotonic() + max(0.0, float(timeout_s))
+            for label, owner in (("controller", controller), ("arbiter", arbiter)):
+                drain = getattr(owner, "drain", None)
+                if not callable(drain):
+                    continue
+                remaining = max(0.0, deadline - time.monotonic())
+                if drain(remaining) is not True:
+                    raise TimeoutError(
+                        f"BEHAVIOR dashboard {label} did not drain before cleanup"
+                    )
+
+            unbind = getattr(dashboard, "unbind_controller", None)
+            if callable(unbind) and controller is not None:
+                unbind(controller)
+
+            close_controller = getattr(controller, "close", None)
+            if callable(close_controller):
+                close_controller(timeout_s=max(0.0, deadline - time.monotonic()))
+            close_arbiter = getattr(arbiter, "close", None)
+            if callable(close_arbiter):
+                close_arbiter(timeout_s=max(0.0, deadline - time.monotonic()))
+            self._control_closed = True
 
     def runner_continuation_state(self) -> dict[str, Any]:
         """Combine toolkit facts with owned child-process liveness."""
@@ -1304,8 +1380,17 @@ class BehaviorRuntimeResources:
         return result
 
     def close(self) -> None:
+        """Single-flight release of controller, transports, and processes."""
+
+        with self._control_lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
         if self._closed:
             return
+        # Never tear down the simulator transport while one validated
+        # discrete CuRobo step is still executing.
+        self.quiesce_control()
         self._closed = True
         failure: BaseException | None = None
         if self.manifest is not None:
@@ -2336,12 +2421,22 @@ def init_runtime(
         dashboard = getattr(args, "_behavior_dashboard_state", None)
         if dashboard is not None:
             dashboard.set_metadata({"task-language": task_language})
+        from robots.behavior.dashboard_control import (
+            BehaviorCommandArbiter,
+            BehaviorRawSuccessLatch,
+        )
+
+        success_latch = BehaviorRawSuccessLatch()
+        command_arbiter = BehaviorCommandArbiter(success_latch=success_latch)
         resources = BehaviorRuntimeResources(
             output_dir=output_dir,
             env_proc=env_proc,
             vla_proc=vla_proc,
             manifest=manifest,
             env_rpc_client=env_rpc_client,
+            command_arbiter=command_arbiter,
+            success_latch=success_latch,
+            dashboard_state=dashboard,
         )
         manifest.running()
         primitives_kwargs = {
@@ -2371,6 +2466,22 @@ def init_runtime(
             "video_path": output_dir / "episode.mp4",
             "initial_observation": initial_observation,
             "initial_info": initial_info,
+            "_dashboard_runtime_resource": resources,
+            "_dashboard_command_arbiter": command_arbiter,
+            "_dashboard_success_latch": success_latch,
+            "_dashboard_motion_allowed": bool(
+                str(getattr(args, "behavior_controller_mode", "hybrid")) == "hybrid"
+                and str(getattr(args, "suite", "")).startswith("behavior")
+            ),
+            "_dashboard_observe_allowed": bool(
+                str(getattr(args, "suite", "")).startswith("behavior")
+            ),
+            "_dashboard_control_unavailable_reason": (
+                "Pure-VLA controller ownership disables manual motion."
+                if str(getattr(args, "behavior_controller_mode", "hybrid"))
+                == "pi0_nav_pick_only"
+                else None
+            ),
         }
         return [resources], primitives_kwargs
     except BaseException as error:

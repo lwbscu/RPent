@@ -22,6 +22,7 @@ from robots.behavior.schemas import (
     extract_policy_state,
     segment_ranges,
     validate_action_chunk,
+    validate_dashboard_manual_command,
     validate_relative_navigation_motion,
 )
 from robots.behavior.task_specs import (
@@ -587,6 +588,58 @@ class BehaviorPrimitives:
             result=self._env_method("observe")(**observe_kwargs),
         )
 
+    def dashboard_control_capabilities(self) -> dict[str, Any]:
+        """Return internal manual-control capabilities without changing tools."""
+
+        result = self._env_method("dashboard_control_capabilities")()
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "dashboard_control_capabilities returned a non-mapping result"
+            )
+        return result
+
+    def dashboard_manual_command(
+        self,
+        *,
+        target: str,
+        action: str,
+        camera: str,
+    ) -> dict[str, Any]:
+        """Execute one fixed-size Dashboard command outside the LLM tool surface."""
+
+        command = validate_dashboard_manual_command(
+            target=target,
+            action=action,
+            camera=camera,
+        )
+        result = self._env_method("dashboard_manual_command")(**command)
+        if not isinstance(result, dict):
+            raise RuntimeError("dashboard_manual_command returned a non-mapping result")
+        frames = result.get("_frames_bytes")
+        capture_complete = bool(
+            isinstance(frames, dict)
+            and set(frames) == {"head", "left_wrist", "right_wrist"}
+            and all(isinstance(value, bytes) for value in frames.values())
+        )
+        receipt = result.get("official_success_receipt")
+        raw_done = receipt.get("raw_done") if isinstance(receipt, dict) else None
+        success_without_capture = bool(
+            result.get("task_success") is True
+            and isinstance(receipt, dict)
+            and receipt.get("source") == 'info["done"]["success"]'
+            and isinstance(raw_done, dict)
+            and raw_done.get("success") is True
+            and isinstance(receipt.get("receipt_sha256"), str)
+            and bool(receipt["receipt_sha256"])
+            and isinstance(result.get("capture_error"), str)
+            and bool(result["capture_error"])
+        )
+        if not capture_complete and not success_without_capture:
+            raise RuntimeError(
+                "dashboard_manual_command omitted the atomic three-camera capture"
+            )
+        return result
+
     def pixel_to_world(
         self,
         *,
@@ -882,9 +935,7 @@ class BehaviorPrimitives:
             payload = {
                 "projection_id": projection_id.strip(),
                 "navigation_visual_check": (
-                    self._validated_navigation_visual_check(
-                        navigation_visual_check
-                    )
+                    self._validated_navigation_visual_check(navigation_visual_check)
                 ),
                 "standoff_m": self._validated_navigation_number(
                     "standoff_m",
@@ -915,9 +966,7 @@ class BehaviorPrimitives:
                     "navigation arguments"
                 )
             payload = {
-                "relative_motion": validate_relative_navigation_motion(
-                    relative_motion
-                )
+                "relative_motion": validate_relative_navigation_motion(relative_motion)
             }
         payload["timeout_s"] = self._validated_navigation_number(
             "timeout_s",

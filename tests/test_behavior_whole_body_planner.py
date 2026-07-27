@@ -1123,3 +1123,138 @@ def test_whole_body_contact_monitor_allows_baseline_and_rejects_new_pair():
         ["/World/floor", "/World/robot/left_arm"],
         ["/World/floor", "/World/robot/wheel"],
     ]
+
+
+def test_whole_body_contact_monitor_allows_only_r1pro_wheel_floor_churn():
+    robot_root = "/World/scene_0/controllable__r1pro__robot_r1"
+    floor = "/World/scene_0/floors_ulujpr_0/base_link"
+    contacts = []
+    robot = SimpleNamespace(contact_list=lambda: list(contacts))
+    backend = RealCuroboBackend(None)
+    backend._find_robot = lambda: robot
+    expected = {"left": None, "right": None}
+
+    baseline = backend.capture_whole_body_contact_baseline(
+        expected_attachments_by_hand=expected
+    )
+    contacts.append(
+        SimpleNamespace(
+            body0=f"{robot_root}/wheel_motor_link3",
+            body1=floor,
+        )
+    )
+    appeared = backend.whole_body_contact_report(
+        baseline=baseline,
+        expected_attachments_by_hand=expected,
+    )
+    contacts.clear()
+    backend.whole_body_contact_report(
+        baseline=baseline,
+        expected_attachments_by_hand=expected,
+    )
+    contacts.append(
+        SimpleNamespace(
+            body0=f"{robot_root}/wheel_motor_link3",
+            body1=floor,
+        )
+    )
+    reappeared = backend.whole_body_contact_report(
+        baseline=baseline,
+        expected_attachments_by_hand=expected,
+    )
+
+    expected_pair = sorted([f"{robot_root}/wheel_motor_link3", floor])
+    assert appeared["unexpected_contact"] is False
+    assert appeared["allowed_support_pairs"] == [expected_pair]
+    assert reappeared["unexpected_contact"] is False
+    assert reappeared["allowed_support_pairs"] == [expected_pair]
+    assert reappeared["allowed_support_pair_count"] == 1
+    assert reappeared["support_policy"] == (
+        "r1pro_wheel_motor_link0-3_to_behavior_floors_base_link"
+    )
+
+
+def test_real_probe_shape_two_support_pairs_then_third_wheel_is_not_collision():
+    robot_root = "/World/scene_0/controllable__r1pro__robot_r1"
+    floor = "/World/scene_0/floors_ulujpr_0/base_link"
+    contacts = [
+        SimpleNamespace(
+            body0=f"{robot_root}/wheel_motor_link{index}",
+            body1=floor,
+        )
+        for index in (0, 1)
+    ]
+    robot = SimpleNamespace(contact_list=lambda: list(contacts))
+    backend = RealCuroboBackend(None)
+    backend._find_robot = lambda: robot
+    expected = {"left": None, "right": None}
+    baseline = backend.capture_whole_body_contact_baseline(
+        expected_attachments_by_hand=expected
+    )
+    contacts.append(
+        SimpleNamespace(
+            body0=f"{robot_root}/wheel_motor_link3",
+            body1=floor,
+        )
+    )
+
+    report = backend.whole_body_contact_report(
+        baseline=baseline,
+        expected_attachments_by_hand=expected,
+    )
+
+    assert report["unexpected_contact"] is False
+    assert report["current_pair_count"] == 3
+    assert report["original_baseline_pair_count"] == 2
+    assert report["allowed_support_pair_count"] == 3
+    assert report["monitored_current_pairs"] == []
+
+
+@pytest.mark.parametrize(
+    ("robot_link", "scene_link"),
+    [
+        (
+            "left_arm_link3",
+            "/World/scene_0/floors_ulujpr_0/base_link",
+        ),
+        (
+            "wheel_motor_link3",
+            "/World/scene_0/walls_kitchen_0/base_link",
+        ),
+        (
+            "wheel_motor_link4",
+            "/World/scene_0/floors_ulujpr_0/base_link",
+        ),
+    ],
+)
+def test_whole_body_contact_monitor_keeps_non_support_contacts_fail_closed(
+    robot_link,
+    scene_link,
+):
+    robot_root = "/World/scene_0/controllable__r1pro__robot_r1"
+    contacts = [
+        SimpleNamespace(
+            body0=f"{robot_root}/{robot_link}",
+            body1=scene_link,
+        )
+    ]
+    robot = SimpleNamespace(contact_list=lambda: list(contacts))
+    backend = RealCuroboBackend(None)
+    backend._find_robot = lambda: robot
+    expected = {"left": None, "right": None}
+    baseline = {
+        "available": True,
+        "pairs": [],
+        "continuous_pairs": [],
+    }
+
+    report = backend.whole_body_contact_report(
+        baseline=baseline,
+        expected_attachments_by_hand=expected,
+    )
+
+    assert report["unexpected_contact"] is True
+    assert report["allowed_support_pairs"] == []
+    assert report["unexpected_pairs"] == [
+        sorted([f"{robot_root}/{robot_link}", scene_link])
+    ]

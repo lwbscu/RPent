@@ -43,11 +43,17 @@ def get_toolkit(
     """Return the single sequential BEHAVIOR toolkit."""
     from robots.behavior.toolkit import BehaviorToolkit
 
-    return BehaviorToolkit(
+    toolkit = BehaviorToolkit(
         primitives_kwargs=primitives_kwargs,
         video_path=video_path,
         dashboard=dashboard,
     )
+    try:
+        toolkit.activate_dashboard_control()
+    except BaseException:
+        toolkit.close()
+        raise
+    return toolkit
 
 
 __all__ = ["get_env_spec", "get_toolkit"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
@@ -19,6 +20,30 @@ DEFAULT_ACTION_CHUNK = 32
 # Runtime-owned hard deadline. It is deliberately absent from the public tool
 # schema so the planner cannot shorten or extend CuRobo execution.
 ROTATE_WRIST_RUNTIME_TIMEOUT_S = 30.0
+# Dashboard jog amounts are a server-owned safety contract.  They are
+# intentionally not represented in the browser request schema and must not be
+# overridden by callers at the HTTP or env-RPC boundaries.
+BASE_TRANSLATION_STEP_M = 0.05
+BASE_ROTATION_STEP_RAD = math.radians(5.0)
+EEF_TRANSLATION_STEP_M = 0.03
+TORSO_VERTICAL_STEP_M = 0.03
+WRIST_ROTATION_STEP_RAD = math.radians(5.0)
+
+DASHBOARD_CONTROL_TARGETS = ("chassis", "left_arm", "right_arm")
+DASHBOARD_CONTROL_ACTIONS = (
+    "forward",
+    "backward",
+    "turn_left",
+    "turn_right",
+    "up",
+    "down",
+    "rotate_left",
+    "rotate_right",
+    "open",
+    "close",
+    "observe",
+)
+DASHBOARD_CONTROL_CAMERAS = ("head", "left_wrist", "right_wrist")
 CAMERA_KEYS = ("main", "left_wrist", "right_wrist")
 _PUBLIC_TOOL_CONTRACT_V1 = (
     "pi0_nav_pick",
@@ -48,6 +73,37 @@ FRAME_REVIEW_ASSESSMENTS = (
     "opposite_surface_confirmed",
     "side_or_indeterminate",
 )
+
+
+def validate_dashboard_manual_command(
+    *,
+    target: Any,
+    action: Any,
+    camera: Any,
+) -> dict[str, str]:
+    """Validate the semantic-only manual-control RPC contract.
+
+    Fixed motion amounts and gripper openings are deliberately absent.  This
+    validator is shared by the in-process primitive, RPC client, and simulator
+    facade so no caller can smuggle browser-controlled distances or angles
+    through a looser internal layer.
+    """
+
+    if not isinstance(target, str) or target not in DASHBOARD_CONTROL_TARGETS:
+        raise ValueError("target must be chassis, left_arm, or right_arm")
+    if not isinstance(action, str) or action not in DASHBOARD_CONTROL_ACTIONS:
+        raise ValueError("unsupported dashboard manual action")
+    if not isinstance(camera, str) or camera not in DASHBOARD_CONTROL_CAMERAS:
+        raise ValueError("camera must be head, left_wrist, or right_wrist")
+    if target == "chassis" and action in {
+        "rotate_left",
+        "rotate_right",
+        "open",
+        "close",
+    }:
+        raise ValueError(f"{action} is available for arm control only")
+    return {"target": target, "action": action, "camera": camera}
+
 
 # Pi0.5 compacts raw R1Pro proprio in this order. In particular, both arms
 # precede both grippers.
@@ -683,13 +739,9 @@ def validate_relative_navigation_motion(value: Any) -> dict[str, Any]:
     else:
         raise ValueError("relative_motion.kind must be translation or rotation")
     if set(motion) != expected:
-        raise ValueError(
-            f"relative_motion.{kind} requires exactly {sorted(expected)}"
-        )
+        raise ValueError(f"relative_motion.{kind} requires exactly {sorted(expected)}")
     if direction not in allowed_directions:
-        raise ValueError(
-            f"relative_motion.direction is invalid for {kind}"
-        )
+        raise ValueError(f"relative_motion.direction is invalid for {kind}")
     amount = motion[amount_name]
     if isinstance(amount, bool) or not isinstance(
         amount, (int, float, np.integer, np.floating)
@@ -697,14 +749,13 @@ def validate_relative_navigation_motion(value: Any) -> dict[str, Any]:
         raise ValueError(f"relative_motion.{amount_name} must be a finite number")
     amount = float(amount)
     if not np.isfinite(amount) or amount <= 0.0 or amount > maximum:
-        raise ValueError(
-            f"relative_motion.{amount_name} must be within (0,{maximum}]"
-        )
+        raise ValueError(f"relative_motion.{amount_name} must be within (0,{maximum}]")
     return {
         "kind": str(kind),
         "direction": str(direction),
         amount_name: amount,
     }
+
 
 _MOVE_TARGET_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1020,11 +1071,17 @@ def behavior_tool_specs_for_task(
 
 __all__ = [
     "ACTION_DIM",
+    "BASE_ROTATION_STEP_RAD",
+    "BASE_TRANSLATION_STEP_M",
     "BEHAVIOR_TOOL_NAMES",
     "CAMERA_KEYS",
     "CLOSE_SPEC",
     "CURRENT_PUBLIC_TOOL_CONTRACT_VERSION",
     "DEFAULT_ACTION_CHUNK",
+    "DASHBOARD_CONTROL_ACTIONS",
+    "DASHBOARD_CONTROL_CAMERAS",
+    "DASHBOARD_CONTROL_TARGETS",
+    "EEF_TRANSLATION_STEP_M",
     "ENV_ACTION_SEGMENTS",
     "ENV_WIRE_SCHEMA",
     "FRAME_REVIEW_ASSESSMENTS",
@@ -1042,10 +1099,13 @@ __all__ = [
     "ROTATE_WRIST_SPEC",
     "SAVE_ROBOT_STATE_CHECKPOINT_SPEC",
     "VLA_WIRE_SCHEMA",
+    "TORSO_VERTICAL_STEP_M",
+    "WRIST_ROTATION_STEP_RAD",
     "behavior_tool_specs_for_task",
     "extract_policy_state",
     "segment_ranges",
     "validate_action_chunk",
+    "validate_dashboard_manual_command",
     "validate_policy_state",
     "validate_relative_navigation_motion",
 ]

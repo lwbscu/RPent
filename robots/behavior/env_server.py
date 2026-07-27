@@ -45,13 +45,19 @@ from robots.behavior.planner_executor import (
     _quat_rotate_vector_xyzw,
 )
 from robots.behavior.schemas import (
+    BASE_ROTATION_STEP_RAD,
+    BASE_TRANSLATION_STEP_M,
+    EEF_TRANSLATION_STEP_M,
     ENV_ACTION_SEGMENTS,
     POLICY_STATE_SEGMENTS,
     RAW_PROPRIO_SEGMENTS,
     ROTATE_WRIST_RUNTIME_TIMEOUT_S,
+    TORSO_VERTICAL_STEP_M,
+    WRIST_ROTATION_STEP_RAD,
     extract_policy_state,
     segment_ranges,
     validate_action_chunk,
+    validate_dashboard_manual_command,
     validate_relative_navigation_motion,
 )
 from robots.behavior.task_specs import (
@@ -76,6 +82,8 @@ _ENV_RPC_METHODS = frozenset(
         "reset",
         "prepare_vla_invocation",
         "current_observation",
+        "dashboard_control_capabilities",
+        "dashboard_manual_command",
         "finalize_paused_runtime",
         "observe",
         "pixel_to_world",
@@ -963,7 +971,11 @@ class BehaviorEnvFacade:
             raise RuntimeError(
                 "raw task success is terminal; no further RPC is allowed"
             )
-        if method in {"get_env_meta", "guard_tool_call"}:
+        if method in {
+            "get_env_meta",
+            "guard_tool_call",
+            "dashboard_control_capabilities",
+        }:
             return
         if method == "reset":
             if bool(getattr(self, "_reset_completed", False)):
@@ -1067,9 +1079,7 @@ class BehaviorEnvFacade:
             relative_mode = "relative_motion" in input_dict
             if relative_mode:
                 try:
-                    if not set(input_dict).issubset(
-                        {"relative_motion", "timeout_s"}
-                    ):
+                    if not set(input_dict).issubset({"relative_motion", "timeout_s"}):
                         raise ValueError(
                             "relative navigation contains projection arguments"
                         )
@@ -4281,6 +4291,510 @@ class BehaviorEnvFacade:
         result = _wire_safe((observation, self._info_with_accounting()))
         pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
         return result
+
+    @staticmethod
+    def _dashboard_capability_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, dict):
+            for key in ("available", "supported", "verified", "ok"):
+                flag = value.get(key)
+                if isinstance(flag, bool):
+                    return flag
+        return False
+
+    def dashboard_control_capabilities(self) -> dict[str, Any]:
+        """Return fail-closed manual-control capabilities for this live env."""
+
+        planner = getattr(self, "_planner", None)
+        planner_capability_method = getattr(
+            planner, "dashboard_control_capabilities", None
+        )
+        planner_report: dict[str, Any] = {}
+        planner_available = callable(planner_capability_method)
+        if planner_available:
+            try:
+                value = planner_capability_method()
+                if isinstance(value, dict):
+                    planner_report = _wire_safe(value)
+                else:
+                    planner_available = False
+            except Exception:
+                logger.exception("failed to read dashboard planner capabilities")
+                planner_available = False
+
+        reset_completed = bool(getattr(self, "_reset_completed", False))
+        official_success = bool(
+            getattr(self, "_official_success_latched", False)
+            or _raw_success(getattr(self, "_last_info", None))
+        )
+        stopped = bool(
+            getattr(self, "_done", False)
+            or getattr(self, "_motion_frozen", False)
+            or getattr(self, "_terminal_failure_receipt", None) is not None
+            or official_success
+        )
+        controller_state = str(getattr(self, "_controller_state", "unavailable"))
+        controller_transfer_available = controller_state in {
+            _CONTROLLER_VLA,
+            _CONTROLLER_PLANNER,
+        }
+        hybrid_mode = getattr(self, "_controller_mode", None) == "hybrid"
+        suite_is_behavior = str(getattr(self, "_meta", {}).get("suite", "")).startswith(
+            "behavior"
+        )
+        task_spec = getattr(self, "_task_spec", None)
+        task_identity = getattr(self, "_task_identity", None)
+        task_identity_verified = bool(
+            isinstance(task_spec, BehaviorTaskSpec)
+            and isinstance(task_identity, tuple)
+            and len(task_identity) == 3
+            and task_identity[0] == task_spec.task_name
+            and isinstance(task_identity[1], int)
+            and not isinstance(task_identity[1], bool)
+            and task_identity[1] == task_spec.activity_definition_id
+            and isinstance(task_identity[2], int)
+            and not isinstance(task_identity[2], bool)
+            and task_identity[2] > 0
+        )
+        omni_env = getattr(getattr(self, "_env", None), "omnigibson_env", None)
+        robot = self._robot() if reset_completed else None
+        robot_class = type(robot).__name__.strip().lower() if robot is not None else ""
+        robot_name = str(getattr(robot, "name", "")).strip().lower()
+        robot_is_r1pro = bool(
+            robot is not None
+            and (
+                robot_class in {"r1", "r1pro"}
+                or "r1pro" in robot_name
+                or robot_name == "r1"
+            )
+        )
+        simulation_identity = bool(
+            suite_is_behavior
+            and task_identity_verified
+            and omni_env is not None
+            and robot_is_r1pro
+        )
+        no_motion_in_flight = not bool(getattr(self, "_motion_in_flight", False))
+        position_control_ready = bool(
+            controller_transfer_available
+            and (
+                getattr(self, "_base_controller_mode", None) == "position"
+                or (
+                    controller_state == _CONTROLLER_VLA
+                    and callable(getattr(robot, "reload_controllers", None))
+                )
+            )
+        )
+        common_motion = bool(
+            reset_completed
+            and simulation_identity
+            and hybrid_mode
+            and planner_available
+            and controller_transfer_available
+            and position_control_ready
+            and no_motion_in_flight
+            and not stopped
+        )
+        observe_available = bool(
+            reset_completed
+            and simulation_identity
+            and planner is not None
+            and no_motion_in_flight
+            and not stopped
+        )
+
+        def planner_flag(name: str) -> bool:
+            return self._dashboard_capability_flag(planner_report.get(name))
+
+        base_available = bool(common_motion and planner_flag("base"))
+        eef_flag = planner_report.get("eef")
+        eef_available = {
+            hand: bool(
+                common_motion
+                and (
+                    self._dashboard_capability_flag(eef_flag.get(hand))
+                    if isinstance(eef_flag, dict)
+                    else self._dashboard_capability_flag(eef_flag)
+                )
+            )
+            for hand in ("left", "right")
+        }
+        torso_available = bool(common_motion and planner_flag("torso"))
+        wrist_flag = planner_report.get("wrist")
+        wrist_available = {
+            hand: bool(
+                common_motion
+                and (
+                    self._dashboard_capability_flag(wrist_flag.get(hand))
+                    if isinstance(wrist_flag, dict)
+                    else self._dashboard_capability_flag(wrist_flag)
+                )
+            )
+            for hand in ("left", "right")
+        }
+        gripper_flag = planner_report.get("gripper")
+        gripper_available = {
+            hand: bool(
+                common_motion
+                and (
+                    self._dashboard_capability_flag(gripper_flag.get(hand))
+                    if isinstance(gripper_flag, dict)
+                    else self._dashboard_capability_flag(gripper_flag)
+                )
+            )
+            for hand in ("left", "right")
+        }
+        motion_available = bool(
+            base_available
+            or torso_available
+            or any(eef_available.values())
+            or any(wrist_available.values())
+            or any(gripper_available.values())
+        )
+        unavailable_reason: str | None = None
+        if stopped:
+            unavailable_reason = "run_finished"
+        elif not reset_completed:
+            unavailable_reason = "episode_not_initialized"
+        elif not simulation_identity:
+            unavailable_reason = "behavior_omnigibson_r1pro_unverified"
+        elif not hybrid_mode:
+            unavailable_reason = "manual_motion_requires_hybrid_mode"
+        elif not planner_available:
+            unavailable_reason = "planner_unavailable"
+        elif not controller_transfer_available or not position_control_ready:
+            unavailable_reason = "position_controller_unavailable"
+        elif not no_motion_in_flight:
+            unavailable_reason = "controller_busy"
+        elif not motion_available:
+            unavailable_reason = "manual_motion_capabilities_unverified"
+
+        return {
+            "motion_available": motion_available,
+            "observe_available": observe_available,
+            "unavailable_reason": unavailable_reason,
+            "simulation_identity": (
+                "behavior_omnigibson_r1pro" if simulation_identity else None
+            ),
+            "planner_available": planner_available,
+            "position_control_ready": position_control_ready,
+            "current_base_controller_mode": getattr(
+                self, "_base_controller_mode", None
+            ),
+            "controller_state": controller_state,
+            "base_available": base_available,
+            "eef_available": eef_available,
+            "torso_available": torso_available,
+            "wrist_rotation_available": wrist_available,
+            "gripper_available": gripper_available,
+            "steps": {
+                "base_translation_m": BASE_TRANSLATION_STEP_M,
+                "base_rotation_rad": BASE_ROTATION_STEP_RAD,
+                "eef_translation_m": EEF_TRANSLATION_STEP_M,
+                "torso_vertical_m": TORSO_VERTICAL_STEP_M,
+                "wrist_rotation_rad": WRIST_ROTATION_STEP_RAD,
+            },
+            "planner": planner_report,
+        }
+
+    def _dashboard_capture_group(self) -> dict[str, Any]:
+        """Capture and serialize one fresh, atomic three-camera simulator view."""
+
+        previous_group_ids: set[str] = set()
+        for camera in ("head", "left_wrist", "right_wrist"):
+            try:
+                prior = self._frame_cache.latest(camera)
+            except Exception:
+                continue
+            if isinstance(prior.capture_group_id, str):
+                previous_group_ids.add(prior.capture_group_id)
+
+        self._refresh_observation_without_step()
+        frames_bytes: dict[str, bytes] = {}
+        frame_ids: dict[str, str] = {}
+        group_ids: set[str] = set()
+        simulator_steps: set[int] = set()
+        for camera in ("head", "left_wrist", "right_wrist"):
+            payload = self._frame_cache.observe_payload(camera)
+            image = payload.get("_image_bytes")
+            group = payload.get("capture_group")
+            group_id = group.get("id") if isinstance(group, dict) else None
+            sim_step = group.get("sim_step") if isinstance(group, dict) else None
+            frame_id = payload.get("frame_id")
+            if not isinstance(image, bytes):
+                raise RuntimeError(f"dashboard capture omitted PNG bytes for {camera}")
+            if not isinstance(group_id, str) or not group_id:
+                raise RuntimeError(
+                    f"dashboard capture omitted capture_group_id for {camera}"
+                )
+            if isinstance(sim_step, bool) or not isinstance(
+                sim_step, (int, np.integer)
+            ):
+                raise RuntimeError(
+                    f"dashboard capture omitted simulator step for {camera}"
+                )
+            if not isinstance(frame_id, str) or not frame_id:
+                raise RuntimeError(f"dashboard capture omitted frame id for {camera}")
+            frames_bytes[camera] = image
+            frame_ids[camera] = frame_id
+            group_ids.add(group_id)
+            simulator_steps.add(int(sim_step))
+        if len(group_ids) != 1 or len(simulator_steps) != 1:
+            raise RuntimeError(
+                "dashboard capture cameras do not share one capture group and step"
+            )
+        capture_group_id = next(iter(group_ids))
+        simulator_step = next(iter(simulator_steps))
+        if simulator_step != int(self._env_steps):
+            raise RuntimeError(
+                "dashboard capture is not from the current simulator step"
+            )
+        if capture_group_id in previous_group_ids:
+            raise RuntimeError(
+                "dashboard capture refresh did not publish a fresh capture group"
+            )
+        return {
+            "_frames_bytes": frames_bytes,
+            "frame_ids": frame_ids,
+            "capture_group_id": capture_group_id,
+            "simulator_step": simulator_step,
+        }
+
+    @staticmethod
+    def _dashboard_requested_step(target: str, action: str) -> dict[str, Any]:
+        if action == "observe":
+            return {"camera_refresh": True}
+        if target == "chassis":
+            if action in {"forward", "backward"}:
+                return {
+                    "frame": "base",
+                    "distance_m": BASE_TRANSLATION_STEP_M,
+                    "direction": action,
+                }
+            if action in {"turn_left", "turn_right"}:
+                return {
+                    "frame": "base",
+                    "angle_rad": BASE_ROTATION_STEP_RAD,
+                    "direction": action,
+                }
+            return {
+                "frame": "world",
+                "torso_delta_z_m": (
+                    TORSO_VERTICAL_STEP_M if action == "up" else -TORSO_VERTICAL_STEP_M
+                ),
+            }
+        if action in {
+            "forward",
+            "backward",
+            "turn_left",
+            "turn_right",
+            "up",
+            "down",
+        }:
+            return {
+                "frame": "base",
+                "eef_translation_m": EEF_TRANSLATION_STEP_M,
+                "direction": action,
+            }
+        if action in {"rotate_left", "rotate_right"}:
+            return {
+                "frame": "wrist_camera",
+                "angle_rad": WRIST_ROTATION_STEP_RAD,
+                "visual_direction": (
+                    "clockwise" if action == "rotate_left" else "counterclockwise"
+                ),
+            }
+        return {"opening": 1.0 if action == "open" else 0.0}
+
+    def dashboard_manual_command(
+        self,
+        *,
+        target: str,
+        action: str,
+        camera: str,
+    ) -> dict[str, Any]:
+        """Execute one fixed-size manual primitive and capture all cameras."""
+
+        command = validate_dashboard_manual_command(
+            target=target,
+            action=action,
+            camera=camera,
+        )
+        target = command["target"]
+        action = command["action"]
+        camera = command["camera"]
+        started = time.monotonic()
+        capabilities = self.dashboard_control_capabilities()
+
+        if action == "observe":
+            if capabilities.get("observe_available") is not True:
+                raise RuntimeError(
+                    str(
+                        capabilities.get("unavailable_reason")
+                        or "camera refresh unavailable"
+                    )
+                )
+            capture = self._dashboard_capture_group()
+            result = self._require_planner().observe(camera)
+            if not isinstance(result, dict):
+                raise RuntimeError("observe returned a non-mapping planner result")
+            result = self._planner_public_result(result)
+            # The Dashboard consumes the explicit physical-camera map below;
+            # retain no selected-camera legacy aliases in the new contract.
+            result.pop("_image_bytes", None)
+            result.pop("_depth_image_bytes", None)
+            primitive = "observe"
+        else:
+            if capabilities.get("motion_available") is not True:
+                raise RuntimeError(
+                    str(
+                        capabilities.get("unavailable_reason")
+                        or "manual motion unavailable"
+                    )
+                )
+            hand = "left" if target == "left_arm" else "right"
+            capability_ok = False
+            if target == "chassis":
+                capability_ok = bool(
+                    capabilities.get("torso_available")
+                    if action in {"up", "down"}
+                    else capabilities.get("base_available")
+                )
+            elif action in {"rotate_left", "rotate_right"}:
+                capability_ok = bool(
+                    dict(capabilities.get("wrist_rotation_available") or {}).get(hand)
+                )
+            elif action in {"open", "close"}:
+                capability_ok = bool(
+                    dict(capabilities.get("gripper_available") or {}).get(hand)
+                )
+            else:
+                capability_ok = bool(
+                    dict(capabilities.get("eef_available") or {}).get(hand)
+                )
+            if not capability_ok:
+                raise RuntimeError(
+                    f"{target}/{action} capability is unavailable or unverified"
+                )
+
+            self._switch_controller(_CONTROLLER_PLANNER)
+            if (
+                self._controller_state != _CONTROLLER_PLANNER
+                or self._base_controller_mode != "position"
+            ):
+                raise RuntimeError(
+                    "manual motion requires verified planner position control"
+                )
+            planner = self._require_planner()
+            if self._motion_in_flight:
+                raise RuntimeError("another physical action is already in flight")
+            self._motion_in_flight = True
+            try:
+                if target == "chassis" and action in {
+                    "forward",
+                    "backward",
+                    "turn_left",
+                    "turn_right",
+                }:
+                    result = planner.jog_base(action)
+                    primitive = "navigate_to"
+                elif target == "chassis":
+                    result = planner.jog_torso(action)
+                    primitive = "jog_torso"
+                elif action in {
+                    "forward",
+                    "backward",
+                    "turn_left",
+                    "turn_right",
+                    "up",
+                    "down",
+                }:
+                    result = planner.jog_eef(hand, action)
+                    primitive = "move_to"
+                elif action in {"rotate_left", "rotate_right"}:
+                    result = planner.jog_wrist(hand, action)
+                    primitive = "rotate_wrist"
+                else:
+                    result = planner.set_gripper(
+                        hand,
+                        1.0 if action == "open" else 0.0,
+                    )
+                    primitive = "set_gripper"
+            finally:
+                self._motion_in_flight = False
+            if not isinstance(result, dict):
+                raise RuntimeError(f"{primitive} returned a non-mapping planner result")
+            result = self._planner_public_result(result)
+            # Capture inside this same main-thread RPC, including when the
+            # planner action latched raw success. No follow-up env call occurs.
+            try:
+                capture = self._dashboard_capture_group()
+            except Exception as exc:
+                success_receipt = result.get("official_success_receipt")
+                if (
+                    result.get("task_success") is not True
+                    or not isinstance(success_receipt, dict)
+                    or success_receipt
+                    != _wire_safe(getattr(self, "_official_success_receipt", None))
+                    or success_receipt.get("source") != 'info["done"]["success"]'
+                    or not isinstance(success_receipt.get("raw_done"), dict)
+                    or success_receipt["raw_done"].get("success") is not True
+                ):
+                    raise
+                # Official success is monotonic and more important than optional
+                # Dashboard media. Return its immutable receipt from this same
+                # RPC; State will retain the prior complete frame group.
+                capture = {"capture_error": (f"{type(exc).__name__}: {exc}")}
+
+        response = {
+            **result,
+            **capture,
+            "source": "dashboard_manual",
+            "target": target,
+            "action": action,
+            "camera": camera,
+            "primitive": primitive,
+            "primitive_detail": (
+                "relative jog" if primitive == "navigate_to" else None
+            ),
+            "requested_step": self._dashboard_requested_step(target, action),
+            "elapsed_s": max(0.0, time.monotonic() - started),
+        }
+        metrics = response.get("metrics")
+        metrics = dict(metrics) if isinstance(metrics, dict) else {}
+        response["partial_motion"] = bool(
+            response.get("partial_motion") or metrics.get("partial_motion")
+        )
+        for field in ("actual_target", "fallback_offset", "requested_delta"):
+            if field not in response and field in metrics:
+                response[field] = metrics[field]
+        # Refresh the cached admission state from facts after controller transfer
+        # and execution; the HTTP controller does not poll the simulator.
+        if response.get("task_success") is True:
+            # Do not query planner/backend capabilities after the success step,
+            # even within this RPC. Publish a locally-derived terminal snapshot.
+            terminal_capabilities = dict(capabilities)
+            terminal_capabilities.update(
+                {
+                    "motion_available": False,
+                    "observe_available": False,
+                    "unavailable_reason": "official_success_latched",
+                    "base_available": False,
+                    "eef_available": {"left": False, "right": False},
+                    "torso_available": False,
+                    "wrist_rotation_available": {
+                        "left": False,
+                        "right": False,
+                    },
+                    "gripper_available": {"left": False, "right": False},
+                }
+            )
+            response["control_capabilities"] = terminal_capabilities
+        else:
+            response["control_capabilities"] = self.dashboard_control_capabilities()
+        pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
+        return response
 
     def _planner_result_with_accounting(self, result: dict[str, Any]) -> dict[str, Any]:
         public = self._strip_flow_advice(result)

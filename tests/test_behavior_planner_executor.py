@@ -6,6 +6,7 @@ import math
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +14,7 @@ import pytest
 
 from robots.behavior.camera_geometry import CameraIntrinsics, FrameCache
 from robots.behavior.planner_executor import (
+    BASE_ACTIVE_JOINT_NAMES,
     LOCAL_GUARDED_IK_SEEDS,
     PlannerExecutor,
     RealCuroboBackend,
@@ -1475,6 +1477,93 @@ def test_ik_solution_merge_preserves_every_locked_joint(tmp_path):
     assert report["locked_solution_entries_ignored"] == 2
 
 
+@pytest.mark.parametrize("representation", ["active_only", "already_full"])
+def test_base_ik_merge_never_augments_or_writes_locked_joints(
+    tmp_path,
+    representation,
+):
+    full_names = [
+        "base_footprint_x_joint",
+        "base_footprint_y_joint",
+        "base_footprint_z_joint",
+        "base_footprint_rx_joint",
+        "base_footprint_ry_joint",
+        "base_footprint_rz_joint",
+        *[f"torso_joint{i}" for i in range(1, 5)],
+        *[f"left_arm_joint{i}" for i in range(1, 8)],
+        "left_gripper_finger_joint1",
+        "left_gripper_finger_joint2",
+        *[f"right_arm_joint{i}" for i in range(1, 8)],
+        "right_gripper_finger_joint1",
+        "right_gripper_finger_joint2",
+    ]
+    lock_names = [
+        name for name in full_names if name not in BASE_ACTIVE_JOINT_NAMES
+    ]
+    lock_state = type("LockState", (), {"joint_names": lock_names})()
+    config = type("Config", (), {"lock_jointstate": lock_state})()
+    kinematics = type(
+        "Kinematics",
+        (),
+        {
+            "joint_names": list(BASE_ACTIVE_JOINT_NAMES),
+            "kinematics_config": config,
+        },
+    )()
+    motion_generator = type("MotionGenerator", (), {"kinematics": kinematics})()
+    embodiment = type("Embodiment", (), {"BASE": "base"})
+    generator = type(
+        "Generator",
+        (),
+        {
+            "robot_joint_names": full_names,
+            "mg": {"base": motion_generator},
+        },
+    )()
+    path_names = (
+        list(BASE_ACTIVE_JOINT_NAMES)
+        if representation == "active_only"
+        else full_names
+    )
+    path = type(
+        "Path",
+        (),
+        {
+            "joint_names": path_names,
+            "position": np.arange(
+                100.0,
+                100.0 + len(path_names),
+                dtype=np.float32,
+            ),
+        },
+    )()
+    robot = type("Robot", (), {"joints": dict.fromkeys(full_names)})()
+    call_start = np.arange(28, dtype=np.float32)
+    backend = RealCuroboBackend(None, output_dir=tmp_path)
+    backend._embodiment_cls = embodiment
+
+    merged, report = backend._merge_base_ik_solution_into_full_q(
+        generator,
+        robot,
+        path,
+        call_start_q=call_start,
+    )
+
+    full_index = {name: index for index, name in enumerate(full_names)}
+    path_index = {name: index for index, name in enumerate(path_names)}
+    for name in BASE_ACTIVE_JOINT_NAMES:
+        assert merged[0, full_index[name]] == pytest.approx(
+            path.position[path_index[name]]
+        )
+    for name in lock_names:
+        assert merged[0, full_index[name]] == pytest.approx(
+            call_start[full_index[name]]
+        )
+    assert report["source_representation"] == representation
+    assert report["get_full_js_called"] is False
+    assert report["locked_joint_count"] == 25
+
+
 def test_target_object_resolution_supports_scene_object_mapping(tmp_path):
     target_object = type(
         "Target",
@@ -2272,31 +2361,75 @@ def test_base_reachability_uses_precontact_point_toward_candidate():
 
 
 @_REQUIRES_TORCH
-def test_base_plan_uses_ik_only_without_collision_admission(tmp_path):
+def test_base_plan_requires_dense_collision_admission(tmp_path):
+    full_names = [
+        "base_footprint_x_joint",
+        "base_footprint_y_joint",
+        "base_footprint_z_joint",
+        "base_footprint_rx_joint",
+        "base_footprint_ry_joint",
+        "base_footprint_rz_joint",
+        *[f"torso_joint{i}" for i in range(1, 5)],
+        *[f"left_arm_joint{i}" for i in range(1, 8)],
+        "left_gripper_finger_joint1",
+        "left_gripper_finger_joint2",
+        *[f"right_arm_joint{i}" for i in range(1, 8)],
+        "right_gripper_finger_joint1",
+        "right_gripper_finger_joint2",
+    ]
+    lock_names = [
+        name for name in full_names if name not in BASE_ACTIVE_JOINT_NAMES
+    ]
+    lock_state = type("LockState", (), {"joint_names": lock_names})()
+    config = type("Config", (), {"lock_jointstate": lock_state})()
+    kinematics = type(
+        "Kinematics",
+        (),
+        {
+            "joint_names": list(BASE_ACTIVE_JOINT_NAMES),
+            "kinematics_config": config,
+        },
+    )()
+    motion_generator = type("MotionGenerator", (), {"kinematics": kinematics})()
+    goal = np.zeros(28, dtype=np.float32)
+    goal[0] = 0.2
+    goal[1] = 0.1
+    goal[5] = 0.2
+    path = type(
+        "Path",
+        (),
+        {"joint_names": full_names, "position": goal},
+    )()
+
     class Generator:
         batch_size = 2
+        robot_joint_names = full_names
+        mg = {"base": motion_generator}
 
         def __init__(self):
             self.compute_kwargs = None
 
         def compute_trajectories(self, _positions, _quaternions, **kwargs):
             self.compute_kwargs = kwargs
-            return np.array([True, False]), [object(), None]
+            return np.array([True, False]), [path, None]
 
         @staticmethod
         def path_to_joint_trajectory(_path, **_kwargs):
-            return np.array([0.2, 0.1, 0.0, 0.0, 0.0, 0.2], dtype=np.float32)
+            raise AssertionError("BASE full-js augmentation must not be called")
 
         @staticmethod
-        def check_collisions(*_args, **_kwargs):
-            raise AssertionError("collision booleans must not be queried")
+        def check_collisions(q, **kwargs):
+            assert kwargs["self_collision_check"] is True
+            assert kwargs["skip_obstacle_update"] is True
+            return np.zeros(len(q), dtype=bool)
 
     class Robot:
         base_idx = np.arange(6)
+        joints = dict.fromkeys(full_names)
 
         @staticmethod
         def get_joint_positions():
-            return np.zeros(6, dtype=np.float32)
+            return np.zeros(28, dtype=np.float32)
 
     generator = Generator()
     backend = RealCuroboBackend(None, output_dir=tmp_path)
@@ -2304,6 +2437,10 @@ def test_base_plan_uses_ik_only_without_collision_admission(tmp_path):
     backend._find_robot = lambda: Robot()
     backend._embodiment_cls = type("Embodiment", (), {"BASE": "base"})
     backend._base_config_path = lambda: tmp_path / "base.yaml"
+    backend._all_attached_objects = lambda **_kwargs: (
+        None,
+        {"left": None, "right": None},
+    )
 
     result = backend._compute_base_plan(
         target_xyyaw=np.array([0.2, 0.1, 0.2]),
@@ -2312,10 +2449,14 @@ def test_base_plan_uses_ik_only_without_collision_admission(tmp_path):
 
     assert result["ok"] is True
     assert generator.compute_kwargs["ik_only"] is True
-    assert generator.compute_kwargs["ik_world_collision_check"] is False
-    assert generator.compute_kwargs["skip_obstacle_update"] is True
-    assert result["metrics"]["collision_admission_enabled"] is False
-    assert result["metrics"]["obstacle_update"] is False
+    assert generator.compute_kwargs["ik_world_collision_check"] is True
+    assert generator.compute_kwargs["skip_obstacle_update"] is False
+    assert result["metrics"]["collision_admission_enabled"] is True
+    assert result["metrics"]["obstacle_update"] is True
+    assert result["metrics"]["collision_admission"]["admitted"] is True
+    assert result["metrics"]["base_trajectory_certificate"][
+        "post_interpolation_check"
+    ] is True
     assert len(result["joint_trajectory"]) >= 1
 
 
@@ -3170,7 +3311,7 @@ def test_rotate_and_press_use_whole_body_planning_without_legacy_arm_fallback():
     assert press_env.calls
 
 
-def test_navigation_planner_uses_full_official_path_and_locks_nonbase_q():
+def test_navigation_planner_uses_full_official_path_and_locks_nonbase_q(tmp_path):
     shortest_path_calls: list[dict[str, object]] = []
 
     class TraversabilityMap:
@@ -3219,10 +3360,26 @@ def test_navigation_planner_uses_full_official_path_and_locks_nonbase_q():
         get_joint_positions=lambda: q_reference.copy(),
     )
     robot.scene = SimpleNamespace(trav_map=TraversabilityMap())
-    backend = RealCuroboBackend(None)
+    backend = RealCuroboBackend(None, output_dir=tmp_path)
     backend._robot = robot
     backend._compute_base_plan = lambda **_kwargs: pytest.fail(
         "navigate_to must not replace the official full A* path with CuRobo BASE"
+    )
+    backend._certify_base_trajectory = (
+        lambda q, **_kwargs: (
+            np.asarray(q, dtype=np.float32),
+            {
+                "collision_admission": {
+                    "available": True,
+                    "admitted": True,
+                    "world_collision_check": True,
+                    "self_collision_check": True,
+                    "post_interpolation_check": True,
+                },
+                "base_trajectory_certificate": {"schema_version": 1},
+            },
+            {"left": None, "right": None},
+        )
     )
 
     result = backend.plan_navigation_trajectory(
@@ -3251,7 +3408,7 @@ def test_navigation_planner_uses_full_official_path_and_locks_nonbase_q():
     metrics = result["metrics"]["navigation_path"]
     assert metrics["source"] == "official_robot_eroded_traversability"
     assert metrics["entire_path_requested"] is True
-    assert metrics["dynamic_world_collision_admission"] is False
+    assert metrics["dynamic_world_collision_admission"] is True
     assert metrics["bounded_stage"]["max_travel_m"] == 0.5
     assert metrics["bounded_stage"]["planned_travel_m"] <= 0.5 + 1e-9
     assert metrics["bounded_stage"]["truncated"] is True
@@ -3307,6 +3464,7 @@ class _RelativeTraversabilityMap:
 def test_relative_navigation_plans_body_axis_motion_and_locks_nonbase_q(
     relative_motion,
     expected_goal,
+    tmp_path,
 ):
     q_reference = np.arange(28, dtype=np.float64) * 0.01
     q_reference[:6] = 0.0
@@ -3319,9 +3477,31 @@ def test_relative_navigation_plans_body_axis_motion_and_locks_nonbase_q(
         get_joint_positions=lambda: q_reference.copy(),
     )
     robot.scene = SimpleNamespace(trav_map=_RelativeTraversabilityMap())
-    backend = RealCuroboBackend(None)
+    backend = RealCuroboBackend(None, output_dir=tmp_path)
     backend._robot = robot
     backend._record_base_phase = lambda _record: None
+
+    def compute_exact_base(*, target_xyyaw, **_kwargs):
+        q = q_reference.copy()
+        q[0], q[1], q[5] = np.asarray(target_xyyaw, dtype=np.float64)
+        return {
+            "ok": True,
+            "joint_trajectory": q.reshape(1, -1).astype(np.float32),
+            "base_goal": np.asarray(target_xyyaw, dtype=np.float64),
+            "expected_attachments_by_hand": {"left": None, "right": None},
+            "metrics": {
+                "collision_admission": {
+                    "available": True,
+                    "admitted": True,
+                    "world_collision_check": True,
+                    "self_collision_check": True,
+                    "post_interpolation_check": True,
+                },
+                "base_trajectory_certificate": {"schema_version": 1},
+            },
+        }
+
+    backend._compute_base_plan = compute_exact_base
 
     result = backend.plan_relative_navigation_trajectory(
         relative_motion=relative_motion,
@@ -3349,7 +3529,7 @@ def test_relative_navigation_plans_body_axis_motion_and_locks_nonbase_q(
     path_metrics = result["metrics"]["navigation_path"]
     assert path_metrics["source"] == "official_robot_eroded_traversability"
     assert path_metrics["straight_relative_motion"] is True
-    assert path_metrics["dynamic_world_collision_admission"] is False
+    assert path_metrics["dynamic_world_collision_admission"] is True
 
 
 def test_relative_navigation_rejects_blocked_straight_segment_without_action_plan():
@@ -3400,32 +3580,51 @@ class _NavigationBackend(_FakeBackend):
         self.q_path[:, 1] = [0.0, 0.1, 0.2]
         self.q_path[:, 5] = [0.0, 0.1, 0.2]
 
-    def plan_navigation_trajectory(self, **_kwargs):
+    def _navigation_plan(self):
+        certificate = {
+            "schema_version": 1,
+            "trajectory_sha256": hashlib.sha256(
+                np.ascontiguousarray(self.q_path, dtype=np.float32).tobytes()
+            ).hexdigest(),
+            "start_q_sha256": hashlib.sha256(
+                np.ascontiguousarray(
+                    self.joint_positions, dtype=np.float32
+                ).tobytes()
+            ).hexdigest(),
+            "waypoint_count": int(len(self.q_path)),
+            "world_collision_check": True,
+            "self_collision_check": True,
+            "post_interpolation_check": True,
+            "attachment_hand_count": 2,
+            "colliding_waypoint_count": 0,
+        }
         return {
             "ok": True,
             "joint_trajectory": self.q_path.copy(),
             "base_goal": [0.3, 0.2, 0.2],
+            "expected_attachments_by_hand": {"left": None, "right": None},
             "metrics": {
+                "base_trajectory_certificate": certificate,
+                "collision_admission": {
+                    "available": True,
+                    "admitted": True,
+                    "world_collision_check": True,
+                    "self_collision_check": True,
+                    "post_interpolation_check": True,
+                },
                 "navigation_path": {
                     "source": "official_robot_eroded_traversability",
-                    "dynamic_world_collision_admission": False,
+                    "dynamic_world_collision_admission": True,
                 }
             },
         }
 
+    def plan_navigation_trajectory(self, **_kwargs):
+        return self._navigation_plan()
+
     def plan_relative_navigation_trajectory(self, **kwargs):
         self.relative_navigation_calls.append(kwargs)
-        return {
-            "ok": True,
-            "joint_trajectory": self.q_path.copy(),
-            "base_goal": [0.3, 0.2, 0.2],
-            "metrics": {
-                "navigation_path": {
-                    "source": "official_robot_eroded_traversability",
-                    "dynamic_world_collision_admission": False,
-                }
-            },
-        }
+        return self._navigation_plan()
 
     @staticmethod
     def capture_trajectory_hold_reference(*, hand):
@@ -3478,6 +3677,248 @@ class _NavigationBackend(_FakeBackend):
             "max_base_xy_error_m": 0.0,
             "base_yaw_error_rad": 0.0,
         }
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_motion"),
+    [
+        (
+            "forward",
+            {"kind": "translation", "direction": "forward", "distance_m": 0.05},
+        ),
+        (
+            "backward",
+            {"kind": "translation", "direction": "backward", "distance_m": 0.05},
+        ),
+        (
+            "turn_left",
+            {"kind": "rotation", "direction": "left", "angle_deg": 5.0},
+        ),
+        (
+            "turn_right",
+            {"kind": "rotation", "direction": "right", "angle_deg": 5.0},
+        ),
+    ],
+)
+def test_jog_base_uses_only_fixed_server_steps(action, expected_motion):
+    backend = _NavigationBackend()
+    executor, _env = _executor(backend)
+
+    result = executor.jog_base(action, timeout_s=5.0)
+
+    assert result["primitive_success"] is True
+    assert backend.relative_navigation_calls == [
+        {"relative_motion": expected_motion, "timeout_s": 5.0}
+    ]
+    assert result["metrics"]["fixed_server_step"] is True
+
+
+def test_navigation_missing_collision_certificate_executes_zero_actions():
+    backend = _NavigationBackend()
+    unsafe_plan = backend._navigation_plan()
+    unsafe_plan["metrics"].pop("base_trajectory_certificate")
+    backend.plan_navigation_trajectory = lambda **_kwargs: unsafe_plan
+    executor, env = _executor(backend)
+
+    result = executor.navigate_to(
+        target_xyz=[1.0, 0.0, 0.0],
+        standoff_m=0.85,
+        max_travel_m=1.0,
+        timeout_s=5.0,
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "navigation_collision_certificate_unavailable"
+    assert result["metrics"]["env_actions_sent"] == 0
+    assert env.calls == []
+
+
+def test_jog_eef_transforms_base_local_delta_and_preserves_call_start_quat():
+    backend = _FakeBackend()
+    backend.base_pose[2] = math.pi / 2.0
+    backend.quat = np.array([0.0, 0.0, math.sin(0.2), math.cos(0.2)])
+    call_start_quat = backend.quat.copy()
+    executor, _env = _executor(backend)
+
+    result = executor.jog_eef("left", "forward", timeout_s=10.0)
+
+    assert result["primitive_success"] is True
+    np.testing.assert_allclose(
+        backend.planned_targets[0],
+        [0.5, 0.03, 0.0],
+        atol=1e-8,
+    )
+    np.testing.assert_allclose(
+        backend.whole_body_plan_calls[0]["target_quat_xyzw"],
+        call_start_quat,
+        atol=1e-8,
+    )
+    np.testing.assert_allclose(
+        result["metrics"]["requested_delta_world"],
+        [0.0, 0.03, 0.0],
+        atol=1e-8,
+    )
+
+
+def test_jog_eef_fallback_is_plan_only_single_axis_and_bounded():
+    class FallbackBackend(_FakeBackend):
+        def plan_whole_body_trajectory(self, **kwargs):
+            target = np.asarray(kwargs["target_xyz"], dtype=np.float64)
+            self.planned_targets.append(target.copy())
+            if np.allclose(target, [0.53, 0.0, 0.0], atol=1e-9):
+                return {
+                    "ok": False,
+                    "stop_reason": "unreachable",
+                    "metrics": {"env_actions_sent": 0},
+                }
+            # Avoid recording the same target twice in the base fake.
+            self.planned_targets.pop()
+            return super().plan_whole_body_trajectory(**kwargs)
+
+    backend = FallbackBackend()
+    executor, env = _executor(backend)
+
+    result = executor.jog_eef("right", "forward", timeout_s=10.0)
+
+    assert result["primitive_success"] is True
+    attempts = result["metrics"]["candidate_attempts"]
+    assert attempts[0]["fallback_offset"] == [0.0, 0.0, 0.0]
+    np.testing.assert_allclose(
+        attempts[1]["fallback_offset"],
+        [0.0, 0.0025, 0.0],
+        atol=1e-9,
+    )
+    assert np.count_nonzero(np.abs(attempts[1]["fallback_offset"]) > 0.0) == 1
+    assert max(abs(value) for value in attempts[1]["fallback_offset"]) <= 0.005
+    assert len(env.calls) > 0
+
+
+def test_jog_eef_non_unreachable_failure_does_not_try_compensation():
+    class FailedBackend(_FakeBackend):
+        def plan_whole_body_trajectory(self, **kwargs):
+            self.whole_body_plan_calls.append(dict(kwargs))
+            return {
+                "ok": False,
+                "stop_reason": "planner_unavailable",
+                "metrics": {"env_actions_sent": 0},
+            }
+
+    backend = FailedBackend()
+    executor, env = _executor(backend)
+
+    result = executor.jog_eef("left", "up", timeout_s=10.0)
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "planner_unavailable"
+    assert len(backend.whole_body_plan_calls) == 1
+    assert len(result["metrics"]["candidate_attempts"]) == 1
+    assert env.calls == []
+
+
+def test_jog_torso_fails_closed_without_verified_curobo_controller():
+    backend = _FakeBackend()
+    executor, env = _executor(backend)
+
+    result = executor.jog_torso("up")
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "torso_control_unsupported"
+    assert result["metrics"]["target_link"] == "torso_link4"
+    assert result["metrics"]["requested_delta_z_m"] == pytest.approx(0.03)
+    assert result["metrics"]["env_actions_sent"] == 0
+    assert env.calls == []
+
+
+def _add_wrist_frame(executor, hand):
+    intrinsics = CameraIntrinsics(
+        fx=2.0,
+        fy=2.0,
+        cx=2.0,
+        cy=2.0,
+        width=5,
+        height=5,
+    )
+    executor.frame_cache.add(
+        camera=f"{hand}_wrist",
+        rgb=np.zeros((5, 5, 3), dtype=np.uint8),
+        depth_m=np.ones((5, 5), dtype=np.float32),
+        intrinsics=intrinsics,
+        camera_to_world=np.eye(4),
+        step_index=1,
+        frame_id=f"{hand}-wrist-1",
+    )
+
+
+def test_jog_wrist_is_unavailable_before_real_visual_probe():
+    backend = _FakeBackend()
+    executor, env = _executor(backend)
+    _add_wrist_frame(executor, "left")
+
+    result = executor.jog_wrist("left", "rotate_left", timeout_s=10.0)
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "wrist_calibration_unavailable"
+    assert result["metrics"]["env_actions_sent"] == 0
+    assert env.calls == []
+
+
+@pytest.mark.parametrize(("hand", "sign"), [("left", 1.0), ("right", -1.0)])
+def test_jog_wrist_uses_independent_verified_visual_sign_and_holds_position(
+    hand,
+    sign,
+):
+    class CalibratedBackend(_FakeBackend):
+        @staticmethod
+        def wrist_visual_rotation_capability(selected_hand):
+            return {
+                "verified": True,
+                "hand": selected_hand,
+                "clockwise_angle_sign": (
+                    1.0 if selected_hand == "left" else -1.0
+                ),
+                "probe_artifact": f"{selected_hand}-visual-probe.json",
+            }
+
+    backend = CalibratedBackend()
+    start_position = backend.pose.copy()
+    executor, env = _executor(backend)
+    _add_wrist_frame(executor, hand)
+
+    result = executor.jog_wrist(hand, "rotate_left", timeout_s=10.0)
+
+    assert result["primitive_success"] is True
+    assert result["metrics"]["requested_rotation_rad"] == pytest.approx(
+        sign * math.radians(5.0)
+    )
+    assert result["metrics"]["final_position_drift_m"] <= 0.005
+    np.testing.assert_allclose(backend.pose, start_position, atol=1e-9)
+    assert len(env.calls) > 0
+
+
+@pytest.mark.parametrize("hand", ["left", "right"])
+def test_set_gripper_is_formal_latched_primitive_without_retreat(hand):
+    backend = _FakeBackend()
+    executor, env = _executor(backend)
+
+    result = executor.set_gripper(hand, 0.0, timeout_s=10.0)
+
+    assert result["primitive_success"] is True
+    assert result["metrics"]["manual_primitive"] == "set_gripper"
+    assert result["metrics"]["retreat_executed"] is False
+    assert result["metrics"]["network_primitive_calls"] == 1
+    assert env._gripper_latch[hand] == -1.0
+    assert len(env.calls) > 0
+
+
+def test_real_backend_default_artifacts_never_use_repository_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    backend = RealCuroboBackend(None)
+
+    backend._record_base_phase({"phase": "test"})
+
+    assert backend.output_dir != tmp_path
+    assert not (tmp_path / "planner_base_phases.jsonl").exists()
+    assert (backend.output_dir / "planner_base_phases.jsonl").is_file()
 
 
 def test_navigation_execution_emits_base_only_actions_and_preserves_attachments():
@@ -4366,3 +4807,165 @@ def test_uniform_envelope_finishes_only_on_official_success():
         "trace_artifact",
     ):
         assert key in result
+
+
+def _load_base_curobo_probe_module():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "behavior_base_curobo_probe.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "rpent_behavior_base_curobo_probe_test",
+        path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_base_curobo_probe_resolves_public_seed_from_task_spec():
+    probe = _load_base_curobo_probe_module()
+
+    radio, radio_seed = probe._resolve_probe_identity("turning_on_radio", 211)
+    trash, trash_seed = probe._resolve_probe_identity("picking_up_trash", 108)
+
+    assert radio.task_index == 0
+    assert radio_seed == 6
+    assert radio.tag(radio_seed) == "turning_on_radio_s6"
+    assert trash.task_index == 1
+    assert trash_seed == 10
+    with pytest.raises(ValueError, match="not a mapped public instance"):
+        probe._resolve_probe_identity("turning_on_radio", 999_999)
+
+
+def _probe_test_args(tmp_path):
+    return SimpleNamespace(
+        activity_instance_dir=str(
+            tmp_path / "house_double_floor_lower_task_turning_on_radio_instances"
+        ),
+        output_dir=str(tmp_path / "probe"),
+        task_name="turning_on_radio",
+        seed=0,
+        activity_instance_id=211,
+        compatible_only=False,
+        execute_sim_jogs=False,
+        probe_arm_candidates=False,
+    )
+
+
+def test_base_curobo_probe_config_failure_writes_structured_report(
+    tmp_path,
+    monkeypatch,
+):
+    probe = _load_base_curobo_probe_module()
+
+    monkeypatch.setattr(probe, "_args", lambda: _probe_test_args(tmp_path))
+
+    def fail_config(_args):
+        raise FileNotFoundError("synthetic config failure")
+
+    monkeypatch.setattr(probe, "_load_env_config", fail_config)
+    with pytest.raises(FileNotFoundError, match="synthetic config failure"):
+        probe.main()
+
+    output_dir = tmp_path / "probe"
+    report = json.loads((output_dir / "base_curobo_probe.json").read_text())
+    events = [
+        json.loads(line)
+        for line in (
+            output_dir / "base_curobo_probe.events.jsonl"
+        ).read_text().splitlines()
+    ]
+    assert report["status"] == "failed"
+    assert report["failed_stage"] == "load_env_config"
+    assert report["configuration"]["public_seed"] == 6
+    assert report["configuration"]["attempt_index"] == 1
+    assert report["configuration"]["seed"] == 0
+    failure_event = next(
+        event for event in events if event["event"] == "probe_failed"
+    )
+    assert failure_event["stage"] == "load_env_config"
+    assert events[-1]["event"] == "probe_lifecycle_sealed"
+
+
+def test_base_curobo_probe_facade_failure_preserves_complete_identity(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    probe = _load_base_curobo_probe_module()
+
+    args = _probe_test_args(tmp_path)
+    captured = {}
+    monkeypatch.setattr(probe, "_args", lambda: args)
+    monkeypatch.setattr(probe, "_load_env_config", lambda _args: object())
+
+    def fail_facade(*, cfg, meta, output_dir):
+        captured.update(cfg=cfg, meta=meta, output_dir=output_dir)
+        raise RuntimeError("synthetic facade failure")
+
+    monkeypatch.setattr(probe, "BehaviorEnvFacade", fail_facade)
+    with pytest.raises(RuntimeError, match="synthetic facade failure"):
+        probe.main()
+
+    report = json.loads(
+        (tmp_path / "probe" / "base_curobo_probe.json").read_text()
+    )
+    assert captured["meta"]["public_seed"] == 6
+    assert captured["meta"]["attempt_index"] == 1
+    assert captured["meta"]["activity_instance_id"] == 211
+    assert report["failed_stage"] == "construct_facade"
+    stderr = capsys.readouterr().err
+    assert '"event": "probe_failed"' in stderr
+    assert '"stage": "construct_facade"' in stderr
+
+
+def test_base_curobo_probe_failure_uses_shutdown_not_gripper_close(
+    tmp_path,
+    monkeypatch,
+):
+    probe = _load_base_curobo_probe_module()
+    args = _probe_test_args(tmp_path)
+    calls = {"shutdown": 0, "close": 0, "flush": 0}
+
+    class Facade:
+        _env_steps = 17
+
+        def reset(self):
+            raise RuntimeError("synthetic reset failure")
+
+        def shutdown(self):
+            calls["shutdown"] += 1
+
+        def close(self, *, hand, visual_hand_check):
+            del hand, visual_hand_check
+            calls["close"] += 1
+            raise AssertionError("gripper close must never be lifecycle cleanup")
+
+    facade = Facade()
+    monkeypatch.setattr(probe, "_args", lambda: args)
+    monkeypatch.setattr(probe, "_load_env_config", lambda _args: object())
+    monkeypatch.setattr(
+        probe,
+        "BehaviorEnvFacade",
+        lambda **_kwargs: facade,
+    )
+    monkeypatch.setattr(
+        probe,
+        "_flush_shutdown_artifacts",
+        lambda _output_dir: calls.__setitem__("flush", calls["flush"] + 1),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic reset failure"):
+        probe.main()
+
+    report = json.loads(
+        (tmp_path / "probe" / "base_curobo_probe.json").read_text()
+    )
+    assert calls == {"shutdown": 1, "close": 0, "flush": 1}
+    assert report["cleanup"]["method"] == "BehaviorEnvFacade.shutdown"
+    assert report["cleanup"]["gripper_close_called"] is False
+    assert report["cleanup"]["env_step_delta"] == 0
+    assert report["cleanup"]["artifacts_flushed"] is True

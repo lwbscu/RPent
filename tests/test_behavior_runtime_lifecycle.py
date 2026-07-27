@@ -823,7 +823,8 @@ def test_non_pi0_success_still_freezes_immediately(tmp_path):
 def test_env_client_kwargs_dispatch_through_real_server_signatures():
     facade = _runtime()
     facade._meta = {}
-    facade._run_nonce = "run"
+    run_nonce = "1" * 32
+    facade._run_nonce = run_nonce
     facade._physical_gripper_opening = lambda hand: 0.0
     facade._gripper_latch = {"left": -1.0, "right": -1.0}
     facade._attachment_runtime_facts = lambda: {
@@ -863,7 +864,7 @@ def test_env_client_kwargs_dispatch_through_real_server_signatures():
     )
     facade._planner = planner
     facade._projection_receipts["projection-current"] = {
-        "run_nonce": "run",
+        "run_nonce": run_nonce,
         "attempt_nonce": "attempt",
         "env_step": 0,
         "projection_id": "projection-current",

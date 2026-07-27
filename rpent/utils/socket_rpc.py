@@ -8,6 +8,7 @@ frames (length-prefixed, one frame per request/response).
 Both processes are spawned by the same user on the same host, so we use
 pickle rather than a more defensive codec.
 """
+
 from __future__ import annotations
 
 import pickle
@@ -18,7 +19,6 @@ import threading
 import uuid
 from collections.abc import Callable
 from typing import Any
-
 
 DEFAULT_CONNECT_TIMEOUT_S = 10.0
 DEFAULT_REQUEST_TIMEOUT_S = 30.0
@@ -129,6 +129,7 @@ class _RequestHandler(socketserver.StreamRequestHandler):
             response: dict = {"id": req_id, "ok": True, "result": result}
         except Exception as exc:
             import traceback as _tb
+
             response = {
                 "id": req_id,
                 "ok": False,
@@ -136,9 +137,28 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 "traceback": _tb.format_exc(),
             }
         try:
+            # Validate the complete success envelope before touching the socket.
+            # A handler can return an object whose result cannot be pickled; in
+            # that case the peer still needs a structured RPC error instead of
+            # an unexplained mid-frame disconnect.
+            pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as exc:
+            import traceback as _tb
+
+            response = {
+                "id": req_id,
+                "ok": False,
+                "error": (
+                    f"response serialization failed: {type(exc).__name__}: {exc}"
+                ),
+                "traceback": _tb.format_exc(),
+            }
+        try:
             _write_frame(self.wfile, response)
         except Exception:
-            pass
+            # A socket/write failure cannot be reported on the failed transport.
+            # Serialization failures have already been converted above.
+            return
 
 
 class SocketRpcServer(socketserver.ThreadingTCPServer):

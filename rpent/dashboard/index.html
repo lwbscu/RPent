@@ -110,9 +110,21 @@
   #transcript.alltools .tg-head { pointer-events: none; }
   .tg-body .ev { margin-bottom: 5px; }
 
-  /* frame */
-  .framewrap { background: #e3dccd; display: flex; align-items: center; justify-content: center;
-    border-bottom: 1px solid var(--border); position: relative; min-height: 200px; }
+  /* frame + compact BEHAVIOR manual controls */
+  .framewrap {
+    background: #e3dccd; border-bottom: 1px solid var(--border);
+    position: relative; min-height: 200px; display: grid;
+    grid-template-columns: minmax(168px, .52fr) minmax(260px, 1fr) minmax(168px, .5fr);
+    overflow: hidden;
+  }
+  .framewrap:not(.behavior-mode),
+  .framewrap.controls-collapsed { grid-template-columns: 1fr; }
+  .frame-stage {
+    grid-column: 2; position: relative; min-width: 0; min-height: 0;
+    background: #e3dccd; overflow: hidden;
+  }
+  .framewrap:not(.behavior-mode) .frame-stage,
+  .framewrap.controls-collapsed .frame-stage { grid-column: 1; }
   .frame-media {
     position: absolute; inset: 0; margin: auto; max-width: 100%; max-height: 100%;
     object-fit: contain; display: block;
@@ -128,8 +140,165 @@
     border-radius: 6px; padding: 5px 12px; font-size: 13px; cursor: pointer;
   }
   .frame-tabs button.active { color: var(--fg); border-color: var(--accent); background: var(--panel); }
+  .behavior-frame-tabs { display: none; z-index: 5; top: 4px; right: 2px; gap: 7.5px; }
+  .behavior-frame-tabs button {
+    height: 23px; padding: 3px 8px; font-size: 12px;
+  }
+  .behavior-frame-tabs button[data-camera="head"] { width: 48px; }
+  .behavior-frame-tabs button[data-camera="left_wrist"] { width: 63px; }
+  .behavior-frame-tabs button[data-camera="right_wrist"] { width: 70px; }
+  .framewrap.behavior-mode .legacy-frame-tabs { display: none; }
+  .framewrap.behavior-mode .behavior-frame-tabs { display: flex; }
   .frame-cap { position: absolute; bottom: 8px; left: 10px; font-size: 13px; color: #f6f1e8;
-    background: rgba(74,60,46,.72); padding: 3px 9px; border-radius: 4px; z-index: 2; }
+    background: rgba(74,60,46,.72); padding: 3px 9px; border-radius: 4px; z-index: 6; }
+
+  .control-rail {
+    position: relative; z-index: 3; min-width: 0; padding: 8px 9px 7px;
+    background:
+      radial-gradient(circle at 45% 20%, rgba(255,255,255,.52), transparent 42%),
+      rgba(246,241,232,.96);
+    color: var(--fg); font-size: 12px; line-height: 1.15;
+    display: none; flex-direction: column; align-items: center;
+  }
+  .framewrap.behavior-mode:not(.controls-collapsed) .control-rail { display: flex; }
+  .control-left { grid-column: 1; border-right: 1px solid rgba(216,207,190,.65); }
+  .control-right { grid-column: 3; border-left: 1px solid rgba(216,207,190,.65); }
+  .controls-toggle {
+    width: min(162px, 100%); height: 27px; flex: 0 0 27px; margin: 0 0 12px;
+    display: inline-flex; align-items: center; justify-content: space-between;
+    padding: 0 10px; border: 1px solid #c9bfad; border-radius: 5px;
+    background: rgba(255,253,248,.92); color: #766e61; font: inherit;
+    box-shadow: 0 1px 2px rgba(73,61,48,.13); cursor: pointer;
+  }
+  .controls-toggle:hover { background: #f1eadf; border-color: #b8ad9a; }
+  .controls-toggle:active { transform: translateY(1px); background: #e6ddd0; }
+  .controls-toggle .chevron { font-size: 13px; line-height: 1; transition: transform .12s ease; }
+  .controls-toggle[aria-expanded="false"] .chevron { transform: rotate(180deg); }
+  .collapsed-toggle {
+    display: none; position: absolute; top: 8px; left: 9px; z-index: 5;
+    width: 162px; margin: 0;
+  }
+  .framewrap.behavior-mode.controls-collapsed .collapsed-toggle { display: inline-flex; }
+  .target-row { display: flex; gap: 8px; justify-content: center; width: 100%; min-height: 26px; }
+  .target-button {
+    box-sizing: border-box; width: 76px; height: 26px; flex: 0 0 76px;
+    margin: 0; padding: 0 7px; color: #655f55; background: #f7f3eb;
+    border: 1px solid #bdb4a5; border-radius: 5px;
+    font: 12px/24px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    white-space: nowrap; box-shadow: 0 2px 3px rgba(67,56,43,.22);
+    cursor: pointer;
+  }
+  .target-button:hover { background: #ede6da; border-color: #a99e8c; }
+  .target-button:active, .target-button.pressed {
+    transform: translateY(1px); background: #ddd3c4; box-shadow: 0 1px 1px rgba(67,56,43,.18);
+  }
+  .target-button.selected {
+    color: #31567d; border-color: #8ba5bd; background: #e6edf2;
+    box-shadow: 0 2px 3px rgba(67,56,43,.22);
+  }
+  .control-left .target-row { margin-bottom: 25px; }
+  .control-left .controls-toggle { left: -2px; position: relative; }
+  .control-left .target-row { transform: translateX(-4.5px); }
+  .control-right .target-row {
+    gap: 9px; margin-top: 61px; margin-bottom: 36px; transform: translateX(5px);
+  }
+  .control-section { width: 100%; display: flex; flex-direction: column; align-items: center; }
+  .dpad-wrap { position: relative; width: 152px; height: 151px; margin-top: 0; }
+  .dpad {
+    position: absolute; left: 21.58px; top: 26px; width: 96px; height: 96px;
+  }
+  .dpad::before, .dpad::after {
+    content: ""; position: absolute; background: #e9e2d6; border: 1px solid #bdb3a2;
+    box-shadow: 0 2px 3px rgba(67,56,43,.2);
+  }
+  .dpad::before { left: 32px; top: 0; width: 32px; height: 96px; border-radius: 7px; }
+  .dpad::after { left: 0; top: 32px; width: 96px; height: 32px; border-radius: 7px; }
+  .control-button {
+    position: relative; z-index: 2; margin: 0; padding: 0;
+    color: #756d60; background: linear-gradient(#fffdf8, #e9e1d5);
+    border: 1px solid #bcb2a1; box-shadow: 0 2px 3px rgba(67,56,43,.2);
+    cursor: pointer; user-select: none; touch-action: none;
+    font: 600 19px/1 -apple-system, "Segoe UI Symbol", "Segoe UI", sans-serif;
+  }
+  .control-button:hover:not([aria-disabled="true"]) {
+    color: #554e45; border-color: #9f9481; background: linear-gradient(#f8f3eb, #ddd3c4);
+  }
+  .control-button:active:not([aria-disabled="true"]),
+  .control-button.pressed {
+    color: #433d35; background: #d3c8b8; transform: translateY(1px);
+    box-shadow: inset 0 1px 2px rgba(67,56,43,.2);
+  }
+  .control-button[aria-disabled="true"] {
+    color: #b5ac9e; background: #eee9e0; border-color: #d3cabd;
+    box-shadow: none; cursor: not-allowed;
+  }
+  .control-button.error, .target-button.error {
+    border-color: var(--red); box-shadow: 0 0 0 1px rgba(200,57,47,.18);
+  }
+  .control-button::after, .target-button::after {
+    content: attr(data-tooltip); position: absolute; left: 50%; bottom: calc(100% + 7px);
+    transform: translateX(-50%); width: max-content; max-width: 230px;
+    padding: 5px 7px; color: #fffdf8; background: rgba(59,57,52,.94);
+    border-radius: 4px; font: 11px/1.3 -apple-system, "Segoe UI", sans-serif;
+    white-space: normal; text-align: left; pointer-events: none;
+    opacity: 0; visibility: hidden; transition: opacity .1s; z-index: 20;
+  }
+  .control-button:hover::after, .control-button:focus-visible::after,
+  .target-button:hover::after, .target-button:focus-visible::after {
+    opacity: 1; visibility: visible;
+  }
+  .control-right .control-button::after, .control-right .target-button::after {
+    left: auto; right: 0; transform: none;
+  }
+  .control-left .control-button::after, .control-left .target-button::after {
+    left: 0; transform: none;
+  }
+  .dpad .control-button {
+    position: absolute; width: 32px; height: 32px; border: 0; background: transparent;
+    box-shadow: none; border-radius: 5px; font-size: 13px;
+  }
+  .dpad .control-button:hover:not([aria-disabled="true"]) { background: rgba(184,173,155,.27); }
+  .dpad .control-button.pressed { background: rgba(132,119,101,.28); transform: translateY(1px); }
+  .dpad-up { left: 32px; top: 0; }
+  .dpad-down { left: 32px; bottom: 0; }
+  .dpad-left { left: 0; top: 32px; }
+  .dpad-right { right: 0; top: 32px; }
+  .dpad-label { position: absolute; color: #4f4a42; font-size: 12px; line-height: 1.05; text-align: center; }
+  .label-forward { top: 0; left: 47px; width: 58px; }
+  .label-backward { bottom: 0; left: 43px; width: 66px; }
+  .label-left { left: -12px; top: 61px; width: 25px; }
+  .label-right { right: -5px; top: 61px; width: 31px; }
+  .round-button {
+    width: 39px; height: 39px; border-radius: 50%; flex: 0 0 39px;
+  }
+  .observe-wrap {
+    margin-top: 16px; display: flex; flex-direction: column; align-items: center;
+    gap: 5px; transform: translateX(-7px);
+  }
+  .observe-wrap .round-button { font-size: 18px; }
+  .button-caption { color: #4f4a42; font-size: 12px; line-height: 1.1; text-align: center; }
+  .function-grid {
+    display: grid; grid-template-columns: 64px 64px; column-gap: 16px; row-gap: 29px;
+    align-items: start; justify-content: center; transform: translateX(6px);
+  }
+  .function-key { display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 64px; }
+  .function-key .round-button { font-size: 22px; }
+  .function-key.gripper .round-button { font-size: 17px; }
+  .control-status {
+    min-height: 13px; margin-top: auto; padding-top: 7px; color: var(--muted);
+    font-size: 10px; line-height: 1; text-transform: capitalize;
+  }
+  .control-status.error { color: var(--red); }
+  .col.right > .col .panel-title { padding: 7px 14px; }
+  @media (max-width: 820px) {
+    .framewrap {
+      grid-template-columns: minmax(150px, .48fr) minmax(230px, 1fr) minmax(150px, .47fr);
+    }
+    .control-rail { padding-left: 5px; padding-right: 5px; }
+    .controls-toggle { width: 145px; }
+    .control-right .target-row { gap: 4px; }
+    .function-grid { column-gap: 9px; }
+  }
 
   /* timeline */
   #timeline { overflow-y: auto; padding: 6px 0; }
@@ -301,20 +470,109 @@
     <div class="gutter gutter-v" id="gutterV" title="拖动调整左右宽度"></div>
 
     <div class="col right">
-      <div class="framewrap">
-        <div class="frame-tabs">
-          <button data-kind="agent" class="active">realtime-Pi0 view</button>
-          <button data-kind="camera">realtime-camera</button>
+      <div class="framewrap" id="framewrap">
+        <button class="controls-toggle collapsed-toggle" type="button" aria-expanded="false"
+                aria-controls="interactiveControls" title="Show or hide manual robot controls.">
+          <span>Interactive Controls</span><span class="chevron" aria-hidden="true">⌃</span>
+        </button>
+        <div class="frame-tabs behavior-frame-tabs" aria-label="Camera view">
+          <button data-kind="head" data-camera="head" class="active">head</button>
+          <button data-kind="left_wrist" data-camera="left_wrist">left wrist</button>
+          <button data-kind="right_wrist" data-camera="right_wrist">right wrist</button>
         </div>
-        <img class="frame-media" id="frame-a" alt="" />
-        <img class="frame-media" id="frame-b" alt="" />
-        <video class="frame-media" id="video-a" controls playsinline></video>
-        <video class="frame-media" id="video-b" controls playsinline></video>
+        <section class="control-rail control-left" id="interactiveControls"
+                 aria-label="Interactive robot controls">
+          <button class="controls-toggle" type="button" aria-expanded="true"
+                  aria-controls="interactiveControls" title="Show or hide manual robot controls.">
+            <span>Interactive Controls</span><span class="chevron" aria-hidden="true">⌃</span>
+          </button>
+          <div class="target-row">
+            <button class="target-button selected" type="button" data-target="chassis"
+                    aria-pressed="true">Chassis</button>
+          </div>
+          <div class="control-section">
+            <div class="dpad-wrap">
+              <span class="dpad-label label-forward">Forward</span>
+              <span class="dpad-label label-left">Turn<br>left</span>
+              <span class="dpad-label label-right">Turn<br>right</span>
+              <span class="dpad-label label-backward">Backward</span>
+              <div class="dpad" aria-label="Directional controls">
+                <button class="control-button dpad-up" type="button" data-action="forward"
+                        data-repeat="true" aria-label="Forward">▲</button>
+                <button class="control-button dpad-left" type="button" data-action="turn_left"
+                        data-repeat="true" aria-label="Turn left">◀</button>
+                <button class="control-button dpad-right" type="button" data-action="turn_right"
+                        data-repeat="true" aria-label="Turn right">▶</button>
+                <button class="control-button dpad-down" type="button" data-action="backward"
+                        data-repeat="true" aria-label="Backward">▼</button>
+              </div>
+            </div>
+            <div class="observe-wrap">
+              <button class="control-button round-button" type="button" data-action="observe"
+                      data-repeat="false" aria-label="Observe">◉</button>
+              <span class="button-caption">Observe</span>
+            </div>
+          </div>
+          <span class="control-status" aria-live="polite"></span>
+        </section>
+        <div class="frame-stage">
+          <div class="frame-tabs legacy-frame-tabs">
+            <button data-kind="agent" class="active">realtime-Pi0 view</button>
+            <button data-kind="camera">realtime-camera</button>
+          </div>
+          <img class="frame-media" id="frame-a" alt="" />
+          <img class="frame-media" id="frame-b" alt="" />
+          <video class="frame-media" id="video-a" controls playsinline></video>
+          <video class="frame-media" id="video-b" controls playsinline></video>
+        </div>
         <div class="frame-cap" id="frameCap">waiting for first frame…</div>
+        <section class="control-rail control-right" aria-label="Arm and body controls">
+          <div class="target-row">
+            <button class="target-button" type="button" data-target="left_arm"
+                    aria-pressed="false">Left arm</button>
+            <button class="target-button" type="button" data-target="right_arm"
+                    aria-pressed="false">Right arm</button>
+          </div>
+          <div class="function-grid">
+            <div class="function-key">
+              <button class="control-button round-button" type="button" data-action="up"
+                      data-repeat="true" aria-label="Up">↑</button>
+              <span class="button-caption">Up</span>
+            </div>
+            <div class="function-key">
+              <button class="control-button round-button" type="button" data-action="down"
+                      data-repeat="true" aria-label="Down">↓</button>
+              <span class="button-caption">Down</span>
+            </div>
+            <div class="function-key">
+              <button class="control-button round-button" type="button" data-action="rotate_left"
+                      data-repeat="true" aria-label="Rotate left">↻</button>
+              <span class="button-caption">Rotate left</span>
+            </div>
+            <div class="function-key">
+              <button class="control-button round-button" type="button" data-action="rotate_right"
+                      data-repeat="true" aria-label="Rotate right">↺</button>
+              <span class="button-caption">Rotate right</span>
+            </div>
+            <div class="function-key gripper">
+              <button class="control-button round-button" type="button" data-action="open"
+                      data-repeat="false" aria-label="Open">↱</button>
+              <span class="button-caption">Open</span>
+            </div>
+            <div class="function-key gripper">
+              <button class="control-button round-button" type="button" data-action="close"
+                      data-repeat="false" aria-label="Close">↲</button>
+              <span class="button-caption">Close</span>
+            </div>
+          </div>
+          <span class="control-status" aria-hidden="true"></span>
+        </section>
       </div>
       <div class="gutter gutter-h" id="gutterH" title="拖动调整画面高度"></div>
       <div class="col" style="min-height:0">
-        <div class="panel-title">Action timeline <span class="count" id="stepCount"></span></div>
+        <div class="panel-title">Action timeline <span class="count" id="stepCount"></span>
+          <span id="toolContractMeta"></span>
+        </div>
         <div id="timeline"><div class="empty">No actions yet.</div></div>
       </div>
     </div>
@@ -331,7 +589,36 @@ let autoActionPrimed = false;
 let autoActionPlayback = null;
 let autoActionReturnTimer = null;
 let stepTransitioning = false;  // suppress realtime frames during step transition
+let controlsExpanded = true;
+let selectedTarget = "chassis";
+let selectedCamera = "head";
+let pressedAction = null;
+let activeLeaseId = null;
+let controlStatus = "idle";
+let behaviorControlsEnabled = false;
+let controlSnapshot = { available: false, busy: false, owner: null, phase: "idle" };
+let controlSequence = 0;
+let activeControlButton = null;
+let activePointerId = null;
+let repeatArmed = false;
+let repeatTimer = null;
+let heartbeatTimer = null;
+let controlLoopGeneration = 0;
+let lastCommandSubmittedAt = 0;
+let controlErrorTimer = null;
+let controlCommandInFlight = false;
+let controlPollAbort = null;
 const AUTO_ACTION_RETURN_DELAY_MS = 300;
+const CONTROL_HOLD_DELAY_MS = 320;
+const CONTROL_REPEAT_MIN_MS = 220;
+const CONTROL_HEARTBEAT_MS = 400;
+const CONTROL_POLL_MS = 100;
+const CONTROL_COMMAND_TIMEOUT_MS = 245000;
+const PHYSICAL_CAMERAS = new Set(["head", "left_wrist", "right_wrist"]);
+const REPEATABLE_ACTIONS = new Set([
+  "forward", "backward", "turn_left", "turn_right",
+  "up", "down", "rotate_left", "rotate_right",
+]);
 const MODEL_PRESETS = {
   api: [
     "",
@@ -561,6 +848,517 @@ function resetAllMedia() {
   activeVideo = null;
 }
 
+// --- BEHAVIOR interactive controls ---------------------------------------
+// The browser sends semantic actions only. Distances, angles, poses and
+// gripper openings remain server-owned safety constants.
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function isRealtimeFrameKind(kind) {
+  return kind === "agent" || kind === "camera" || PHYSICAL_CAMERAS.has(kind);
+}
+
+function makeLeaseId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `manual-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function isBehaviorRun(meta) {
+  const identity = `${meta?.suite || ""} ${meta?.name || ""}`.toLowerCase();
+  return identity.includes("behavior") || identity.includes("omnigibson");
+}
+
+function controlTooltip(action) {
+  if (action === "observe") return "Refresh the currently selected camera view.";
+  if (action === "open") return "Open the selected gripper and keep it open.";
+  if (action === "close") return "Close the selected gripper and maintain gripping pressure.";
+  if (selectedTarget === "chassis") {
+    const tips = {
+      forward: "Move the chassis forward by 5 cm. Hold to continue.",
+      backward: "Move the chassis backward by 5 cm. Hold to continue.",
+      turn_left: "Rotate the chassis left by 5°. Hold to continue.",
+      turn_right: "Rotate the chassis right by 5°. Hold to continue.",
+      up: "Raise the R1Pro body by 3 cm. Hold to continue.",
+      down: "Lower the R1Pro body by 3 cm. Hold to continue.",
+    };
+    return tips[action] || "Available for arm control only.";
+  }
+  const hand = selectedTarget === "left_arm" ? "left" : "right";
+  const tips = {
+    forward: `Move the ${hand} hand forward by 3 cm. Hold to continue.`,
+    backward: `Move the ${hand} hand backward by 3 cm. Hold to continue.`,
+    turn_left: `Move the ${hand} hand 3 cm to the robot’s left. Hold to continue.`,
+    turn_right: `Move the ${hand} hand 3 cm to the robot’s right. Hold to continue.`,
+    up: `Move the ${hand} hand up by 3 cm. Hold to continue.`,
+    down: `Move the ${hand} hand down by 3 cm. Hold to continue.`,
+    rotate_left: "Rotate the selected wrist 5° clockwise. Hold to continue.",
+    rotate_right: "Rotate the selected wrist 5° counterclockwise. Hold to continue.",
+  };
+  return tips[action] || "";
+}
+
+function actionCapability(action) {
+  if (action === "observe") return { available: true, reason: "" };
+  const capabilities = controlSnapshot.capabilities;
+  if (!capabilities || typeof capabilities !== "object") {
+    return {
+      available: false,
+      reason: "Control unavailable until its safety capability is verified.",
+    };
+  }
+  if (selectedTarget === "chassis") {
+    if (["forward", "backward", "turn_left", "turn_right"].includes(action)) {
+      return {
+        available: capabilities.base_available === true,
+        reason: "Base control unavailable.",
+      };
+    }
+    if (["up", "down"].includes(action)) {
+      return {
+        available: capabilities.torso_available === true,
+        reason: "Torso control unsupported.",
+      };
+    }
+    return { available: false, reason: "Available for arm control only." };
+  }
+  const hand = selectedTarget === "left_arm" ? "left" : "right";
+  if (["forward", "backward", "turn_left", "turn_right", "up", "down"].includes(action)) {
+    return {
+      available: capabilities.eef_available?.[hand] === true,
+      reason: `The ${hand} arm control capability is unavailable.`,
+    };
+  }
+  if (["rotate_left", "rotate_right"].includes(action)) {
+    return {
+      available: capabilities.wrist_rotation_available?.[hand] === true,
+      reason: `The ${hand} wrist rotation capability is unavailable.`,
+    };
+  }
+  if (["open", "close"].includes(action)) {
+    return {
+      available: capabilities.gripper_available?.[hand] === true,
+      reason: `The ${hand} gripper control capability is unavailable.`,
+    };
+  }
+  return { available: false, reason: "Control capability unavailable." };
+}
+
+function setBehaviorControlMode(enabled) {
+  behaviorControlsEnabled = !!enabled;
+  const wrap = $("#framewrap");
+  wrap.classList.toggle("behavior-mode", behaviorControlsEnabled);
+  wrap.classList.toggle("controls-collapsed", behaviorControlsEnabled && !controlsExpanded);
+  if (!behaviorControlsEnabled) {
+    controlSnapshot = { available: false, busy: false, owner: null, phase: "idle" };
+    controlStatus = "idle";
+  }
+  renderControlUI();
+}
+
+function renderControlUI() {
+  const wrap = $("#framewrap");
+  wrap.classList.toggle("controls-collapsed", behaviorControlsEnabled && !controlsExpanded);
+  document.querySelectorAll(".controls-toggle").forEach(button => {
+    button.setAttribute("aria-expanded", String(controlsExpanded));
+  });
+  document.querySelectorAll(".target-button").forEach(button => {
+    const selected = button.dataset.target === selectedTarget;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+    button.dataset.tooltip = button.dataset.error || `Control the ${button.textContent.trim().toLowerCase()}.`;
+  });
+
+  const locallyBusy = controlCommandInFlight ||
+    ["planning", "moving", "stopping"].includes(controlStatus);
+  const backendBusy = !!controlSnapshot.busy;
+  const busy = locallyBusy || backendBusy;
+  const available = behaviorControlsEnabled && controlSnapshot.available !== false;
+  const motionAvailable = available &&
+    (controlSnapshot.motion_available ?? controlSnapshot.available) === true;
+  document.querySelectorAll(".control-button").forEach(button => {
+    const action = button.dataset.action;
+    const armOnly = selectedTarget === "chassis" &&
+      ["rotate_left", "rotate_right", "open", "close"].includes(action);
+    const capability = actionCapability(action);
+    const observeAvailable = available &&
+      (controlSnapshot.observe_available ?? controlSnapshot.available) === true;
+    const capabilityAvailable = action === "observe"
+      ? observeAvailable
+      : motionAvailable && capability.available;
+    const isCurrent = button === activeControlButton && pressedAction === action;
+    const disabled = armOnly || !capabilityAvailable || (busy && !isCurrent);
+    button.setAttribute("aria-disabled", String(disabled));
+    button.dataset.tooltip = button.dataset.error ||
+      (armOnly
+        ? "Available for arm control only."
+        : !capabilityAvailable && action !== "observe"
+          ? capability.reason
+          : controlTooltip(action));
+    button.title = button.dataset.tooltip;
+  });
+  document.querySelectorAll(".target-button").forEach(button => {
+    // Target changes are themselves a stop condition: keep them selectable
+    // while a manual lease is active so the handler can stop first, then
+    // change target. They remain unavailable only when control is unavailable.
+    button.setAttribute("aria-disabled", String(!available));
+  });
+
+  const phase = controlStatus === "idle"
+    ? (controlSnapshot.phase || "idle")
+    : controlStatus;
+  document.querySelectorAll(".control-status").forEach((el, index) => {
+    el.textContent = index === 0 && phase !== "idle" ? phase : "";
+    el.classList.toggle("error", phase === "error" || phase === "failed");
+  });
+}
+
+function showControlError(error, button = activeControlButton) {
+  const message = typeof error === "string"
+    ? error
+    : (error?.detail || error?.error || error?.message || "Manual control failed.");
+  controlStatus = "error";
+  const target = button || activeControlButton;
+  if (target) {
+    target.dataset.error = String(message);
+    target.classList.add("error");
+  }
+  if (controlErrorTimer) clearTimeout(controlErrorTimer);
+  controlErrorTimer = setTimeout(() => {
+    document.querySelectorAll(".control-button.error, .target-button.error").forEach(el => {
+      el.classList.remove("error");
+      delete el.dataset.error;
+    });
+    if (controlStatus === "error") controlStatus = "idle";
+    renderControlUI();
+  }, 2400);
+  renderControlUI();
+}
+
+function applyControlSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return;
+  const next = snapshot.control && typeof snapshot.control === "object"
+    ? snapshot.control : snapshot;
+  controlSnapshot = { ...controlSnapshot, ...next };
+  const phase = next.phase;
+  if (phase === "accepted" || phase === "planning") controlStatus = "planning";
+  else if (phase === "moving") controlStatus = "moving";
+  else if (phase === "stopping") controlStatus = "stopping";
+  else if (phase === "completed" || phase === "cancelled" || phase === "idle") {
+    controlStatus = "idle";
+  } else if (phase === "failed") {
+    showControlError(next.error || "Manual control failed.");
+    return;
+  }
+  renderControlUI();
+}
+
+async function controlRequest(path, body = null, method = "POST", signal = null) {
+  const options = { method, headers: { "Content-Type": "application/json" } };
+  if (body != null) options.body = JSON.stringify(body);
+  if (signal) options.signal = signal;
+  const response = await fetch(path, options);
+  let data = {};
+  try { data = await response.json(); } catch {
+    try { data = { detail: await response.text() }; } catch {}
+  }
+  if (!response.ok) {
+    const error = new Error(data.detail || data.error || `Control request failed (${response.status}).`);
+    error.status = response.status;
+    error.payload = data;
+    throw error;
+  }
+  return data;
+}
+
+async function refreshControlState() {
+  if (!curRun || !behaviorControlsEnabled) return null;
+  try {
+    const data = await controlRequest(
+      `/api/run/control/state?run=${encodeURIComponent(curRun)}`, null, "GET");
+    applyControlSnapshot(data);
+    return data;
+  } catch (error) {
+    controlSnapshot = { ...controlSnapshot, available: false, busy: false };
+    renderControlUI();
+    return null;
+  }
+}
+
+function clearControlTimers() {
+  if (repeatTimer) { clearTimeout(repeatTimer); repeatTimer = null; }
+  if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; }
+}
+
+function scheduleHeartbeat(leaseId, runId) {
+  if (heartbeatTimer) clearTimeout(heartbeatTimer);
+  heartbeatTimer = setTimeout(async () => {
+    if (activeLeaseId !== leaseId || curRun !== runId) return;
+    try {
+      await controlRequest("/api/run/control/heartbeat", {
+        run: runId, lease_id: leaseId,
+      });
+    } catch (error) {
+      showControlError(error);
+      await stopActiveLease("heartbeat_failed");
+      return;
+    }
+    scheduleHeartbeat(leaseId, runId);
+  }, CONTROL_HEARTBEAT_MS);
+}
+
+async function waitForCommand(commandId, runId, generation, signal) {
+  const deadline = performance.now() + CONTROL_COMMAND_TIMEOUT_MS;
+  while (performance.now() < deadline) {
+    if (generation !== controlLoopGeneration || runId !== curRun) {
+      return { phase: "cancelled", stop_reason: "client_stopped" };
+    }
+    const data = await controlRequest(
+      `/api/run/control/state?run=${encodeURIComponent(runId)}`, null, "GET", signal);
+    const state = data.control && typeof data.control === "object" ? data.control : data;
+    applyControlSnapshot(state);
+    // Never attribute a stale/global terminal phase to this command. The
+    // command id is the completion receipt that closes the single-flight
+    // loop; without an exact match, keep waiting.
+    if (
+      state.command_id === commandId &&
+      ["completed", "failed", "cancelled"].includes(state.phase)
+    ) return state;
+    await sleep(CONTROL_POLL_MS);
+  }
+  throw new Error("Manual control command timed out.");
+}
+
+async function submitDiscreteAction(leaseId, runId, action, camera, generation) {
+  controlCommandInFlight = true;
+  controlStatus = "planning";
+  renderControlUI();
+  const sequence = ++controlSequence;
+  lastCommandSubmittedAt = performance.now();
+  try {
+    const accepted = await controlRequest("/api/run/control/command", {
+      run: runId,
+      lease_id: leaseId,
+      sequence,
+      target: selectedTarget,
+      action,
+      camera,
+    });
+    const commandId = accepted.command_id || accepted.control?.command_id;
+    if (!commandId) throw new Error("Control command was accepted without a command ID.");
+    if (generation !== controlLoopGeneration || activeLeaseId !== leaseId) {
+      // Release may race the initial POST. Stop again after acceptance so a
+      // stop that arrived before the server created the lease cannot leave a
+      // live lease behind.
+      try {
+        await controlRequest("/api/run/control/stop", {
+          run: runId, lease_id: leaseId, reason: "released_after_accept",
+        });
+      } catch {}
+      throw new DOMException("Control wait aborted.", "AbortError");
+    }
+    const pollAbort = new AbortController();
+    controlPollAbort = pollAbort;
+    const terminal = ["completed", "failed", "cancelled"].includes(accepted.phase)
+      ? accepted
+      : await waitForCommand(commandId, runId, generation, pollAbort.signal);
+    if (terminal.capture_error || terminal.error) {
+      throw new Error(terminal.capture_error || terminal.error);
+    }
+    if (terminal.phase !== "completed") {
+      throw new Error(terminal.error || terminal.stop_reason || `Control command ${terminal.phase}.`);
+    }
+    return terminal;
+  } finally {
+    controlPollAbort = null;
+    controlCommandInFlight = false;
+    renderControlUI();
+  }
+}
+
+async function runControlLoop(button, leaseId, runId, action, camera, generation) {
+  const repeatable = REPEATABLE_ACTIONS.has(action);
+  try {
+    while (activeLeaseId === leaseId && generation === controlLoopGeneration) {
+      await submitDiscreteAction(leaseId, runId, action, camera, generation);
+      if (!repeatable) break;
+      // A repeat may only be admitted after the hold gate opens. Polling
+      // this local flag does not submit or queue backend work; it only keeps
+      // the single loop dormant until the 320 ms timer has fired.
+      while (
+        activeLeaseId === leaseId && generation === controlLoopGeneration &&
+        pressedAction === action && !repeatArmed
+      ) await sleep(16);
+      if (
+        activeLeaseId !== leaseId || generation !== controlLoopGeneration ||
+        pressedAction !== action || !repeatArmed
+      ) break;
+      const elapsedSinceSubmit = performance.now() - lastCommandSubmittedAt;
+      if (elapsedSinceSubmit < CONTROL_REPEAT_MIN_MS) {
+        await sleep(CONTROL_REPEAT_MIN_MS - elapsedSinceSubmit);
+      }
+    }
+  } catch (error) {
+    if (activeLeaseId === leaseId) {
+      showControlError(error, button);
+      await stopActiveLease("command_failed");
+    }
+  } finally {
+    if (activeLeaseId === leaseId && !repeatable) {
+      clearControlTimers();
+      activeLeaseId = null;
+      controlStatus = "idle";
+    }
+    renderControlUI();
+  }
+}
+
+function beginControlAction(button, pointerId = "keyboard") {
+  const action = button.dataset.action;
+  if (
+    pressedAction || activeLeaseId || !behaviorControlsEnabled ||
+    button.getAttribute("aria-disabled") === "true"
+  ) return;
+  const runId = curRun;
+  if (!runId) return;
+  pressedAction = action;
+  activeControlButton = button;
+  activePointerId = pointerId;
+  repeatArmed = false;
+  button.classList.add("pressed");
+  const leaseId = makeLeaseId();
+  activeLeaseId = leaseId;
+  controlSequence = 0;
+  const generation = ++controlLoopGeneration;
+  const leaseCamera = selectedCamera;
+  scheduleHeartbeat(leaseId, runId);
+  if (REPEATABLE_ACTIONS.has(action)) {
+    repeatTimer = setTimeout(() => {
+      if (activeLeaseId === leaseId && pressedAction === action) repeatArmed = true;
+    }, CONTROL_HOLD_DELAY_MS);
+  }
+  runControlLoop(button, leaseId, runId, action, leaseCamera, generation);
+  renderControlUI();
+}
+
+async function endControlPress(pointerId = activePointerId) {
+  if (activePointerId !== pointerId || !pressedAction) return;
+  const action = pressedAction;
+  const button = activeControlButton;
+  pressedAction = null;
+  activePointerId = null;
+  repeatArmed = false;
+  if (repeatTimer) { clearTimeout(repeatTimer); repeatTimer = null; }
+  if (button) button.classList.remove("pressed");
+  activeControlButton = null;
+  if (REPEATABLE_ACTIONS.has(action)) await stopActiveLease("released");
+  renderControlUI();
+}
+
+async function stopActiveLease(reason = "client_stop") {
+  const leaseId = activeLeaseId;
+  const runId = curRun;
+  clearControlTimers();
+  if (controlPollAbort) {
+    controlPollAbort.abort();
+    controlPollAbort = null;
+  }
+  controlLoopGeneration++;
+  activeLeaseId = null;
+  repeatArmed = false;
+  pressedAction = null;
+  activePointerId = null;
+  if (activeControlButton) activeControlButton.classList.remove("pressed");
+  activeControlButton = null;
+  if (!leaseId || !runId) {
+    controlStatus = "idle";
+    renderControlUI();
+    return;
+  }
+  controlStatus = "stopping";
+  renderControlUI();
+  try {
+    await controlRequest("/api/run/control/stop", {
+      run: runId, lease_id: leaseId, reason,
+    });
+  } catch (error) {
+    // A completed/expired lease is already stopped. Surface other failures.
+    if (![404, 409, 410].includes(error.status)) showControlError(error);
+  } finally {
+    if (controlStatus === "stopping") controlStatus = "idle";
+    renderControlUI();
+  }
+}
+
+async function setControlsExpanded(expanded) {
+  if (!expanded) await stopActiveLease("controls_collapsed");
+  controlsExpanded = !!expanded;
+  renderControlUI();
+}
+
+async function selectControlTarget(target) {
+  if (target === selectedTarget) return;
+  await stopActiveLease("target_changed");
+  selectedTarget = target;
+  renderControlUI();
+}
+
+async function publishSelectedCamera(camera) {
+  if (!curRun || !behaviorControlsEnabled) return;
+  try {
+    await controlRequest("/api/run/control/camera", { run: curRun, camera });
+  } catch (error) {
+    showControlError(error);
+  }
+}
+
+document.querySelectorAll(".controls-toggle").forEach(button => {
+  button.addEventListener("click", () => setControlsExpanded(!controlsExpanded));
+});
+document.querySelectorAll(".target-button").forEach(button => {
+  button.addEventListener("click", () => {
+    if (button.getAttribute("aria-disabled") !== "true") {
+      selectControlTarget(button.dataset.target);
+    }
+  });
+});
+document.querySelectorAll(".control-button").forEach(button => {
+  button.addEventListener("pointerdown", event => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    try { button.setPointerCapture(event.pointerId); } catch {}
+    beginControlAction(button, event.pointerId);
+  });
+  button.addEventListener("pointerup", event => {
+    event.preventDefault();
+    endControlPress(event.pointerId);
+    try { button.releasePointerCapture(event.pointerId); } catch {}
+  });
+  button.addEventListener("pointercancel", event => endControlPress(event.pointerId));
+  button.addEventListener("lostpointercapture", event => endControlPress(event.pointerId));
+  button.addEventListener("keydown", event => {
+    if (![" ", "Enter"].includes(event.key) || event.repeat) return;
+    event.preventDefault();
+    beginControlAction(button, "keyboard");
+  });
+  button.addEventListener("keyup", event => {
+    if (![" ", "Enter"].includes(event.key)) return;
+    event.preventDefault();
+    endControlPress("keyboard");
+  });
+});
+window.addEventListener("blur", () => stopActiveLease("window_blur"));
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopActiveLease("page_hidden");
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    stopActiveLease("escape");
+  }
+});
+renderControlUI();
+
 function fmtArgs(o) {
   if (o == null) return "";
   if (typeof o === "string") return o;
@@ -606,12 +1404,28 @@ function maybeAutoPlayNewAction(tl, nextFrameIdx) {
     s.has_action_video && (Number(s.step) || 0) > autoActionLastStep);
   autoActionLastStep = Math.max(autoActionLastStep, maxTimelineStep(tl));
   const step = candidates[candidates.length - 1];
-  if (!step || !(frameKind === "agent" || frameKind === "camera")) return false;
+  if (!step || !isRealtimeFrameKind(frameKind)) return false;
   return playActionVideo(step, {
     auto: true,
     nextFrameIdx,
     returnKind: frameKind,
   });
+}
+
+function renderToolContractMeta(metadata) {
+  const el = $("#toolContractMeta");
+  const count = Number(metadata?.["public-tool-count"]);
+  const rawVersion = metadata?.["public-tool-contract-version"];
+  const version = rawVersion == null
+    ? ""
+    : String(rawVersion).trim().replace(/^v/i, "");
+  if (
+    !behaviorControlsEnabled || !Number.isInteger(count) || count < 0 || !version
+  ) {
+    el.textContent = "";
+    return;
+  }
+  el.textContent = `${count} primitives · contract v${version}`;
 }
 
 function renderTimeline(tl, hasEpisodeVideo = episodeVideoAvailable) {
@@ -645,7 +1459,7 @@ function renderTimeline(tl, hasEpisodeVideo = episodeVideoAvailable) {
       div.title = "Click to replay this action";
       div.addEventListener("click", () => playActionVideo(s, {
         returnAfterEnd: true,
-        returnKind: "agent",
+        returnKind: lastRealtimeFrameKind,
       }));
     }
     el.appendChild(div);
@@ -756,9 +1570,13 @@ async function refreshTranscript() {
 
 function setFrameKind(kind) {
   cancelAutoActionReturn();
-  if (kind === "agent" || kind === "camera") {
+  if (isRealtimeFrameKind(kind)) {
     lastRealtimeFrameKind = kind;
     autoActionPlayback = null;
+  }
+  if (PHYSICAL_CAMERAS.has(kind)) {
+    selectedCamera = kind;
+    publishSelectedCamera(kind);
   }
   frameKind = kind;
   if (kind !== "actionVideo") actionVideo = null;
@@ -884,7 +1702,9 @@ function refreshFrame(idx, opts = {}) {
   swapMedia({
     kind: "img",
     url,
-    cap: `${frameKind} · frame #${frameIdx}`,
+    cap: PHYSICAL_CAMERAS.has(frameKind)
+      ? `${frameKind} - frame #${frameIdx}`
+      : `${frameKind} · frame #${frameIdx}`,
     source,
   });
 }
@@ -892,25 +1712,48 @@ function refreshFrame(idx, opts = {}) {
 async function refreshMeta(opts = {}) {
   if (!curRun) return;
   const r = await fetch(`/api/run?run=${encodeURIComponent(curRun)}`).then(x => x.json());
+  const behavior = isBehaviorRun(r);
+  if (behavior && !behaviorControlsEnabled) {
+    selectedCamera = "head";
+    frameKind = "head";
+    lastRealtimeFrameKind = "head";
+    frameIdx = -1;
+    document.querySelectorAll(".frame-tabs button").forEach(b =>
+      b.classList.toggle("active", b.dataset.kind === "head"));
+  } else if (!behavior && behaviorControlsEnabled && PHYSICAL_CAMERAS.has(frameKind)) {
+    frameKind = "agent";
+    lastRealtimeFrameKind = "agent";
+    frameIdx = -1;
+    document.querySelectorAll(".frame-tabs button").forEach(b =>
+      b.classList.toggle("active", b.dataset.kind === "agent"));
+  }
+  setBehaviorControlMode(behavior);
+  if (r.control) applyControlSnapshot(r.control);
+  else if (behavior) refreshControlState();
   setBadge(r.state);
   setResult(r.terminated, r.state);
   $("#taskMeta").innerHTML = `<b>${r.suite ?? r.name}</b> · task ${r.task ?? "?"} · seed ${r.seed ?? "?"}`;
   if (r.usage) $("#usageMeta").textContent =
     `token in ${r.usage.in.toLocaleString()} · out ${r.usage.out.toLocaleString()} · ${r.usage.tool_calls} tools`;
   renderTimeline(r.timeline || [], r.has_video);
+  renderToolContractMeta(r.metadata);
   if (opts.primeAutoActionStep) {
     autoActionLastStep = maxTimelineStep(r.timeline || []);
     autoActionPrimed = true;
   }
   const autoStarted = opts.autoPlayNewAction && autoActionPrimed && !autoActionPlayback
-    ? maybeAutoPlayNewAction(r.timeline || [], opts.nextFrameIdx ?? r.frame_idx)
+    ? maybeAutoPlayNewAction(
+        r.timeline || [],
+        opts.nextFrameIdx ?? r.frame_revisions?.[selectedCamera] ?? r.frame_idx)
     : false;
-  if (!r.has_video && frameKind === "video") setFrameKind("agent");
+  if (!r.has_video && frameKind === "video") {
+    setFrameKind(behaviorControlsEnabled ? selectedCamera : "agent");
+  }
   if (
     !autoStarted
     && !autoActionPlayback
-    && (frameKind === "agent" || frameKind === "camera")
-  ) refreshFrame(r.frame_idx);
+    && isRealtimeFrameKind(frameKind)
+  ) refreshFrame(r.frame_revisions?.[selectedCamera] ?? r.frame_idx);
 }
 
 function connectSSE() {
@@ -920,6 +1763,7 @@ function connectSSE() {
     const sig = JSON.parse(e.data);
     setBadge(sig.state);
     setResult(sig.terminated, sig.state);
+    if (sig.control) applyControlSnapshot(sig.control);
     if (sig.usage) $("#usageMeta").textContent =
       `tok in ${sig.usage.in.toLocaleString()} · out ${sig.usage.out.toLocaleString()} · ${sig.usage.tool_calls} tools`;
     $("#connMeta").textContent = "● live";
@@ -942,7 +1786,7 @@ function connectSSE() {
       refreshMeta({
         autoPlayNewAction: autoActionPrimed,
         primeAutoActionStep: !autoActionPrimed,
-        nextFrameIdx: sig.frame_idx,
+        nextFrameIdx: sig.frame_revisions?.[selectedCamera] ?? sig.frame_idx,
       }).finally(() => { stepTransitioning = false; });
       return;
     }
@@ -950,15 +1794,16 @@ function connectSSE() {
     if (
       !autoActionPlayback
       && !stepTransitioning
-      && (frameKind === "agent" || frameKind === "camera")
-      && sig.frame_idx != null
-      && sig.frame_idx !== frameIdx
-    ) refreshFrame(sig.frame_idx);
+      && isRealtimeFrameKind(frameKind)
+      && (sig.frame_revisions?.[selectedCamera] ?? sig.frame_idx) != null
+      && (sig.frame_revisions?.[selectedCamera] ?? sig.frame_idx) !== frameIdx
+    ) refreshFrame(sig.frame_revisions?.[selectedCamera] ?? sig.frame_idx);
   };
   es.onerror = () => { $("#connMeta").textContent = "○ reconnecting…"; };
 }
 
-function selectRun(id) {
+async function selectRun(id) {
+  await stopActiveLease("run_changed");
   cancelAutoActionReturn();
   curRun = id; evShown = 0; frameIdx = -1; connectSSE._steps = -1;
   curToolGroup = null;
@@ -968,6 +1813,10 @@ function selectRun(id) {
   autoActionPrimed = false;
   autoActionPlayback = null;
   stepTransitioning = false;
+  selectedTarget = "chassis";
+  selectedCamera = "head";
+  controlsExpanded = true;
+  setBehaviorControlMode(false);
   resetAllMedia();
   frameKind = "agent"; lastRealtimeFrameKind = "agent";
   document.querySelectorAll(".frame-tabs button").forEach(b =>

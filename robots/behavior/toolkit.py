@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
+import hmac
 import json
 import re
 import shutil
@@ -18,6 +20,7 @@ from robots.behavior.schemas import (
     BEHAVIOR_TOOL_NAMES,
     behavior_tool_specs_for_task,
 )
+from robots.behavior.spec import BEHAVIOR_CONTROL_DRAIN_TIMEOUT_S
 from robots.behavior.task_specs import (
     BehaviorTaskSpec,
     get_task_spec,
@@ -222,6 +225,35 @@ class BehaviorToolkit(Toolkit):
         # BEHAVIOR is a deliberately closed control surface. Generic file and
         # lifecycle tools would bypass the synchronized public observations and
         # the runner-owned attempt lifecycle.
+        primitives_kwargs = dict(primitives_kwargs)
+        self._runtime_resource = primitives_kwargs.pop(
+            "_dashboard_runtime_resource",
+            None,
+        )
+        self._command_arbiter = primitives_kwargs.pop(
+            "_dashboard_command_arbiter",
+            None,
+        )
+        self._success_latch = primitives_kwargs.pop(
+            "_dashboard_success_latch",
+            None,
+        )
+        self._dashboard_motion_allowed = bool(
+            primitives_kwargs.pop("_dashboard_motion_allowed", False)
+        )
+        self._dashboard_observe_allowed = bool(
+            primitives_kwargs.pop("_dashboard_observe_allowed", False)
+        )
+        self._dashboard_control_unavailable_reason = primitives_kwargs.pop(
+            "_dashboard_control_unavailable_reason",
+            None,
+        )
+        self._dashboard_controller = None
+        self._close_lock = threading.RLock()
+        self._manual_intervention_latch = threading.Event()
+        self._closed = False
+        initial_info = primitives_kwargs.get("initial_info")
+        self._shared_success_evidence: dict[str, Any] | None = None
         runtime_video_path = primitives_kwargs.get("video_path")
         if video_path is not None:
             requested_video_path = Path(video_path)
@@ -241,6 +273,13 @@ class BehaviorToolkit(Toolkit):
             **primitives_kwargs,
             progress_callback=self._dashboard_progress,
         )
+        bind_attempt = getattr(self._success_latch, "bind_attempt", None)
+        if callable(bind_attempt):
+            bind_attempt(
+                run_nonce=self._primitives.run_nonce,
+                attempt_nonce=self._primitives.attempt_nonce,
+                attempt_index=int(self._primitives.attempt_index),
+            )
         self._behavior_phase = str(primitives_kwargs.get("behavior_phase", "eval"))
         if self._behavior_phase not in {"explore", "eval"}:
             raise ValueError("behavior_phase must be 'explore' or 'eval'")
@@ -278,6 +317,156 @@ class BehaviorToolkit(Toolkit):
         if tuple(spec["name"] for spec in self.get_tools_spec()) != BEHAVIOR_TOOL_NAMES:
             raise RuntimeError("registered toolkit does not match the frozen API")
         self._tools = MappingProxyType(dict(self._tools))
+        if self._runtime_resource is not None:
+            self._runtime_resource.toolkit = self
+        initial_evidence = {"info": initial_info}
+        if (
+            self._receipt_binding_from_result(initial_evidence) is not None
+            and self._success_latch is not None
+            and self._success_latch.observe(initial_evidence)
+        ):
+            self._shared_success_evidence = self._success_evidence(initial_evidence)
+            self._official_task_success = True
+
+    def activate_dashboard_control(self) -> Any:
+        """Create and bind one manual controller to this toolkit and State."""
+
+        dashboard = self._dashboard
+        bind_state = getattr(dashboard, "bind_controller", None)
+        if not callable(bind_state):
+            return None
+        if self._dashboard_controller is not None:
+            return self._dashboard_controller
+        if self._command_arbiter is None or self._success_latch is None:
+            raise RuntimeError(
+                "Dashboard manual control requires the runtime-owned arbiter "
+                "and raw-success latch"
+            )
+
+        from robots.behavior.dashboard_control import BehaviorDashboardController
+
+        controller = BehaviorDashboardController(
+            state=dashboard,
+            arbiter=self._command_arbiter,
+            success_latch=self._success_latch,
+            motion_available=self._dashboard_motion_allowed,
+            observe_available=self._dashboard_observe_allowed,
+            unavailable_reason=self._dashboard_control_unavailable_reason,
+        )
+        resource = self._runtime_resource
+        try:
+            controller.bind_toolkit(self)
+            bind_state(controller)
+            self._dashboard_controller = controller
+            if resource is not None:
+                resource.attach_dashboard_control(
+                    toolkit=self,
+                    controller=controller,
+                    dashboard_state=dashboard,
+                )
+            controller.activate()
+        except BaseException:
+            unbind = getattr(dashboard, "unbind_controller", None)
+            if callable(unbind):
+                try:
+                    unbind(controller)
+                except BaseException:
+                    pass
+            close = getattr(controller, "close", None)
+            if callable(close):
+                try:
+                    close(timeout_s=0.0)
+                except BaseException:
+                    pass
+            self._dashboard_controller = None
+            if resource is not None and resource.dashboard_controller is controller:
+                resource.dashboard_controller = None
+            raise
+        return controller
+
+    def dashboard_control_capabilities(self) -> dict[str, Any]:
+        """Return a sanitized fail-closed capability snapshot for the UI."""
+
+        capability = self._primitives.dashboard_control_capabilities()
+        if not isinstance(capability, dict):
+            raise RuntimeError("dashboard control capability must be an object")
+        public = dict(capability)
+        simulation_verified = (
+            public.get("simulation_identity") == "behavior_omnigibson_r1pro"
+        )
+        public["motion_available"] = bool(
+            self._dashboard_motion_allowed
+            and public.get("motion_available") is True
+            and simulation_verified
+            and public.get("planner_available") is True
+            and public.get("position_control_ready") is True
+        )
+        public["observe_available"] = bool(
+            self._dashboard_observe_allowed
+            and public.get("observe_available") is True
+            and simulation_verified
+        )
+        if not public["motion_available"] and not public.get(
+            "motion_unavailable_reason"
+        ):
+            public["motion_unavailable_reason"] = (
+                self._dashboard_control_unavailable_reason
+                or "Manual motion capability is unavailable."
+            )
+        if not public["observe_available"] and not public.get(
+            "observe_unavailable_reason"
+        ):
+            public["observe_unavailable_reason"] = (
+                self._dashboard_control_unavailable_reason
+                or "Manual observation capability is unavailable."
+            )
+        if (
+            not public["motion_available"]
+            and not public["observe_available"]
+            and not public.get("unavailable_reason")
+        ):
+            public["unavailable_reason"] = public["motion_unavailable_reason"]
+        return public
+
+    def dashboard_manual_command(
+        self,
+        *,
+        target: str,
+        action: str,
+        camera: str,
+    ) -> dict[str, Any]:
+        """Execute one controller-arbitrated manual primitive."""
+
+        if self._closed:
+            raise RuntimeError("BEHAVIOR toolkit is closed")
+        arbiter = getattr(self, "_command_arbiter", None)
+        snapshot = getattr(arbiter, "snapshot", None)
+        ownership = snapshot() if callable(snapshot) else {}
+        if not isinstance(ownership, dict) or ownership.get("owner") != "manual":
+            raise RuntimeError(
+                "Dashboard manual primitive requires the shared manual permit"
+            )
+        if action != "observe":
+            latch = getattr(self, "_manual_intervention_latch", None)
+            if latch is None:
+                latch = self.__dict__.setdefault(
+                    "_manual_intervention_latch",
+                    threading.Event(),
+                )
+            latch.set()
+        handler = getattr(self._primitives, "dashboard_manual_command", None)
+        if not callable(handler):
+            raise RuntimeError("Dashboard manual primitive is unavailable")
+        result = handler(target=target, action=action, camera=camera)
+        if not isinstance(result, dict):
+            raise RuntimeError("Dashboard manual primitive returned a non-object")
+        receipt_binding = self._receipt_binding_from_result(result)
+        if receipt_binding is not None:
+            latch = self._success_latch
+            if latch is not None and latch.observe(result):
+                self._shared_success_evidence = self._success_evidence(result)
+                self._official_task_success = True
+        return result
 
     def _dashboard_progress(self, name: str, payload: dict[str, Any]) -> None:
         dashboard = self._dashboard
@@ -473,16 +662,28 @@ class BehaviorToolkit(Toolkit):
     def _has_verified_raw_success(self) -> bool:
         """Accept only a nonce-bound runtime raw-success receipt."""
 
+        latch = getattr(self, "_success_latch", None)
+        is_latched = getattr(latch, "is_latched", None)
+        shared_evidence = getattr(self, "_shared_success_evidence", None)
+        shared_success = bool(
+            callable(is_latched)
+            and is_latched()
+            and isinstance(shared_evidence, dict)
+            and self._receipt_binding_from_result(shared_evidence) is not None
+        )
         return bool(
-            self._official_task_success
-            and any(
-                isinstance(record, dict)
-                and isinstance(record.get("result"), dict)
-                and record["result"].get("task_success") is True
-                and record["result"].get("official_success_source")
-                in _OFFICIAL_SUCCESS_SOURCES
-                and self._receipt_binding_from_result(record["result"]) is not None
-                for record in self._tool_trace
+            shared_success
+            or (
+                self._official_task_success
+                and any(
+                    isinstance(record, dict)
+                    and isinstance(record.get("result"), dict)
+                    and record["result"].get("task_success") is True
+                    and record["result"].get("official_success_source")
+                    in _OFFICIAL_SUCCESS_SOURCES
+                    and self._receipt_binding_from_result(record["result"]) is not None
+                    for record in self._tool_trace
+                )
             )
         )
 
@@ -514,6 +715,7 @@ class BehaviorToolkit(Toolkit):
         if not isinstance(receipt, dict):
             return None
         required = {
+            "schema_version",
             "source",
             "run_nonce",
             "attempt_nonce",
@@ -522,23 +724,41 @@ class BehaviorToolkit(Toolkit):
             "raw_done",
             "receipt_sha256",
         }
-        if not required.issubset(receipt):
+        if set(receipt) != required:
             return None
         unsigned = dict(receipt)
         claimed = unsigned.pop("receipt_sha256", None)
-        canonical = json.dumps(
-            unsigned,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-        if claimed != hashlib.sha256(canonical).hexdigest():
+        try:
+            canonical = json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
             return None
+        run_nonce = receipt.get("run_nonce")
+        attempt_nonce = receipt.get("attempt_nonce")
+        attempt_index = receipt.get("attempt_index")
+        env_step = receipt.get("env_step")
         raw_done = receipt.get("raw_done")
         if (
-            receipt.get("source") != 'info["done"]["success"]'
+            type(receipt.get("schema_version")) is not int
+            or receipt["schema_version"] != 1
+            or receipt.get("source") != 'info["done"]["success"]'
             or not isinstance(raw_done, dict)
-            or raw_done.get("success") is not True
+            or type(raw_done.get("success")) is not bool
+            or raw_done["success"] is not True
+            or not isinstance(run_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{32}", run_nonce) is None
+            or not isinstance(attempt_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{32}", attempt_nonce) is None
+            or type(attempt_index) is not int
+            or attempt_index < 1
+            or type(env_step) is not int
+            or env_step < 0
+            or not isinstance(claimed, str)
+            or re.fullmatch(r"[0-9a-f]{64}", claimed) is None
             or receipt.get("attempt_nonce")
             != getattr(self._primitives, "attempt_nonce", None)
             or receipt.get("attempt_index")
@@ -547,11 +767,10 @@ class BehaviorToolkit(Toolkit):
                 getattr(self._primitives, "run_nonce", None) is not None
                 and receipt.get("run_nonce") != self._primitives.run_nonce
             )
-            or not isinstance(receipt.get("run_nonce"), str)
-            or not receipt["run_nonce"]
-            or not isinstance(receipt.get("env_step"), int)
-            or isinstance(receipt.get("env_step"), bool)
-            or receipt["env_step"] < 0
+            or not hmac.compare_digest(
+                claimed,
+                hashlib.sha256(canonical).hexdigest(),
+            )
         ):
             return None
         return {
@@ -561,6 +780,38 @@ class BehaviorToolkit(Toolkit):
             "attempt_index": int(receipt["attempt_index"]),
             "env_step": int(receipt["env_step"]),
             "receipt_sha256": str(receipt["receipt_sha256"]),
+        }
+
+    @staticmethod
+    def _success_evidence(result: dict[str, Any]) -> dict[str, Any]:
+        """Copy only immutable receipt material from one verified result."""
+
+        receipt = result.get("official_success_receipt")
+        if not isinstance(receipt, dict):
+            for info_key in ("info", "last_info"):
+                info = result.get(info_key)
+                runtime = info.get("_rpent") if isinstance(info, dict) else None
+                if isinstance(runtime, dict) and isinstance(
+                    runtime.get("official_success_receipt"), dict
+                ):
+                    receipt = runtime["official_success_receipt"]
+                    break
+                monitor = (
+                    runtime.get("pi0_nav_pick_monitor")
+                    if isinstance(runtime, dict)
+                    else None
+                )
+                if isinstance(monitor, dict) and isinstance(
+                    monitor.get("official_success_receipt"), dict
+                ):
+                    receipt = monitor["official_success_receipt"]
+                    break
+        if not isinstance(receipt, dict):
+            raise RuntimeError("verified success result lost its immutable receipt")
+        return {
+            "task_success": True,
+            "official_success_source": 'info["done"]["success"]',
+            "official_success_receipt": dict(receipt),
         }
 
     @staticmethod
@@ -682,8 +933,14 @@ class BehaviorToolkit(Toolkit):
                 "_execute_tool_lock",
                 threading.Lock(),
             )
-        with execute_tool_lock:
-            return self._execute_tool_locked(name, input_dict)
+        arbiter = getattr(self, "_command_arbiter", None)
+        transaction = getattr(arbiter, "agent_transaction", None)
+        transaction_context = (
+            transaction() if callable(transaction) else contextlib.nullcontext()
+        )
+        with transaction_context:
+            with execute_tool_lock:
+                return self._execute_tool_locked(name, input_dict)
 
     def _execute_tool_locked(self, name: str, input_dict: dict[str, Any]):
         call_started = time.monotonic()
@@ -764,6 +1021,11 @@ class BehaviorToolkit(Toolkit):
                         )
                     else:
                         payload["official_success_receipt_valid"] = True
+                        latch = getattr(self, "_success_latch", None)
+                        if latch is not None and latch.observe(payload):
+                            self._shared_success_evidence = self._success_evidence(
+                                payload
+                            )
                         self._official_task_success = True
                 self._last_tool_result = payload
                 terminal_policy = self._task_spec.terminal_failure_policy
@@ -846,15 +1108,54 @@ class BehaviorToolkit(Toolkit):
         return BehaviorToolResult(name=name, result=payload)
 
     def close(self) -> None:
-        primitives = self._primitives
-        model = getattr(primitives, "model", None)
-        model_close = getattr(model, "close", None)
-        if callable(model_close):
-            model_close()
-        env = getattr(primitives, "env", None)
-        env_close = getattr(env, "close_transport", None)
-        if callable(env_close):
-            env_close()
+        close_lock = getattr(self, "_close_lock", None)
+        if close_lock is None:
+            close_lock = self.__dict__.setdefault("_close_lock", threading.RLock())
+        with close_lock:
+            if getattr(self, "_closed", False):
+                return
+            resource = getattr(self, "_runtime_resource", None)
+            if resource is not None:
+                resource.quiesce_control()
+            else:
+                controller = getattr(self, "_dashboard_controller", None)
+                arbiter = getattr(self, "_command_arbiter", None)
+                dashboard = getattr(self, "_dashboard", None)
+                for owner in (controller, arbiter):
+                    quiesce = getattr(owner, "quiesce", None)
+                    if callable(quiesce):
+                        quiesce()
+                for label, owner in (
+                    ("controller", controller),
+                    ("arbiter", arbiter),
+                ):
+                    drain = getattr(owner, "drain", None)
+                    if (
+                        callable(drain)
+                        and drain(BEHAVIOR_CONTROL_DRAIN_TIMEOUT_S) is not True
+                    ):
+                        raise TimeoutError(
+                            f"BEHAVIOR dashboard {label} did not drain before cleanup"
+                        )
+                unbind = getattr(dashboard, "unbind_controller", None)
+                if callable(unbind) and controller is not None:
+                    unbind(controller)
+                close_controller = getattr(controller, "close", None)
+                if callable(close_controller):
+                    close_controller(timeout_s=BEHAVIOR_CONTROL_DRAIN_TIMEOUT_S)
+                close_arbiter = getattr(arbiter, "close", None)
+                if callable(close_arbiter):
+                    close_arbiter(timeout_s=BEHAVIOR_CONTROL_DRAIN_TIMEOUT_S)
+            primitives = self._primitives
+            model = getattr(primitives, "model", None)
+            model_close = getattr(model, "close", None)
+            if callable(model_close):
+                model_close()
+            env = getattr(primitives, "env", None)
+            env_close = getattr(env, "close_transport", None)
+            if resource is None and callable(env_close):
+                env_close()
+            self._closed = True
 
     def write_recipe(self, recipe_tag: str) -> str | None:
         if recipe_tag != self._recipe_tag:
@@ -862,8 +1163,25 @@ class BehaviorToolkit(Toolkit):
         path = self._primitives.output_dir / f"recipe_{recipe_tag}.jsonl"
         final_record = self._tool_trace[-1] if self._tool_trace else None
         task_success = self._has_verified_raw_success()
+        manual_latch = getattr(self, "_manual_intervention_latch", None)
+        manual_intervention = bool(
+            manual_latch is not None and manual_latch.is_set()
+        )
         recipe_path = None
-        publish_task_memory = bool(task_success and self._behavior_phase == "explore")
+        publish_task_memory = bool(
+            task_success
+            and self._behavior_phase == "explore"
+            and not manual_intervention
+        )
+        publication_reason = (
+            "eligible_raw_success_explore"
+            if publish_task_memory
+            else "dashboard_manual_intervention"
+            if manual_intervention
+            else "official_task_success_not_verified"
+            if not task_success
+            else "phase_not_explore"
+        )
         if publish_task_memory:
             symbolic_recipe = self._symbolic_recipe()
             self.validate_symbolic_publication(symbolic_recipe)
@@ -873,6 +1191,8 @@ class BehaviorToolkit(Toolkit):
             "success": task_success,
             "task_success": task_success,
             "publication_eligible": publish_task_memory,
+            "manual_intervention": manual_intervention,
+            "publication_reason": publication_reason,
             "publication_source": (
                 RAW_OFFICIAL_SUCCESS_PUBLICATION_SOURCE if publish_task_memory else None
             ),
@@ -895,6 +1215,8 @@ class BehaviorToolkit(Toolkit):
             "phase": self._behavior_phase,
             "task_success": task_success,
             "publication_eligible": publish_task_memory,
+            "manual_intervention": manual_intervention,
+            "publication_reason": publication_reason,
             "publication_source": (
                 RAW_OFFICIAL_SUCCESS_PUBLICATION_SOURCE if publish_task_memory else None
             ),

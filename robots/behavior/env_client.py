@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import re
 from copy import deepcopy
 from typing import Any
 
@@ -9,6 +13,7 @@ import numpy as np
 
 from robots.behavior.schemas import (
     ROTATE_WRIST_RUNTIME_TIMEOUT_S,
+    validate_dashboard_manual_command,
     validate_relative_navigation_motion,
 )
 from rpent.utils.rpc import RpcClient
@@ -30,6 +35,8 @@ _TIMEOUT_S = {
     "env.close": 120.0,
     "env.open": 120.0,
     "env.press": 1800.0,
+    "env.dashboard_control_capabilities": 30.0,
+    "env.dashboard_manual_command": 360.0,
 }
 _SUCCESS_CLEANUP_RPC_METHODS = frozenset({"env.finalize_paused_runtime"})
 
@@ -49,6 +56,8 @@ class BehaviorEnvClient:
         self.vla_endpoint: str | None = None
         self._official_success_latched = False
         self._official_success_receipt: dict[str, Any] | None = None
+        self._expected_run_nonce: str | None = None
+        self._attempt_identity: tuple[str, str, int] | None = None
         server_meta = self._rpc_call(
             "env.get_env_meta",
             timeout_s=_TIMEOUT_S["default"],
@@ -63,11 +72,23 @@ class BehaviorEnvClient:
         if mismatches:
             raise RuntimeError(f"env_meta mismatch: {mismatches!r}")
         self.server_meta = dict(server_meta)
+        run_nonce = server_meta.get("run_nonce")
+        if run_nonce is not None:
+            if (
+                not isinstance(run_nonce, str)
+                or re.fullmatch(r"[0-9a-f]{32}", run_nonce) is None
+            ):
+                raise RuntimeError(
+                    "env_meta.run_nonce must be 32 lowercase hex characters"
+                )
+            self._expected_run_nonce = run_nonce
 
     def reset(self) -> tuple[dict[str, Any], Any]:
         """Runtime-only initialization for the current fresh episode."""
 
         ret = self._rpc_call("env.reset", timeout_s=_TIMEOUT_S["env.reset"])
+        info = ret[1] if isinstance(ret, (tuple, list)) and len(ret) == 2 else None
+        self._bind_attempt_identity_from_info(info)
         if not self._official_success_latched:
             self.episode_done = False
         self.total_env_steps = 0
@@ -96,16 +117,101 @@ class BehaviorEnvClient:
         return deepcopy(receipt) if isinstance(receipt, dict) else None
 
     @staticmethod
-    def _valid_success_receipt(value: Any) -> dict[str, Any] | None:
+    def _canonical_receipt_bytes(value: dict[str, Any]) -> bytes:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+
+    def _bind_attempt_identity_from_info(self, info: Any) -> None:
+        runtime = info.get("_rpent") if isinstance(info, dict) else None
+        if not isinstance(runtime, dict):
+            return
+        run_nonce = runtime.get("run_nonce")
+        attempt_nonce = runtime.get("attempt_nonce")
+        attempt_index = runtime.get("attempt_index")
+        if run_nonce is None and attempt_nonce is None and attempt_index is None:
+            return
+        if (
+            not isinstance(run_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{32}", run_nonce) is None
+            or not isinstance(attempt_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{32}", attempt_nonce) is None
+            or isinstance(attempt_index, bool)
+            or not isinstance(attempt_index, int)
+            or attempt_index < 1
+        ):
+            raise RuntimeError("env.reset returned an invalid runtime attempt identity")
+        expected_run_nonce = getattr(self, "_expected_run_nonce", None)
+        if expected_run_nonce is not None and run_nonce != expected_run_nonce:
+            raise RuntimeError("env.reset run_nonce disagrees with env metadata")
+        identity = (run_nonce, attempt_nonce, attempt_index)
+        bound = getattr(self, "_attempt_identity", None)
+        if bound is not None and bound != identity:
+            raise RuntimeError("env runtime attempt identity changed after binding")
+        self._attempt_identity = identity
+
+    def _valid_success_receipt(self, value: Any) -> dict[str, Any] | None:
         if not isinstance(value, dict):
             return None
+        required = {
+            "schema_version",
+            "source",
+            "run_nonce",
+            "attempt_nonce",
+            "attempt_index",
+            "env_step",
+            "raw_done",
+            "receipt_sha256",
+        }
+        if set(value) != required:
+            return None
         raw_done = value.get("raw_done")
+        run_nonce = value.get("run_nonce")
+        attempt_nonce = value.get("attempt_nonce")
+        attempt_index = value.get("attempt_index")
+        env_step = value.get("env_step")
+        digest = value.get("receipt_sha256")
         if (
-            value.get("source") != 'info["done"]["success"]'
+            value.get("schema_version") != 1
+            or isinstance(value.get("schema_version"), bool)
+            or value.get("source") != 'info["done"]["success"]'
             or not isinstance(raw_done, dict)
-            or raw_done.get("success") is not True
-            or not isinstance(value.get("receipt_sha256"), str)
-            or not value["receipt_sha256"]
+            or type(raw_done.get("success")) is not bool
+            or raw_done["success"] is not True
+            or not isinstance(run_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{32}", run_nonce) is None
+            or not isinstance(attempt_nonce, str)
+            or re.fullmatch(r"[0-9a-f]{32}", attempt_nonce) is None
+            or isinstance(attempt_index, bool)
+            or not isinstance(attempt_index, int)
+            or attempt_index < 1
+            or isinstance(env_step, bool)
+            or not isinstance(env_step, int)
+            or env_step < 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            return None
+        material = {key: item for key, item in value.items() if key != "receipt_sha256"}
+        try:
+            expected_digest = hashlib.sha256(
+                self._canonical_receipt_bytes(material)
+            ).hexdigest()
+        except (TypeError, ValueError):
+            return None
+        if not hmac.compare_digest(digest, expected_digest):
+            return None
+        expected_run_nonce = getattr(self, "_expected_run_nonce", None)
+        if expected_run_nonce is not None and run_nonce != expected_run_nonce:
+            return None
+        attempt_identity = getattr(self, "_attempt_identity", None)
+        if attempt_identity is not None and attempt_identity != (
+            run_nonce,
+            attempt_nonce,
+            attempt_index,
         ):
             return None
         return deepcopy(value)
@@ -320,6 +426,55 @@ class BehaviorEnvClient:
             kwargs["depth_probe"] = depth_probe
         return self._planner_call("observe", **kwargs)
 
+    def dashboard_control_capabilities(self) -> dict[str, Any]:
+        """Return fail-closed simulator-owned manual-control capabilities."""
+
+        return self._planner_call("dashboard_control_capabilities")
+
+    def dashboard_manual_command(
+        self,
+        *,
+        target: str,
+        action: str,
+        camera: str,
+    ) -> dict[str, Any]:
+        """Execute one server-sized manual command in one env-RPC transaction."""
+
+        command = validate_dashboard_manual_command(
+            target=target,
+            action=action,
+            camera=camera,
+        )
+        result = self._planner_call("dashboard_manual_command", **command)
+        frames = result.get("_frames_bytes")
+        capture_complete = bool(
+            isinstance(frames, dict)
+            and set(frames) == {"head", "left_wrist", "right_wrist"}
+            and all(isinstance(value, bytes) for value in frames.values())
+        )
+        success_without_capture = bool(
+            result.get("task_success") is True
+            and self._valid_success_receipt(result.get("official_success_receipt"))
+            is not None
+            and isinstance(result.get("capture_error"), str)
+            and bool(result["capture_error"])
+        )
+        if not capture_complete and not success_without_capture:
+            raise RuntimeError(
+                "env.dashboard_manual_command omitted the atomic three-camera capture"
+            )
+        if success_without_capture:
+            return result
+        group_id = result.get("capture_group_id")
+        simulator_step = result.get("simulator_step")
+        if not isinstance(group_id, str) or not group_id:
+            raise RuntimeError("env.dashboard_manual_command omitted capture_group_id")
+        if isinstance(simulator_step, bool) or not isinstance(
+            simulator_step, (int, np.integer)
+        ):
+            raise RuntimeError("env.dashboard_manual_command omitted simulator_step")
+        return result
+
     @staticmethod
     def _validated_analytic_hand(hand: str) -> str:
         if not isinstance(hand, str) or hand not in {"left", "right"}:
@@ -425,9 +580,7 @@ class BehaviorEnvClient:
             payload = {
                 "projection_id": projection_id.strip(),
                 "navigation_visual_check": (
-                    self._validated_navigation_visual_check(
-                        navigation_visual_check
-                    )
+                    self._validated_navigation_visual_check(navigation_visual_check)
                 ),
                 "standoff_m": self._validated_navigation_number(
                     "standoff_m",
@@ -458,9 +611,7 @@ class BehaviorEnvClient:
                     "navigation arguments"
                 )
             payload = {
-                "relative_motion": validate_relative_navigation_motion(
-                    relative_motion
-                )
+                "relative_motion": validate_relative_navigation_motion(relative_motion)
             }
         payload["timeout_s"] = self._validated_navigation_number(
             "timeout_s",

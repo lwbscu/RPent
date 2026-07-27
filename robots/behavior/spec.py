@@ -28,6 +28,10 @@ if TYPE_CHECKING:
 
 ResourcePolicy = Literal["sync_remote", "frozen_local"]
 
+# One manual command may consume the full 240 s planner / execution deadline
+# and still need to publish its synchronized capture and terminal receipt.
+BEHAVIOR_CONTROL_DRAIN_TIMEOUT_S = 365.0
+
 
 class RuntimeResource(Protocol):
     """One owned runtime resource released by the shared CLI."""
