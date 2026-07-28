@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import pickle
 import re
@@ -27,12 +26,17 @@ os.environ.setdefault("ACCEPT_EULA", "Y")
 import numpy as np
 
 from robots.behavior.camera_geometry import (
+    HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M,
+    HAND_GEOMETRY_ROTATION_TOLERANCE_DEG,
+    HAND_GEOMETRY_SYNC_RENDER_ITERATIONS,
+    HAND_GEOMETRY_TRANSLATION_TOLERANCE_M,
     CameraGeometryError,
     CameraIntrinsics,
     FrameCache,
     camera_point_from_pixel,
     canonical_camera,
     frame_bound_hand_distance_report,
+    hand_geometry_sync_certificate_is_valid,
     load_camera_correction_profiles,
     r1pro_wrist_camera_reference_transforms,
     rigid_transform_residual,
@@ -114,10 +118,16 @@ _PHYSICAL_GRIPPER_CLOSED_M = 0.003
 _HELD_CLOSE_LATCH_MAX = -0.99
 _HELD_ATTACHMENT_CONFIRMATION_STEPS = 10
 _PI0_NAV_PICK_DISABLE_RECEIPT_FILENAME = "pi0_nav_pick_disable_receipt.json"
-_HAND_GEOMETRY_SYNC_RENDER_ITERATIONS = 3
-_HAND_GEOMETRY_TRANSLATION_TOLERANCE_M = 0.001
-_HAND_GEOMETRY_ROTATION_TOLERANCE_DEG = 0.25
-_HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M = 0.0001
+_HAND_GEOMETRY_SYNC_RENDER_ITERATIONS = HAND_GEOMETRY_SYNC_RENDER_ITERATIONS
+_HAND_GEOMETRY_TRANSLATION_TOLERANCE_M = (
+    HAND_GEOMETRY_TRANSLATION_TOLERANCE_M
+)
+_HAND_GEOMETRY_ROTATION_TOLERANCE_DEG = (
+    HAND_GEOMETRY_ROTATION_TOLERANCE_DEG
+)
+_HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M = (
+    HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M
+)
 _FRAME_REVIEW_ASSESSMENTS = frozenset(
     {
         "target_bearing_surface_confirmed",
@@ -1533,92 +1543,11 @@ class BehaviorEnvFacade:
     ) -> bool:
         """Recompute certificate admission from sealed numeric residuals."""
 
-        if not isinstance(certificate, dict):
-            return False
-        try:
-            iterations = certificate["render_sync_iterations"]
-            translation_tolerance = float(certificate["translation_tolerance_m"])
-            rotation_tolerance = float(certificate["rotation_tolerance_deg"])
-            finger_tolerance = float(certificate["finger_joint_tolerance_m"])
-            selected = certificate["hands"][hand]
-            palm = selected["palm_from_camera"]
-            grip = selected["grip_point_from_camera"]
-            finger = selected["finger_joint_capture_match"]
-            values = [
-                translation_tolerance,
-                rotation_tolerance,
-                finger_tolerance,
-                float(palm["translation_error_m"]),
-                float(palm["rotation_error_rad"]),
-                float(palm["rotation_error_deg"]),
-                float(grip["translation_error_m"]),
-                float(grip["rotation_error_rad"]),
-                float(grip["rotation_error_deg"]),
-                float(finger["max_abs_error_m"]),
-            ]
-        except (KeyError, TypeError, ValueError, OverflowError):
-            return False
-        if (
-            isinstance(iterations, bool)
-            or not isinstance(iterations, (int, np.integer))
-            or not all(math.isfinite(value) and value >= 0.0 for value in values)
-        ):
-            return False
-        if (
-            certificate.get("available") is not True
-            or certificate.get("synchronized") is not True
-            or certificate.get("source")
-            != "render_sync_plus_official_r1pro_fixed_extrinsics"
-            or int(certificate.get("env_step", -1)) != int(env_step)
-            or int(iterations) < _HAND_GEOMETRY_SYNC_RENDER_ITERATIONS
-            or selected.get("passed") is not True
-            or selected.get("camera_pose_render_bound") is not True
-            or selected.get("camera_pose_source")
-            not in {
-                "payload_view_matrix",
-                "payload_view_transform",
-                "payload_world_to_camera",
-                "sensor_cameraViewTransform",
-            }
-            or palm.get("passed") is not True
-            or grip.get("passed") is not True
-            or finger.get("passed") is not True
-        ):
-            return False
-        if (
-            not math.isclose(
-                translation_tolerance,
-                _HAND_GEOMETRY_TRANSLATION_TOLERANCE_M,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
-            or not math.isclose(
-                rotation_tolerance,
-                _HAND_GEOMETRY_ROTATION_TOLERANCE_DEG,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
-            or not math.isclose(
-                finger_tolerance,
-                _HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
-        ):
-            return False
-        for residual in (palm, grip):
-            if (
-                float(residual["translation_error_m"]) > translation_tolerance
-                or float(residual["rotation_error_deg"]) > rotation_tolerance
-                or not math.isclose(
-                    math.degrees(float(residual["rotation_error_rad"])),
-                    float(residual["rotation_error_deg"]),
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
-            ):
-                return False
-        return bool(float(finger["max_abs_error_m"]) <= finger_tolerance)
+        return hand_geometry_sync_certificate_is_valid(
+            certificate,
+            hand=hand,
+            env_step=env_step,
+        )
 
     def _register_public_observation_lineage(
         self,
@@ -3668,6 +3597,14 @@ class BehaviorEnvFacade:
                     "hybrid R1Pro cuRobo warmup did not complete successfully"
                 )
             self._planner_warmup_report = planner_warmup
+            capture_step = int(self._env_steps)
+            self._refresh_observation_without_step(
+                synchronize_hand_geometry=True
+            )
+            if int(self._env_steps) != capture_step:
+                raise RuntimeError(
+                    "post-warmup Dashboard camera refresh advanced the simulator"
+                )
         logger.info(
             "BEHAVIOR reset completed in %.1fs on thread %s",
             time.monotonic() - started_at,
@@ -4470,7 +4407,32 @@ class BehaviorEnvFacade:
             )
             for hand in ("left", "right")
         }
-        torso_available = bool(common_motion and planner_flag("torso"))
+        warmup_report = getattr(self, "_planner_warmup_report", None)
+        warmup_identity = (
+            warmup_report.get("identity_warmup")
+            if isinstance(warmup_report, dict)
+            and isinstance(warmup_report.get("identity_warmup"), dict)
+            else {}
+        )
+        torso_warmup = (
+            warmup_identity.get("torso")
+            if isinstance(warmup_identity.get("torso"), dict)
+            else {}
+        )
+        torso_warmup_verified = bool(
+            isinstance(warmup_report, dict)
+            and warmup_report.get("status") == "complete"
+            and torso_warmup.get("ok") is True
+            and torso_warmup.get("collision_admitted") is True
+            and int(torso_warmup.get("active_dof_count", -1)) == 3
+            and int(torso_warmup.get("env_actions_sent", -1)) == 0
+            and torso_warmup.get("simulator_advanced") is False
+        )
+        torso_available = bool(
+            common_motion
+            and planner_flag("torso")
+            and torso_warmup_verified
+        )
         wrist_flag = planner_report.get("wrist")
         wrist_available = {
             hand: bool(
@@ -4536,6 +4498,7 @@ class BehaviorEnvFacade:
             "base_available": base_available,
             "eef_available": eef_available,
             "torso_available": torso_available,
+            "torso_warmup_verified": torso_warmup_verified,
             "wrist_rotation_available": wrist_available,
             "gripper_available": gripper_available,
             "steps": {
@@ -4560,7 +4523,9 @@ class BehaviorEnvFacade:
             if isinstance(prior.capture_group_id, str):
                 previous_group_ids.add(prior.capture_group_id)
 
-        self._refresh_observation_without_step()
+        self._refresh_observation_without_step(
+            synchronize_hand_geometry=True
+        )
         frames_bytes: dict[str, bytes] = {}
         frame_ids: dict[str, str] = {}
         group_ids: set[str] = set()
@@ -4652,7 +4617,7 @@ class BehaviorEnvFacade:
                 "frame": "wrist_camera",
                 "angle_rad": WRIST_ROTATION_STEP_RAD,
                 "visual_direction": (
-                    "clockwise" if action == "rotate_left" else "counterclockwise"
+                    "counterclockwise" if action == "rotate_left" else "clockwise"
                 ),
             }
         return {"opening": 1.0 if action == "open" else 0.0}
@@ -4692,10 +4657,12 @@ class BehaviorEnvFacade:
         action: str,
         predecessor_plan_id: str | None = None,
         background: bool = False,
+        planning_only_probe: bool = False,
     ) -> dict[str, Any]:
         """Prepare motion on the Env RPC FIFO."""
 
         method_started = time.monotonic()
+        start_env_step = int(getattr(self, "_env_steps", -1))
         controller_switch_elapsed_s = 0.0
         controller_state_before = str(getattr(self, "_controller_state", "unavailable"))
         controller_switch_attempted = False
@@ -4705,9 +4672,11 @@ class BehaviorEnvFacade:
             action=action,
             predecessor_plan_id=predecessor_plan_id,
             background=background,
+            planning_only_probe=planning_only_probe,
         )
         target = request["target"]
         action = request["action"]
+        planning_only_probe = request.get("planning_only_probe") is True
         if action in {"open", "close"}:
             raise ValueError(
                 "open and close are one-shot commands, not prepared motions"
@@ -4733,11 +4702,37 @@ class BehaviorEnvFacade:
                         or "manual motion unavailable"
                     )
                 )
-            if not self._dashboard_motion_capability_available(
+            capability_available = self._dashboard_motion_capability_available(
                 capabilities,
                 target=target,
                 action=action,
-            ):
+            )
+            if not capability_available and planning_only_probe:
+                planner_report = (
+                    dict(capabilities.get("planner") or {})
+                    if isinstance(capabilities.get("planner"), dict)
+                    else {}
+                )
+                if target == "chassis":
+                    torso = planner_report.get("torso")
+                    capability_available = bool(
+                        isinstance(torso, dict)
+                        and isinstance(torso.get("backend_report"), dict)
+                        and torso["backend_report"].get("verified") is True
+                    )
+                else:
+                    hand = "left" if target == "left_arm" else "right"
+                    geometry = planner_report.get("wrist_geometry")
+                    hand_geometry = (
+                        geometry.get(hand)
+                        if isinstance(geometry, dict)
+                        else None
+                    )
+                    capability_available = bool(
+                        isinstance(hand_geometry, dict)
+                        and hand_geometry.get("verified") is True
+                    )
+            if not capability_available:
                 raise RuntimeError(
                     f"{target}/{action} capability is unavailable or unsupported"
                 )
@@ -4779,6 +4774,11 @@ class BehaviorEnvFacade:
             raise RuntimeError(
                 "raw task success became terminal during Dashboard planning"
             )
+        finish_env_step = int(getattr(self, "_env_steps", -1))
+        if planning_only_probe and finish_env_step != start_env_step:
+            raise RuntimeError(
+                "planning-only Dashboard probe advanced the simulator"
+            )
         if not isinstance(result, dict):
             raise RuntimeError(
                 "prepare_dashboard_motion returned a non-mapping result"
@@ -4804,6 +4804,11 @@ class BehaviorEnvFacade:
             "source": "dashboard_prepare",
             "requested_step": self._dashboard_requested_step(target, action),
             "elapsed_s": legacy_elapsed_s,
+            "planning_only_probe": planning_only_probe,
+            "env_step_delta": finish_env_step - start_env_step,
+            "zero_action_verified": bool(
+                planning_only_probe and finish_env_step == start_env_step
+            ),
         }
         if request["background"]:
             deadline = response.get("planning_deadline_s")
@@ -4990,10 +4995,18 @@ class BehaviorEnvFacade:
             raise RuntimeError(
                 "discard_dashboard_motion returned a non-mapping result"
             )
+        result_plan_id = str(result.get("plan_id") or "").strip()
+        if (
+            result_plan_id != plan_id
+            or result.get("discarded") is not True
+            or result.get("status") != "discarded"
+        ):
+            raise RuntimeError(
+                "discard_dashboard_motion returned an invalid discard receipt"
+            )
         response = {
             **_wire_safe(result),
             "source": "dashboard_discard",
-            "plan_id": plan_id,
         }
         pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
         return response

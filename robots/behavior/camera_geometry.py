@@ -51,6 +51,11 @@ _R1PRO_GRIP_FROM_WRIST_CAMERA = np.array(
     dtype=np.float64,
 )
 
+HAND_GEOMETRY_SYNC_RENDER_ITERATIONS = 3
+HAND_GEOMETRY_TRANSLATION_TOLERANCE_M = 0.001
+HAND_GEOMETRY_ROTATION_TOLERANCE_DEG = 0.25
+HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M = 0.0001
+
 
 def canonical_camera(camera: str) -> str:
     """Return the canonical BEHAVIOR camera name."""
@@ -60,6 +65,102 @@ def canonical_camera(camera: str) -> str:
             f"unknown camera {camera!r}; expected head, left_wrist, or right_wrist"
         )
     return CAMERA_ALIASES[key]
+
+
+def hand_geometry_sync_certificate_is_valid(
+    certificate: Any,
+    *,
+    hand: str,
+    env_step: int,
+) -> bool:
+    """Recompute admission for one sealed render-bound hand certificate."""
+
+    if hand not in {"left", "right"} or not isinstance(certificate, dict):
+        return False
+    try:
+        iterations = certificate["render_sync_iterations"]
+        translation_tolerance = float(certificate["translation_tolerance_m"])
+        rotation_tolerance = float(certificate["rotation_tolerance_deg"])
+        finger_tolerance = float(certificate["finger_joint_tolerance_m"])
+        selected = certificate["hands"][hand]
+        palm = selected["palm_from_camera"]
+        grip = selected["grip_point_from_camera"]
+        finger = selected["finger_joint_capture_match"]
+        values = [
+            translation_tolerance,
+            rotation_tolerance,
+            finger_tolerance,
+            float(palm["translation_error_m"]),
+            float(palm["rotation_error_rad"]),
+            float(palm["rotation_error_deg"]),
+            float(grip["translation_error_m"]),
+            float(grip["rotation_error_rad"]),
+            float(grip["rotation_error_deg"]),
+            float(finger["max_abs_error_m"]),
+        ]
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    if (
+        isinstance(iterations, bool)
+        or not isinstance(iterations, (int, np.integer))
+        or not all(math.isfinite(value) and value >= 0.0 for value in values)
+    ):
+        return False
+    if (
+        certificate.get("available") is not True
+        or certificate.get("synchronized") is not True
+        or certificate.get("source")
+        != "render_sync_plus_official_r1pro_fixed_extrinsics"
+        or int(certificate.get("env_step", -1)) != int(env_step)
+        or int(iterations) < HAND_GEOMETRY_SYNC_RENDER_ITERATIONS
+        or selected.get("passed") is not True
+        or selected.get("camera_pose_render_bound") is not True
+        or selected.get("camera_pose_source")
+        not in {
+            "payload_view_matrix",
+            "payload_view_transform",
+            "payload_world_to_camera",
+            "sensor_cameraViewTransform",
+        }
+        or palm.get("passed") is not True
+        or grip.get("passed") is not True
+        or finger.get("passed") is not True
+    ):
+        return False
+    if (
+        not math.isclose(
+            translation_tolerance,
+            HAND_GEOMETRY_TRANSLATION_TOLERANCE_M,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            rotation_tolerance,
+            HAND_GEOMETRY_ROTATION_TOLERANCE_DEG,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            finger_tolerance,
+            HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        return False
+    for residual in (palm, grip):
+        if (
+            float(residual["translation_error_m"]) > translation_tolerance
+            or float(residual["rotation_error_deg"]) > rotation_tolerance
+            or not math.isclose(
+                math.degrees(float(residual["rotation_error_rad"])),
+                float(residual["rotation_error_deg"]),
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        ):
+            return False
+    return bool(float(finger["max_abs_error_m"]) <= finger_tolerance)
 
 
 def _as_array(value: Any, *, dtype: Any | None = None) -> np.ndarray:
@@ -1190,6 +1291,10 @@ __all__ = [
     "CameraCorrectionProfile",
     "CameraIntrinsics",
     "FrameCache",
+    "HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M",
+    "HAND_GEOMETRY_ROTATION_TOLERANCE_DEG",
+    "HAND_GEOMETRY_SYNC_RENDER_ITERATIONS",
+    "HAND_GEOMETRY_TRANSLATION_TOLERANCE_M",
     "RgbdFrame",
     "backproject_pixel_to_world",
     "camera_point_from_pixel",
@@ -1198,6 +1303,7 @@ __all__ = [
     "evaluate_camera_correction_profile",
     "fit_camera_correction_profile",
     "frame_bound_hand_distance_report",
+    "hand_geometry_sync_certificate_is_valid",
     "load_camera_correction_profiles",
     "pixel_from_camera_point",
     "project_world_to_pixel",

@@ -16,6 +16,8 @@ import importlib.util
 import json
 import math
 import time
+import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -57,6 +59,11 @@ BASE_TERMINAL_POSITION_TOLERANCE_M = 0.020
 BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD = math.radians(3.0)
 HIGH_DPI_VISUAL_MAE_MAX = 10.0
 HIGH_DPI_VISUAL_WITHIN_24_MIN = 0.88
+# This script is the final release acceptance, not the pre-calibration probe.
+# Planning-only wrist evidence is recorded by behavior_base_curobo_probe.py
+# while the public wrist capability may still be disabled.  Only a separately
+# admitted, per-hand visual calibration may make the release Dashboard satisfy
+# this final 29-enabled / 4-disabled oracle.
 RELEASE_EXPECTED_ENABLED = frozenset(
     {
         *(
@@ -67,6 +74,8 @@ RELEASE_EXPECTED_ENABLED = frozenset(
                 "backward",
                 "turn_left",
                 "turn_right",
+                "up",
+                "down",
             )
         ),
         *(
@@ -79,6 +88,8 @@ RELEASE_EXPECTED_ENABLED = frozenset(
                 "turn_right",
                 "up",
                 "down",
+                "rotate_left",
+                "rotate_right",
                 "open",
                 "close",
                 "observe",
@@ -92,9 +103,9 @@ RELEASE_EXPECTED_DISABLED = frozenset(
     for action in ALL_ACTIONS
     if (target, action) not in RELEASE_EXPECTED_ENABLED
 )
-if len(RELEASE_EXPECTED_ENABLED) != 23 or len(RELEASE_EXPECTED_DISABLED) != 10:
+if len(RELEASE_EXPECTED_ENABLED) != 29 or len(RELEASE_EXPECTED_DISABLED) != 4:
     raise AssertionError(
-        "release control oracle must be exactly 23 enabled / 10 disabled"
+        "release control oracle must be exactly 29 enabled / 4 disabled"
     )
 MOTION_ORDER = {
     "chassis": (
@@ -148,6 +159,11 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--sustain-seconds", type=float, default=600.0)
     parser.add_argument("--sustain-interval-s", type=float, default=5.0)
     parser.add_argument("--execute-sim-controls", action="store_true")
+    parser.add_argument(
+        "--planning-only-probes",
+        action="store_true",
+        help="plan and discard torso/wrist probes, then exit without browser actions",
+    )
     return parser.parse_args()
 
 
@@ -189,6 +205,29 @@ def _http_json(base_url: str, path: str) -> dict[str, Any]:
     return value
 
 
+def _post_json(
+    base_url: str,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    timeout_s: float,
+) -> dict[str, Any]:
+    request = Request(
+        base_url.rstrip("/") + path,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=timeout_s) as response:
+        value = json.load(response)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{path} returned a non-object")
+    return value
+
+
 def _http_bytes(base_url: str, path: str) -> bytes:
     request = Request(
         base_url.rstrip("/") + path, headers={"Cache-Control": "no-store"}
@@ -222,6 +261,22 @@ def _run_payload(base_url: str, run_id: str) -> dict[str, Any]:
     return _http_json(base_url, f"/api/run?run={quote(run_id)}")
 
 
+def _wait_for_run_ready(
+    *,
+    base_url: str,
+    run_id: str,
+    checks: Callable[[dict[str, Any]], dict[str, bool]],
+    timeout_s: float = 30.0,
+) -> dict[str, Any]:
+    """Wait until one live run satisfies every supplied readiness check."""
+
+    def ready_payload() -> dict[str, Any] | None:
+        payload = _run_payload(base_url, run_id)
+        return payload if all(checks(payload).values()) else None
+
+    return _wait(ready_payload, timeout_s=timeout_s)
+
+
 def _manual_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     timeline = payload.get("timeline")
     if not isinstance(timeline, list):
@@ -231,6 +286,330 @@ def _manual_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         for item in timeline
         if isinstance(item, dict) and item.get("source") == "dashboard_manual"
     ]
+
+
+def _raw_success_latched(
+    payload: dict[str, Any],
+    result: dict[str, Any] | None = None,
+) -> bool:
+    """Recognize only the Dashboard's raw-success latch or a returned true result."""
+
+    control = payload.get("control")
+    control = control if isinstance(control, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    return bool(
+        control.get("success_latched") is True
+        or result.get("task_success") is True
+    )
+
+
+def _run_planning_only_probes(
+    *,
+    base_url: str,
+    run_id: str,
+    output_dir: Path,
+    timeout_s: float,
+) -> dict[str, Any]:
+    """Exercise the shared Dashboard/EnvClient planning path with zero action."""
+
+    specs = (
+        ("chassis", "up"),
+        ("chassis", "down"),
+        ("left_arm", "rotate_left"),
+        ("left_arm", "rotate_right"),
+        ("right_arm", "rotate_left"),
+        ("right_arm", "rotate_right"),
+    )
+    baseline = _run_payload(base_url, run_id)
+    baseline_timeline_revision = baseline.get("timeline_revision")
+    baseline_step = baseline.get("simulator_step")
+    baseline_indices = dict(baseline.get("frame_indices") or {})
+    baseline_capture_group_id = baseline.get("capture_group_id")
+    records: list[dict[str, Any]] = []
+    for target, action in specs:
+        before = _run_payload(base_url, run_id)
+        if _raw_success_latched(before):
+            break
+        started = time.monotonic()
+        result = _post_json(
+            base_url,
+            "/api/run/control/plan",
+            {"run": run_id, "target": target, "action": action},
+            timeout_s=timeout_s,
+        )
+        after = _run_payload(base_url, run_id)
+        safety_certificate = result.get("safety_certificate")
+        safety_certificate = (
+            safety_certificate
+            if isinstance(safety_certificate, dict)
+            else {}
+        )
+        safety_checks = safety_certificate.get("checks")
+        safety_checks = (
+            safety_checks if isinstance(safety_checks, dict) else {}
+        )
+        prepared = result.get("prepared")
+        prepared = prepared if isinstance(prepared, dict) else {}
+        requested_step = prepared.get("requested_step")
+        requested_step = (
+            requested_step if isinstance(requested_step, dict) else {}
+        )
+        discard_receipt = result.get("discard_receipt")
+        discard_receipt = (
+            discard_receipt if isinstance(discard_receipt, dict) else {}
+        )
+        expected_motion_kind = "torso" if target == "chassis" else "eef"
+        expected_hand = target.removesuffix("_arm")
+        expected_direction = (
+            "counterclockwise" if action == "rotate_left" else "clockwise"
+        )
+        expected_signed_rotation = (
+            WRIST_ROTATION_STEP_RAD
+            if action == "rotate_left"
+            else -WRIST_ROTATION_STEP_RAD
+        )
+        calibration = prepared.get("calibration")
+        calibration = calibration if isinstance(calibration, dict) else {}
+        requested_step_matches = (
+            requested_step.get("frame") == "world"
+            and _finite_close(
+                requested_step.get("torso_delta_z_m"),
+                (
+                    TORSO_VERTICAL_STEP_M
+                    if action == "up"
+                    else -TORSO_VERTICAL_STEP_M
+                ),
+                tolerance=1e-12,
+            )
+            if target == "chassis"
+            else (
+                requested_step.get("frame") == "wrist_camera"
+                and requested_step.get("visual_direction") == expected_direction
+                and _finite_close(
+                    requested_step.get("angle_rad"),
+                    WRIST_ROTATION_STEP_RAD,
+                    tolerance=1e-12,
+                )
+                and _finite_close(
+                    prepared.get("requested_rotation_rad"),
+                    expected_signed_rotation,
+                    tolerance=1e-12,
+                )
+            )
+        )
+        record = {
+            "target": target,
+            "action": action,
+            "elapsed_s": round(time.monotonic() - started, 3),
+            "result": result,
+            "checks": {
+                "endpoint_ok": result.get("ok") is True,
+                "response_identity": (
+                    result.get("target") == target
+                    and result.get("action") == action
+                ),
+                "prepared_identity": (
+                    prepared.get("target") == target
+                    and prepared.get("action") == action
+                    and prepared.get("motion_kind") == expected_motion_kind
+                    and prepared.get("plan_id") == result.get("plan_id")
+                ),
+                "requested_step_exact": requested_step_matches,
+                "planning_only": result.get("planning_only") is True,
+                "release_admission_false": (
+                    result.get("release_admission") is False
+                ),
+                "zero_action_verified": (
+                    result.get("zero_action_verified") is True
+                ),
+                "env_step_delta_zero": result.get("env_step_delta") == 0,
+                "safety_certificate_admitted": (
+                    safety_certificate.get("admitted") is True
+                ),
+                "safety_motion_kind": (
+                    safety_certificate.get("motion_kind")
+                    == expected_motion_kind
+                ),
+                "selected_hand_exact": (
+                    target == "chassis"
+                    or (
+                        safety_certificate.get("selected_hand") == expected_hand
+                        and calibration.get("hand") == expected_hand
+                    )
+                ),
+                "wrist_capture_lineage_fresh": (
+                    target == "chassis"
+                    or (
+                        calibration.get("capture_group_id")
+                        == baseline_capture_group_id
+                        and calibration.get("step_index") == baseline_step
+                    )
+                ),
+                "discard_receipt_terminal": (
+                    result.get("discarded") is True
+                    and discard_receipt.get("discarded") is True
+                    and discard_receipt.get("status") == "discarded"
+                    and discard_receipt.get("plan_id") == result.get("plan_id")
+                ),
+                "dual_attachment_collision": (
+                    safety_certificate.get("attachment_hand_count") == 2
+                    and safety_checks.get("dual_attachment_collision")
+                    is True
+                ),
+                "collision_checks_complete": (
+                    safety_checks.get("world_collision_check") is True
+                    and safety_checks.get("self_collision_check") is True
+                    and safety_checks.get("post_interpolation_check") is True
+                    and safety_checks.get("collision_admitted") is True
+                ),
+                "all_safety_checks_passed": (
+                    bool(safety_checks)
+                    and all(value is True for value in safety_checks.values())
+                ),
+                "simulator_step_unchanged": (
+                    after.get("simulator_step") == baseline_step
+                ),
+                "frame_indices_unchanged": (
+                    dict(after.get("frame_indices") or {}) == baseline_indices
+                ),
+                "timeline_revision_unchanged": (
+                    after.get("timeline_revision")
+                    == baseline_timeline_revision
+                ),
+                "raw_success_not_latched": not _raw_success_latched(after),
+            },
+        }
+        record["verdict"] = (
+            "pass" if all(record["checks"].values()) else "fail"
+        )
+        records.append(record)
+        _progress(
+            "planning_only_probe_complete",
+            target=target,
+            action=action,
+            verdict=record["verdict"],
+        )
+        if record["verdict"] != "pass":
+            break
+    final = _run_payload(base_url, run_id)
+    summary = {
+        "mode": "planning_only",
+        "run_id": run_id,
+        "expected_probe_count": len(specs),
+        "completed_probe_count": len(records),
+        "probes": records,
+        "baseline": {
+            "timeline_revision": baseline_timeline_revision,
+            "simulator_step": baseline_step,
+            "frame_indices": baseline_indices,
+            "capture_group_id": baseline_capture_group_id,
+        },
+        "final": {
+            "timeline_revision": final.get("timeline_revision"),
+            "simulator_step": final.get("simulator_step"),
+            "frame_indices": final.get("frame_indices"),
+            "control_capabilities": dict(final.get("control") or {}).get(
+                "capabilities"
+            ),
+        },
+        "release_admission": False,
+        "real_robot_deployment_allowed": False,
+    }
+    summary["verdict"] = (
+        "pass"
+        if len(records) == len(specs)
+        and all(record["verdict"] == "pass" for record in records)
+        and not _raw_success_latched(final)
+        else "fail"
+    )
+    _json_dump(output_dir / "planning_only_probes.json", summary)
+    return summary
+
+
+def _refresh_planning_only_capture(
+    *,
+    base_url: str,
+    run_id: str,
+    timeout_s: float,
+) -> dict[str, Any]:
+    """Publish one fresh atomic camera group without advancing simulation."""
+
+    before = _run_payload(base_url, run_id)
+    if _raw_success_latched(before):
+        return {
+            "verdict": "fail",
+            "reason": "official_task_success_latched",
+            "request_sent": False,
+        }
+    lease_id = str(uuid.uuid4())
+    accepted = _post_json(
+        base_url,
+        "/api/run/control/command",
+        {
+            "run": run_id,
+            "lease_id": lease_id,
+            "sequence": 1,
+            "target": "chassis",
+            "action": "observe",
+            "camera": "head",
+        },
+        timeout_s=timeout_s,
+    )
+    command_id = str(accepted.get("accepted_command_id") or "").strip()
+    if not command_id:
+        return {
+            "verdict": "fail",
+            "reason": "observe_command_not_accepted",
+            "request_sent": True,
+            "accepted": accepted,
+        }
+    after, row = _wait(
+        lambda: _terminal_command_row(
+            base_url,
+            run_id,
+            command_id,
+        ),
+        timeout_s=timeout_s,
+    )
+    result = row.get("result")
+    result = result if isinstance(result, dict) else {}
+    checks = {
+        "accepted": accepted.get("accepted") is True,
+        "terminal_completed": row.get("status") == "completed",
+        "observe_action": (
+            row.get("target") == "chassis"
+            and row.get("action") == "observe"
+        ),
+        "primitive_success": result.get("primitive_success") is True,
+        "simulator_step_unchanged": (
+            after.get("simulator_step") == before.get("simulator_step")
+        ),
+        "fresh_capture_group": (
+            isinstance(after.get("capture_group_id"), str)
+            and bool(after["capture_group_id"])
+            and after.get("capture_group_id") != before.get("capture_group_id")
+        ),
+        **_complete_frame_group_checks(after),
+        "raw_success_not_latched": not _raw_success_latched(after, result),
+    }
+    return {
+        "verdict": "pass" if all(checks.values()) else "fail",
+        "request_sent": True,
+        "lease_id": lease_id,
+        "command_id": command_id,
+        "checks": checks,
+        "before": {
+            "simulator_step": before.get("simulator_step"),
+            "capture_group_id": before.get("capture_group_id"),
+            "frame_indices": before.get("frame_indices"),
+        },
+        "after": {
+            "simulator_step": after.get("simulator_step"),
+            "capture_group_id": after.get("capture_group_id"),
+            "frame_indices": after.get("frame_indices"),
+        },
+        "result": result,
+    }
 
 
 def _inject_fetch_audit(page: Any) -> None:
@@ -562,23 +941,68 @@ def _control_ready_checks(payload: dict[str, Any]) -> dict[str, bool]:
         "simulation_identity_verified": capabilities.get("simulation_identity")
         == "behavior_omnigibson_r1pro",
         "release_base_enabled": capabilities.get("base_available") is True,
-        "release_torso_disabled": capabilities.get("torso_available") is False,
+        "release_torso_enabled": capabilities.get("torso_available") is True,
         "release_eef_enabled": all(
             eef_available.get(hand) is True for hand in ("left", "right")
         ),
-        "release_wrist_disabled": all(
-            wrist_available.get(hand) is False for hand in ("left", "right")
+        "release_wrist_enabled": all(
+            wrist_available.get(hand) is True for hand in ("left", "right")
         ),
         "release_gripper_enabled": all(
             gripper_available.get(hand) is True for hand in ("left", "right")
         ),
-        "release_oracle_cardinality_23_10": (
-            len(RELEASE_EXPECTED_ENABLED) == 23 and len(RELEASE_EXPECTED_DISABLED) == 10
+        "release_oracle_cardinality_29_4": (
+            len(RELEASE_EXPECTED_ENABLED) == 29 and len(RELEASE_EXPECTED_DISABLED) == 4
         ),
         "head_revision_visible": isinstance(head_revision, int) and head_revision > 0,
         "head_index_matches_simulator_step": isinstance(simulator_step, int)
         and indices.get("head") == simulator_step,
     }
+
+
+def _planning_only_ready_checks(payload: dict[str, Any]) -> dict[str, bool]:
+    """Require safe calibration inputs while wrist release remains disabled."""
+
+    checks = _control_ready_checks(payload)
+    checks.pop("release_wrist_enabled", None)
+    control = payload.get("control")
+    control = control if isinstance(control, dict) else {}
+    capabilities = control.get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    wrist_available = capabilities.get("wrist_rotation_available")
+    wrist_available = wrist_available if isinstance(wrist_available, dict) else {}
+    planner = capabilities.get("planner")
+    planner = planner if isinstance(planner, dict) else {}
+    geometry = planner.get("wrist_geometry")
+    geometry = geometry if isinstance(geometry, dict) else {}
+    checks.update(
+        {
+            "planning_wrist_release_fail_closed": all(
+                wrist_available.get(hand) is False
+                for hand in ("left", "right")
+            ),
+            "planning_wrist_geometry_verified": all(
+                isinstance(geometry.get(hand), dict)
+                and geometry[hand].get("verified") is True
+                and geometry[hand].get("release_admission") is False
+                and geometry[hand].get("real_visual_probe_required") is True
+                for hand in ("left", "right")
+            ),
+            **_complete_frame_group_checks(payload),
+        }
+    )
+    return checks
+
+
+def _planning_only_pre_capture_ready_checks(
+    payload: dict[str, Any],
+) -> dict[str, bool]:
+    """Admit one zero-step Observe before a three-camera group is published."""
+
+    checks = _planning_only_ready_checks(payload)
+    for name in _complete_frame_group_checks(payload):
+        checks.pop(name, None)
+    return checks
 
 
 def _complete_frame_group_checks(payload: dict[str, Any]) -> dict[str, bool]:
@@ -823,13 +1247,15 @@ def _semantic_checks(
     if action in {"rotate_left", "rotate_right"}:
         calibration = metrics.get("calibration")
         calibration = calibration if isinstance(calibration, dict) else {}
-        clockwise = action == "rotate_left"
+        counterclockwise = action == "rotate_left"
         try:
-            clockwise_sign = float(calibration.get("clockwise_angle_sign"))
+            ccw_sign = float(calibration.get("visual_ccw_angle_sign"))
         except (TypeError, ValueError):
-            clockwise_sign = math.nan
+            ccw_sign = math.nan
         expected_angle = (
-            clockwise_sign * WRIST_ROTATION_STEP_RAD * (1.0 if clockwise else -1.0)
+            ccw_sign
+            * WRIST_ROTATION_STEP_RAD
+            * (1.0 if counterclockwise else -1.0)
         )
         checks.update(
             {
@@ -840,7 +1266,7 @@ def _semantic_checks(
                 "wrist_calibration_verified": calibration.get("verified") is True,
                 "wrist_calibration_hand_matches": calibration.get("hand") == hand,
                 "wrist_visual_direction_matches": metrics.get("visual_direction")
-                == ("clockwise" if clockwise else "counterclockwise"),
+                == ("counterclockwise" if counterclockwise else "clockwise"),
                 "wrist_signed_fixed_step_matches": math.isfinite(expected_angle)
                 and _finite_close(
                     metrics.get("requested_rotation_rad"),
@@ -1242,47 +1668,69 @@ def _exercise_button(
         timeout_s=timeout_s,
         interval_s=0.15,
     )
-    _wait(
-        lambda: page.evaluate(
-            """
-            activeLeaseId === null
-            && !controlCommandInFlight
-            && controlLoopPromise === null
-            && stopLeasePromise === null
-            """
-        ),
-        timeout_s=5,
-    )
-    payload = _wait(
-        lambda: (
-            (settled if _manual_control_quiescent(settled) else None)
+    result = row.get("result") if isinstance(row.get("result"), dict) else {}
+    before_capture_revision = _capture_snapshot(before).get("revision")
+    task_success = _raw_success_latched(payload, result)
+    if task_success:
+        # The terminal receipt is the raw-success cutover.  From this point the
+        # acceptance driver performs only passive state reads: no playback wait,
+        # frame HTTP read, observe, hold, or capture request is permitted.
+        payload = _wait(
+            lambda: (
+                settled
+                if (
+                    _raw_success_latched(settled, result)
+                    and _manual_control_quiescent(settled)
+                    and _capture_snapshot(settled).get("phase")
+                    in {"idle", "discarded"}
+                )
+                else None
+            )
             if isinstance(
                 (settled := _run_payload(base_url, run_id)),
                 dict,
             )
-            else None
-        ),
-        timeout_s=10,
-        interval_s=0.1,
-    )
-    action_terminal_payload = payload
-    result = row.get("result") if isinstance(row.get("result"), dict) else {}
-    timeline_step = int(row.get("step") or 0)
-    _wait(
-        lambda: page.evaluate(
-            f"""
-            autoActionLastStep >= {timeline_step}
-            && autoActionPlayback === null
-            && frameKind === selectedCamera
-            """
-        ),
-        timeout_s=timeout_s,
-        interval_s=0.1,
-    )
-    page.sleep(100)
-    before_capture_revision = _capture_snapshot(before).get("revision")
-    task_success = result.get("task_success") is True
-    if not task_success:
+            else None,
+            timeout_s=10,
+            interval_s=0.1,
+        )
+    else:
+        _wait(
+            lambda: page.evaluate(
+                """
+                activeLeaseId === null
+                && !controlCommandInFlight
+                && controlLoopPromise === null
+                && stopLeasePromise === null
+                """
+            ),
+            timeout_s=5,
+        )
+        payload = _wait(
+            lambda: (
+                (settled if _manual_control_quiescent(settled) else None)
+                if isinstance(
+                    (settled := _run_payload(base_url, run_id)),
+                    dict,
+                )
+                else None
+            ),
+            timeout_s=10,
+            interval_s=0.1,
+        )
+        timeline_step = int(row.get("step") or 0)
+        _wait(
+            lambda: page.evaluate(
+                f"""
+                autoActionLastStep >= {timeline_step}
+                && autoActionPlayback === null
+                && frameKind === selectedCamera
+                """
+            ),
+            timeout_s=timeout_s,
+            interval_s=0.1,
+        )
+        page.sleep(100)
         payload = _wait(
             lambda: (
                 settled
@@ -1305,6 +1753,7 @@ def _exercise_button(
             timeout_s=10,
             interval_s=0.1,
         )
+    action_terminal_payload = payload
     command_fetches = [
         item
         for item in _fetch_audit(page)[fetches_before:]
@@ -1321,12 +1770,20 @@ def _exercise_button(
     )
     request_body = command_request.get("body")
     request_body = request_body if isinstance(request_body, dict) else {}
-    frame_evidence = _save_frames(
-        base_url=base_url,
-        run_id=run_id,
-        output_dir=output_dir,
-        case_index=case_index,
-        payload=payload,
+    frame_evidence = (
+        {
+            "skipped": True,
+            "reason": "official_task_success_latched",
+            "post_success_frame_http_reads": 0,
+        }
+        if task_success
+        else _save_frames(
+            base_url=base_url,
+            run_id=run_id,
+            output_dir=output_dir,
+            case_index=case_index,
+            payload=payload,
+        )
     )
     before_revisions = before.get("frame_revisions") or {}
     after_revisions = payload.get("frame_revisions") or {}
@@ -1374,6 +1831,7 @@ def _exercise_button(
                 "frame_indices": payload.get("frame_indices"),
                 "capture_group_id": payload.get("capture_group_id"),
                 "terminated": payload.get("terminated"),
+                "success_latched": _raw_success_latched(payload, result),
             },
             "checks": {
                 "exactly_one_command_request": len(command_fetches) == 1,
@@ -1397,6 +1855,10 @@ def _exercise_button(
                 "three_revisions_advanced_once": (
                     revisions_advanced if not task_success
                     else after_revisions == before_revisions
+                ),
+                "raw_success_cutover_zero_frame_reads": (
+                    not task_success
+                    or frame_evidence.get("post_success_frame_http_reads") == 0
                 ),
                 **_complete_frame_group_checks(payload),
                 **capture_checks,
@@ -1552,8 +2014,8 @@ def _check_release_oracle_dom(page: Any) -> dict[str, Any]:
     disabled = sum(not item["actual_enabled"] for item in cases)
     checks = {
         "exact_33_dom_cases": len(cases) == 33,
-        "exact_23_enabled": enabled == 23,
-        "exact_10_disabled": disabled == 10,
+        "exact_29_enabled": enabled == 29,
+        "exact_4_disabled": disabled == 4,
         "all_dom_states_match_release_oracle": all(item["matches"] for item in cases),
         "no_control_mutation_requests": not control_fetches,
         "restored_chassis_target": page.evaluate('selectedTarget === "chassis"')
@@ -1816,7 +2278,7 @@ def _sustain_live_run(
         payload = _run_payload(base_url, run_id)
         control = payload.get("control")
         control = control if isinstance(control, dict) else {}
-        if payload.get("terminated") is True or control.get("success_latched") is True:
+        if _raw_success_latched(payload):
             sample = {
                 "sample_index": samples,
                 "elapsed_s": round(time.monotonic() - started, 3),
@@ -2450,13 +2912,96 @@ def main() -> int:
     else:
         raise RuntimeError(f"expected one live run, got {runs!r}")
 
-    ready = _wait(
-        lambda: (
-            (payload if all(_control_ready_checks(payload).values()) else None)
-            if isinstance((payload := _run_payload(args.base_url, run_id)), dict)
-            else None
-        ),
-        timeout_s=30,
+    if args.planning_only_probes:
+        pre_capture_ready = _wait_for_run_ready(
+            base_url=args.base_url,
+            run_id=run_id,
+            checks=_planning_only_pre_capture_ready_checks,
+        )
+        capture_preflight = _refresh_planning_only_capture(
+            base_url=args.base_url,
+            run_id=run_id,
+            timeout_s=args.command_timeout_s,
+        )
+        _json_dump(
+            output_dir / "planning_only_capture_preflight.json",
+            capture_preflight,
+        )
+        _progress(
+            "planning_only_capture_preflight_complete",
+            verdict=capture_preflight["verdict"],
+        )
+        if capture_preflight["verdict"] != "pass":
+            raise RuntimeError(
+                "planning-only Dashboard capture preflight failed"
+            )
+        ready = _wait_for_run_ready(
+            base_url=args.base_url,
+            run_id=run_id,
+            checks=_planning_only_ready_checks,
+        )
+        ready_record = {
+            "payload": ready,
+            "checks": _planning_only_ready_checks(ready),
+            "pre_capture": {
+                "payload": pre_capture_ready,
+                "checks": _planning_only_pre_capture_ready_checks(
+                    pre_capture_ready
+                ),
+            },
+            "capture_preflight": capture_preflight,
+            "verdict": "pass",
+        }
+        _json_dump(output_dir / "initial_run.json", ready_record)
+        _progress("live_run_ready", run_id=run_id)
+        summary = _run_planning_only_probes(
+            base_url=args.base_url,
+            run_id=run_id,
+            output_dir=output_dir,
+            timeout_s=args.command_timeout_s,
+        )
+        summary["capture_preflight"] = capture_preflight
+        summary["reference_sha256"] = REFERENCE_SHA256
+        summary["artifact_manifest"] = {"verdict": "pending"}
+        _json_dump(output_dir / "planning_only_probes.json", summary)
+        _json_dump(output_dir / "acceptance_summary.json", summary)
+        sections = {
+            "ready": ready_record,
+            "planning_only": summary,
+        }
+        manifest = _artifact_manifest(output_dir=output_dir, sections=sections)
+        manifest_ok = bool(
+            manifest["self_check"]["manifest_json_reloaded"]
+            and manifest["self_check"]["artifact_hashes_revalidated"]
+            and not manifest["self_check"]["errors"]
+        )
+        summary["artifact_manifest"] = {
+            "verdict": "pass" if manifest_ok else "fail",
+            "artifact_count": manifest["artifact_count"],
+        }
+        if not manifest_ok:
+            summary["verdict"] = "fail"
+        _json_dump(output_dir / "planning_only_probes.json", summary)
+        _json_dump(output_dir / "acceptance_summary.json", summary)
+        manifest = _artifact_manifest(output_dir=output_dir, sections=sections)
+        manifest_ok = bool(
+            manifest["self_check"]["manifest_json_reloaded"]
+            and manifest["self_check"]["artifact_hashes_revalidated"]
+            and not manifest["self_check"]["errors"]
+        )
+        _progress(
+            "planning_only_acceptance_complete",
+            verdict=summary["verdict"],
+            completed_probe_count=summary["completed_probe_count"],
+        )
+        if summary["verdict"] != "pass" or not manifest_ok:
+            raise RuntimeError("planning-only Dashboard acceptance failed")
+        return 0
+
+    ready = _wait_for_run_ready(
+        base_url=args.base_url,
+        run_id=run_id,
+        checks=_control_ready_checks,
     )
     ready_record = {
         "payload": ready,
@@ -2631,7 +3176,7 @@ def main() -> int:
                         f"{target}/{action} failed or produced incomplete evidence"
                     )
                 if (
-                    record.get("after", {}).get("terminated") is True
+                    record.get("after", {}).get("success_latched") is True
                     or result.get("task_success") is True
                 ):
                     halt_reason = "official task success latched"
@@ -2816,8 +3361,8 @@ def main() -> int:
     ]
     matrix_summary = {
         "required_total": 33,
-        "required_enabled": 23,
-        "required_disabled": 10,
+        "required_enabled": 29,
+        "required_disabled": 4,
         "cases_total": len(matrix),
         "enabled_cases": len(enabled_cases),
         "disabled_cases": len(disabled_cases),
@@ -2830,11 +3375,11 @@ def main() -> int:
         if matrix_summary
         == {
             "required_total": 33,
-            "required_enabled": 23,
-            "required_disabled": 10,
+            "required_enabled": 29,
+            "required_disabled": 4,
             "cases_total": 33,
-            "enabled_cases": 23,
-            "disabled_cases": 10,
+            "enabled_cases": 29,
+            "disabled_cases": 4,
             "passed": 33,
             "failed": 0,
             "not_run": 0,
@@ -2912,7 +3457,7 @@ def main() -> int:
             "media_acceptable": media_acceptable,
         },
         "halt_reason": halt_reason,
-        "official_task_success": bool(final_run.get("terminated")),
+        "official_task_success": _raw_success_latched(final_run),
         "artifact_manifest": {"verdict": "pending"},
         "verdict": (
             "pass"

@@ -276,8 +276,12 @@ class State:
                             "publication_complete"
                         ]
                     self._terminated = True
-                    if self._timeline:
+                    if (
+                        self._timeline
+                        and self._timeline[-1].get("terminated") is not True
+                    ):
                         self._timeline[-1]["terminated"] = True
+                        self._timeline_revision += 1
                 self._update_artifact_warning_locked()
             elif event_type == "publication_complete":
                 if self._trusted_attempt_event(
@@ -576,10 +580,15 @@ class State:
             ):
                 return
             previous = dict(self._control_snapshot)
+            terminal = previous.get("last_terminal")
             preserve_success_terminal = bool(
                 previous.get("success_latched") is True
                 and previous.get("command_id")
                 and previous.get("phase") in {"completed", "failed", "cancelled"}
+                and isinstance(terminal, Mapping)
+                and terminal.get("command_id") == previous.get("command_id")
+                and terminal.get("phase") == previous.get("phase")
+                and terminal.get("task_success") is True
             )
             self._control_controller = None
             self._control_capture_generation += 1
@@ -611,7 +620,6 @@ class State:
                 "unavailable_reason": "controller_not_bound",
             }
             if preserve_success_terminal:
-                terminal = previous.get("last_terminal")
                 for key in (
                     "command_id",
                     "lease_id",
@@ -760,11 +768,11 @@ class State:
         result: Mapping[str, Any],
         *,
         official_success_latched: bool,
-    ) -> None:
+    ) -> bool:
         """Publish only the immutable manual action receipt and Timeline result."""
 
         if not isinstance(result, Mapping):
-            return
+            return False
         safe_result = _json_safe(result)
         if not isinstance(safe_result, dict):
             safe_result = {}
@@ -787,7 +795,7 @@ class State:
                 None,
             )
             if item is None:
-                return
+                return False
             env_step = self._env_step(dict(result))
             if env_step is not None:
                 item["env_step"] = env_step
@@ -861,6 +869,7 @@ class State:
             item["terminated"] = bool(self._progress["official_task_success"])
             self._update_progress_from_payload_locked(dict(result))
             self._timeline_revision += 1
+            return True
 
     def on_dashboard_capture_result(
         self,
@@ -1392,6 +1401,9 @@ class State:
             return {
                 "kind": "wrist_rotation",
                 "visual_degrees": 5.0 if action == "rotate_left" else -5.0,
+                "visual_direction": (
+                    "counterclockwise" if action == "rotate_left" else "clockwise"
+                ),
             }
         if action in {"open", "close"}:
             return {"kind": "gripper", "opening": 1.0 if action == "open" else 0.0}

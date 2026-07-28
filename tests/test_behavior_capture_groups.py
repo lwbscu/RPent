@@ -36,7 +36,8 @@ def test_dashboard_capture_returns_one_fresh_three_camera_group():
     facade._env_steps = 5
     facade._frame_cache = _FrameCache()
 
-    def refresh():
+    def refresh(*, synchronize_hand_geometry=False):
+        assert synchronize_hand_geometry is True
         facade._frame_cache.group = "capture:5:new"
         facade._frame_cache.step = 5
         facade._frame_cache.images = {
@@ -64,7 +65,13 @@ def test_dashboard_capture_rejects_nonfresh_group_instead_of_republishing_old_fr
     facade._env_steps = 4
     facade._frame_cache = _FrameCache()
     old_images = dict(facade._frame_cache.images)
-    facade._refresh_observation_without_step = lambda: None
+    facade._refresh_observation_without_step = (
+        lambda *, synchronize_hand_geometry=False: (
+            None
+            if synchronize_hand_geometry is True
+            else pytest.fail("Dashboard capture omitted hand-geometry synchronization")
+        )
+    )
 
     with pytest.raises(RuntimeError, match="fresh capture group"):
         facade._dashboard_capture_group()
@@ -78,7 +85,8 @@ def test_dashboard_capture_rejects_partial_camera_payload():
     facade._env_steps = 5
     facade._frame_cache = _FrameCache()
 
-    def refresh():
+    def refresh(*, synchronize_hand_geometry=False):
+        assert synchronize_hand_geometry is True
         facade._frame_cache.group = "capture:5:bad"
         facade._frame_cache.step = 5
         facade._frame_cache.images["right_wrist"] = None
@@ -95,7 +103,8 @@ def test_dashboard_capture_rejects_mixed_lineage():
     cache = _FrameCache()
     facade._frame_cache = cache
 
-    def refresh():
+    def refresh(*, synchronize_hand_geometry=False):
+        assert synchronize_hand_geometry is True
         cache.group = "capture:5:new"
         cache.step = 5
 

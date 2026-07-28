@@ -32,11 +32,16 @@ from PIL import Image, ImageChops, ImageDraw, ImageStat
 
 REPO = Path(__file__).resolve().parents[1]
 HTML = REPO / "rpent/dashboard/index.html"
-REFERENCE = REPO / "tests/fixtures/dashboard_interactive_controls_reference.png"
-REFERENCE_SHA256 = "9d3071e672c81845c6e88247bcf0d0642a0a9b7c5b28c887823b99d5d3a1607c"
-HIGH_DPI_REFERENCE = Path("/home/ubuntu/lwb/Projects/test/image.png")
-HIGH_DPI_REFERENCE_SHA256 = (
+ZH_HTML = REPO / "rpent/dashboard/index.zh-cn.html"
+REFERENCE = Path("/home/ubuntu/lwb/Projects/test/image.png")
+REFERENCE_SHA256 = (
     "ef0d70afaf83b07a79e0cae37d23c90534a787c4ef8dcf8b0a0784e307369223"
+)
+LEGACY_LAYOUT_FIXTURE = (
+    REPO / "tests/fixtures/dashboard_interactive_controls_reference.png"
+)
+LEGACY_LAYOUT_FIXTURE_SHA256 = (
+    "9d3071e672c81845c6e88247bcf0d0642a0a9b7c5b28c887823b99d5d3a1607c"
 )
 OUTPUT_DIR = Path("/home/ubuntu/lwb/RPent_outputs/dashboard_visual_acceptance")
 LIVE_SCREENSHOT = OUTPUT_DIR / "interactive_controls_live_823x526.png"
@@ -72,10 +77,10 @@ class _MockDashboard:
 
     @staticmethod
     def _make_head_frame() -> bytes:
-        # The reference's center camera view is reused as deterministic mock
+        # The auxiliary layout fixture's center camera view is reused as mock
         # simulator RGB.  Controls remain live DOM/CSS; this only removes
         # nondeterministic scene imagery from pixel comparisons.
-        with Image.open(REFERENCE) as image:
+        with Image.open(LEGACY_LAYOUT_FIXTURE) as image:
             camera = image.convert("RGB").crop((211, 0, 619, 410))
             output = io.BytesIO()
             camera.save(output, format="PNG")
@@ -83,12 +88,12 @@ class _MockDashboard:
 
     def _make_high_dpi_head_frame(self) -> bytes:
         if (
-            not HIGH_DPI_REFERENCE.exists()
-            or hashlib.sha256(HIGH_DPI_REFERENCE.read_bytes()).hexdigest()
-            != HIGH_DPI_REFERENCE_SHA256
+            not REFERENCE.exists()
+            or hashlib.sha256(REFERENCE.read_bytes()).hexdigest()
+            != REFERENCE_SHA256
         ):
             return self.head_png
-        with Image.open(HIGH_DPI_REFERENCE) as image:
+        with Image.open(REFERENCE) as image:
             camera = image.convert("RGB").crop((325, 0, 962, 650))
             output = io.BytesIO()
             camera.save(output, format="PNG")
@@ -147,6 +152,7 @@ class _MockDashboard:
             self.command_posts_in_flight = 0
             self.max_command_posts_in_flight = 0
             self.control_revision = 0
+            self.timeline_revision = 56
             self.pending_cleared_count = 0
             self.run_get_count = 0
             self.frame_get_count = 0
@@ -184,7 +190,7 @@ class _MockDashboard:
             "state": "running",
             "terminated": False,
             "frame_idx": 1587,
-            "timeline_revision": 56,
+            "timeline_revision": self.timeline_revision,
             "frame_revisions": {
                 "head": 1587,
                 "left_wrist": 1587,
@@ -436,7 +442,11 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         mock = self.server.mock
         if parsed.path == "/":
-            self._send(HTTPStatus.OK, HTML.read_bytes(), "text/html; charset=utf-8")
+            self._send(
+                HTTPStatus.OK,
+                self.server.html_path.read_bytes(),
+                "text/html; charset=utf-8",
+            )
         elif parsed.path == "/api/launch/state":
             self._json({"enabled": False, "pending": False})
         elif parsed.path == "/api/runs":
@@ -490,9 +500,10 @@ class _Handler(BaseHTTPRequestHandler):
 class _DashboardHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, mock: _MockDashboard):
+    def __init__(self, mock: _MockDashboard, html_path: Path = HTML):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.mock = mock
+        self.html_path = html_path
 
 
 class _WebSocket:
@@ -836,6 +847,10 @@ class _ChromePage:
 @pytest.fixture(scope="module")
 def visual_dashboard():
     assert hashlib.sha256(REFERENCE.read_bytes()).hexdigest() == REFERENCE_SHA256
+    assert (
+        hashlib.sha256(LEGACY_LAYOUT_FIXTURE.read_bytes()).hexdigest()
+        == LEGACY_LAYOUT_FIXTURE_SHA256
+    )
     mock = _MockDashboard()
     server = _DashboardHTTPServer(mock)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -865,6 +880,24 @@ def isolated_dashboard():
     """Fresh browser process for timing-sensitive arbiter admission checks."""
     mock = _MockDashboard()
     server = _DashboardHTTPServer(mock)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    page = _ChromePage(f"http://127.0.0.1:{server.server_port}/")
+    try:
+        yield page, mock
+    finally:
+        page.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.fixture(params=(HTML, ZH_HTML), ids=("en", "zh-cn"))
+def bilingual_dashboard(request: pytest.FixtureRequest):
+    """Fresh English/Chinese page for Timeline concurrency acceptance."""
+
+    mock = _MockDashboard()
+    server = _DashboardHTTPServer(mock, html_path=request.param)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     page = _ChromePage(f"http://127.0.0.1:{server.server_port}/")
@@ -914,10 +947,36 @@ def _wait_stops(mock: _MockDashboard, count: int, timeout: float = 2.0):
     )
 
 
-def test_reference_fixture_has_exact_approved_identity():
+def test_reference_has_exact_approved_identity():
     with Image.open(REFERENCE) as image:
-        assert image.size == (823, 526)
+        assert image.size == (1280, 867)
     assert hashlib.sha256(REFERENCE.read_bytes()).hexdigest() == REFERENCE_SHA256
+
+
+def test_legacy_layout_fixture_is_auxiliary_and_stable():
+    with Image.open(LEGACY_LAYOUT_FIXTURE) as image:
+        assert image.size == (823, 526)
+    assert (
+        hashlib.sha256(LEGACY_LAYOUT_FIXTURE.read_bytes()).hexdigest()
+        == LEGACY_LAYOUT_FIXTURE_SHA256
+    )
+
+
+@pytest.mark.parametrize("html_path", (HTML, ZH_HTML), ids=("en", "zh-cn"))
+def test_bilingual_timeline_refresh_source_contract(html_path: Path):
+    source = html_path.read_text(encoding="utf-8")
+
+    assert "const CONTROL_HOLD_DELAY_MS = 320;" in source
+    assert "const CONTROL_REPEAT_MIN_MS = 220;" in source
+    assert "function queueBehaviorTimelineRefresh(revision, nextFrameIdx)" in source
+    assert "metaRequestGeneration !== behaviorMetaRequestGeneration" in source
+    assert "opts.behaviorTimelineGeneration !== behaviorTimelineRefreshGeneration" in source
+    assert "responseTimelineRevision < minimumTimelineRevision" in source
+    assert "timelineRevision = sig.timeline_revision;" in source
+    assert 'reason: "Torso control unavailable."' in source
+    assert "Torso control unsupported." not in source
+    assert 'terminal.phase === "cancelled"' in source
+    assert '"command_cancelled"' in source
 
 
 def test_initial_state_collapse_tabs_and_equal_targets(dashboard):
@@ -1049,7 +1108,7 @@ def test_dynamic_tooltips_pressed_style_and_capability_gate(dashboard):
     )
     assert arm["rotate"] == {
         "disabled": "false",
-        "tip": "Rotate the selected wrist 5° clockwise. Hold to continue.",
+        "tip": "Rotate the selected wrist 5° counterclockwise. Hold to continue.",
     }
 
     button = '[data-action="forward"]'
@@ -1065,7 +1124,7 @@ def test_dynamic_tooltips_pressed_style_and_capability_gate(dashboard):
     assert released["pressed"] is False
 
 
-def test_short_press_once_and_long_press_fills_bounded_tail(dashboard):
+def test_short_press_once_and_long_press_waits_for_each_terminal(dashboard):
     page, mock = dashboard
     selector = '[data-action="forward"]'
 
@@ -1095,19 +1154,21 @@ def test_short_press_once_and_long_press_fills_bounded_tail(dashboard):
     _dispatch_pointer(page, selector, "pointerup", 202)
     page.sleep(120)
     commands = list(mock.commands)
-    # Six commands proves the initial head + five-tail fill; the seventh
-    # proves the same pump refilled after queue_depth dropped.
-    assert len(commands) >= 7
+    assert len(commands) >= 2
     accepted = [item["accepted_at"] for item in commands]
     intervals_ms = [
         (later - earlier) * 1000
         for earlier, later in zip(accepted, accepted[1:], strict=False)
     ]
     assert intervals_ms[0] >= 315
-    assert all(interval >= 95 for interval in intervals_ms[1:])
+    assert all(interval >= 440 for interval in intervals_ms)
+    assert all(
+        later["accepted_at"] >= earlier["terminal_receipt_at"]
+        for earlier, later in zip(commands, commands[1:], strict=False)
+    )
     assert mock.max_in_flight == 1
     assert mock.max_command_posts_in_flight == 1
-    assert mock.max_queue_depth <= 5
+    assert mock.max_queue_depth == 0
     assert len(mock.heartbeats) >= 2
     heartbeat_intervals_ms = [
         (later["at"] - earlier["at"]) * 1000
@@ -1117,7 +1178,7 @@ def test_short_press_once_and_long_press_fills_bounded_tail(dashboard):
     assert [item["sequence"] for item in commands] == list(range(1, len(commands) + 1))
 
 
-def test_repeat_does_not_wait_for_terminal_and_stop_clears_only_tail(
+def test_repeat_waits_for_terminal_and_stop_leaves_only_current_action(
     isolated_dashboard,
 ):
     page, mock = isolated_dashboard
@@ -1125,19 +1186,19 @@ def test_repeat_does_not_wait_for_terminal_and_stop_clears_only_tail(
     page.reload()
 
     page.mouse('[data-action="forward"]', down=True)
-    _wait_commands(mock, 6, timeout=2)
+    _wait_commands(mock, 2, timeout=3)
     first, second = mock.commands[:2]
-    assert second["accepted_at"] < first["complete_at"]
-    assert first.get("terminal_receipt_at") is None
+    assert first.get("terminal_receipt_at") is not None
+    assert second["accepted_at"] >= first["terminal_receipt_at"]
     page.mouse('[data-action="forward"]', down=False)
     _wait_stops(mock, 1)
     page.sleep(100)
 
-    assert mock.commands[0]["cancelled"] is False
-    assert all(command["cancelled"] for command in mock.commands[1:6])
+    assert len(mock.commands) == 2
+    assert all(command["cancelled"] is False for command in mock.commands)
     assert mock.max_in_flight == 1
     assert mock.max_command_posts_in_flight == 1
-    assert mock.max_queue_depth == 5
+    assert mock.max_queue_depth == 0
 
 
 def test_release_before_first_202_retries_clear_pending_after_acceptance(
@@ -1175,7 +1236,7 @@ def test_camera_change_does_not_stop_motion_and_lease_payload_is_frozen(
         lambda: len(mock.cameras) == 1
         and mock.cameras[0]["state"] == "completed"
     )
-    _wait_commands(mock, 6, timeout=2)
+    _wait_commands(mock, 2, timeout=3)
 
     assert not mock.stops
     assert all(command["target"] == "chassis" for command in mock.commands)
@@ -1184,8 +1245,8 @@ def test_camera_change_does_not_stop_motion_and_lease_payload_is_frozen(
     assert page.evaluate(
         """
         selectedCamera === "left_wrist" &&
-        controlQueueDepth() === 5 &&
-        document.querySelector(".control-status").textContent.includes("q 5/5")
+        controlQueueDepth() === 0 &&
+        activeLeaseId !== null
         """
     )
 
@@ -1260,6 +1321,7 @@ def test_sse_uses_timeline_and_per_camera_frame_revisions(dashboard):
     with mock.lock:
         run_gets_before = mock.run_get_count
         frame_gets_before = mock.frame_get_count
+        mock.timeline_revision = 57
     page.evaluate(
         """
         es.onmessage({data: JSON.stringify({
@@ -1285,6 +1347,190 @@ def test_sse_uses_timeline_and_per_camera_frame_revisions(dashboard):
             """
         )
     )
+
+
+def test_bilingual_behavior_timeline_refresh_is_generation_safe_and_retries(
+    bilingual_dashboard,
+):
+    page, _mock = bilingual_dashboard
+    result = page.evaluate(
+        """
+        (async () => {
+          const originalFetch = window.fetch;
+          const pending = [];
+          const waitForPending = async count => {
+            const deadline = performance.now() + 3000;
+            while (pending.length < count && performance.now() < deadline) {
+              await sleep(10);
+            }
+            if (pending.length < count) {
+              throw new Error(`expected ${count} run requests, got ${pending.length}`);
+            }
+          };
+          const payload = (revision, action, behavior = true) => ({
+            id: "mock-run",
+            suite: behavior ? "behavior_2025_challenge" : "libero",
+            name: behavior ? "picking_up_trash" : "pick_place",
+            task: 1,
+            seed: 13,
+            state: "running",
+            terminated: false,
+            frame_idx: 1500 + revision,
+            timeline_revision: revision,
+            frame_revisions: {
+              head: 1500 + revision,
+              left_wrist: 1500 + revision,
+              right_wrist: 1500 + revision
+            },
+            timeline: [{
+              step: revision,
+              action,
+              args: {},
+              result: {},
+              elapsed_s: 0.1,
+              has_action_video: false
+            }],
+            has_video: false,
+            control: controlSnapshot,
+            metadata: {
+              "public-tool-count": 10,
+              "public-tool-contract-version": "v2"
+            }
+          });
+          const resolveRequest = (index, value) => {
+            pending[index].resolve({json: async () => value});
+          };
+          try {
+            window.fetch = (input, init) => {
+              if (String(input).startsWith("/api/run?")) {
+                return new Promise((resolve, reject) => {
+                  pending.push({resolve, reject});
+                });
+              }
+              return originalFetch(input, init);
+            };
+
+            timelineRevision = 56;
+            behaviorTimelineTargetRevision = 56;
+            renderTimeline([{
+              step: 56, action: "baseline", args: {}, result: {},
+              elapsed_s: 0.1, has_action_video: false
+            }], false);
+
+            const older = refreshMeta();
+            await waitForPending(1);
+            const newer = refreshMeta();
+            await waitForPending(2);
+            resolveRequest(1, payload(58, "newer"));
+            const newerApplied = await newer;
+            resolveRequest(0, payload(57, "older"));
+            const olderApplied = await older;
+            const concurrent = {
+              newerApplied,
+              olderApplied,
+              revision: timelineRevision,
+              action: document.querySelector("#timeline .act")?.textContent
+            };
+
+            const generationRefresh = queueBehaviorTimelineRefresh(59, 1559);
+            await waitForPending(3);
+            queueBehaviorTimelineRefresh(60, 1560);
+            resolveRequest(2, payload(59, "stale_generation"));
+            await waitForPending(4);
+            const beforeCurrentGeneration = {
+              revision: timelineRevision,
+              target: behaviorTimelineTargetRevision,
+              action: document.querySelector("#timeline .act")?.textContent
+            };
+            resolveRequest(3, payload(60, "current_generation"));
+            const generationApplied = await generationRefresh;
+            await sleep(0);
+            const afterCurrentGeneration = {
+              revision: timelineRevision,
+              action: document.querySelector("#timeline .act")?.textContent
+            };
+
+            const retryRefresh = queueBehaviorTimelineRefresh(61, 1561);
+            await waitForPending(5);
+            pending[4].reject(new Error("transient run fetch failure"));
+            await waitForPending(6);
+            const beforeRetrySuccess = {
+              revision: timelineRevision,
+              target: behaviorTimelineTargetRevision,
+              action: document.querySelector("#timeline .act")?.textContent,
+              pendingStatus: document.querySelector("#connMeta").textContent
+            };
+            resolveRequest(5, payload(61, "retry_success"));
+            const retryApplied = await retryRefresh;
+            await sleep(0);
+            const afterRetrySuccess = {
+              revision: timelineRevision,
+              action: document.querySelector("#timeline .act")?.textContent
+            };
+
+            setBehaviorControlMode(false);
+            timelineRevision = 70;
+            es.onmessage({data: JSON.stringify({
+              state: "running",
+              terminated: false,
+              timeline_revision: 71,
+              frame_idx: 1571,
+              frame_revisions: {}
+            })});
+            const nonBehaviorPreAcknowledged = timelineRevision === 71;
+            await waitForPending(7);
+            resolveRequest(6, payload(71, "non_behavior", false));
+            await sleep(0);
+
+            return {
+              concurrent,
+              beforeCurrentGeneration,
+              generationApplied,
+              afterCurrentGeneration,
+              beforeRetrySuccess,
+              retryApplied,
+              afterRetrySuccess,
+              nonBehaviorPreAcknowledged,
+              requestCount: pending.length,
+              transitioning: stepTransitioning,
+              refreshInFlight: behaviorTimelineRefreshPromise !== null
+            };
+          } finally {
+            window.fetch = originalFetch;
+          }
+        })()
+        """
+    )
+
+    assert result["concurrent"] == {
+        "newerApplied": True,
+        "olderApplied": False,
+        "revision": 58,
+        "action": "newer",
+    }
+    assert result["beforeCurrentGeneration"] == {
+        "revision": 58,
+        "target": 60,
+        "action": "newer",
+    }
+    assert result["generationApplied"] is True
+    assert result["afterCurrentGeneration"] == {
+        "revision": 60,
+        "action": "current_generation",
+    }
+    assert result["beforeRetrySuccess"]["revision"] == 60
+    assert result["beforeRetrySuccess"]["target"] == 61
+    assert result["beforeRetrySuccess"]["action"] == "current_generation"
+    assert "refresh pending" in result["beforeRetrySuccess"]["pendingStatus"]
+    assert result["retryApplied"] is True
+    assert result["afterRetrySuccess"] == {
+        "revision": 61,
+        "action": "retry_success",
+    }
+    assert result["nonBehaviorPreAcknowledged"] is True
+    assert result["requestCount"] == 7
+    assert result["transitioning"] is False
+    assert result["refreshInFlight"] is False
 
 
 @pytest.mark.parametrize("terminal_kind", ["failed", "raw_success"])
@@ -1807,7 +2053,7 @@ def test_action_video_returns_to_previously_selected_camera(dashboard):
     }
 
 
-def test_reference_layout_coordinates_and_write_acceptance_artifacts(dashboard):
+def test_legacy_layout_fixture_coordinates_and_write_artifacts(dashboard):
     page, _mock = dashboard
     page.layout_fixture()
     page.sleep(120)
@@ -1878,7 +2124,10 @@ def test_reference_layout_coordinates_and_write_acceptance_artifacts(dashboard):
         "timelineTitle": {"x": 0, "y": 416, "width": 823, "height": 36},
     }
     page.screenshot_clip(LIVE_SCREENSHOT)
-    with Image.open(LIVE_SCREENSHOT) as live, Image.open(REFERENCE) as reference:
+    with (
+        Image.open(LIVE_SCREENSHOT) as live,
+        Image.open(LEGACY_LAYOUT_FIXTURE) as reference,
+    ):
         assert live.size == reference.size == (823, 526)
         overlay = Image.blend(reference.convert("RGB"), live.convert("RGB"), alpha=0.5)
         OVERLAY_SCREENSHOT.parent.mkdir(parents=True, exist_ok=True)
@@ -1892,13 +2141,13 @@ def test_reference_layout_coordinates_and_write_acceptance_artifacts(dashboard):
         # Compare deterministic UI chrome only. Simulator RGB, the dynamic
         # frame caption, and Timeline content are deliberately excluded.
         # The mask covers both control rails (including the camera tabs) while
-        # retaining the reference-approved low-saturation selected state and
+        # retaining the auxiliary fixture's low-saturation selected state and
         # capability-disabled controls as intentional product differences.
         chrome_mask = Image.new("L", reference.size, 0)
         chrome_draw = ImageDraw.Draw(chrome_mask)
         chrome_draw.rectangle((0, 0, 210, 369), fill=255)
         chrome_draw.rectangle((619, 0, 822, 409), fill=255)
-        # The immutable reference intentionally remains the before-state.
+        # The auxiliary fixture intentionally remains the before-state.
         # Geometry assertions below validate the explicitly moved left control
         # group; exclude the union of its old/new footprints from the pixel
         # similarity score so that the requested 22 px move is not counted as
@@ -1970,17 +2219,16 @@ def test_reference_layout_coordinates_and_write_acceptance_artifacts(dashboard):
             "timelineTitleText: "
             f"{geometry['timelineTitleText']!r} != {expected_title!r}"
         )
-    assert not errors, "reference coordinate mismatches:\n" + "\n".join(errors)
+    assert not errors, "auxiliary layout coordinate mismatches:\n" + "\n".join(errors)
 
 
-def test_high_dpi_reference_layout_and_write_acceptance_artifacts(dashboard):
-    if not HIGH_DPI_REFERENCE.exists():
-        pytest.skip("optional local 1280x867 Dashboard reference is unavailable")
+def test_reference_layout_and_write_acceptance_artifacts(dashboard):
+    assert REFERENCE.exists(), "the authoritative 1280x867 reference is required"
     assert (
-        hashlib.sha256(HIGH_DPI_REFERENCE.read_bytes()).hexdigest()
-        == HIGH_DPI_REFERENCE_SHA256
+        hashlib.sha256(REFERENCE.read_bytes()).hexdigest()
+        == REFERENCE_SHA256
     )
-    with Image.open(HIGH_DPI_REFERENCE) as reference:
+    with Image.open(REFERENCE) as reference:
         assert reference.size == (1280, 867)
 
     page, mock = dashboard
@@ -2041,7 +2289,7 @@ def test_high_dpi_reference_layout_and_write_acceptance_artifacts(dashboard):
         )
         with (
             Image.open(HIGH_DPI_LIVE_SCREENSHOT) as live,
-            Image.open(HIGH_DPI_REFERENCE) as reference,
+            Image.open(REFERENCE) as reference,
         ):
             assert live.size == reference.size == (1280, 867)
             overlay = Image.blend(

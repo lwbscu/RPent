@@ -445,6 +445,7 @@ class BehaviorEnvClient:
         action: str,
         predecessor_plan_id: str | None = None,
         background: bool = False,
+        planning_only_probe: bool = False,
     ) -> dict[str, Any]:
         """Prepare one internal Dashboard motion without executing an action."""
 
@@ -453,6 +454,7 @@ class BehaviorEnvClient:
             action=action,
             predecessor_plan_id=predecessor_plan_id,
             background=background,
+            planning_only_probe=planning_only_probe,
         )
         result = self._planner_call(
             "dashboard_prepare_manual_command",

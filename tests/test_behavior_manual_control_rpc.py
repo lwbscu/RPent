@@ -213,6 +213,23 @@ def test_prepared_command_schema_is_internal_motion_only():
             action="up",
             background=True,
         )
+    assert validate_dashboard_prepare_request(
+        target="right_arm",
+        action="rotate_left",
+        planning_only_probe=True,
+    ) == {
+        "target": "right_arm",
+        "action": "rotate_left",
+        "predecessor_plan_id": None,
+        "background": False,
+        "planning_only_probe": True,
+    }
+    with pytest.raises(ValueError, match="limited"):
+        validate_dashboard_prepare_request(
+            target="right_arm",
+            action="forward",
+            planning_only_probe=True,
+        )
     assert {
         "dashboard_prepare_manual_command",
         "dashboard_execute_prepared_command",
@@ -251,6 +268,43 @@ def test_env_client_background_prepare_uses_dedicated_rpc_contract():
                 "action": "forward",
                 "predecessor_plan_id": "plan-1",
                 "background": True,
+            },
+            72.0,
+        )
+    ]
+
+
+def test_env_client_planning_only_probe_uses_explicit_zero_action_contract():
+    client = _client(
+        {
+            **_prepared_response(
+                plan_id="probe-plan",
+                target="left_arm",
+                action="rotate_left",
+            ),
+            "planning_only_probe": True,
+            "env_step_delta": 0,
+            "zero_action_verified": True,
+        }
+    )
+
+    returned = client.dashboard_prepare_manual_command(
+        target="left_arm",
+        action="rotate_left",
+        planning_only_probe=True,
+    )
+
+    assert returned["zero_action_verified"] is True
+    assert client._client.calls == [
+        (
+            "env.dashboard_prepare_manual_command",
+            (),
+            {
+                "target": "left_arm",
+                "action": "rotate_left",
+                "predecessor_plan_id": None,
+                "background": False,
+                "planning_only_probe": True,
             },
             72.0,
         )
@@ -456,6 +510,25 @@ def test_behavior_primitives_route_internal_pipeline_without_public_tools():
         ("capture", {"command_id": "capture-1"}),
     ]
 
+    calls.clear()
+    primitives.dashboard_prepare_manual_command(
+        target="right_arm",
+        action="rotate_right",
+        planning_only_probe=True,
+    )
+    assert calls == [
+        (
+            "prepare",
+            {
+                "target": "right_arm",
+                "action": "rotate_right",
+                "predecessor_plan_id": None,
+                "background": False,
+                "planning_only_probe": True,
+            },
+        )
+    ]
+
 
 def test_toolkit_pipeline_requires_reservation_and_exact_command_permits():
     permit_calls = []
@@ -483,6 +556,12 @@ def test_toolkit_pipeline_requires_reservation_and_exact_command_permits():
             action=kwargs["action"],
         ),
         dashboard_execute_prepared_command=lambda **kwargs: _manual_response(),
+        dashboard_discard_prepared_command=lambda **kwargs: {
+            "schema_version": 1,
+            "plan_id": kwargs["plan_id"],
+            "discarded": True,
+            "status": "discarded",
+        },
         dashboard_capture_views=lambda **kwargs: _capture_response(),
     )
     toolkit = BehaviorToolkit.__new__(BehaviorToolkit)
@@ -490,11 +569,14 @@ def test_toolkit_pipeline_requires_reservation_and_exact_command_permits():
     toolkit._command_arbiter = _Arbiter()
     toolkit._success_latch = SimpleNamespace(is_latched=lambda: False)
     toolkit._manual_intervention_latch = SimpleNamespace(set=lambda: None)
+    toolkit._dashboard_plan_bindings_lock = threading.RLock()
+    toolkit._dashboard_plan_bindings = {}
     toolkit._primitives = primitives
 
     prepared = toolkit.dashboard_prepare_manual_command(
         target="left_arm",
         action="up",
+        permit_command_id="command-1",
     )
     toolkit.dashboard_execute_prepared_command(
         plan_id=prepared["plan_id"],
@@ -502,13 +584,63 @@ def test_toolkit_pipeline_requires_reservation_and_exact_command_permits():
     )
     toolkit.dashboard_capture_views(command_id="capture-1")
 
-    assert permit_calls == ["command-1", "capture-1"]
+    assert permit_calls == ["command-1", "command-1", "capture-1"]
+    probe = toolkit.dashboard_prepare_manual_command(
+        target="left_arm",
+        action="rotate_left",
+        permit_command_id="command-1",
+        planning_only_probe=True,
+    )
+    assert probe["status"] == "prepared"
+    assert permit_calls[-1] == "command-1"
+    toolkit.dashboard_discard_prepared_command(plan_id=probe["plan_id"])
+    assert probe["plan_id"] not in toolkit._dashboard_plan_bindings
     toolkit._command_arbiter.owner = "agent"
-    with pytest.raises(RuntimeError, match="manual reservation"):
+    with pytest.raises(RuntimeError, match="wrong permit"):
         toolkit.dashboard_prepare_manual_command(
             target="left_arm",
             action="up",
+            permit_command_id="command-1",
         )
+
+
+def test_toolkit_prepared_plan_is_bound_to_the_original_command():
+    class _Arbiter:
+        def require_manual_permit(self, command_id):
+            if command_id not in {"command-1", "command-2"}:
+                raise RuntimeError("wrong permit")
+
+    primitives = SimpleNamespace(
+        dashboard_prepare_manual_command=lambda **kwargs: _prepared_response(),
+        dashboard_execute_prepared_command=lambda **kwargs: _manual_response(),
+    )
+    toolkit = BehaviorToolkit.__new__(BehaviorToolkit)
+    toolkit._closed = False
+    toolkit._command_arbiter = _Arbiter()
+    toolkit._success_latch = SimpleNamespace(is_latched=lambda: False)
+    toolkit._manual_intervention_latch = SimpleNamespace(set=lambda: None)
+    toolkit._dashboard_plan_bindings_lock = threading.RLock()
+    toolkit._dashboard_plan_bindings = {}
+    toolkit._primitives = primitives
+
+    prepared = toolkit.dashboard_prepare_manual_command(
+        target="left_arm",
+        action="up",
+        permit_command_id="command-1",
+    )
+
+    with pytest.raises(RuntimeError, match="different command"):
+        toolkit.dashboard_execute_prepared_command(
+            plan_id=prepared["plan_id"],
+            command_id="command-2",
+        )
+
+    result = toolkit.dashboard_execute_prepared_command(
+        plan_id=prepared["plan_id"],
+        command_id="command-1",
+    )
+    assert result["primitive_success"] is True
+    assert prepared["plan_id"] not in toolkit._dashboard_plan_bindings
 
 
 def test_behavior_primitives_preserve_success_without_partial_frame_publish():
@@ -788,6 +920,50 @@ def test_env_facade_execute_is_exactly_once_by_command_id_without_capture():
             plan_id="plan-2",
             command_id="command-1",
         )
+
+
+@pytest.mark.parametrize(
+    "invalid_receipt",
+    [
+        {
+            "schema_version": 1,
+            "plan_id": "wrong-plan",
+            "discarded": True,
+            "status": "discarded",
+        },
+        {
+            "schema_version": 1,
+            "plan_id": "plan-1",
+            "discarded": False,
+            "status": "discarded",
+        },
+        {
+            "schema_version": 1,
+            "plan_id": "plan-1",
+            "discarded": True,
+            "status": "prepared",
+        },
+    ],
+)
+def test_env_facade_discard_requires_an_exact_terminal_receipt(invalid_receipt):
+    facade = _facade()
+    facade._planner.discard_dashboard_motion = lambda _plan_id: dict(
+        invalid_receipt
+    )
+
+    with pytest.raises(RuntimeError, match="invalid discard receipt"):
+        facade.dashboard_discard_prepared_command(plan_id="plan-1")
+
+
+def test_env_facade_discard_preserves_the_verified_plan_identity():
+    facade = _facade()
+
+    receipt = facade.dashboard_discard_prepared_command(plan_id="plan-1")
+
+    assert receipt["plan_id"] == "plan-1"
+    assert receipt["discarded"] is True
+    assert receipt["status"] == "discarded"
+    assert receipt["source"] == "dashboard_discard"
 
 
 def test_env_facade_capture_views_returns_one_complete_independent_group():

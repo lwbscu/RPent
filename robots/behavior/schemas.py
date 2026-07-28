@@ -117,6 +117,7 @@ def validate_dashboard_prepare_request(
     action: Any,
     predecessor_plan_id: Any = None,
     background: Any = False,
+    planning_only_probe: Any = False,
 ) -> dict[str, Any]:
     """Validate one internal, motion-only Dashboard planning request."""
 
@@ -129,6 +130,8 @@ def validate_dashboard_prepare_request(
         raise ValueError("observe must use dashboard_capture_views")
     if type(background) is not bool:
         raise TypeError("background must be boolean")
+    if type(planning_only_probe) is not bool:
+        raise TypeError("planning_only_probe must be boolean")
     predecessor = (
         None
         if predecessor_plan_id is None
@@ -141,12 +144,34 @@ def validate_dashboard_prepare_request(
         raise ValueError(
             "background planning requires a predecessor_plan_id"
         )
-    return {
+    if planning_only_probe:
+        probe_action = bool(
+            (
+                command["target"] == "chassis"
+                and command["action"] in {"up", "down"}
+            )
+            or (
+                command["target"] in {"left_arm", "right_arm"}
+                and command["action"] in {"rotate_left", "rotate_right"}
+            )
+        )
+        if not probe_action:
+            raise ValueError(
+                "planning_only_probe is limited to torso and wrist calibration"
+            )
+        if background or predecessor is not None:
+            raise ValueError(
+                "planning_only_probe cannot use background or predecessor planning"
+            )
+    request = {
         "target": command["target"],
         "action": command["action"],
         "predecessor_plan_id": predecessor,
         "background": background,
     }
+    if planning_only_probe:
+        request["planning_only_probe"] = True
+    return request
 
 
 def validate_dashboard_plan_id(value: Any) -> str:

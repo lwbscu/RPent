@@ -608,6 +608,7 @@ class BehaviorPrimitives:
         action: str,
         predecessor_plan_id: str | None = None,
         background: bool = False,
+        planning_only_probe: bool = False,
     ) -> dict[str, Any]:
         """Prepare one internal Dashboard motion outside the public tool surface."""
 
@@ -616,6 +617,7 @@ class BehaviorPrimitives:
             action=action,
             predecessor_plan_id=predecessor_plan_id,
             background=background,
+            planning_only_probe=planning_only_probe,
         )
         result = self._env_method("dashboard_prepare_manual_command")(**request)
         if not isinstance(result, dict):

@@ -250,6 +250,8 @@ class BehaviorToolkit(Toolkit):
         )
         self._dashboard_controller = None
         self._close_lock = threading.RLock()
+        self._dashboard_plan_bindings_lock = threading.RLock()
+        self._dashboard_plan_bindings: dict[str, str] = {}
         self._manual_intervention_latch = threading.Event()
         self._closed = False
         initial_info = primitives_kwargs.get("initial_info")
@@ -475,13 +477,17 @@ class BehaviorToolkit(Toolkit):
         target: str,
         action: str,
         predecessor_plan_id: str | None = None,
+        permit_command_id: str,
         background: bool = False,
+        planning_only_probe: bool = False,
     ) -> dict[str, Any]:
         """Prepare one reserved manual motion without entering the public tools."""
 
         if self._closed:
             raise RuntimeError("BEHAVIOR toolkit is closed")
-        self._require_dashboard_manual_reservation()
+        permit_command_id = self._require_dashboard_command_permit(
+            permit_command_id
+        )
         self._manual_intervention_latch.set()
         handler = getattr(
             self._primitives,
@@ -495,9 +501,20 @@ class BehaviorToolkit(Toolkit):
             action=action,
             predecessor_plan_id=predecessor_plan_id,
             background=background,
+            planning_only_probe=planning_only_probe,
         )
         if not isinstance(result, dict):
             raise RuntimeError("Dashboard motion planning returned a non-object")
+        plan_id = str(result.get("plan_id") or "").strip()
+        if not plan_id:
+            raise RuntimeError("Dashboard motion planning omitted plan_id")
+        with self._dashboard_plan_bindings_lock:
+            existing = self._dashboard_plan_bindings.get(plan_id)
+            if existing is not None and existing != permit_command_id:
+                raise RuntimeError(
+                    "Dashboard motion planning reused plan_id across commands"
+                )
+            self._dashboard_plan_bindings[plan_id] = permit_command_id
         return result
 
     def dashboard_execute_prepared_command(
@@ -511,6 +528,15 @@ class BehaviorToolkit(Toolkit):
         if self._closed:
             raise RuntimeError("BEHAVIOR toolkit is closed")
         command_id = self._require_dashboard_command_permit(command_id)
+        plan_id = str(plan_id or "").strip()
+        with self._dashboard_plan_bindings_lock:
+            prepared_command_id = self._dashboard_plan_bindings.get(plan_id)
+        if prepared_command_id is None:
+            raise RuntimeError("Dashboard prepared plan has no command binding")
+        if prepared_command_id != command_id:
+            raise RuntimeError(
+                "Dashboard prepared plan belongs to a different command"
+            )
         self._manual_intervention_latch.set()
         handler = getattr(
             self._primitives,
@@ -522,6 +548,8 @@ class BehaviorToolkit(Toolkit):
         result = handler(plan_id=plan_id, command_id=command_id)
         if not isinstance(result, dict):
             raise RuntimeError("Dashboard prepared execution returned a non-object")
+        with self._dashboard_plan_bindings_lock:
+            self._dashboard_plan_bindings.pop(plan_id, None)
         receipt_binding = self._receipt_binding_from_result(result)
         if receipt_binding is not None:
             latch = self._success_latch
@@ -549,6 +577,15 @@ class BehaviorToolkit(Toolkit):
         result = handler(plan_id=plan_id)
         if not isinstance(result, dict):
             raise RuntimeError("Dashboard plan discard returned a non-object")
+        receipt_plan_id = str(result.get("plan_id") or "").strip()
+        if (
+            receipt_plan_id != str(plan_id or "").strip()
+            or result.get("discarded") is not True
+            or result.get("status") != "discarded"
+        ):
+            raise RuntimeError("Dashboard plan discard returned an invalid receipt")
+        with self._dashboard_plan_bindings_lock:
+            self._dashboard_plan_bindings.pop(receipt_plan_id, None)
         return result
 
     def dashboard_capture_views(
@@ -1297,6 +1334,12 @@ class BehaviorToolkit(Toolkit):
             env_close = getattr(env, "close_transport", None)
             if resource is None and callable(env_close):
                 env_close()
+            plan_bindings_lock = getattr(
+                self, "_dashboard_plan_bindings_lock", None
+            )
+            if plan_bindings_lock is not None:
+                with plan_bindings_lock:
+                    self._dashboard_plan_bindings.clear()
             self._closed = True
 
     def write_recipe(self, recipe_tag: str) -> str | None:

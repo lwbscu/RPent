@@ -36,6 +36,8 @@ from robots.behavior.schemas import (  # noqa: E402
     BASE_ROTATION_STEP_RAD,
     BASE_TRANSLATION_STEP_M,
     EEF_TRANSLATION_STEP_M,
+    TORSO_VERTICAL_STEP_M,
+    WRIST_ROTATION_STEP_RAD,
 )
 from robots.behavior.task_specs import (  # noqa: E402
     BehaviorTaskSpec,
@@ -159,6 +161,65 @@ def _safe_probe_value(call: Any) -> tuple[Any, str | None]:
         return call(), None
     except Exception as exc:
         return None, f"{type(exc).__name__}: {exc}"
+
+
+def _official_task_success_latched(
+    env: Any,
+    result: dict[str, Any] | None = None,
+) -> bool:
+    """Use only the raw env success bit, its latch, or the returned task_success."""
+
+    info = getattr(env, "_last_info", None)
+    info = info if isinstance(info, dict) else {}
+    done = info.get("done")
+    done = done if isinstance(done, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    return bool(
+        done.get("success") is True
+        or getattr(env, "_official_success_latched", False)
+        or result.get("task_success") is True
+    )
+
+
+def _quat_multiply_xyzw(left: Any, right: Any) -> np.ndarray:
+    left_q = np.asarray(left, dtype=np.float64).reshape(4)
+    right_q = np.asarray(right, dtype=np.float64).reshape(4)
+    if not np.isfinite(left_q).all() or not np.isfinite(right_q).all():
+        raise ValueError("quaternion must be finite")
+    lx, ly, lz, lw = left_q
+    rx, ry, rz, rw = right_q
+    product = np.asarray(
+        [
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        ],
+        dtype=np.float64,
+    )
+    norm = float(np.linalg.norm(product))
+    if not math.isfinite(norm) or norm <= 1e-12:
+        raise ValueError("quaternion product is degenerate")
+    return product / norm
+
+
+def _axis_angle_quat_xyzw(axis: Any, angle_rad: float) -> np.ndarray:
+    axis_array = np.asarray(axis, dtype=np.float64).reshape(3)
+    angle = float(angle_rad)
+    norm = float(np.linalg.norm(axis_array))
+    if (
+        not np.isfinite(axis_array).all()
+        or not math.isfinite(angle)
+        or not math.isfinite(norm)
+        or norm <= 1e-12
+    ):
+        raise ValueError("axis-angle rotation is invalid")
+    unit = axis_array / norm
+    half = angle / 2.0
+    return np.asarray(
+        [*(unit * math.sin(half)), math.cos(half)],
+        dtype=np.float64,
+    )
 
 
 def _capture_lineage(env: Any) -> dict[str, Any]:
@@ -298,6 +359,7 @@ def _result_evidence(result: Any) -> dict[str, Any]:
         "collision_certificate": (
             metrics.get("base_trajectory_certificate")
             or metrics.get("whole_body_certificate")
+            or result.get("torso_certificate")
         ),
         "collision_admission": metrics.get("collision_admission"),
         "tracking": {
@@ -425,6 +487,208 @@ def _plan_only_arm_probe(
         "elapsed_s": round(time.monotonic() - started, 3),
         "env_step_delta": env_step_delta,
         "zero_action_verified": env_step_delta == 0,
+        "before": before,
+        "after": after,
+        "error": error,
+        "evidence": _result_evidence(result),
+        "real_robot_deployment_allowed": False,
+    }
+
+
+def _plan_only_torso_probe(
+    env: Any,
+    backend: Any,
+    *,
+    action: str,
+) -> dict[str, Any]:
+    """Plan one torso world-Z jog without admitting it for public execution."""
+
+    action = str(action)
+    if action not in {"up", "down"}:
+        raise ValueError("planning-only torso action must be up or down")
+    if _official_task_success_latched(env):
+        return {
+            **_skipped_after_success(
+                name=f"torso_{action}_3cm_plan_only",
+                target="chassis",
+                action=action,
+                camera="head",
+            ),
+            "mode": "planning_only",
+            "release_admission": False,
+        }
+    before = _runtime_snapshot(env, backend)
+    started = time.monotonic()
+    delta_z = TORSO_VERTICAL_STEP_M * (1.0 if action == "up" else -1.0)
+    try:
+        start_pose = backend.get_torso_pose()
+        start_position = np.asarray(start_pose[0], dtype=np.float64).reshape(3)
+        target_z = float(start_position[2] + delta_z)
+        result = backend.plan_torso_trajectory(
+            target_z_m=target_z,
+            timeout_s=60.0,
+            start_torso_pose=start_pose,
+        )
+        error = None
+    except Exception as exc:
+        start_position = None
+        target_z = None
+        result = None
+        error = f"{type(exc).__name__}: {exc}"
+    after = _runtime_snapshot(env, backend)
+    env_step_delta = int(after["env_steps"]) - int(before["env_steps"])
+    metrics = (
+        dict(result.get("metrics") or {}) if isinstance(result, dict) else {}
+    )
+    planner_actions = metrics.get("env_actions_sent")
+    before_digest = before["joint_state"].get("sha256")
+    zero_action = bool(
+        env_step_delta == 0
+        and (planner_actions is None or planner_actions == 0)
+        and isinstance(before_digest, str)
+        and after["joint_state"].get("sha256") == before_digest
+    )
+    return {
+        "name": f"torso_{action}_3cm_plan_only",
+        "mode": "planning_only",
+        "target": "chassis",
+        "action": action,
+        "target_link": "torso_link4",
+        "requested_delta_z_m": delta_z,
+        "start_world_xyz": _jsonable(start_position),
+        "target_world_z_m": target_z,
+        "elapsed_s": round(time.monotonic() - started, 3),
+        "env_step_delta": env_step_delta,
+        "planner_env_actions_sent": planner_actions,
+        "zero_action_verified": zero_action,
+        "plan_admitted": bool(
+            isinstance(result, dict) and result.get("ok") is True
+        ),
+        # A collision-certified plan is not a public-control calibration.
+        "release_admission": False,
+        "release_admission_reason": (
+            "planning-only evidence cannot enable a public motion capability"
+        ),
+        "before": before,
+        "after": after,
+        "error": error,
+        "evidence": _result_evidence(result),
+        "real_robot_deployment_allowed": False,
+    }
+
+
+def _plan_only_wrist_probe(
+    env: Any,
+    backend: Any,
+    *,
+    hand: str,
+    action: str,
+) -> dict[str, Any]:
+    """Plan one camera-relative wrist turn with zero simulator actions."""
+
+    hand = str(hand)
+    action = str(action)
+    if hand not in {"left", "right"}:
+        raise ValueError("planning-only wrist hand must be left or right")
+    if action not in {"rotate_left", "rotate_right"}:
+        raise ValueError(
+            "planning-only wrist action must be rotate_left or rotate_right"
+        )
+    visual_direction = (
+        "counterclockwise" if action == "rotate_left" else "clockwise"
+    )
+    if _official_task_success_latched(env):
+        return {
+            **_skipped_after_success(
+                name=f"{hand}_wrist_visual_{visual_direction}_5deg_plan_only",
+                target=f"{hand}_arm",
+                action=action,
+                camera=f"{hand}_wrist",
+            ),
+            "mode": "planning_only",
+            "release_admission": False,
+        }
+    before = _runtime_snapshot(env, backend)
+    started = time.monotonic()
+    calibration: dict[str, Any] | None = None
+    start_position: np.ndarray | None = None
+    start_quaternion: np.ndarray | None = None
+    signed_angle: float | None = None
+    target_quaternion: np.ndarray | None = None
+    result: dict[str, Any] | None = None
+    try:
+        calibration = env._planner._wrist_camera_rotation_calibration(hand)
+        if not isinstance(calibration, dict) or calibration.get("verified") is not True:
+            raise RuntimeError("wrist planning calibration is unavailable")
+        start_position, start_quaternion = backend.get_eef_pose(hand)
+        start_position = np.asarray(start_position, dtype=np.float64).reshape(3)
+        start_quaternion = np.asarray(
+            start_quaternion, dtype=np.float64
+        ).reshape(4)
+        signed_angle = (
+            float(calibration["visual_ccw_angle_sign"])
+            * WRIST_ROTATION_STEP_RAD
+            * (1.0 if action == "rotate_left" else -1.0)
+        )
+        target_quaternion = _quat_multiply_xyzw(
+            start_quaternion,
+            _axis_angle_quat_xyzw(
+                calibration["screen_normal_axis_eef"],
+                signed_angle,
+            ),
+        )
+        result = env._planner.move_to(
+            hand=hand,
+            target_xyz=start_position,
+            frame="world",
+            target_quat_xyzw=target_quaternion,
+            plan_only=True,
+            position_tolerance_m=0.005,
+            orientation_tolerance_rad=math.radians(1.0),
+            timeout_s=60.0,
+        )
+        error = None
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    after = _runtime_snapshot(env, backend)
+    env_step_delta = int(after["env_steps"]) - int(before["env_steps"])
+    metrics = (
+        dict(result.get("metrics") or {}) if isinstance(result, dict) else {}
+    )
+    planner_actions = metrics.get("env_actions_sent")
+    before_digest = before["joint_state"].get("sha256")
+    zero_action = bool(
+        env_step_delta == 0
+        and (planner_actions is None or planner_actions == 0)
+        and isinstance(before_digest, str)
+        and after["joint_state"].get("sha256") == before_digest
+    )
+    return {
+        "name": f"{hand}_wrist_visual_{visual_direction}_5deg_plan_only",
+        "mode": "planning_only",
+        "target": f"{hand}_arm",
+        "hand": hand,
+        "action": action,
+        "camera": f"{hand}_wrist",
+        "visual_direction": visual_direction,
+        "requested_rotation_rad": signed_angle,
+        "start_world_xyz": _jsonable(start_position),
+        "start_quaternion_xyzw": _jsonable(start_quaternion),
+        "target_quaternion_xyzw": _jsonable(target_quaternion),
+        "calibration": _artifact_jsonable(calibration),
+        "elapsed_s": round(time.monotonic() - started, 3),
+        "env_step_delta": env_step_delta,
+        "planner_env_actions_sent": planner_actions,
+        "zero_action_verified": zero_action,
+        "plan_admitted": bool(
+            isinstance(result, dict)
+            and result.get("primitive_success") is True
+        ),
+        # Per-hand live image evidence must separately admit this capability.
+        "release_admission": False,
+        "release_admission_reason": (
+            "planning-only camera geometry is not a real visual rotation probe"
+        ),
         "before": before,
         "after": after,
         "error": error,
@@ -758,6 +1022,24 @@ def main() -> None:
         report["stage"] = "reset"
         save()
         env.reset()
+        if _official_task_success_latched(env):
+            report["integration_preflight"] = {
+                "mode": "planning_only",
+                "skipped": True,
+                "skip_reason": "official_task_success_latched",
+                "post_success_follow_up_rpc_count": 0,
+                "zero_action_verified": True,
+                "real_robot_deployment_allowed": False,
+            }
+            report["status"] = "complete"
+            report["stage"] = "complete"
+            save()
+            log_event(
+                "probe_complete",
+                report_path=str(report_path),
+                official_success_stop=True,
+            )
+            return
         report["stage"] = "planning_probe"
         backend = env._planner.backend
         robot = backend._find_robot()
@@ -929,6 +1211,31 @@ def main() -> None:
             _plan_only_arm_probe(env, backend, hand=hand)
             for hand in ("left", "right")
         ]
+        torso_preflight = [
+            _plan_only_torso_probe(env, backend, action=action)
+            for action in ("up", "down")
+        ]
+        wrist_sync_before_step = int(getattr(env, "_env_steps", -1))
+        env._refresh_observation_without_step(
+            synchronize_hand_geometry=True
+        )
+        wrist_sync_after_step = int(getattr(env, "_env_steps", -1))
+        if wrist_sync_after_step != wrist_sync_before_step:
+            raise RuntimeError(
+                "wrist planning capture advanced the simulator"
+            )
+        wrist_preflight = {
+            hand: [
+                _plan_only_wrist_probe(
+                    env,
+                    backend,
+                    hand=hand,
+                    action=action,
+                )
+                for action in ("rotate_left", "rotate_right")
+            ]
+            for hand in ("left", "right")
+        }
         capabilities = env.dashboard_control_capabilities()
         preflight_end = _runtime_snapshot(env, backend)
         report["integration_preflight"] = {
@@ -938,6 +1245,7 @@ def main() -> None:
             "base": report["formal_relative_jog_plans"],
             "arm": arm_preflight,
             "wrist": {
+                "planning_only": wrist_preflight,
                 "left": _artifact_jsonable(
                     dict(capabilities.get("planner") or {})
                     .get("wrist", {})
@@ -958,21 +1266,36 @@ def main() -> None:
                         capabilities.get("wrist_rotation_available") or {}
                     ).get("right")
                 ),
+                "planning_phase_public_capability_blocked": all(
+                    not bool(
+                        dict(
+                            capabilities.get("wrist_rotation_available") or {}
+                        ).get(hand)
+                    )
+                    for hand in ("left", "right")
+                ),
                 "env_step_delta": 0,
-                "unavailable_policy": (
-                    "zero-action fail-closed; explicit execution records the "
-                    "rejection without bypassing capability admission"
+                "render_sync_env_step_delta": (
+                    wrist_sync_after_step - wrist_sync_before_step
+                ),
+                "release_admission": False,
+                "admission_policy": (
+                    "planning-only camera geometry remains blocked from public "
+                    "release until each hand has an independent real visual "
+                    "rotation probe"
                 ),
             },
             "torso": {
+                "planning_only": torso_preflight,
                 "available": bool(capabilities.get("torso_available")),
                 "planner": _artifact_jsonable(
                     dict(capabilities.get("planner") or {}).get("torso")
                 ),
                 "env_step_delta": 0,
-                "unavailable_policy": (
-                    "zero-action fail-closed; no arm motion or direct joint "
-                    "write is substituted"
+                "release_admission": False,
+                "admission_policy": (
+                    "planning-only evidence does not bypass the Dashboard "
+                    "capability gate"
                 ),
             },
             "gripper": {
@@ -990,6 +1313,18 @@ def main() -> None:
                 int(preflight_end["env_steps"])
                 - int(preflight_start["env_steps"])
             ),
+            "planning_admission": {
+                "torso_all_plans_admitted": all(
+                    bool(item.get("plan_admitted"))
+                    for item in torso_preflight
+                ),
+                "wrist_all_plans_admitted": all(
+                    bool(item.get("plan_admitted"))
+                    for hand_cases in wrist_preflight.values()
+                    for item in hand_cases
+                ),
+                "public_release_admitted": False,
+            },
             "zero_action_verified": (
                 int(preflight_end["env_steps"])
                 == int(preflight_start["env_steps"])
@@ -1000,6 +1335,15 @@ def main() -> None:
                 and all(
                     bool(item.get("zero_action_verified"))
                     for item in arm_preflight
+                )
+                and all(
+                    bool(item.get("zero_action_verified"))
+                    for item in torso_preflight
+                )
+                and all(
+                    bool(item.get("zero_action_verified"))
+                    for hand_cases in wrist_preflight.values()
+                    for item in hand_cases
                 )
             ),
             "real_robot_deployment_allowed": False,
@@ -1057,12 +1401,90 @@ def main() -> None:
                 raise RuntimeError(
                     "--execute-sim-jogs requires BEHAVIOR hybrid simulation"
                 )
+            execution_capabilities = env.dashboard_control_capabilities()
+            wrist_available = dict(
+                execution_capabilities.get("wrist_rotation_available") or {}
+            )
+            release_motion_gate = {
+                "torso_available": (
+                    execution_capabilities.get("torso_available") is True
+                ),
+                "left_wrist_available": wrist_available.get("left") is True,
+                "right_wrist_available": wrist_available.get("right") is True,
+            }
+            if not all(release_motion_gate.values()):
+                report["integration_execution"] = {
+                    "mode": "explicit_behavior_simulation",
+                    "blocked": True,
+                    "block_reason": (
+                        "torso/wrist public release capability is not admitted; "
+                        "planning-only evidence cannot bridge the real visual "
+                        "probe gate"
+                    ),
+                    "release_motion_gate": release_motion_gate,
+                    "capabilities": _artifact_jsonable(execution_capabilities),
+                    "ordered_cases": [],
+                    "env_step_delta": 0,
+                    "post_success_follow_up_rpc_count": 0,
+                    "real_robot_deployment_allowed": False,
+                }
+                report["status"] = "complete"
+                report["stage"] = "complete"
+                save()
+                log_event(
+                    "probe_complete",
+                    report_path=str(report_path),
+                    execution_blocked=True,
+                )
+                return
             report["integration_execution"] = {
                 "mode": "explicit_behavior_simulation",
                 "ordered_cases": [],
                 "real_robot_deployment_allowed": False,
             }
             case_specs: list[dict[str, Any]] = [
+                {
+                    "name": "torso_link4_world_up_3cm",
+                    "target": "chassis",
+                    "action": "up",
+                    "camera": "head",
+                    "capability": "torso_available",
+                },
+                {
+                    "name": "torso_link4_world_down_3cm",
+                    "target": "chassis",
+                    "action": "down",
+                    "camera": "head",
+                    "capability": "torso_available",
+                },
+                {
+                    "name": "left_wrist_visual_counterclockwise_5deg",
+                    "target": "left_arm",
+                    "action": "rotate_left",
+                    "camera": "left_wrist",
+                    "capability": ("wrist_rotation_available", "left"),
+                },
+                {
+                    "name": "left_wrist_visual_clockwise_5deg",
+                    "target": "left_arm",
+                    "action": "rotate_right",
+                    "camera": "left_wrist",
+                    "capability": ("wrist_rotation_available", "left"),
+                },
+                {
+                    "name": "right_wrist_visual_counterclockwise_5deg",
+                    "target": "right_arm",
+                    "action": "rotate_left",
+                    "camera": "right_wrist",
+                    "capability": ("wrist_rotation_available", "right"),
+                },
+                {
+                    "name": "right_wrist_visual_clockwise_5deg",
+                    "target": "right_arm",
+                    "action": "rotate_right",
+                    "camera": "right_wrist",
+                    "capability": ("wrist_rotation_available", "right"),
+                },
                 {
                     "name": "base_forward_5cm",
                     "target": "chassis",
@@ -1076,20 +1498,6 @@ def main() -> None:
                     "action": "forward",
                     "camera": "left_wrist",
                     "capability": ("eef_available", "left"),
-                },
-                {
-                    "name": "left_wrist_visual_clockwise_5deg",
-                    "target": "left_arm",
-                    "action": "rotate_left",
-                    "camera": "left_wrist",
-                    "capability": ("wrist_rotation_available", "left"),
-                },
-                {
-                    "name": "torso_link4_world_up_3cm",
-                    "target": "chassis",
-                    "action": "up",
-                    "camera": "head",
-                    "capability": "torso_available",
                 },
             ]
             left_attached = bool(
@@ -1118,9 +1526,7 @@ def main() -> None:
                 }
             )
 
-            success_latched = bool(
-                getattr(env, "_official_success_latched", False)
-            )
+            success_latched = _official_task_success_latched(env)
             for spec in case_specs:
                 if success_latched:
                     case = _skipped_after_success(
@@ -1174,10 +1580,14 @@ def main() -> None:
                 report["integration_execution"]["ordered_cases"].append(case)
                 save()
                 evidence = case.get("evidence")
-                success_latched = bool(
-                    isinstance(evidence, dict)
-                    and evidence.get("task_success") is True
-                ) or bool(getattr(env, "_official_success_latched", False))
+                success_latched = _official_task_success_latched(
+                    env,
+                    (
+                        {"task_success": evidence.get("task_success")}
+                        if isinstance(evidence, dict)
+                        else None
+                    ),
+                )
             execution_cases = report["integration_execution"]["ordered_cases"]
             camera_case = next(
                 (

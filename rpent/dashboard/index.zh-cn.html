@@ -736,6 +736,11 @@ let cameraSelectionQueue = Promise.resolve();
 let frameTransitionGeneration = 0;
 let runSelectionGeneration = 0;
 let timelineRevision = -1;
+let behaviorMetaRequestGeneration = 0;
+let behaviorTimelineTargetRevision = -1;
+let behaviorTimelineRefreshGeneration = 0;
+let behaviorTimelineRefreshPromise = null;
+let behaviorTimelineNextFrameIdx = null;
 let frameRevisions = {};
 let pressedAction = null;
 let activeLeaseId = null;
@@ -762,10 +767,11 @@ let activeLeaseToken = null;
 let stopLeasePromise = null;
 const AUTO_ACTION_RETURN_DELAY_MS = 300;
 const CONTROL_HOLD_DELAY_MS = 320;
-const CONTROL_REPEAT_MIN_MS = 100;
+const CONTROL_REPEAT_MIN_MS = 220;
 const CONTROL_HEARTBEAT_MS = 400;
 const CONTROL_POLL_MS = 100;
 const CONTROL_QUIESCE_TIMEOUT_MS = 15000;
+const TIMELINE_REFRESH_RETRY_MS = 250;
 const PHYSICAL_CAMERAS = new Set(["head", "left_wrist", "right_wrist"]);
 const REPEATABLE_ACTIONS = new Set([
   "forward", "backward", "turn_left", "turn_right",
@@ -1048,8 +1054,8 @@ function controlTooltip(action) {
       backward: "Move the chassis backward by 5 cm. Hold to continue.",
       turn_left: "Rotate the chassis left by 5°. Hold to continue.",
       turn_right: "Rotate the chassis right by 5°. Hold to continue.",
-      up: "Raise the R1Pro body by 3 cm. Hold to continue.",
-      down: "Lower the R1Pro body by 3 cm. Hold to continue.",
+      up: "Raise the R1Pro torso by 3 cm. Hold to continue.",
+      down: "Lower the R1Pro torso by 3 cm. Hold to continue.",
     };
     return tips[action] || "Available for arm control only.";
   }
@@ -1061,8 +1067,8 @@ function controlTooltip(action) {
     turn_right: `Move the ${hand} hand 3 cm to the robot’s right. Hold to continue.`,
     up: `Move the ${hand} hand up by 3 cm. Hold to continue.`,
     down: `Move the ${hand} hand down by 3 cm. Hold to continue.`,
-    rotate_left: "Rotate the selected wrist 5° clockwise. Hold to continue.",
-    rotate_right: "Rotate the selected wrist 5° counterclockwise. Hold to continue.",
+    rotate_left: "Rotate the selected wrist 5° counterclockwise. Hold to continue.",
+    rotate_right: "Rotate the selected wrist 5° clockwise. Hold to continue.",
   };
   return tips[action] || "";
 }
@@ -1086,7 +1092,7 @@ function actionCapability(action) {
     if (["up", "down"].includes(action)) {
       return {
         available: capabilities.torso_available === true,
-        reason: "Torso control unsupported.",
+        reason: "Torso control unavailable.",
       };
     }
     return { available: false, reason: "Available for arm control only." };
@@ -1293,12 +1299,19 @@ function applyControlSnapshot(snapshot) {
       terminal?.task_success === true ||
       controlSnapshot.success_latched === true ||
       (terminalBelongsToLease &&
-        (terminal.phase === "failed" || !!terminal.error))
+        (
+          terminal.phase === "failed" ||
+          terminal.phase === "cancelled" ||
+          !!terminal.error
+        ))
     )
   ) {
     const reason = terminal?.task_success === true ||
       controlSnapshot.success_latched === true
-      ? "official_success" : "command_failed";
+      ? "official_success"
+      : terminal?.phase === "cancelled"
+      ? "command_cancelled"
+      : "command_failed";
     void stopActiveLease(reason);
   }
   renderControlUI();
@@ -1388,11 +1401,41 @@ async function submitDiscreteAction(
       leaseToken.heartbeatStarted = true;
       scheduleHeartbeat(leaseId, runId);
     }
-    return accepted;
+    return commandId;
   } finally {
     controlCommandInFlight = false;
     renderControlUI();
   }
+}
+
+async function waitForCommandTerminal(
+  commandId, leaseId, runId, generation, leaseToken
+) {
+  while (
+    !leaseToken.stopRequested &&
+    activeLeaseId === leaseId &&
+    curRun === runId &&
+    generation === controlLoopGeneration
+  ) {
+    const terminal = controlSnapshot.last_terminal;
+    if (terminal?.command_id === commandId) {
+      if (["completed", "failed", "cancelled"].includes(terminal.phase)) {
+        return terminal;
+      }
+    }
+    if (controlSnapshot.success_latched === true) {
+      return terminal || { task_success: true, phase: "completed" };
+    }
+    await sleep(CONTROL_POLL_MS);
+    if (
+      leaseToken.stopRequested ||
+      activeLeaseId !== leaseId ||
+      curRun !== runId ||
+      generation !== controlLoopGeneration
+    ) return null;
+    await refreshControlState();
+  }
+  return null;
 }
 
 async function runControlLoop(
@@ -1439,10 +1482,20 @@ async function runControlLoop(
       const postPromise = submitDiscreteAction(
         leaseId, runId, action, camera, generation, leaseToken);
       leaseToken.commandPostPromise = postPromise;
-      await postPromise;
+      const commandId = await postPromise;
       if (leaseToken.commandPostPromise === postPromise) {
         leaseToken.commandPostPromise = null;
       }
+      const terminal = await waitForCommandTerminal(
+        commandId, leaseId, runId, generation, leaseToken);
+      if (!terminal) break;
+      if (
+        terminal.task_success === true ||
+        controlSnapshot.success_latched === true ||
+        terminal.phase === "failed" ||
+        terminal.phase === "cancelled" ||
+        !!terminal.error
+      ) break;
     }
   } catch (error) {
     if (!leaseToken.stopRequested && activeLeaseId === leaseId) {
@@ -2181,11 +2234,36 @@ function refreshFrame(idx, opts = {}) {
 }
 
 async function refreshMeta(opts = {}) {
-  if (!curRun) return;
+  if (!curRun) return false;
   const runId = curRun;
+  const metaRequestGeneration = ++behaviorMetaRequestGeneration;
   const r = await fetch(`/api/run?run=${encodeURIComponent(runId)}`).then(x => x.json());
-  if (runId !== curRun) return;
+  if (runId !== curRun) return false;
   const behavior = isBehaviorRun(r);
+  if (behavior) {
+    const responseTimelineRevision = Number(r.timeline_revision);
+    const expectedTimelineRevision = Number(opts.expectedTimelineRevision);
+    const minimumTimelineRevision = Math.max(
+      Number.isFinite(expectedTimelineRevision)
+        ? expectedTimelineRevision : Number.NEGATIVE_INFINITY,
+      Number.isFinite(Number(behaviorTimelineTargetRevision))
+        ? Number(behaviorTimelineTargetRevision) : Number.NEGATIVE_INFINITY,
+    );
+    if (
+      metaRequestGeneration !== behaviorMetaRequestGeneration ||
+      (
+        opts.behaviorTimelineGeneration != null &&
+        opts.behaviorTimelineGeneration !== behaviorTimelineRefreshGeneration
+      ) ||
+      (
+        Number.isFinite(minimumTimelineRevision) &&
+        (
+          !Number.isFinite(responseTimelineRevision) ||
+          responseTimelineRevision < minimumTimelineRevision
+        )
+      )
+    ) return false;
+  }
   if (behavior && !behaviorControlsEnabled) {
     const serverCamera = PHYSICAL_CAMERAS.has(r.control?.selected_camera)
       ? r.control.selected_camera : "head";
@@ -2221,7 +2299,10 @@ async function refreshMeta(opts = {}) {
         r.timeline || [],
         opts.nextFrameIdx ?? frameRevisions[selectedCamera] ?? r.frame_idx)
     : false;
-  if (runId !== curRun) return;
+  if (
+    runId !== curRun ||
+    (behavior && metaRequestGeneration !== behaviorMetaRequestGeneration)
+  ) return false;
   if (!r.has_video && frameKind === "video") {
     setFrameKind(
       behaviorControlsEnabled ? selectedCamera : "agent",
@@ -2232,6 +2313,65 @@ async function refreshMeta(opts = {}) {
     && !autoActionPlayback
     && isRealtimeFrameKind(frameKind)
   ) refreshFrame(frameRevisions[selectedCamera] ?? r.frame_idx);
+  return true;
+}
+
+function queueBehaviorTimelineRefresh(revision, nextFrameIdx) {
+  const requestedRevision = Number(revision);
+  if (
+    !Number.isFinite(requestedRevision) ||
+    requestedRevision <= Number(timelineRevision)
+  ) return behaviorTimelineRefreshPromise;
+  if (requestedRevision > Number(behaviorTimelineTargetRevision)) {
+    behaviorTimelineTargetRevision = requestedRevision;
+    behaviorTimelineRefreshGeneration++;
+  }
+  if (nextFrameIdx != null) behaviorTimelineNextFrameIdx = nextFrameIdx;
+  if (behaviorTimelineRefreshPromise) return behaviorTimelineRefreshPromise;
+
+  const runId = curRun;
+  stepTransitioning = true;
+  const refreshPromise = (async () => {
+    while (
+      runId === curRun &&
+      behaviorControlsEnabled &&
+      Number(timelineRevision) < Number(behaviorTimelineTargetRevision)
+    ) {
+      const targetRevision = Number(behaviorTimelineTargetRevision);
+      const targetGeneration = behaviorTimelineRefreshGeneration;
+      let applied = false;
+      try {
+        applied = await refreshMeta({
+          autoPlayNewAction: autoActionPrimed,
+          primeAutoActionStep: !autoActionPrimed,
+          nextFrameIdx: behaviorTimelineNextFrameIdx,
+          expectedTimelineRevision: targetRevision,
+          behaviorTimelineGeneration: targetGeneration,
+        });
+      } catch {
+        if (runId === curRun && behaviorControlsEnabled) {
+          $("#connMeta").textContent = "○ refresh pending…";
+        }
+      }
+      if (
+        runId !== curRun ||
+        !behaviorControlsEnabled ||
+        Number(timelineRevision) >= Number(behaviorTimelineTargetRevision)
+      ) break;
+      if (!applied || targetGeneration !== behaviorTimelineRefreshGeneration) {
+        await sleep(TIMELINE_REFRESH_RETRY_MS);
+      }
+    }
+    return Number(timelineRevision) >= Number(behaviorTimelineTargetRevision);
+  })();
+  behaviorTimelineRefreshPromise = refreshPromise;
+  const finishRefresh = () => {
+    if (behaviorTimelineRefreshPromise !== refreshPromise) return;
+    behaviorTimelineRefreshPromise = null;
+    stepTransitioning = false;
+  };
+  refreshPromise.then(finishRefresh, finishRefresh);
+  return refreshPromise;
 }
 
 function connectSSE() {
@@ -2251,9 +2391,23 @@ function connectSSE() {
     // A terminal transition changes timeline_revision without changing the
     // number of rows, so n_steps is not a sufficient refresh key.
     if (
-      sig.timeline_revision != null &&
-      sig.timeline_revision !== timelineRevision
+      behaviorControlsEnabled &&
+      Number.isFinite(Number(sig.timeline_revision)) &&
+      Number(sig.timeline_revision) > Number(timelineRevision)
     ) {
+      queueBehaviorTimelineRefresh(
+        Number(sig.timeline_revision),
+        frameRevisions[selectedCamera] ?? sig.frame_idx,
+      );
+      return;
+    }
+    if (
+      !behaviorControlsEnabled &&
+      sig.timeline_revision != null &&
+      sig.timeline_revision !== timelineRevision &&
+      !stepTransitioning
+    ) {
+      // Preserve the legacy non-BEHAVIOR revision acknowledgement.
       timelineRevision = sig.timeline_revision;
       // Suppress realtime frame refreshes for the duration of the step
       // transition. ``refreshMeta`` is async (awaits ``/api/run``); during
@@ -2296,6 +2450,11 @@ async function selectRun(id) {
   cancelAutoActionReturn();
   curRun = id; evShown = 0; frameIdx = -1;
   timelineRevision = -1; frameRevisions = {};
+  behaviorMetaRequestGeneration++;
+  behaviorTimelineTargetRevision = -1;
+  behaviorTimelineRefreshGeneration++;
+  behaviorTimelineRefreshPromise = null;
+  behaviorTimelineNextFrameIdx = null;
   curToolGroup = null;
   actionVideo = null;
   episodeVideoAvailable = false;

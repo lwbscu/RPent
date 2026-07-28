@@ -29,9 +29,12 @@ from robots.behavior.planner_executor import (
     LOCAL_GUARDED_IK_SEEDS,
     PREPARED_DASHBOARD_BASE_EXECUTION_POLICY,
     PREPARED_DASHBOARD_EEF_EXECUTION_POLICY,
+    PREPARED_DASHBOARD_TORSO_EXECUTION_POLICY,
     RESET_IDENTITY_WARMUP_PROFILE,
     RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S,
     TERMINAL_COMMAND_LIMIT,
+    TORSO_ACTIVE_JOINT_NAMES,
+    TORSO_LINK_NAME,
     TRACKING_HARD_ARTICULATION_ERROR_RAD,
     TRACKING_HARD_BASE_XY_ERROR_M,
     TRACKING_HARD_BASE_YAW_ERROR_RAD,
@@ -66,8 +69,10 @@ from robots.behavior.planner_executor import (
     _interpolate_whole_body_execution_trajectory,
     _minimum_jerk_base_execution_trajectory,
     _quat_to_intrinsic_rpy,
+    _reorder_joint_trajectory,
     _retime_joint_trajectory,
     _terminally_smoothed_joint_trajectory,
+    _torso_z_path_direction_admitted,
     _tracking_hard_deviation_report,
     _wall_clock_deadline,
     _whole_body_execution_step_report,
@@ -1172,7 +1177,11 @@ class _FakeBackend:
         timeout_s,
         attached_obj=None,
         search_profile=WHOLE_BODY_SEARCH_PROFILE_DEFAULT,
+        start_q=None,
+        start_eef_pose=None,
+        background=False,
     ):
+        del start_q, start_eef_pose, background
         self.target = np.asarray(target_xyz, dtype=np.float64)
         self.target_quat = (
             None
@@ -3933,6 +3942,25 @@ def test_real_warmup_includes_base_and_whole_body_identity_plans_without_actions
         }
 
     backend._compute_base_plan = base_plan
+    torso_pose = (
+        np.asarray([0.0, 0.0, 0.8]),
+        np.asarray([0.0, 0.0, 0.0, 1.0]),
+    )
+    backend.get_torso_pose = lambda: torso_pose
+    torso_calls = []
+
+    def torso_plan(**kwargs):
+        torso_calls.append(kwargs)
+        return {
+            "ok": True,
+            "joint_trajectory": np.zeros((1, 4), dtype=np.float32),
+            "metrics": {
+                "active_dof_count": 3,
+                "collision_admission": {"admitted": True},
+            },
+        }
+
+    backend.plan_torso_trajectory = torso_plan
     arm_calls = []
 
     def arm_plan(**kwargs):
@@ -3963,6 +3991,11 @@ def test_real_warmup_includes_base_and_whole_body_identity_plans_without_actions
     assert base_calls[0]["planning_profile"] == RESET_IDENTITY_WARMUP_PROFILE
     assert base_calls[0]["wall_clock_timeout_s"] == pytest.approx(120.0)
     assert arm_calls == []
+    assert len(torso_calls) == 1
+    assert torso_calls[0]["target_z_m"] == pytest.approx(0.8)
+    assert torso_calls[0]["timeout_s"] == pytest.approx(12.0)
+    np.testing.assert_allclose(torso_calls[0]["start_torso_pose"][0], torso_pose[0])
+    np.testing.assert_allclose(torso_calls[0]["start_torso_pose"][1], torso_pose[1])
     assert [call["hand"] for call in whole_body_calls] == ["left", "right"]
     for call in whole_body_calls:
         expected_position, expected_quaternion = eef_poses[call["hand"]]
@@ -3983,6 +4016,16 @@ def test_real_warmup_includes_base_and_whole_body_identity_plans_without_actions
         "stop_reason": None,
         "trajectory_waypoints": 1,
         "collision_admitted": True,
+    }
+    assert result["identity_warmup"]["torso"] == {
+        "query": "current_pose_identity_trajectory",
+        "ok": True,
+        "stop_reason": None,
+        "trajectory_waypoints": 1,
+        "collision_admitted": True,
+        "active_dof_count": 3,
+        "env_actions_sent": 0,
+        "simulator_advanced": False,
     }
     assert [sample["query"] for sample in result["identity_warmup"]["hands"]] == [
         "identity_trajectory",
@@ -4059,6 +4102,8 @@ def test_dashboard_feedback_warmup_compiles_all_read_only_safety_paths_without_a
     assert result["env_actions_sent"] == 0
     assert result["simulator_advanced"] is False
     assert result["checks"] and all(result["checks"].values())
+    assert all(type(value) is bool for value in result["checks"].values())
+    json.dumps(result)
     assert calls == [
         "attachment:left",
         "attachment:right",
@@ -8186,6 +8231,274 @@ class _NavigationBackend(_FakeBackend):
         }
 
 
+class _TorsoBackend(_FakeBackend):
+    def __init__(self, *, contact_mode=None):
+        super().__init__(contact_mode=contact_mode)
+        self.torso_origin_z = 0.8
+        self.torso_position = np.asarray(
+            [0.1, -0.2, self.torso_origin_z],
+            dtype=np.float64,
+        )
+        self.torso_quaternion = np.asarray(
+            [0.0, 0.0, 0.0, 1.0],
+            dtype=np.float64,
+        )
+        self.pending_torso_q = None
+        self.torso_plan_calls = []
+        self.torso_action_targets = []
+
+    def torso_jog_capability(self):
+        return {
+            "available": True,
+            "verified": True,
+            "active_joint_names": list(TORSO_ACTIVE_JOINT_NAMES),
+            "locked_joint_count": 25,
+            "env_actions_sent": 0,
+            "simulator_advanced": False,
+        }
+
+    def torso_joint_names(self):
+        return self.joint_names
+
+    def get_torso_pose(self):
+        return self.torso_position.copy(), self.torso_quaternion.copy()
+
+    def torso_poses(self, *, q_trajectory):
+        q_path = np.asarray(q_trajectory, dtype=np.float32).reshape(-1, 28)
+        positions = np.repeat(
+            self.torso_position.reshape(1, 3),
+            len(q_path),
+            axis=0,
+        )
+        positions[:, 2] = self.torso_origin_z + q_path[:, 6]
+        quaternions = np.repeat(
+            self.torso_quaternion.reshape(1, 4),
+            len(q_path),
+            axis=0,
+        )
+        return positions, quaternions
+
+    def plan_torso_trajectory(
+        self,
+        *,
+        target_z_m,
+        timeout_s,
+        start_q=None,
+        start_torso_pose=None,
+        background=False,
+    ):
+        start = np.asarray(
+            self.joint_positions if start_q is None else start_q,
+            dtype=np.float32,
+        ).reshape(28)
+        start_position = np.asarray(
+            self.get_torso_pose()[0]
+            if start_torso_pose is None
+            else start_torso_pose[0],
+            dtype=np.float64,
+        ).reshape(3)
+        start_quaternion = np.asarray(
+            self.get_torso_pose()[1]
+            if start_torso_pose is None
+            else start_torso_pose[1],
+            dtype=np.float64,
+        ).reshape(4)
+        target_z = float(target_z_m)
+        trajectory = np.repeat(start.reshape(1, -1), 3, axis=0)
+        trajectory[:, 6] = np.linspace(
+            float(start[6]) + (target_z - start_position[2]) / 3.0,
+            float(start[6]) + (target_z - start_position[2]),
+            3,
+            dtype=np.float32,
+        )
+        positions, quaternions = self.torso_poses(q_trajectory=trajectory)
+        positions[:, 0] = start_position[0]
+        positions[:, 1] = start_position[1]
+        positions[:, 2] = np.linspace(
+            start_position[2] + (target_z - start_position[2]) / 3.0,
+            target_z,
+            3,
+        )
+        trajectory = np.ascontiguousarray(trajectory, dtype=np.float32)
+        positions = np.ascontiguousarray(positions, dtype=np.float32)
+        quaternions = np.ascontiguousarray(quaternions, dtype=np.float32)
+        certificate = {
+            "schema_version": 1,
+            "kind": "torso_link4_world_z",
+            "trajectory_sha256": hashlib.sha256(
+                trajectory.tobytes()
+            ).hexdigest(),
+            "start_q_sha256": hashlib.sha256(
+                np.ascontiguousarray(start, dtype=np.float32).tobytes()
+            ).hexdigest(),
+            "joint_name_layout_sha256": hashlib.sha256(
+                json.dumps(
+                    list(self.joint_names),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "q_dimension": 28,
+            "active_joint_names": list(TORSO_ACTIVE_JOINT_NAMES),
+            "locked_joint_count": 25,
+            "target_link": "torso_link4",
+            "target_z_m": target_z,
+            "start_position": start_position.tolist(),
+            "start_quaternion_xyzw": start_quaternion.tolist(),
+            "terminal_position": positions[-1].astype(float).tolist(),
+            "terminal_quaternion_xyzw": quaternions[-1].astype(float).tolist(),
+            "execution_torso_positions": positions.astype(float).tolist(),
+            "execution_torso_positions_sha256": hashlib.sha256(
+                positions.tobytes()
+            ).hexdigest(),
+            "execution_torso_quaternions_xyzw": (
+                quaternions.astype(float).tolist()
+            ),
+            "execution_torso_quaternions_sha256": hashlib.sha256(
+                quaternions.tobytes()
+            ).hexdigest(),
+            "world_collision_check": True,
+            "self_collision_check": True,
+            "post_interpolation_check": True,
+            "collision_free_waypoints": 4,
+            "path_checks": {
+                "start_pose_matches": True,
+                "terminal_z_matches": True,
+                "xy_locked": True,
+                "z_step_bounded": True,
+                "z_direction_monotonic": True,
+                "orientation_locked": True,
+            },
+            "attachment_hand_count": 2,
+        }
+        self.torso_plan_calls.append(
+            {
+                "target_z_m": target_z,
+                "timeout_s": float(timeout_s),
+                "start_q": start.copy(),
+                "start_torso_pose": (
+                    start_position.copy(),
+                    start_quaternion.copy(),
+                ),
+                "background": bool(background),
+            }
+        )
+        return {
+            "ok": True,
+            "joint_trajectory": trajectory,
+            "torso_certificate": certificate,
+            "torso_goal": {
+                "target_z_m": target_z,
+                "target_xyz": positions[-1].astype(float).tolist(),
+            },
+            "expected_attachments_by_hand": {
+                side: self.get_attached_object(side)
+                for side in ("left", "right")
+            },
+            "metrics": {
+                "motion_scope": "torso_only",
+                "generator_kind": "torso",
+                "active_dof_count": 3,
+                "active_joint_names": list(TORSO_ACTIVE_JOINT_NAMES),
+                "locked_joint_count": 25,
+                "target_link": "torso_link4",
+                "collision_admission": {
+                    "available": True,
+                    "admitted": True,
+                    "world_collision_check": True,
+                    "self_collision_check": True,
+                    "full_trajectory": True,
+                    "post_interpolation_check": True,
+                },
+                "env_actions_sent": 0,
+            },
+        }
+
+    def capture_trajectory_hold_reference(self, *, hand, motion_scope="arm_only"):
+        del motion_scope
+        assert hand is None
+        return {
+            "hand": None,
+            "q_indices": [],
+            "q_values": [],
+            "gripper_commands": {"left": 1.0, "right": 1.0},
+        }
+
+    def joint_target_to_action(self, target_q, *, hand, fixed_reference=None):
+        assert hand is None
+        assert isinstance(fixed_reference, dict)
+        assert fixed_reference["hand"] is None
+        target = np.asarray(target_q, dtype=np.float32).reshape(28)
+        self.pending_torso_q = target.copy()
+        self.torso_action_targets.append(target.copy())
+        action = self.hold.copy()
+        action[ENV_ACTION_SEGMENTS["trunk"]] = target[6:10]
+        return action
+
+    def advance(self):
+        if self.pending_torso_q is None:
+            return
+        self.joint_positions = self.pending_torso_q.copy()
+        self.torso_position[2] = (
+            self.torso_origin_z + float(self.joint_positions[6])
+        )
+        self.pending_torso_q = None
+
+
+class _PermutedTorsoBackend(_TorsoBackend):
+    """Expose CuRobo and live q layouts in deliberately different orders."""
+
+    _torso_joint_layouts = RealCuroboBackend._torso_joint_layouts
+    torso_joint_names = RealCuroboBackend.torso_joint_names
+    torso_poses = RealCuroboBackend.torso_poses
+
+    def __init__(self):
+        super().__init__()
+        self.generator_joint_names = (
+            *self.joint_names[8:],
+            *self.joint_names[:8],
+        )
+        self._torso_robot = SimpleNamespace(
+            joints=dict.fromkeys(self.joint_names),
+        )
+        self._torso_generator = SimpleNamespace(
+            robot_joint_names=self.generator_joint_names,
+        )
+        self.torso_fk_generator_trajectories = []
+
+    def _find_robot(self):
+        return self._torso_robot
+
+    def _generator(self, *, kind, hand="left"):
+        del hand
+        assert kind == "torso"
+        return self._torso_generator
+
+    def _curobo_eef_poses(self, generator, q_trajectory):
+        assert generator is self._torso_generator
+        generator_q = np.ascontiguousarray(
+            np.asarray(q_trajectory, dtype=np.float32)
+        )
+        assert generator_q.ndim == 2
+        assert generator_q.shape[1] == len(self.generator_joint_names)
+        self.torso_fk_generator_trajectories.append(generator_q.copy())
+        torso_joint1_index = self.generator_joint_names.index("torso_joint1")
+        positions = np.repeat(
+            self.torso_position.reshape(1, 3),
+            len(generator_q),
+            axis=0,
+        )
+        positions[:, 2] = (
+            self.torso_origin_z + generator_q[:, torso_joint1_index]
+        )
+        quaternions = np.repeat(
+            self.torso_quaternion.reshape(1, 4),
+            len(generator_q),
+            axis=0,
+        )
+        return positions, quaternions
+
+
 class _NavigationDynamicsBackend(_NavigationBackend):
     def __init__(self, dynamics_reports, isolation_reports=None):
         super().__init__(isolation_reports=isolation_reports)
@@ -8825,6 +9138,11 @@ def test_prepared_eef_live_start_drift_requires_replan_without_actions():
     backend = Backend()
     executor, env = _executor(backend)
     prepared = executor.prepare_dashboard_motion("left_arm", "forward")
+    assert prepared["safety_certificate"]["admitted"] is True
+    assert prepared["safety_certificate"]["motion_kind"] == "eef"
+    assert prepared["safety_certificate"]["active_dof_count"] == 21
+    assert prepared["safety_certificate"]["attachment_hand_count"] == 2
+    assert all(prepared["safety_certificate"]["checks"].values())
     backend.joint_positions[6] = np.nextafter(
         np.float32(0.0),
         np.float32(np.inf),
@@ -9133,14 +9451,263 @@ def test_discard_prepared_motion_invalidates_all_descendants():
             executor.execute_dashboard_motion(plan["plan_id"], command)
 
 
-def test_prepared_dashboard_queue_rejects_one_shots_and_unsupported_torso():
-    executor, _env = _executor(_NavigationBackend())
+def test_prepared_dashboard_queue_rejects_one_shots_and_prepares_torso():
+    backend = _TorsoBackend()
+    executor, env = _executor(backend)
 
     for action in ("observe", "open", "close"):
         with pytest.raises(ValueError, match="one-shot"):
             executor.prepare_dashboard_motion("left_arm", action)
-    with pytest.raises(RuntimeError, match="torso_control_unsupported"):
-        executor.prepare_dashboard_motion("chassis", "up")
+    prepared = executor.prepare_dashboard_motion("chassis", "up")
+
+    assert prepared["motion_kind"] == "torso"
+    assert prepared["execution_policy"] == (
+        PREPARED_DASHBOARD_TORSO_EXECUTION_POLICY
+    )
+    assert prepared["predicted_terminal"]["torso_link4"]["xyz"][2] == (
+        pytest.approx(0.83)
+    )
+    assert isinstance(
+        prepared["predicted_terminal"]["torso_link4"]["pose_sha256"],
+        str,
+    )
+    assert prepared["predicted_terminal"]["joint_positions_sha256"]
+    assert prepared["safety_certificate"]["admitted"] is True
+    assert prepared["safety_certificate"]["motion_kind"] == "torso"
+    assert prepared["safety_certificate"]["attachment_hand_count"] == 2
+    assert all(prepared["safety_certificate"]["checks"].values())
+    assert backend.torso_plan_calls[0]["target_z_m"] == pytest.approx(0.83)
+    assert env.calls == []
+
+
+@pytest.mark.parametrize("motion_kind", ["torso", "eef"])
+def test_prepared_dashboard_motion_rejects_tampered_safety_certificate(
+    motion_kind,
+):
+    if motion_kind == "torso":
+        class Backend(_TorsoBackend):
+            def plan_torso_trajectory(self, **kwargs):
+                result = super().plan_torso_trajectory(**kwargs)
+                result["torso_certificate"]["attachment_hand_count"] = 1
+                return result
+
+        backend = Backend()
+        target, action = "chassis", "up"
+    else:
+        class Backend(_FakeBackend):
+            def plan_whole_body_trajectory(self, **kwargs):
+                result = super().plan_whole_body_trajectory(**kwargs)
+                result["whole_body_certificate"][
+                    "attachment_hand_count"
+                ] = 1
+                return result
+
+        backend = Backend()
+        target, action = "left_arm", "forward"
+    executor, env = _executor(backend)
+
+    with pytest.raises(RuntimeError, match="dual_attachment_collision"):
+        executor.prepare_dashboard_motion(target, action)
+
+    assert env.calls == []
+
+
+def test_prepared_dashboard_torso_executes_once_and_replays_receipt():
+    backend = _TorsoBackend()
+    executor, env = _executor(backend)
+    prepared = executor.prepare_dashboard_motion("chassis", "up")
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "torso-up-command",
+    )
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert result["metrics"]["torso_certificate_verified_before_first_action"] is True
+    assert result["metrics"]["prepared_start_strict_float32_equal"] is True
+    assert backend.torso_position[2] == pytest.approx(0.83)
+    assert len(env.calls) == 3
+    action_count = len(env.calls)
+
+    replay = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "torso-up-command",
+    )
+
+    assert replay == result
+    assert len(env.calls) == action_count
+
+
+def test_prepared_dashboard_torso_predecessor_uses_predicted_pose_and_returns():
+    backend = _TorsoBackend()
+    executor, env = _executor(backend)
+    up = executor.prepare_dashboard_motion("chassis", "up")
+    down = executor.prepare_dashboard_motion(
+        "chassis",
+        "down",
+        predecessor_plan_id=up["plan_id"],
+    )
+
+    assert backend.torso_plan_calls[1]["start_torso_pose"][0][2] == pytest.approx(
+        0.83
+    )
+    assert backend.torso_plan_calls[1]["target_z_m"] == pytest.approx(0.8)
+    assert down["predicted_terminal"]["torso_link4"]["xyz"][2] == pytest.approx(
+        0.8
+    )
+    assert executor.execute_dashboard_motion(
+        up["plan_id"],
+        "torso-up",
+    )["primitive_success"] is True
+    result = executor.execute_dashboard_motion(
+        down["plan_id"],
+        "torso-down",
+    )
+
+    assert result["primitive_success"] is True
+    assert backend.torso_position[2] == pytest.approx(0.8)
+    assert len(env.calls) == 6
+
+
+def test_prepared_dashboard_torso_start_drift_and_certificate_tamper_send_zero_action():
+    backend = _TorsoBackend()
+    executor, env = _executor(backend)
+    drifted = executor.prepare_dashboard_motion("chassis", "up")
+    backend.joint_positions[6] = 0.001
+
+    drift_result = executor.execute_dashboard_motion(
+        drifted["plan_id"],
+        "torso-drift",
+    )
+
+    assert drift_result["primitive_success"] is False
+    assert drift_result["stop_reason"] == "prepared_start_drift"
+    assert drift_result["metrics"]["env_actions_sent"] == 0
+    assert env.calls == []
+
+    backend = _TorsoBackend()
+    executor, env = _executor(backend)
+    tampered = executor.prepare_dashboard_motion("chassis", "up")
+    executor._prepared_motions[tampered["plan_id"]]["plan"][
+        "torso_certificate"
+    ]["attachment_hand_count"] = 1
+
+    tamper_result = executor.execute_dashboard_motion(
+        tampered["plan_id"],
+        "torso-tamper",
+    )
+
+    assert tamper_result["primitive_success"] is False
+    assert tamper_result["stop_reason"] == "torso_certificate_invalid"
+    assert tamper_result["metrics"]["env_actions_sent"] == 0
+    assert env.calls == []
+
+
+def test_dashboard_torso_capability_requires_verified_reset_warmup_receipt():
+    backend = _TorsoBackend()
+    executor, _env = _executor(backend)
+
+    assert executor.dashboard_control_capabilities()["torso"]["available"] is False
+
+    executor._warmup_report = {
+        "status": "complete",
+        "identity_warmup": {
+            "torso": {
+                "ok": True,
+                "collision_admitted": True,
+                "active_dof_count": 3,
+                "env_actions_sent": 0,
+                "simulator_advanced": False,
+            }
+        },
+    }
+    capability = executor.dashboard_control_capabilities()["torso"]
+
+    assert capability["available"] is True
+    assert capability["warmup_verified"] is True
+
+
+def test_torso_contact_preflight_and_post_step_tracking_fail_closed():
+    unavailable = _TorsoBackend(contact_mode="unavailable")
+    executor, env = _executor(unavailable)
+    prepared = executor.prepare_dashboard_motion("chassis", "up")
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "torso-contact-unavailable",
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "contact_feedback_unavailable"
+    assert result["metrics"]["env_actions_sent"] == 0
+    assert env.calls == []
+
+    class TrackingFailureBackend(_TorsoBackend):
+        @staticmethod
+        def joint_tracking_report(target_q, *, hand):
+            del target_q
+            assert hand is None
+            return {
+                "available": True,
+                "reached": False,
+                "max_articulation_error_rad": (
+                    TRACKING_HARD_ARTICULATION_ERROR_RAD + 0.01
+                ),
+                "max_base_xy_error_m": 0.0,
+                "base_yaw_error_rad": 0.0,
+            }
+
+    tracking = TrackingFailureBackend()
+    executor, env = _executor(tracking)
+    prepared = executor.prepare_dashboard_motion("chassis", "up")
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "torso-tracking-failure",
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "joint_tracking_deviation"
+    assert result["metrics"]["env_actions_sent"] == 1
+    assert result["metrics"]["post_stop_env_actions"] == 0
+    assert len(env.calls) == 1
+
+
+def test_torso_raw_success_after_first_step_preempts_all_follow_up_actions():
+    backend = _TorsoBackend()
+    executor, old_env = _executor(backend)
+
+    class SuccessEnv(_FakeEnv):
+        def chunk_step(self, actions):
+            self.calls.append(np.asarray(actions).copy())
+            self.backend.advance()
+            return (
+                None,
+                0.0,
+                False,
+                False,
+                {
+                    "done": {"success": True},
+                    "_rpent": {"executed_steps": 1},
+                },
+            )
+
+    env = SuccessEnv(backend)
+    backend.env = env
+    executor.env = env
+    del old_env
+    prepared = executor.prepare_dashboard_motion("chassis", "up")
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "torso-raw-success",
+    )
+
+    assert result["task_success"] is True
+    assert result["stop_reason"] == "official_task_success"
+    assert result["metrics"]["env_actions_sent"] == 1
+    assert len(env.calls) == 1
 
 
 def test_prepared_arm_successor_uses_predicted_eef_and_has_no_extra_hold():
@@ -9690,7 +10257,273 @@ def test_jog_torso_fails_closed_without_verified_curobo_controller():
     assert env.calls == []
 
 
-def _add_wrist_frame(executor, hand):
+def test_jog_torso_executes_verified_world_z_step_with_safety_certificate():
+    backend = _TorsoBackend()
+    executor, env = _executor(backend)
+
+    result = executor.jog_torso("up", timeout_s=10.0)
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert result["metrics"]["requested_delta_z_m"] == pytest.approx(0.03)
+    assert result["metrics"]["actual_target"] == {
+        "torso_link4_world_z_m": pytest.approx(0.83)
+    }
+    assert result["metrics"]["torso_certificate_verified_before_first_action"] is True
+    assert backend.torso_position[2] == pytest.approx(0.83)
+    assert len(env.calls) == 3
+
+
+def test_torso_fk_reorders_live_q_into_permuted_generator_layout():
+    backend = _PermutedTorsoBackend()
+    live_q = np.arange(len(backend.joint_names), dtype=np.float32).reshape(1, -1)
+
+    positions, quaternions = backend.torso_poses(live_q)
+
+    expected_generator_q = _reorder_joint_trajectory(
+        live_q,
+        source_names=backend.joint_names,
+        target_names=backend.generator_joint_names,
+    )
+    assert backend.torso_joint_names() == backend.joint_names
+    np.testing.assert_array_equal(
+        backend.torso_fk_generator_trajectories[-1],
+        expected_generator_q,
+    )
+    torso_joint1_live_index = backend.joint_names.index("torso_joint1")
+    assert positions[0, 2] == pytest.approx(
+        backend.torso_origin_z + live_q[0, torso_joint1_live_index]
+    )
+    np.testing.assert_allclose(quaternions[0], backend.torso_quaternion)
+
+
+def test_prepared_torso_permuted_generator_layout_is_json_safe_and_executes():
+    backend = _PermutedTorsoBackend()
+    executor, env = _executor(backend)
+
+    prepared = executor.prepare_dashboard_motion("chassis", "up")
+
+    assert json.loads(json.dumps(prepared)) == prepared
+    assert prepared["motion_kind"] == "torso"
+    assert prepared["predicted_terminal"]["torso_link4"]["xyz"][2] == (
+        pytest.approx(0.83)
+    )
+    assert prepared["safety_certificate"]["admitted"] is True
+    assert all(prepared["safety_certificate"]["checks"].values())
+    entry = executor._prepared_motions[prepared["plan_id"]]
+    certificate = entry["plan"]["torso_certificate"]
+    expected_layout_digest = hashlib.sha256(
+        json.dumps(
+            list(backend.joint_names),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert certificate["joint_name_layout_sha256"] == expected_layout_digest
+    predicted_live_q = np.asarray(
+        prepared["predicted_terminal"]["joint_positions"],
+        dtype=np.float32,
+    ).reshape(1, -1)
+    np.testing.assert_array_equal(
+        backend.torso_fk_generator_trajectories[-1],
+        _reorder_joint_trajectory(
+            predicted_live_q,
+            source_names=backend.joint_names,
+            target_names=backend.generator_joint_names,
+        ),
+    )
+
+    executor._warmup_report = {
+        "status": "complete",
+        "identity_warmup": {
+            "torso": {
+                "ok": True,
+                "collision_admitted": True,
+                "active_dof_count": 3,
+                "env_actions_sent": 0,
+                "simulator_advanced": False,
+            }
+        },
+    }
+    capabilities = executor.dashboard_control_capabilities()
+    assert capabilities["torso"]["available"] is True
+    json.dumps(capabilities)
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "permuted-torso-command",
+    )
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert result["metrics"]["torso_certificate_verified_before_first_action"] is True
+    assert result["metrics"]["prepared_start_strict_float32_equal"] is True
+    assert backend.torso_position[2] == pytest.approx(0.83)
+    assert len(env.calls) == 3
+    json.dumps(result)
+
+
+def test_torso_config_maps_live_joint_values_by_name_when_orders_differ(
+    tmp_path,
+):
+    yaml = pytest.importorskip("yaml")
+    live_names = tuple(_FakeBackend().joint_names)
+    config_names = (*live_names[10:], *live_names[:10])
+    source = tmp_path / "r1pro_description_curobo_default.yaml"
+    source.write_text(
+        yaml.safe_dump(
+            {
+                "robot_cfg": {
+                    "kinematics": {
+                        "cspace": {
+                            "joint_names": list(config_names),
+                            "retract_config": [0.0] * len(config_names),
+                        }
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    live_q = np.arange(len(live_names), dtype=np.float64) + 0.25
+    robot = SimpleNamespace(
+        joints=dict.fromkeys(live_names),
+        links={TORSO_LINK_NAME: object()},
+        get_joint_positions=lambda: live_q.copy(),
+    )
+    backend = RealCuroboBackend.__new__(RealCuroboBackend)
+    backend.output_dir = tmp_path / "output"
+    backend._config_paths = {}
+    backend._find_robot = lambda: robot
+    backend._asset_curobo_dir = lambda _robot: tmp_path
+
+    generated = backend._torso_config_path()
+    document = yaml.safe_load(generated.read_text(encoding="utf-8"))
+    cspace = document["robot_cfg"]["kinematics"]["cspace"]
+    by_name = dict(zip(live_names, live_q, strict=True))
+
+    assert cspace["retract_config"] == pytest.approx(
+        [by_name[name] for name in config_names]
+    )
+
+
+def test_torso_path_merges_active_values_into_live_robot_order():
+    live_names = tuple(_FakeBackend().joint_names)
+    generator_names = (*live_names[8:], *live_names[:8])
+    start = np.arange(len(live_names), dtype=np.float32)
+    robot = SimpleNamespace(joints=dict.fromkeys(live_names))
+    generator = SimpleNamespace(
+        robot_joint_names=generator_names,
+        mg={
+            "default": SimpleNamespace(
+                kinematics=SimpleNamespace(
+                    joint_names=TORSO_ACTIVE_JOINT_NAMES
+                )
+            )
+        },
+    )
+    path = SimpleNamespace(
+        joint_names=TORSO_ACTIVE_JOINT_NAMES,
+        position=np.asarray(
+            [[10.0, 20.0, 30.0], [11.0, 21.0, 31.0]],
+            dtype=np.float32,
+        ),
+    )
+    backend = RealCuroboBackend.__new__(RealCuroboBackend)
+    backend._embodiment_cls = SimpleNamespace(DEFAULT="default")
+
+    merged = backend._torso_path_to_full_joint_trajectory(
+        generator,
+        robot,
+        path,
+        start_q=start,
+    )
+
+    live_index = {name: index for index, name in enumerate(live_names)}
+    for active_index, name in enumerate(TORSO_ACTIVE_JOINT_NAMES):
+        np.testing.assert_allclose(
+            merged[:, live_index[name]],
+            path.position[:, active_index],
+        )
+    locked = [
+        index
+        for index, name in enumerate(live_names)
+        if name not in TORSO_ACTIVE_JOINT_NAMES
+    ]
+    np.testing.assert_allclose(
+        merged[:, locked],
+        np.repeat(start[locked][None, :], len(merged), axis=0),
+    )
+
+
+def test_torso_generator_joint_order_roundtrip_preserves_live_trajectory():
+    live_names = tuple(_FakeBackend().joint_names)
+    generator_names = (*live_names[8:], *live_names[:8])
+    live_trajectory = np.arange(
+        3 * len(live_names), dtype=np.float32
+    ).reshape(3, len(live_names))
+
+    generator_trajectory = _reorder_joint_trajectory(
+        live_trajectory,
+        source_names=live_names,
+        target_names=generator_names,
+    )
+    roundtrip = _reorder_joint_trajectory(
+        generator_trajectory,
+        source_names=generator_names,
+        target_names=live_names,
+    )
+
+    np.testing.assert_array_equal(roundtrip, live_trajectory)
+
+
+def test_torso_identity_path_has_no_invented_upward_direction():
+    assert _torso_z_path_direction_admitted(
+        [0.8, 0.7999, 0.8],
+        start_z_m=0.8,
+        target_z_m=0.8,
+    )
+    assert not _torso_z_path_direction_admitted(
+        [0.8, 0.789, 0.8],
+        start_z_m=0.8,
+        target_z_m=0.8,
+    )
+
+
+@pytest.mark.parametrize(
+    ("z_values", "target_z_m", "expected"),
+    (
+        ([0.8, 0.81, 0.83], 0.83, True),
+        ([0.8, 0.82, 0.81, 0.83], 0.83, False),
+        ([0.8, 0.79, 0.77], 0.77, True),
+        ([0.8, 0.78, 0.79, 0.77], 0.77, False),
+    ),
+)
+def test_torso_motion_path_keeps_requested_z_direction(
+    z_values,
+    target_z_m,
+    expected,
+):
+    assert (
+        _torso_z_path_direction_admitted(
+            z_values,
+            start_z_m=0.8,
+            target_z_m=target_z_m,
+        )
+        is expected
+    )
+
+
+def _add_wrist_frame(
+    executor,
+    hand,
+    *,
+    calibrated=False,
+    env_step=1,
+    camera_transforms=None,
+    eef_transforms=None,
+):
     intrinsics = CameraIntrinsics(
         fx=2.0,
         fy=2.0,
@@ -9699,14 +10532,99 @@ def _add_wrist_frame(executor, hand):
         width=5,
         height=5,
     )
-    executor.frame_cache.add(
-        camera=f"{hand}_wrist",
-        rgb=np.zeros((5, 5, 3), dtype=np.uint8),
-        depth_m=np.ones((5, 5), dtype=np.float32),
-        intrinsics=intrinsics,
-        camera_to_world=np.eye(4),
-        step_index=1,
-        frame_id=f"{hand}-wrist-1",
+    executor.env._env_steps = env_step
+    camera_transforms = dict(camera_transforms or {})
+    eef_transforms = dict(eef_transforms or {})
+    residual = {
+        "translation_error_m": 0.0,
+        "rotation_error_rad": 0.0,
+        "rotation_error_deg": 0.0,
+        "passed": bool(calibrated),
+    }
+    hand_certificate = {
+        "passed": bool(calibrated),
+        "camera_pose_source": "payload_view_matrix",
+        "camera_pose_render_bound": bool(calibrated),
+        "palm_from_camera": dict(residual),
+        "grip_point_from_camera": dict(residual),
+        "finger_joint_capture_match": {
+            "max_abs_error_m": 0.0,
+            "passed": bool(calibrated),
+        },
+    }
+    sync_certificate = {
+        "schema_version": 1,
+        "available": bool(calibrated),
+        "synchronized": bool(calibrated),
+        "reason": None if calibrated else "not_calibrated",
+        "env_step": env_step,
+        "render_sync_iterations": 3,
+        "translation_tolerance_m": 0.001,
+        "rotation_tolerance_deg": 0.25,
+        "finger_joint_tolerance_m": 0.0001,
+        "source": "render_sync_plus_official_r1pro_fixed_extrinsics",
+        "hands": {
+            "left": dict(hand_certificate),
+            "right": dict(hand_certificate),
+        },
+    }
+    metadata = {
+        "hand_geometry_sync_certificate": sync_certificate,
+        "r1pro_hand_reference_transforms": {
+            "schema_version": 1,
+            "available": bool(calibrated),
+            "reason": None if calibrated else "not_calibrated",
+            "env_step": env_step,
+            "source": "capture_time_live_r1pro_link_transforms",
+            "hands": {
+                "left": {
+                    "palm": np.eye(4).tolist(),
+                    "grip_point": np.asarray(
+                        eef_transforms.get("left", np.eye(4))
+                    ).tolist(),
+                    "finger_roots": [
+                        np.eye(4).tolist(),
+                        np.eye(4).tolist(),
+                    ],
+                },
+                "right": {
+                    "palm": np.eye(4).tolist(),
+                    "grip_point": np.asarray(
+                        eef_transforms.get("right", np.eye(4))
+                    ).tolist(),
+                    "finger_roots": [
+                        np.eye(4).tolist(),
+                        np.eye(4).tolist(),
+                    ],
+                },
+            },
+        },
+        "camera_pose_lineage": {
+            camera: {
+                "source": "payload_view_matrix",
+                "render_bound": bool(calibrated),
+                "env_step": env_step,
+                "render_sync_iterations": 3,
+            }
+            for camera in ("head", "left_wrist", "right_wrist")
+        },
+        "render_sync_iterations": 3,
+    }
+    executor.frame_cache.add_capture_group(
+        frames={
+            camera: {
+                "rgb": np.zeros((5, 5, 3), dtype=np.uint8),
+                "depth_m": np.ones((5, 5), dtype=np.float32),
+                "intrinsics": intrinsics,
+                "camera_to_world": np.asarray(
+                    camera_transforms.get(camera, np.eye(4))
+                ),
+            }
+            for camera in ("head", "left_wrist", "right_wrist")
+        },
+        step_index=env_step,
+        capture_group_id=f"{hand}-calibration-group",
+        capture_metadata=metadata,
     )
 
 
@@ -9723,34 +10641,155 @@ def test_jog_wrist_is_unavailable_before_real_visual_probe():
     assert env.calls == []
 
 
-@pytest.mark.parametrize(("hand", "sign"), [("left", 1.0), ("right", -1.0)])
-def test_jog_wrist_uses_independent_verified_visual_sign_and_holds_position(
-    hand,
-    sign,
-):
-    class CalibratedBackend(_FakeBackend):
-        @staticmethod
-        def wrist_visual_rotation_capability(selected_hand):
-            return {
-                "verified": True,
-                "hand": selected_hand,
-                "clockwise_angle_sign": (
-                    1.0 if selected_hand == "left" else -1.0
-                ),
-                "probe_artifact": f"{selected_hand}-visual-probe.json",
-            }
+def test_wrist_calibration_rejects_stale_frame_and_malformed_sync_certificate():
+    backend = _FakeBackend()
+    executor, _env = _executor(backend)
+    _add_wrist_frame(executor, "left", calibrated=True)
 
-    backend = CalibratedBackend()
+    executor.env._env_steps = 2
+    stale = executor._wrist_camera_rotation_calibration("left")
+    assert stale["verified"] is False
+    assert "current simulator step" in stale["reason"]
+
+    executor.env._env_steps = 1
+    frame = executor.frame_cache.latest("left_wrist")
+    frame.capture_metadata["hand_geometry_sync_certificate"]["hands"]["left"][
+        "finger_joint_capture_match"
+    ]["passed"] = False
+    malformed = executor._wrist_camera_rotation_calibration("left")
+    assert malformed["verified"] is False
+    assert "sync certificate is invalid" in malformed["reason"]
+
+
+def test_wrist_axes_are_computed_independently_from_each_camera_and_eef():
+    backend = _FakeBackend()
+    executor, _env = _executor(backend)
+    right_eef = np.eye(4)
+    right_eef[:3, :3] = np.asarray(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+        ]
+    )
+    _add_wrist_frame(
+        executor,
+        "left",
+        calibrated=True,
+        eef_transforms={"left": np.eye(4), "right": right_eef},
+    )
+
+    left = executor._wrist_camera_rotation_calibration("left")
+    right = executor._wrist_camera_rotation_calibration("right")
+
+    assert left["verified"] is True
+    assert right["verified"] is True
+    np.testing.assert_allclose(
+        left["screen_normal_axis_eef"], [0.0, 0.0, 1.0], atol=1e-9
+    )
+    np.testing.assert_allclose(
+        right["screen_normal_axis_eef"], [-1.0, 0.0, 0.0], atol=1e-9
+    )
+    assert left["capture_group_id"] == right["capture_group_id"]
+
+
+@pytest.mark.parametrize("hand", ["left", "right"])
+@pytest.mark.parametrize(
+    ("action", "expected_sign"),
+    [("rotate_left", 1.0), ("rotate_right", -1.0)],
+)
+def test_prepared_and_direct_wrist_targets_match_visual_direction(
+    hand,
+    action,
+    expected_sign,
+):
+    backend = _FakeBackend()
+    executor, _env = _executor(backend)
+    right_eef = np.eye(4)
+    right_eef[:3, :3] = np.asarray(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+        ]
+    )
+    _add_wrist_frame(
+        executor,
+        hand,
+        calibrated=True,
+        eef_transforms={"left": np.eye(4), "right": right_eef},
+    )
+    calibration = executor._wrist_camera_rotation_calibration(hand)
+    axis = np.asarray(calibration["screen_normal_axis_eef"])
+    half_angle = expected_sign * math.radians(2.5)
+    expected = np.concatenate(
+        [axis * math.sin(half_angle), [math.cos(half_angle)]]
+    )
+
+    prepared = executor.prepare_dashboard_motion(f"{hand}_arm", action)
+    prepared_target = backend.target_quat.copy()
+    direct_call = {}
+
+    def move_to(**kwargs):
+        direct_call.update(kwargs)
+        return {
+            "primitive_success": True,
+            "task_success": False,
+            "stop_reason": "reached",
+            "recoverable": True,
+            "metrics": {"env_actions_sent": 0},
+            "diagnostics": {},
+        }
+
+    executor.move_to = move_to
+    direct = executor.jog_wrist(hand, action, timeout_s=10.0)
+
+    assert prepared["status"] == "prepared"
+    assert direct["primitive_success"] is True
+    np.testing.assert_allclose(prepared_target, expected, atol=1e-8)
+    np.testing.assert_allclose(
+        direct_call["target_quat_xyzw"], prepared_target, atol=1e-8
+    )
+    assert direct["metrics"]["visual_direction"] == (
+        "counterclockwise" if action == "rotate_left" else "clockwise"
+    )
+
+
+def test_public_wrist_capability_remains_closed_before_real_visual_receipts():
+    backend = _FakeBackend()
+    executor, _env = _executor(backend)
+    _add_wrist_frame(executor, "left", calibrated=True)
+
+    capabilities = executor.dashboard_control_capabilities()
+
+    assert capabilities["wrist"] == {
+        "left": False,
+        "right": False,
+    }
+    assert capabilities["wrist_geometry"]["left"]["verified"] is True
+    assert capabilities["wrist_geometry"]["right"]["verified"] is True
+    assert (
+        capabilities["wrist_geometry"]["left"]["release_admission"]
+        is False
+    )
+
+
+@pytest.mark.parametrize("hand", ["left", "right"])
+def test_jog_wrist_uses_synchronized_hand_geometry_and_holds_position(
+    hand,
+):
+    backend = _FakeBackend()
     start_position = backend.pose.copy()
     executor, env = _executor(backend)
-    _add_wrist_frame(executor, hand)
+    _add_wrist_frame(executor, hand, calibrated=True)
 
     result = executor.jog_wrist(hand, "rotate_left", timeout_s=10.0)
 
     assert result["primitive_success"] is True
     assert result["metrics"]["requested_rotation_rad"] == pytest.approx(
-        sign * math.radians(5.0)
+        math.radians(5.0)
     )
+    assert result["metrics"]["visual_direction"] == "counterclockwise"
     assert result["metrics"]["final_position_drift_m"] <= 0.005
     np.testing.assert_allclose(backend.pose, start_position, atol=1e-9)
     assert len(env.calls) > 0
@@ -9761,15 +10800,6 @@ def test_jog_wrist_nonfinite_final_position_cannot_preserve_success():
         def __init__(self):
             super().__init__()
             self.pose_reads = 0
-
-        @staticmethod
-        def wrist_visual_rotation_capability(selected_hand):
-            return {
-                "verified": True,
-                "hand": selected_hand,
-                "clockwise_angle_sign": 1.0,
-                "probe_artifact": "left-visual-probe.json",
-            }
 
         def get_eef_pose(self, hand):
             del hand
@@ -9783,7 +10813,7 @@ def test_jog_wrist_nonfinite_final_position_cannot_preserve_success():
 
     backend = Backend()
     executor, _env = _executor(backend)
-    _add_wrist_frame(executor, "left")
+    _add_wrist_frame(executor, "left", calibrated=True)
     executor.move_to = lambda **_kwargs: {
         "primitive_success": True,
         "task_success": False,

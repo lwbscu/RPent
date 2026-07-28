@@ -50,6 +50,7 @@ _PLANNING_METADATA_FIELDS = (
     "fast_solver_deadline",
     "latency_metrics",
     "obstacle_refresh",
+    "safety_certificate",
     "selected_solver_stage",
     "solver_stages",
 )
@@ -241,7 +242,11 @@ class BehaviorRawSuccessLatch:
             "receipt_sha256": claimed,
         }
 
-    def observe(self, result: Any) -> bool:
+    def observe_with_binding(
+        self, result: Any
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Latch success and identify whether this exact result supplied it."""
+
         binding = self._validated_receipt(result)
         with self._lock:
             if binding is not None:
@@ -254,7 +259,13 @@ class BehaviorRawSuccessLatch:
                     )
                 self._receipt_binding = binding
                 self._latched = True
-            return self._latched
+            return self._latched, (
+                dict(binding) if binding is not None else None
+            )
+
+    def observe(self, result: Any) -> bool:
+        latched, _ = self.observe_with_binding(result)
+        return latched
 
     def is_latched(self) -> bool:
         with self._lock:
@@ -359,8 +370,13 @@ class BehaviorCommandArbiter:
                 self._command_id = None
                 self._condition.notify_all()
 
-    def handoff_manual(self, command_id: str, next_command_id: str) -> None:
-        """Retain one manual reservation while changing its exact permit."""
+    def handoff_manual(self, command_id: str, next_command_id: str) -> bool:
+        """Retain a manual reservation unless an Agent is already waiting.
+
+        The check and permit change are one condition-locked operation.  A
+        separate ``snapshot()`` check would leave a race in which an Agent
+        waiter could arrive immediately before the manual tail handoff.
+        """
 
         command_id = str(command_id or "").strip()
         next_command_id = str(next_command_id or "").strip()
@@ -372,7 +388,17 @@ class BehaviorCommandArbiter:
                 or self._command_id != command_id
             ):
                 raise RuntimeError("manual reservation handoff does not match owner")
+            if (
+                self._quiescing
+                or self.success_latch.is_latched()
+                or self._agent_waiters
+            ):
+                # Keep the old exact permit until the controller publishes the
+                # deferred command's cancellation terminal.  The caller
+                # explicitly releases only after that publication barrier.
+                return False
             self._command_id = next_command_id
+            return True
 
     def require_manual_permit(self, command_id: str) -> None:
         """Require the exact command-scoped manual permit.
@@ -552,6 +578,7 @@ class BehaviorDashboardController:
         self._plans_to_discard: list[str] = []
         self._last_terminal: dict[str, Any] | None = None
         self._pending_cleared_count = 0
+        self._publication_failed = False
         self._active = False
         self._quiescing = False
         self._closed = False
@@ -663,6 +690,175 @@ class BehaviorDashboardController:
             self._touch_locked()
             self._work.notify_all()
         self._publish_snapshot()
+
+    def plan_only_probe(self, *, target: str, action: str) -> dict[str, Any]:
+        """Plan and discard one torso/wrist calibration motion with zero action."""
+
+        target = str(target).strip()
+        action = str(action).strip()
+        self._validate_target_action(target, action, "head")
+        if not (
+            (target == "chassis" and action in {"up", "down"})
+            or (
+                target in {"left_arm", "right_arm"}
+                and action in {"rotate_left", "rotate_right"}
+            )
+        ):
+            raise ControlRequestError(
+                422,
+                "invalid_planning_probe",
+                "planning-only probes are limited to torso and wrist calibration",
+            )
+        lifecycle = self._state.control_admission_snapshot()
+        if lifecycle["state"] != "running" or lifecycle["official_task_success"]:
+            raise ControlRequestError(410, "run_finished", "run is already finished")
+
+        command_id = f"planning-probe-{uuid.uuid4().hex}"
+        with self._submit_lock:
+            with self._work:
+                if self.success_latch.is_latched():
+                    raise ControlRequestError(
+                        410, "run_finished", "official success latched"
+                    )
+                if not self._active or self._quiescing or self._closed:
+                    raise ControlRequestError(
+                        409,
+                        "controller_unavailable",
+                        "manual controller unavailable",
+                    )
+                if (
+                    self._head is not None
+                    or self._pending
+                    or self._planning_command is not None
+                    or self._capture["phase"] == "started"
+                ):
+                    raise ControlRequestError(
+                        409, "controller_busy", "robot controller is busy"
+                    )
+                if self._capture["phase"] == "pending":
+                    self._capture.update({"phase": "discarded", "error": None})
+                    self._capture_ready_at = 0.0
+                acquired, reason = self.arbiter.try_acquire_manual(command_id)
+                if not acquired:
+                    if reason == "official_success_latched":
+                        raise ControlRequestError(
+                            410, "run_finished", "official success latched"
+                        )
+                    raise ControlRequestError(
+                        409,
+                        reason or "controller_busy",
+                        (
+                            "agent command is waiting"
+                            if reason == "agent_waiting"
+                            else "robot controller is busy"
+                        ),
+                    )
+                self._touch_locked()
+                self._work.notify_all()
+            self._publish_snapshot()
+
+            plan_id: str | None = None
+            try:
+                toolkit = self._require_toolkit()
+                prepared = toolkit.dashboard_prepare_manual_command(
+                    target=target,
+                    action=action,
+                    predecessor_plan_id=None,
+                    permit_command_id=command_id,
+                    background=False,
+                    planning_only_probe=True,
+                )
+                if not isinstance(prepared, Mapping):
+                    raise RuntimeError(
+                        "planning-only probe returned a non-object result"
+                    )
+                plan_id = str(prepared.get("plan_id") or "").strip()
+                if not plan_id:
+                    raise RuntimeError("planning-only probe omitted plan_id")
+                discarded = toolkit.dashboard_discard_prepared_command(
+                    plan_id=plan_id
+                )
+                if not isinstance(discarded, Mapping):
+                    raise RuntimeError(
+                        "planning-only probe discard returned a non-object result"
+                    )
+                discard_plan_id = str(discarded.get("plan_id") or "").strip()
+                if discarded.get("discarded") is not True:
+                    raise RuntimeError(
+                        "planning-only probe discard was not acknowledged"
+                    )
+                if discard_plan_id != plan_id:
+                    raise RuntimeError(
+                        "planning-only probe discard plan_id mismatch"
+                    )
+                if (
+                    prepared.get("planning_only_probe") is not True
+                    or prepared.get("zero_action_verified") is not True
+                    or int(prepared.get("env_step_delta", -1)) != 0
+                ):
+                    raise RuntimeError(
+                        "planning-only probe omitted zero-action verification"
+                    )
+                safety_certificate = prepared.get("safety_certificate")
+                safety_checks = (
+                    safety_certificate.get("checks")
+                    if isinstance(safety_certificate, Mapping)
+                    else None
+                )
+                expected_motion_kind = (
+                    "torso" if target == "chassis" else "eef"
+                )
+                if (
+                    not isinstance(safety_certificate, Mapping)
+                    or safety_certificate.get("admitted") is not True
+                    or safety_certificate.get("motion_kind")
+                    != expected_motion_kind
+                    or int(
+                        safety_certificate.get(
+                            "attachment_hand_count",
+                            -1,
+                        )
+                    )
+                    != 2
+                    or not isinstance(safety_checks, Mapping)
+                    or not safety_checks
+                    or any(value is not True for value in safety_checks.values())
+                ):
+                    raise RuntimeError(
+                        "planning-only probe omitted a verified safety certificate"
+                    )
+                result = {
+                    "ok": True,
+                    "planning_only": True,
+                    "release_admission": False,
+                    "target": target,
+                    "action": action,
+                    "command_id": command_id,
+                    "plan_id": plan_id,
+                    "env_step_delta": 0,
+                    "zero_action_verified": True,
+                    "safety_certificate": _bounded_planning_value(
+                        safety_certificate
+                    ),
+                    "prepared": _bounded_planning_value(prepared),
+                    "discarded": True,
+                    "discard_receipt": _bounded_planning_value(discarded),
+                }
+            except ControlRequestError:
+                raise
+            except BaseException as exc:
+                raise ControlRequestError(
+                    409,
+                    "planning_probe_failed",
+                    f"{type(exc).__name__}: {exc}",
+                ) from exc
+            finally:
+                self.arbiter.release_manual(command_id)
+                with self._work:
+                    self._touch_locked()
+                    self._work.notify_all()
+                self._publish_snapshot()
+        return result
 
     def submit(
         self,
@@ -829,21 +1025,26 @@ class BehaviorDashboardController:
     def heartbeat(self, *, lease_id: str) -> dict[str, Any]:
         lease_id = str(lease_id).strip()
         with self._work:
-            self._expire_lease_locked(time.monotonic())
+            _, published = self._expire_lease_locked(time.monotonic())
             lease = self._lease
-            if (
+            inactive = bool(
                 lease is None
                 or lease.lease_id != lease_id
                 or lease.stopped
                 or lease.expired
-            ):
-                raise ControlRequestError(
-                    409, "lease_expired", "control lease is not active"
-                )
-            lease.deadline = time.monotonic() + self._lease_timeout_s
-            self._touch_locked()
-            result = self._snapshot_locked()
-            self._work.notify_all()
+            )
+            if not inactive:
+                assert lease is not None
+                lease.deadline = time.monotonic() + self._lease_timeout_s
+                self._touch_locked()
+                result = self._snapshot_locked()
+                self._work.notify_all()
+        if not published:
+            self.arbiter.quiesce()
+        if inactive:
+            raise ControlRequestError(
+                409, "lease_expired", "control lease is not active"
+            )
         self._publish_snapshot()
         return result
 
@@ -865,11 +1066,20 @@ class BehaviorDashboardController:
                 raise ControlRequestError(409, "unknown_lease", "control lease not found")
             lease.stopped = True
             lease.stop_reason = str(reason or "client_stop")
-            cleared = self._clear_pending_locked(lease.stop_reason)
+            cleared, exposed_terminal = self._clear_deferred_head_locked(
+                lease.stop_reason
+            )
             self._touch_locked()
-            result = self._snapshot_locked()
             self._work.notify_all()
-        self._publish_cleared(cleared)
+            published = self._publish_cleared(
+                cleared,
+                expose_first_terminal=exposed_terminal,
+            )
+            if not published:
+                self._mark_publication_failed_locked("cancel terminal rejected")
+            result = self._snapshot_locked()
+        if not published:
+            self.arbiter.quiesce()
         self._publish_snapshot()
         return result
 
@@ -890,10 +1100,13 @@ class BehaviorDashboardController:
 
     def snapshot(self) -> dict[str, Any]:
         with self._work:
-            changed = self._expire_lease_locked(time.monotonic())
+            changed, published = self._expire_lease_locked(time.monotonic())
             if changed:
                 self._work.notify_all()
-            return self._snapshot_locked()
+            result = self._snapshot_locked()
+        if not published:
+            self.arbiter.quiesce()
+        return result
 
     def quiesce(self) -> None:
         with self._work:
@@ -902,13 +1115,20 @@ class BehaviorDashboardController:
             if self._lease is not None:
                 self._lease.stopped = True
                 self._lease.stop_reason = "controller_quiescing"
-            cleared = self._clear_pending_locked("controller_quiescing")
+            cleared, exposed_terminal = self._clear_deferred_head_locked(
+                "controller_quiescing"
+            )
             if self._capture["phase"] == "pending":
                 self._capture.update({"phase": "discarded", "error": None})
                 self._capture_ready_at = 0.0
             self._touch_locked()
             self._work.notify_all()
-        self._publish_cleared(cleared)
+            published = self._publish_cleared(
+                cleared,
+                expose_first_terminal=exposed_terminal,
+            )
+            if not published:
+                self._mark_publication_failed_locked("cancel terminal rejected")
         self.arbiter.quiesce()
         self._publish_snapshot()
 
@@ -980,6 +1200,7 @@ class BehaviorDashboardController:
                     target=command.target,
                     action=command.action,
                     predecessor_plan_id=command.predecessor_plan_id,
+                    permit_command_id=command.command_id,
                     # Controller admission only plans the current FIFO head.
                     # Never re-enable the Env RPC background escape hatch here.
                     background=False,
@@ -1020,7 +1241,8 @@ class BehaviorDashboardController:
                         return
                     head = self._head
                     if head is not None and (
-                        head.timeline_started
+                        self._command_has_exact_permit_locked(head)
+                        and head.timeline_started
                         and (
                             head.action in _ONE_SHOT_ACTIONS
                             or head.plan_id
@@ -1074,7 +1296,9 @@ class BehaviorDashboardController:
         result.setdefault("elapsed_s", max(0.0, time.monotonic() - started))
         capture_result = self._detach_capture_payload(result)
         try:
-            success_latched = self.success_latch.observe(result)
+            success_latched, manual_success_binding = (
+                self.success_latch.observe_with_binding(result)
+            )
         except BaseException as exc:
             result.update(
                 {
@@ -1085,20 +1309,36 @@ class BehaviorDashboardController:
                 }
             )
             success_latched = self.success_latch.is_latched()
+            manual_success_binding = None
+        if manual_success_binding is not None:
+            result["task_success"] = True
+            result.setdefault("stop_reason", "official_task_success")
+        elif result.get("task_success") is True:
+            result.update(
+                {
+                    "primitive_success": False,
+                    "task_success": False,
+                    "stop_reason": "invalid_success_receipt",
+                    "error": (
+                        "manual result claimed task success without a valid "
+                        "raw-success receipt"
+                    ),
+                }
+            )
         failed = self._action_failed(result)
         command.result = result
         command.phase = "failed" if failed else "completed"
         if success_latched:
             command.phase = "completed" if not failed else "failed"
 
-        try:
-            self._state.on_manual_command_result(
-                command.public(),
-                result,
-                official_success_latched=success_latched,
-            )
-        except BaseException as exc:
-            result["state_publish_error"] = f"{type(exc).__name__}: {exc}"
+        timeline_published, timeline_error = self._publish_manual_result(
+            command,
+            result,
+            official_success_latched=manual_success_binding is not None,
+        )
+        if not timeline_published:
+            result["state_publish_error"] = str(timeline_error)
+            command.phase = "failed"
         if capture_result is not None and not success_latched:
             revision = self._new_capture_revision()
             publish_error = self._publish_capture_result(
@@ -1154,27 +1394,84 @@ class BehaviorDashboardController:
 
             next_head = self._head
             self._touch_locked()
-            # Publish the immutable action terminal while the exact manual
-            # permit is still visible.  The reservation is handed off/released
-            # only after State and control readers can observe that terminal.
-            self._publish_snapshot()
-            if next_head is not None:
-                self.arbiter.handoff_manual(
-                    command.command_id, next_head.command_id
+            self._work.notify_all()
+
+        # The current action and every cancellation caused by it must be
+        # committed while the old exact permit is still held.
+        terminal_published = timeline_published and self._publish_snapshot()
+        if not terminal_published:
+            self._fail_closed_publication(
+                owner_command_id=command.command_id,
+                error=timeline_error or "control terminal snapshot was rejected",
+            )
+            return
+        if cleared and not self._publish_cleared(cleared):
+            self._fail_closed_publication(
+                owner_command_id=command.command_id,
+                error="queued cancellation terminal was rejected",
+            )
+            return
+
+        if next_head is not None:
+            with self._work:
+                if (
+                    self._head is not next_head
+                    or next_head.phase == "cancelled"
+                ):
+                    next_head = None
+                    handed_off = False
+                else:
+                    handed_off = self.arbiter.handoff_manual(
+                        command.command_id, next_head.command_id
+                    )
+        if next_head is not None:
+            if not handed_off:
+                arbiter_snapshot = self.arbiter.snapshot()
+                reason = (
+                    "official_task_success"
+                    if arbiter_snapshot.get("success_latched") is True
+                    else "controller_quiescing"
+                    if arbiter_snapshot.get("quiescing") is True
+                    else "agent_waiting"
                 )
-            else:
+                with self._work:
+                    preempted: list[_Command] = []
+                    if self._head is next_head:
+                        preempted = [next_head, *self._pending]
+                        self._head = None
+                        self._pending.clear()
+                        self._mark_cleared_locked(preempted, reason)
+                        if lease is not None:
+                            lease.stopped = True
+                            lease.stop_reason = reason
+                        self._touch_locked()
+                        self._work.notify_all()
+                if preempted and not self._publish_cleared(
+                    preempted,
+                    expose_first_terminal=reason == "agent_waiting",
+                ):
+                    self._fail_closed_publication(
+                        owner_command_id=command.command_id,
+                        error="preempted cancellation terminal was rejected",
+                    )
+                    return
+                # handoff_manual deliberately retains the old permit on a
+                # refusal so cancellation remains observable first.
                 self.arbiter.release_manual(command.command_id)
+        else:
+            self.arbiter.release_manual(command.command_id)
+            with self._work:
                 if (
                     not success_latched
                     and command.action != "observe"
                     and result.get("cancelled_before_execution") is not True
                     and not self._quiescing
                     and not self._closed
+                    and not self._publication_failed
                 ):
                     self._schedule_capture_locked()
-            self._touch_locked()
-            self._work.notify_all()
-        self._publish_cleared(cleared)
+                self._touch_locked()
+                self._work.notify_all()
         self._publish_snapshot()
 
     def _execute_capture(self, revision: int, command_id: str) -> None:
@@ -1202,13 +1499,64 @@ class BehaviorDashboardController:
                 }
             )
             next_head = self._head
-            if next_head is not None:
-                self.arbiter.handoff_manual(command_id, next_head.command_id)
-            else:
-                self.arbiter.release_manual(command_id)
             self._capture_command_id = None
             self._touch_locked()
             self._work.notify_all()
+
+        # Capture completion/failure is visible before its exact permit can be
+        # handed to a deferred motion or released.
+        if not self._publish_snapshot():
+            self._fail_closed_publication(
+                owner_command_id=command_id,
+                error="capture terminal snapshot was rejected",
+            )
+            return
+        if next_head is not None:
+            with self._work:
+                if (
+                    self._head is not next_head
+                    or next_head.phase == "cancelled"
+                ):
+                    next_head = None
+                    handed_off = False
+                else:
+                    handed_off = self.arbiter.handoff_manual(
+                        command_id, next_head.command_id
+                    )
+        if next_head is not None:
+            if not handed_off:
+                arbiter_snapshot = self.arbiter.snapshot()
+                reason = (
+                    "official_task_success"
+                    if arbiter_snapshot.get("success_latched") is True
+                    else "controller_quiescing"
+                    if arbiter_snapshot.get("quiescing") is True
+                    else "agent_waiting"
+                )
+                with self._work:
+                    cleared: list[_Command] = []
+                    if self._head is next_head:
+                        cleared = [next_head, *self._pending]
+                        self._head = None
+                        self._pending.clear()
+                        self._mark_cleared_locked(cleared, reason)
+                        if self._lease is not None:
+                            self._lease.stopped = True
+                            self._lease.stop_reason = reason
+                        self._touch_locked()
+                        self._work.notify_all()
+                if cleared and not self._publish_cleared(
+                    cleared,
+                    expose_first_terminal=reason == "agent_waiting",
+                ):
+                    self._fail_closed_publication(
+                        owner_command_id=command_id,
+                        error="deferred cancellation terminal was rejected",
+                    )
+                    return
+                self.arbiter.release_manual(command_id)
+        else:
+            self.arbiter.release_manual(command_id)
         self._publish_snapshot()
 
     def _publish_capture_result(
@@ -1247,6 +1595,7 @@ class BehaviorDashboardController:
             "stop_reason": "planning_error",
             "error": f"{type(exc).__name__}: {exc}",
         }
+        release_command_id: str | None = None
         with self._work:
             if self._planning_command is command:
                 self._planning_command = None
@@ -1263,7 +1612,7 @@ class BehaviorDashboardController:
                 if self._lease is not None:
                     self._lease.stopped = True
                     self._lease.stop_reason = "planning_error"
-                self.arbiter.release_manual(command.command_id)
+                release_command_id = command.command_id
             else:
                 index = self._pending.index(command)
                 cleared = self._pending[index + 1 :]
@@ -1275,17 +1624,34 @@ class BehaviorDashboardController:
                     self._lease.stop_reason = "planning_error"
             self._touch_locked()
             self._work.notify_all()
-        try:
-            self._state.on_manual_command_result(
-                command.public(),
-                result,
-                official_success_latched=False,
-            )
-        except BaseException:
-            pass
-        self._publish_cleared(
-            [item for item in cleared if item is not command]
+        timeline_published, timeline_error = self._publish_manual_result(
+            command,
+            result,
+            official_success_latched=False,
         )
+        # State and control readers must see the immutable terminal before the
+        # exact permit is released to an Agent or a fresh manual lease.
+        terminal_published = timeline_published and self._publish_snapshot()
+        cleared = [item for item in cleared if item is not command]
+        if terminal_published and cleared:
+            terminal_published = self._publish_cleared(cleared)
+        if not terminal_published:
+            if release_command_id is not None:
+                self._fail_closed_publication(
+                    owner_command_id=release_command_id,
+                    error=timeline_error
+                    or "planning terminal snapshot was rejected",
+                )
+            else:
+                with self._work:
+                    self._mark_publication_failed_locked(
+                        timeline_error
+                        or "planning terminal snapshot was rejected"
+                    )
+                self.arbiter.quiesce()
+            return
+        if release_command_id is not None:
+            self.arbiter.release_manual(release_command_id)
         self._publish_snapshot()
 
     def _fail_admission(self, command: _Command, exc: BaseException) -> None:
@@ -1294,12 +1660,13 @@ class BehaviorDashboardController:
             "stop_reason": "dashboard_state_error",
             "error": f"{type(exc).__name__}: {exc}",
         }
+        release_command_id: str | None = None
         with self._work:
             command.phase = "failed"
             command.result = result
             if self._head is command:
                 self._head = None
-                self.arbiter.release_manual(command.command_id)
+                release_command_id = command.command_id
             elif command in self._pending:
                 self._pending.remove(command)
             if self._lease is not None:
@@ -1308,7 +1675,22 @@ class BehaviorDashboardController:
             self._last_terminal = self._terminal_public(command)
             self._touch_locked()
             self._work.notify_all()
-        self._publish_snapshot()
+        published = self._publish_snapshot()
+        if not published:
+            if release_command_id is not None:
+                self._fail_closed_publication(
+                    owner_command_id=release_command_id,
+                    error="admission failure terminal snapshot was rejected",
+                )
+            else:
+                with self._work:
+                    self._mark_publication_failed_locked(
+                        "admission failure terminal snapshot was rejected"
+                    )
+                self.arbiter.quiesce()
+            return
+        if release_command_id is not None:
+            self.arbiter.release_manual(release_command_id)
 
     def _reserve_for_new_head_locked(self, command_id: str) -> None:
         arbiter = self.arbiter.snapshot()
@@ -1318,6 +1700,9 @@ class BehaviorDashboardController:
             and arbiter.get("owner") == "manual"
             and arbiter.get("command_id") == self._capture_command_id
         ):
+            # The already-started capture cannot be cancelled honestly.  Admit
+            # one deferred head, but neither plan nor execute it until capture
+            # completion atomically hands over the exact permit.
             return
         acquired, reason = self.arbiter.try_acquire_manual(command_id)
         if acquired:
@@ -1344,8 +1729,17 @@ class BehaviorDashboardController:
             or command.plan_id
         ):
             return None
+        if not self._command_has_exact_permit_locked(command):
+            return None
         command.predecessor_plan_id = None
         return command
+
+    def _command_has_exact_permit_locked(self, command: _Command) -> bool:
+        arbiter = self.arbiter.snapshot()
+        return bool(
+            arbiter.get("owner") == "manual"
+            and arbiter.get("command_id") == command.command_id
+        )
 
     def _start_capture_if_ready_locked(self) -> tuple[int, str] | None:
         if (
@@ -1409,6 +1803,30 @@ class BehaviorDashboardController:
         self._mark_cleared_locked(cleared, reason)
         return cleared
 
+    def _clear_deferred_head_locked(
+        self, reason: str
+    ) -> tuple[list[_Command], bool]:
+        """Clear queued work without cancelling an exact-permit motion.
+
+        A head accepted while capture is already running has no permit of its
+        own.  It is therefore queued work, not an in-flight robot action, and
+        must be cancelled together with the tail on stop/expiry/quiesce.
+        """
+
+        deferred_head = bool(
+            self._head is not None
+            and self._head.phase == "accepted"
+            and not self._command_has_exact_permit_locked(self._head)
+        )
+        if not deferred_head:
+            return self._clear_pending_locked(reason), False
+        assert self._head is not None
+        cleared = [self._head, *self._pending]
+        self._head = None
+        self._pending.clear()
+        self._mark_cleared_locked(cleared, reason)
+        return cleared, True
+
     def _mark_cleared_locked(
         self, commands: list[_Command], reason: str
     ) -> None:
@@ -1423,18 +1841,87 @@ class BehaviorDashboardController:
             }
         self._pending_cleared_count += len(commands)
 
-    def _publish_cleared(self, commands: list[_Command]) -> None:
+    def _publish_cleared(
+        self,
+        commands: list[_Command],
+        *,
+        expose_first_terminal: bool = False,
+    ) -> bool:
         for command in commands:
             if not command.timeline_started:
                 continue
             try:
-                self._state.on_manual_command_result(
+                accepted = self._state.on_manual_command_result(
                     command.public(),
                     dict(command.result or {}),
                     official_success_latched=False,
                 )
+                if accepted is not True:
+                    return False
             except BaseException:
-                continue
+                return False
+        if expose_first_terminal and commands:
+            with self._work:
+                self._last_terminal = self._terminal_public(commands[0])
+                self._touch_locked()
+        return self._publish_snapshot()
+
+    def _publish_manual_result(
+        self,
+        command: _Command,
+        result: Mapping[str, Any],
+        *,
+        official_success_latched: bool,
+    ) -> tuple[bool, str | None]:
+        try:
+            accepted = self._state.on_manual_command_result(
+                command.public(),
+                dict(result),
+                official_success_latched=official_success_latched,
+            )
+        except BaseException as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        if accepted is not True:
+            return False, "Dashboard manual terminal was rejected"
+        return True, None
+
+    def _mark_publication_failed_locked(self, _error: str) -> None:
+        self._publication_failed = True
+        self._active = False
+        self._quiescing = True
+        self._unavailable_reason = "dashboard_state_publication_failed"
+        if self._lease is not None:
+            self._lease.stopped = True
+            self._lease.stop_reason = "dashboard_state_publication_failed"
+        self._touch_locked()
+
+    def _fail_closed_publication(
+        self,
+        *,
+        owner_command_id: str,
+        error: str,
+    ) -> None:
+        """Disable all admission before releasing a permit with no State ack."""
+
+        with self._work:
+            remaining: list[_Command] = []
+            if self._head is not None:
+                remaining.append(self._head)
+                self._head = None
+            remaining.extend(self._pending)
+            self._pending.clear()
+            self._mark_cleared_locked(
+                remaining,
+                "dashboard_state_publication_failed",
+            )
+            self._mark_publication_failed_locked(error)
+            self._work.notify_all()
+        # Quiescing is the fail-closed barrier: waiting Agent transactions and
+        # every future manual admission are rejected before the old permit is
+        # released for cleanup.
+        self.arbiter.quiesce()
+        self.arbiter.release_manual(owner_command_id)
+        self._publish_snapshot()
 
     def _discard_plan(self, plan_id: str) -> None:
         try:
@@ -1514,7 +2001,7 @@ class BehaviorDashboardController:
                 f"{action} is available for arm control only",
             )
 
-    def _expire_lease_locked(self, now: float) -> bool:
+    def _expire_lease_locked(self, now: float) -> tuple[bool, bool]:
         lease = self._lease
         if (
             lease is None
@@ -1522,32 +2009,51 @@ class BehaviorDashboardController:
             or lease.expired
             or now <= lease.deadline
         ):
-            return False
+            return False, True
         lease.expired = True
         lease.stopped = True
         lease.stop_reason = "lease_expired"
-        cleared = self._clear_pending_locked("lease_expired")
+        cleared, exposed_terminal = self._clear_deferred_head_locked(
+            "lease_expired"
+        )
         self._touch_locked()
-        if cleared:
-            threading.Thread(
-                target=self._publish_cleared,
-                args=(cleared,),
-                name="behavior-dashboard-expiry-publication",
-                daemon=True,
-            ).start()
-        return True
+        published = self._publish_cleared(
+            cleared,
+            expose_first_terminal=exposed_terminal,
+        )
+        if not published:
+            self._mark_publication_failed_locked("cancel terminal rejected")
+        return True, published
 
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.wait(_WATCHDOG_PERIOD_S):
             with self._work:
-                changed = self._expire_lease_locked(time.monotonic())
+                changed, published = self._expire_lease_locked(time.monotonic())
                 if changed:
                     self._work.notify_all()
+            if not published:
+                self.arbiter.quiesce()
             if changed:
                 self._publish_snapshot()
 
     def _on_arbiter_change(self) -> None:
         with self._work:
+            if self.success_latch.is_latched():
+                self._active = False
+                if self._lease is not None:
+                    self._lease.stopped = True
+                    self._lease.stop_reason = "official_task_success"
+                cleared, _ = self._clear_deferred_head_locked(
+                    "official_task_success"
+                )
+                if self._capture["phase"] == "pending":
+                    self._capture.update({"phase": "discarded", "error": None})
+                    self._capture_ready_at = 0.0
+                published = self._publish_cleared(cleared)
+                if not published:
+                    self._mark_publication_failed_locked(
+                        "raw-success cancellation terminal rejected"
+                    )
             self._touch_locked()
             self._work.notify_all()
         self._publish_snapshot()
@@ -1579,13 +2085,26 @@ class BehaviorDashboardController:
             if self._last_terminal is not None
             else None
         )
-        display = head or terminal or {}
+        run_success_latched = self.success_latch.is_latched()
+        manual_success_terminal = bool(
+            isinstance(terminal, Mapping)
+            and terminal.get("task_success") is True
+        )
+        display = (
+            head
+            or (
+                terminal
+                if not run_success_latched or manual_success_terminal
+                else None
+            )
+            or {}
+        )
         lease = self._lease
         lease_status = (
             "expired"
             if lease is not None and lease.expired
             else "succeeded"
-            if self.success_latch.is_latched()
+            if run_success_latched
             else "stopped"
             if lease is not None and lease.stopped
             else "active"
@@ -1596,7 +2115,7 @@ class BehaviorDashboardController:
         error = result.get("error") if isinstance(result, Mapping) else None
         stop_reason = (
             "official_task_success"
-            if self.success_latch.is_latched()
+            if run_success_latched
             else lease.stop_reason
             if lease is not None and lease.stop_reason
             else result.get("stop_reason")
@@ -1608,7 +2127,7 @@ class BehaviorDashboardController:
             and not self._quiescing
             and not self._closed
             and (self._motion_available or self._observe_available)
-            and not self.success_latch.is_latched()
+            and not run_success_latched
         )
         return {
             "control_revision": self._control_revision,
@@ -1639,7 +2158,7 @@ class BehaviorDashboardController:
             "capture_error": self._capture.get("error"),
             "stop_reason": stop_reason,
             "selected_camera": self._selected_camera,
-            "success_latched": self.success_latch.is_latched(),
+            "success_latched": run_success_latched,
             "unavailable_reason": (
                 self._unavailable_reason
                 if not (self._motion_available or self._observe_available)
@@ -1648,12 +2167,16 @@ class BehaviorDashboardController:
             "capabilities": dict(self._capabilities),
         }
 
-    def _publish_snapshot(self) -> None:
+    def _publish_snapshot(self) -> bool:
         with self._lock:
             snapshot = self._snapshot_locked()
         callback = getattr(self._state, "update_control_snapshot", None)
         if callable(callback):
-            callback(snapshot, controller=self)
+            try:
+                return callback(snapshot, controller=self) is True
+            except BaseException:
+                return False
+        return False
 
 
 __all__ = [

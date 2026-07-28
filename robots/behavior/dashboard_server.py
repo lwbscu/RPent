@@ -218,6 +218,29 @@ class DashboardServer(OfficialDashboardServer):
             except ControlRequestError as exc:
                 return error_response(exc, controller)
 
+        @self._app.post("/api/run/control/plan")
+        def api_control_plan(
+            payload: dict[str, Any] = Body(default={}),
+        ) -> JSONResponse:
+            """Run one zero-action torso/wrist planning acceptance probe."""
+
+            controller = None
+            try:
+                body = validate_payload(
+                    payload,
+                    required={"run", "target", "action"},
+                )
+                state = state_for_run(body["run"])
+                controller = controller_for_state(state)
+                return JSONResponse(
+                    controller.plan_only_probe(
+                        target=body["target"],
+                        action=body["action"],
+                    )
+                )
+            except ControlRequestError as exc:
+                return error_response(exc, controller)
+
         @self._app.post("/api/run/control/stop")
         def api_control_stop(
             payload: dict[str, Any] = Body(default={}),
@@ -277,12 +300,22 @@ class DashboardServer(OfficialDashboardServer):
                         if isinstance(public_state, dict)
                         else None
                     )
+                    last_terminal = (
+                        terminal.get("last_terminal")
+                        if isinstance(terminal, dict)
+                        else None
+                    )
                     if (
                         isinstance(terminal, dict)
                         and terminal.get("success_latched") is True
                         and terminal.get("command_id")
                         and terminal.get("phase")
                         in {"completed", "failed", "cancelled"}
+                        and isinstance(last_terminal, dict)
+                        and last_terminal.get("command_id")
+                        == terminal.get("command_id")
+                        and last_terminal.get("phase") == terminal.get("phase")
+                        and last_terminal.get("task_success") is True
                     ):
                         return JSONResponse(terminal)
                     raise ControlRequestError(

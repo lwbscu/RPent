@@ -2613,13 +2613,14 @@ def test_raw_success_phase_b_clears_authority_without_reenabling_vla(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("controller_mode", "expected_warmup_calls"),
-    [("hybrid", 1), ("pi0_nav_pick_only", 0)],
+    ("controller_mode", "expected_warmup_calls", "expected_refresh_calls"),
+    [("hybrid", 1, 1), ("pi0_nav_pick_only", 0, 0)],
 )
 def test_reset_clears_opposite_surface_attempt_state(
     tmp_path,
     controller_mode,
     expected_warmup_calls,
+    expected_refresh_calls,
 ):
     facade, _attachment = _opposite_surface_runtime(tmp_path, held_hand="left")
     facade._controller_mode = controller_mode
@@ -2641,6 +2642,10 @@ def test_reset_clears_opposite_surface_attempt_state(
     facade._robot = lambda: SimpleNamespace(_controller_config={"base": {}})
     facade._record_rgbd_frames = lambda *_args, **_kwargs: None
     facade._append_video = lambda _observation: None
+    refresh_calls: list[dict[str, object]] = []
+    facade._refresh_observation_without_step = lambda **kwargs: refresh_calls.append(
+        kwargs
+    )
     warmup_calls: list[bool] = []
     facade._planner.warmup = lambda: (
         warmup_calls.append(True) or {"status": "complete", "real_plan_only": True}
@@ -2654,6 +2659,9 @@ def test_reset_clears_opposite_surface_attempt_state(
     assert facade._active_vla_invocation is None
     assert facade._pending_vla_visual_authorization is None
     assert len(warmup_calls) == expected_warmup_calls
+    assert refresh_calls == (
+        [{"synchronize_hand_geometry": True}] if expected_refresh_calls else []
+    )
     if controller_mode == "hybrid":
         assert facade._planner_warmup_report["real_plan_only"] is True
     else:
