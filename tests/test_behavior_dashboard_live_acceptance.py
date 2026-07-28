@@ -120,7 +120,12 @@ def test_open_requires_unattached_hand_but_allows_closed_or_open():
 
 def test_open_semantics_require_capability_latch_to_restore_open():
     module = _module()
-    row = {"source": "dashboard_manual", "target": "left_arm"}
+    row = {
+        "source": "dashboard_manual",
+        "target": "left_arm",
+        "manual_action": "open",
+        "primitive": "set_gripper",
+    }
     result = {
         "action": "open",
         "metrics": {
@@ -159,6 +164,80 @@ def test_open_semantics_require_capability_latch_to_restore_open():
         result=result,
     )
     assert checks["single_gripper_network_call"] is False
+
+
+@pytest.mark.parametrize(
+    ("action", "kind", "direction", "signed_key", "signed_value"),
+    [
+        ("forward", "translation", "forward", "meters", 0.05),
+        ("backward", "translation", "backward", "meters", -0.05),
+        ("turn_left", "rotation", "left", "degrees", 5.0),
+        ("turn_right", "rotation", "right", "degrees", -5.0),
+    ],
+)
+def test_chassis_semantics_use_timeline_request_and_current_fast_contract(
+    action,
+    kind,
+    direction,
+    signed_key,
+    signed_value,
+):
+    module = _module()
+    requested_step = {"kind": kind, signed_key: signed_value}
+    row = {
+        "source": "dashboard_manual",
+        "target": "chassis",
+        "action": "navigate_to",
+        "manual_action": action,
+        "primitive": "navigate_to",
+        "args": {
+            "action": action,
+            "detail": "relative jog",
+            "requested_step": requested_step,
+        },
+    }
+    result = {
+        "metrics": {
+            "relative_motion": {
+                "kind": kind,
+                "direction": direction,
+                **(
+                    {"distance_m": 0.05}
+                    if kind == "translation"
+                    else {"angle_deg": 5.0}
+                ),
+            },
+            "base_goal_construction": {
+                "method": "analytic_full_q_base_assignment",
+                "nonbase_locked_to_call_start": True,
+            },
+            "base_goal": [0.05, 0.0, 0.0],
+            "final_position_error_m": 0.019,
+            "final_yaw_error_rad": 0.04,
+            "navigation_terminal": {
+                "position_tolerance_m": 0.02,
+                "orientation_tolerance_rad": (
+                    module.BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD
+                ),
+            },
+            "navigation_isolation": {"ok": True},
+            "execution_resampling": {
+                "method": "quintic_minimum_jerk",
+                "measured_max_xy_step_m": 0.0075,
+                "measured_max_yaw_step_rad": (
+                    module.DASHBOARD_BASE_EXECUTION_YAW_STEP_RAD
+                ),
+            },
+        }
+    }
+
+    checks = module._semantic_checks(
+        target="chassis",
+        action=action,
+        row=row,
+        result=result,
+    )
+    assert all(checks.values()), checks
 
 
 def test_manual_quiescence_ignores_independent_capture_plane():

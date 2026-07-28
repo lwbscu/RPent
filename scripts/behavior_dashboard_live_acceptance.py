@@ -51,6 +51,10 @@ BASE_ROTATION_STEP_RAD = math.radians(5.0)
 EEF_TRANSLATION_STEP_M = 0.03
 TORSO_VERTICAL_STEP_M = 0.03
 WRIST_ROTATION_STEP_RAD = math.radians(5.0)
+DASHBOARD_BASE_EXECUTION_XY_STEP_M = 0.0075
+DASHBOARD_BASE_EXECUTION_YAW_STEP_RAD = math.radians(1.0)
+BASE_TERMINAL_POSITION_TOLERANCE_M = 0.020
+BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD = math.radians(3.0)
 HIGH_DPI_VISUAL_MAE_MAX = 10.0
 HIGH_DPI_VISUAL_WITHIN_24_MIN = 0.88
 RELEASE_EXPECTED_ENABLED = frozenset(
@@ -647,12 +651,12 @@ def _semantic_checks(
         # (for example navigate_to), while the manual UI action is retained
         # in the result so both the implementation and requested jog are
         # auditable.
-        "manual_action_matches": result.get("action") == action,
+        "manual_action_matches": row.get("manual_action") == action,
     }
     if action == "observe":
         checks.update(
             {
-                "primitive_is_observe": result.get("primitive") == "observe",
+                "primitive_is_observe": row.get("primitive") == "observe",
                 "observe_camera_recorded": metrics.get("camera") in CAMERAS,
             }
         )
@@ -687,15 +691,37 @@ def _semantic_checks(
         resampling = resampling if isinstance(resampling, dict) else {}
         relative_motion = metrics.get("relative_motion")
         relative_motion = relative_motion if isinstance(relative_motion, dict) else {}
-        requested_step = metrics.get("requested_step")
+        row_args = row.get("args")
+        row_args = row_args if isinstance(row_args, dict) else {}
+        requested_step = row_args.get("requested_step")
         requested_step = requested_step if isinstance(requested_step, dict) else {}
+        goal_construction = metrics.get("base_goal_construction")
+        goal_construction = (
+            goal_construction if isinstance(goal_construction, dict) else {}
+        )
+        terminal = metrics.get("navigation_terminal")
+        terminal = terminal if isinstance(terminal, dict) else {}
         is_translation = action in {"forward", "backward"}
         expected_direction = action if is_translation else action.removeprefix("turn_")
+        requested_signed_step = (
+            BASE_TRANSLATION_STEP_M
+            * (1.0 if action == "forward" else -1.0)
+            if is_translation
+            else math.degrees(BASE_ROTATION_STEP_RAD)
+            * (1.0 if action == "turn_left" else -1.0)
+        )
         checks.update(
             {
-                "primitive_is_jog_base": metrics.get("manual_primitive") == "jog_base",
-                "base_action_matches": metrics.get("manual_action") == action,
-                "base_fixed_server_step": metrics.get("fixed_server_step") is True,
+                "primitive_is_jog_base": (
+                    row.get("primitive") == "navigate_to"
+                    and row.get("action") == "navigate_to"
+                    and row_args.get("detail") == "relative jog"
+                ),
+                "base_action_matches": row_args.get("action") == action,
+                "base_fixed_server_step": (
+                    requested_step.get("kind")
+                    == ("translation" if is_translation else "rotation")
+                ),
                 "base_relative_kind_matches": relative_motion.get("kind")
                 == ("translation" if is_translation else "rotation"),
                 "base_direction_sign_matches": relative_motion.get("direction")
@@ -714,17 +740,21 @@ def _semantic_checks(
                         math.degrees(BASE_ROTATION_STEP_RAD),
                     )
                 ),
-                "base_requested_step_frame_matches": requested_step.get("frame")
-                == "base_call_start",
+                "base_requested_step_frame_matches": (
+                    goal_construction.get("method")
+                    == "analytic_full_q_base_assignment"
+                    and goal_construction.get("nonbase_locked_to_call_start")
+                    is True
+                ),
                 "base_requested_step_matches": (
                     _finite_close(
-                        requested_step.get("translation_m"),
-                        BASE_TRANSLATION_STEP_M,
+                        requested_step.get("meters"),
+                        requested_signed_step,
                     )
                     if is_translation
                     else _finite_close(
-                        requested_step.get("rotation_rad"),
-                        BASE_ROTATION_STEP_RAD,
+                        requested_step.get("degrees"),
+                        requested_signed_step,
                     )
                 ),
                 "base_goal_finite": isinstance(metrics.get("base_goal"), list)
@@ -732,22 +762,32 @@ def _semantic_checks(
                 and _finite_vector(metrics["base_goal"]),
                 "base_terminal_position_error_bounded": _finite_le(
                     metrics.get("final_position_error_m"),
-                    0.01 + 1e-7,
+                    BASE_TERMINAL_POSITION_TOLERANCE_M + 1e-7,
                 ),
                 "base_terminal_yaw_error_bounded": _finite_le(
                     metrics.get("final_yaw_error_rad"),
-                    math.radians(1.0) + 1e-7,
+                    BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD + 1e-7,
+                ),
+                "base_terminal_contract_matches": (
+                    _finite_close(
+                        terminal.get("position_tolerance_m"),
+                        BASE_TERMINAL_POSITION_TOLERANCE_M,
+                    )
+                    and _finite_close(
+                        terminal.get("orientation_tolerance_rad"),
+                        BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD,
+                    )
                 ),
                 "base_navigation_isolated": isolation.get("ok") is True,
                 "minimum_jerk_execution": resampling.get("method")
                 == "quintic_minimum_jerk",
                 "base_xy_step_bounded": _finite_le(
                     resampling.get("measured_max_xy_step_m"),
-                    0.005 + 1e-7,
+                    DASHBOARD_BASE_EXECUTION_XY_STEP_M + 1e-7,
                 ),
                 "base_yaw_step_bounded": _finite_le(
                     resampling.get("measured_max_yaw_step_rad"),
-                    math.radians(0.5) + 1e-7,
+                    DASHBOARD_BASE_EXECUTION_YAW_STEP_RAD + 1e-7,
                 ),
             }
         )

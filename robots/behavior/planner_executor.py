@@ -54,7 +54,7 @@ WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD = math.radians(1.0)
 WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD = 0.030
 BASE_EXECUTION_XY_STEP_M = 0.015
 BASE_EXECUTION_YAW_STEP_RAD = math.radians(1.5)
-DASHBOARD_BASE_EXECUTION_XY_STEP_M = 0.010
+DASHBOARD_BASE_EXECUTION_XY_STEP_M = WHOLE_BODY_DENSE_COLLISION_STEP
 DASHBOARD_BASE_EXECUTION_YAW_STEP_RAD = math.radians(1.0)
 WHOLE_BODY_TOTAL_DEADLINE_S = 240.0
 WHOLE_BODY_PLANNING_DEADLINE_S = 60.0
@@ -2380,6 +2380,85 @@ class RealCuroboBackend:
             result["metrics"] = metrics
         return result
 
+    def _warmup_dashboard_feedback(self) -> dict[str, Any]:
+        """Compile every read-only BASE post-step safety path without acting."""
+
+        started = time.monotonic()
+        current_q = self.get_joint_positions()
+        expected_attachments = {
+            hand: self.get_attached_object(hand) for hand in ("left", "right")
+        }
+        isolation_reference = self.capture_navigation_isolation_reference()
+        gripper_commands = isolation_reference.get("gripper_commands")
+        if not isinstance(gripper_commands, dict) or any(
+            side not in gripper_commands
+            or not math.isfinite(float(gripper_commands[side]))
+            for side in ("left", "right")
+        ):
+            raise RuntimeError(
+                "Dashboard read-only safety feedback warmup has no gripper latch "
+                "reference"
+            )
+        # ``navigation_isolation_report`` only needs a valid packed action to
+        # verify that both gripper commands match their immutable call-start
+        # latches.  Do not call ``joint_target_to_action`` here: its official
+        # R1Pro adapter installation intentionally mutates the live robot and
+        # belongs to the first admitted controller action, not a read-only
+        # reset warmup.
+        identity_action = np.zeros(ACTION_DIM, dtype=np.float32)
+        for side in ("left", "right"):
+            identity_action[ENV_ACTION_SEGMENTS[f"{side}_gripper"]] = float(
+                gripper_commands[side]
+            )
+        identity_action = validate_action_chunk(
+            identity_action.reshape(1, ACTION_DIM)
+        )[0]
+        isolation = self.navigation_isolation_report(
+            action=identity_action,
+            reference=isolation_reference,
+        )
+        contact_baseline = self.capture_whole_body_contact_baseline(
+            expected_attachments_by_hand=expected_attachments,
+        )
+        contact = self.whole_body_contact_report(
+            baseline=contact_baseline,
+            expected_attachments_by_hand=expected_attachments,
+            allowed_expected_contact=None,
+        )
+        tracking = self.joint_tracking_report(current_q, hand=None)
+        hard_tracking, hard_tracking_available = (
+            _tracking_hard_deviation_report(tracking)
+        )
+        base_pose = np.asarray(self.get_base_pose(), dtype=np.float64).reshape(-1)
+        checks = {
+            "isolation_available": isolation.get("available") is True,
+            "isolation_ok": isolation.get("ok") is True,
+            "contact_baseline_available": contact_baseline.get("available") is True,
+            "contact_available": contact.get("available") is True,
+            "contact_clear": contact.get("unexpected_contact") is False,
+            "tracking_available": tracking.get("available") is True,
+            "tracking_hard_deviation_available": hard_tracking_available,
+            "tracking_within_hard_limits": (
+                hard_tracking.get("hard_deviation") is False
+            ),
+            "base_pose_finite": (
+                base_pose.shape == (3,) and np.isfinite(base_pose).all()
+            ),
+        }
+        if not all(checks.values()):
+            raise RuntimeError(
+                "Dashboard read-only safety feedback warmup failed closed: "
+                f"{checks!r}"
+            )
+        return {
+            "query": "read_only_post_step_safety_feedback",
+            "ok": True,
+            "checks": checks,
+            "env_actions_sent": 0,
+            "simulator_advanced": False,
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+
     def warmup(self) -> dict[str, Any]:
         """Compile BASE and whole-body planner kernels used by analytic primitives.
 
@@ -2397,6 +2476,7 @@ class RealCuroboBackend:
                 "simulator_advanced": False,
                 "base": None,
                 "hands": [],
+                "dashboard_feedback": None,
             },
         }
         path = self.output_dir / "planner_curobo_warmup.json"
@@ -2459,6 +2539,10 @@ class RealCuroboBackend:
                 base_metrics.get("collision_admission", {}).get("admitted") is True
             ),
         }
+        report["identity_warmup"]["dashboard_feedback"] = stage(
+            "dashboard_read_only_safety_feedback",
+            self._warmup_dashboard_feedback,
+        )
 
         for hand in ("left", "right"):
             def warm_whole_body(hand: str = hand) -> dict[str, Any]:
@@ -14158,6 +14242,23 @@ class PlannerExecutor:
             "left_attachment_identity_unchanged",
             "right_attachment_identity_unchanged",
         }
+        feedback_latency: dict[str, dict[str, float | int]] = {
+            phase: {"count": 0, "total_s": 0.0, "max_s": 0.0}
+            for phase in (
+                "attachment_identity",
+                "navigation_isolation",
+                "whole_body_contact",
+                "joint_tracking",
+                "base_pose",
+            )
+        }
+
+        def record_feedback_latency(phase: str, phase_started: float) -> None:
+            elapsed = max(0.0, time.monotonic() - phase_started)
+            sample = feedback_latency[phase]
+            sample["count"] = int(sample["count"]) + 1
+            sample["total_s"] = float(sample["total_s"]) + elapsed
+            sample["max_s"] = max(float(sample["max_s"]), elapsed)
 
         def finish(
             *,
@@ -14206,6 +14307,10 @@ class PlannerExecutor:
                             BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD
                         ),
                         "terminal_q_sha256": terminal_q_digest,
+                    },
+                    "navigation_feedback_latency": {
+                        "clock": "time.monotonic",
+                        "phases": deepcopy(feedback_latency),
                     },
                     "dashboard_base_terminal_tilt_settle": (
                         terminal_tilt_settle_metrics
@@ -14300,31 +14405,50 @@ class PlannerExecutor:
                     recoverable=False,
                     terminal_step_receipt=step_receipt,
                 )
-            for side in ("left", "right"):
-                live = _call_optional_arg(self.backend, "get_attached_object", side)
-                matches, identity = _attachment_state_status(
-                    live, expected_attachments_by_hand[side], hand=side
+            attachment_started = time.monotonic()
+            attachment_mismatch: tuple[str, dict[str, Any]] | None = None
+            try:
+                for side in ("left", "right"):
+                    live = _call_optional_arg(
+                        self.backend, "get_attached_object", side
+                    )
+                    matches, identity = _attachment_state_status(
+                        live, expected_attachments_by_hand[side], hand=side
+                    )
+                    if not matches:
+                        attachment_mismatch = (side, identity)
+                        break
+            finally:
+                record_feedback_latency(
+                    "attachment_identity", attachment_started
                 )
-                if not matches:
-                    trace.append(
-                        {
-                            "step": executed,
-                            "waypoint_index": waypoint_index,
-                            "whole_body_attachment": {
-                                "hand": side,
-                                **identity,
-                            },
-                        }
-                    )
-                    return finish(
-                        primitive_success=False,
-                        stop_reason="attachment_identity_mismatch",
-                        recoverable=False,
-                    )
-            isolation_report = report_isolation(
-                action=action,
-                reference=isolation_reference,
-            )
+            if attachment_mismatch is not None:
+                side, identity = attachment_mismatch
+                trace.append(
+                    {
+                        "step": executed,
+                        "waypoint_index": waypoint_index,
+                        "whole_body_attachment": {
+                            "hand": side,
+                            **identity,
+                        },
+                    }
+                )
+                return finish(
+                    primitive_success=False,
+                    stop_reason="attachment_identity_mismatch",
+                    recoverable=False,
+                )
+            isolation_started = time.monotonic()
+            try:
+                isolation_report = report_isolation(
+                    action=action,
+                    reference=isolation_reference,
+                )
+            finally:
+                record_feedback_latency(
+                    "navigation_isolation", isolation_started
+                )
             if not isinstance(isolation_report, dict):
                 isolation_report = {
                     "available": False,
@@ -14521,13 +14645,19 @@ class PlannerExecutor:
                     if prior_trunk_drift is None
                     else max(float(prior_trunk_drift), trunk_drift)
                 )
-            contact = _call_optional_kw(
-                self.backend,
-                "whole_body_contact_report",
-                baseline=contact_baseline,
-                expected_attachments_by_hand=expected_attachments_by_hand,
-                allowed_expected_contact=None,
-            )
+            contact_started = time.monotonic()
+            try:
+                contact = _call_optional_kw(
+                    self.backend,
+                    "whole_body_contact_report",
+                    baseline=contact_baseline,
+                    expected_attachments_by_hand=expected_attachments_by_hand,
+                    allowed_expected_contact=None,
+                )
+            finally:
+                record_feedback_latency(
+                    "whole_body_contact", contact_started
+                )
             trace_entry["whole_body_contact"] = contact
             if (
                 not isinstance(contact, dict)
@@ -14547,12 +14677,16 @@ class PlannerExecutor:
                     recoverable=False,
                 )
 
-            tracking = _call_optional_kw(
-                self.backend,
-                "joint_tracking_report",
-                target_q=target_q,
-                hand=None,
-            )
+            tracking_started = time.monotonic()
+            try:
+                tracking = _call_optional_kw(
+                    self.backend,
+                    "joint_tracking_report",
+                    target_q=target_q,
+                    hand=None,
+                )
+            finally:
+                record_feedback_latency("joint_tracking", tracking_started)
             if not isinstance(tracking, dict) or tracking.get("available") is not True:
                 trace_entry["joint_tracking"] = tracking
                 trace.append(trace_entry)
@@ -14589,7 +14723,11 @@ class PlannerExecutor:
                     stop_reason="target_tolerance_not_met",
                     recoverable=True,
                 )
-            base_pose = _call_optional(self.backend, "get_base_pose")
+            base_pose_started = time.monotonic()
+            try:
+                base_pose = _call_optional(self.backend, "get_base_pose")
+            finally:
+                record_feedback_latency("base_pose", base_pose_started)
             if base_pose is None:
                 trace.append(trace_entry)
                 return finish(

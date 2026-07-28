@@ -3943,6 +3943,13 @@ def test_real_warmup_includes_base_and_whole_body_identity_plans_without_actions
     backend.plan_whole_body_trajectory = lambda **kwargs: (
         whole_body_calls.append(kwargs) or {"ok": True}
     )
+    feedback_warmup = {
+        "query": "read_only_post_step_safety_feedback",
+        "ok": True,
+        "env_actions_sent": 0,
+        "simulator_advanced": False,
+    }
+    backend._warmup_dashboard_feedback = lambda: feedback_warmup
 
     result = backend.warmup()
 
@@ -3981,9 +3988,87 @@ def test_real_warmup_includes_base_and_whole_body_identity_plans_without_actions
         "identity_trajectory",
         "identity_trajectory",
     ]
+    assert result["identity_warmup"]["dashboard_feedback"] == feedback_warmup
     artifact = Path(result["artifact"])
     assert artifact.exists()
     assert json.loads(artifact.read_text(encoding="utf-8"))["status"] == "complete"
+
+
+def test_dashboard_feedback_warmup_compiles_all_read_only_safety_paths_without_action(
+    tmp_path,
+):
+    backend = RealCuroboBackend(None, output_dir=tmp_path)
+    current_q = np.zeros(28, dtype=np.float32)
+    calls: list[str] = []
+    backend.get_joint_positions = lambda: current_q.copy()
+    backend.get_attached_object = lambda hand: (
+        calls.append(f"attachment:{hand}") or None
+    )
+    backend.capture_navigation_isolation_reference = lambda: (
+        calls.append("isolation_reference")
+        or {
+            "mode": "base_only",
+            "gripper_commands": {"left": 1.0, "right": -1.0},
+        }
+    )
+    def isolation_report(**kwargs):
+        calls.append("isolation_report")
+        action = np.asarray(kwargs["action"])
+        np.testing.assert_allclose(
+            action[ENV_ACTION_SEGMENTS["left_gripper"]],
+            1.0,
+        )
+        np.testing.assert_allclose(
+            action[ENV_ACTION_SEGMENTS["right_gripper"]],
+            -1.0,
+        )
+        return {"available": True, "ok": True}
+
+    backend.navigation_isolation_report = isolation_report
+    backend.capture_whole_body_contact_baseline = lambda **_kwargs: (
+        calls.append("contact_baseline") or {"available": True}
+    )
+    backend.whole_body_contact_report = lambda **_kwargs: (
+        calls.append("contact_report")
+        or {"available": True, "unexpected_contact": False}
+    )
+    backend.joint_tracking_report = lambda *_args, **_kwargs: (
+        calls.append("tracking_report")
+        or {
+            "available": True,
+            "max_base_xy_error_m": 0.0,
+            "base_yaw_error_rad": 0.0,
+            "max_articulation_error_rad": 0.0,
+        }
+    )
+    backend.get_base_pose = lambda: (
+        calls.append("base_pose") or np.zeros(3, dtype=np.float64)
+    )
+    backend._step_env_action = lambda _action: (_ for _ in ()).throw(
+        AssertionError("read-only warmup must not send an env action")
+    )
+    backend.joint_target_to_action = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(
+            AssertionError("read-only warmup must not install an action adapter")
+        )
+    )
+
+    result = backend._warmup_dashboard_feedback()
+
+    assert result["ok"] is True
+    assert result["env_actions_sent"] == 0
+    assert result["simulator_advanced"] is False
+    assert result["checks"] and all(result["checks"].values())
+    assert calls == [
+        "attachment:left",
+        "attachment:right",
+        "isolation_reference",
+        "isolation_report",
+        "contact_baseline",
+        "contact_report",
+        "tracking_report",
+        "base_pose",
+    ]
 
 
 def test_background_whole_body_planning_does_not_enter_signal_deadline(
@@ -9763,6 +9848,21 @@ def test_navigation_execution_emits_base_only_actions_and_preserves_attachments(
     terminal = result["metrics"]["navigation_terminal"]
     assert terminal["commands_sent"] == 1
     assert terminal["command_limit"] == TERMINAL_COMMAND_LIMIT
+    feedback_latency = result["metrics"]["navigation_feedback_latency"]
+    assert feedback_latency["clock"] == "time.monotonic"
+    assert set(feedback_latency["phases"]) == {
+        "attachment_identity",
+        "navigation_isolation",
+        "whole_body_contact",
+        "joint_tracking",
+        "base_pose",
+    }
+    assert all(
+        phase["count"] == len(backend.q_path)
+        and phase["total_s"] >= 0.0
+        and phase["max_s"] >= 0.0
+        for phase in feedback_latency["phases"].values()
+    )
     assert result["metrics"]["navigation_isolation"]["ok"] is True
     checks = result["metrics"]["navigation_isolation"]["checks"]
     assert checks["left_attachment_identity_unchanged"] is True
@@ -9777,6 +9877,38 @@ def test_navigation_execution_emits_base_only_actions_and_preserves_attachments(
         ):
             segment = ENV_ACTION_SEGMENTS[segment_name]
             np.testing.assert_allclose(action[segment], backend.hold[segment])
+
+
+def test_navigation_attachment_mismatch_records_completed_feedback_latency_phase():
+    class Backend(_NavigationBackend):
+        def __init__(self):
+            super().__init__()
+            self.changed_attachment = object()
+
+        def get_attached_object(self, hand):
+            if self.env.calls and hand == "left":
+                return {"left_eef_link": self.changed_attachment}
+            return None
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    result = executor.navigate_to(
+        target_xyz=[1.0, 0.0, 0.0],
+        standoff_m=0.85,
+        max_travel_m=1.0,
+        timeout_s=5.0,
+    )
+
+    assert len(env.calls) == 1
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "attachment_identity_mismatch"
+    phase = result["metrics"]["navigation_feedback_latency"]["phases"][
+        "attachment_identity"
+    ]
+    assert phase["count"] == 1
+    assert phase["total_s"] >= 0.0
+    assert phase["max_s"] >= 0.0
 
 
 def test_navigation_executor_dispatches_relative_motion_to_relative_planner():
