@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from robots.behavior import runtime as behavior_runtime
 from robots.behavior.dashboard_control import (
     BehaviorCommandArbiter,
     BehaviorRawSuccessLatch,
@@ -22,6 +23,108 @@ from robots.behavior.toolkit import BehaviorToolkit
 
 _RUN_NONCE = "a" * 32
 _ATTEMPT_NONCE = "b" * 32
+
+
+def _env_server_args(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        behavior_python="/usr/bin/python3",
+        suite="behavior_2025_challenge",
+        task=1,
+        task_name="picking_up_trash",
+        activity_definition_id=0,
+        activity_instance_id=198,
+        activity_instance_dir=str(tmp_path),
+        scene_model="house_double_floor_lower",
+        seed=0,
+        public_seed=13,
+        behavior_attempt_index=1,
+        behavior_controller_mode="hybrid",
+        max_episode_steps=100,
+        behavior_config=None,
+        behavior_repo=str(tmp_path),
+        env_ready_timeout_s=30.0,
+    )
+
+
+def test_start_env_server_interrupt_before_ready_terminates_owned_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process = SimpleNamespace(pid=4312, stdout=iter(()), poll=lambda: None)
+    terminated: list[Any] = []
+
+    class InterruptQueue:
+        def get(self, *, timeout: float) -> dict[str, Any]:
+            assert timeout == 2.0
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        behavior_runtime.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(behavior_runtime, "_runtime_env", lambda _args: {})
+    monkeypatch.setattr(
+        behavior_runtime,
+        "_record_owned_process_group",
+        lambda _proc: None,
+    )
+    monkeypatch.setattr(
+        behavior_runtime.threading,
+        "Thread",
+        lambda **_kwargs: SimpleNamespace(start=lambda: None),
+    )
+    monkeypatch.setattr(behavior_runtime.queue, "Queue", InterruptQueue)
+    monkeypatch.setattr(
+        behavior_runtime,
+        "_terminate_process",
+        terminated.append,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        behavior_runtime.start_env_server(
+            _env_server_args(tmp_path),
+            output_dir=tmp_path,
+        )
+
+    assert terminated == [process]
+
+
+def test_start_env_server_early_exit_still_terminates_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process = SimpleNamespace(pid=4313, stdout=iter(()), poll=lambda: 7)
+    terminated: list[Any] = []
+    monkeypatch.setattr(
+        behavior_runtime.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(behavior_runtime, "_runtime_env", lambda _args: {})
+    monkeypatch.setattr(
+        behavior_runtime,
+        "_record_owned_process_group",
+        lambda _proc: None,
+    )
+    monkeypatch.setattr(
+        behavior_runtime.threading,
+        "Thread",
+        lambda **_kwargs: SimpleNamespace(start=lambda: None),
+    )
+    monkeypatch.setattr(
+        behavior_runtime,
+        "_terminate_process",
+        terminated.append,
+    )
+
+    with pytest.raises(RuntimeError, match="exited before ready"):
+        behavior_runtime.start_env_server(
+            _env_server_args(tmp_path),
+            output_dir=tmp_path,
+        )
+
+    assert terminated == [process]
 
 
 def _signed_success_receipt(**updates: Any) -> dict[str, Any]:
@@ -68,7 +171,11 @@ def _publication_ready_toolkit(
     toolkit = object.__new__(BehaviorToolkit)
     toolkit._closed = False
     toolkit._command_arbiter = SimpleNamespace(
-        snapshot=lambda: {"owner": "manual"}
+        require_manual_permit=lambda command_id: (
+            None
+            if command_id == "test-command"
+            else (_ for _ in ()).throw(RuntimeError("wrong manual permit"))
+        )
     )
     toolkit._manual_intervention_latch = threading.Event()
     toolkit._success_latch = None
@@ -141,8 +248,14 @@ class _Dashboard:
         self.events.append("state.unbind")
         self.controller = None
 
-    def update_control_snapshot(self, snapshot: dict[str, Any]) -> None:
+    def update_control_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        controller: Any,
+    ) -> bool:
         assert isinstance(snapshot, dict)
+        return controller is self.controller
 
 
 def test_runtime_resource_quiesces_before_env_transport_close(
@@ -310,7 +423,9 @@ def test_manual_command_uses_public_primitive_and_shared_success_latch() -> None
     toolkit._primitives = primitives
     toolkit._success_latch = Latch()
     toolkit._command_arbiter = SimpleNamespace(
-        snapshot=lambda: {"owner": "manual"}
+        require_manual_permit=lambda command_id: calls.append(
+            {"permit": command_id}
+        )
     )
     toolkit._official_task_success = False
 
@@ -318,15 +433,17 @@ def test_manual_command_uses_public_primitive_and_shared_success_latch() -> None
         target="left_arm",
         action="open",
         camera="head",
+        permit_command_id="manual-command",
     )
 
     assert returned is result
-    assert calls[0] == {
+    assert calls[0] == {"permit": "manual-command"}
+    assert calls[1] == {
         "target": "left_arm",
         "action": "open",
         "camera": "head",
     }
-    assert calls[1] == {"latched": result}
+    assert calls[2] == {"latched": result}
     assert toolkit._official_task_success is True
 
 
@@ -371,7 +488,7 @@ def test_manual_task_success_flag_without_receipt_does_not_latch() -> None:
     )
     toolkit._success_latch = latch
     toolkit._command_arbiter = SimpleNamespace(
-        snapshot=lambda: {"owner": "manual"}
+        require_manual_permit=lambda command_id: None
     )
     toolkit._official_task_success = False
     toolkit._shared_success_evidence = None
@@ -380,6 +497,7 @@ def test_manual_task_success_flag_without_receipt_does_not_latch() -> None:
         target="chassis",
         action="forward",
         camera="head",
+        permit_command_id="manual-command",
     )
 
     assert latch.is_latched() is False
@@ -498,7 +616,9 @@ def test_manual_command_rejects_calls_without_shared_manual_permit() -> None:
     toolkit = object.__new__(BehaviorToolkit)
     toolkit._closed = False
     toolkit._command_arbiter = SimpleNamespace(
-        snapshot=lambda: {"owner": "agent"}
+        require_manual_permit=lambda command_id: (_ for _ in ()).throw(
+            RuntimeError("Dashboard manual primitive requires its exact command permit")
+        )
     )
     toolkit._primitives = SimpleNamespace(
         dashboard_manual_command=lambda **kwargs: pytest.fail(
@@ -506,12 +626,68 @@ def test_manual_command_rejects_calls_without_shared_manual_permit() -> None:
         )
     )
 
-    with pytest.raises(RuntimeError, match="shared manual permit"):
+    with pytest.raises(RuntimeError, match="exact command permit"):
         toolkit.dashboard_manual_command(
             target="chassis",
             action="forward",
             camera="head",
+            permit_command_id="borrowed-command",
         )
+
+
+def test_manual_command_permit_is_bound_to_exact_current_command() -> None:
+    latch = BehaviorRawSuccessLatch(
+        run_nonce=_RUN_NONCE,
+        attempt_nonce=_ATTEMPT_NONCE,
+        attempt_index=1,
+    )
+    arbiter = BehaviorCommandArbiter(success_latch=latch)
+    calls: list[dict[str, Any]] = []
+    toolkit = object.__new__(BehaviorToolkit)
+    toolkit._closed = False
+    toolkit._command_arbiter = arbiter
+    toolkit._manual_intervention_latch = threading.Event()
+    toolkit._success_latch = latch
+    toolkit._official_task_success = False
+    toolkit._shared_success_evidence = None
+    toolkit._primitives = SimpleNamespace(
+        run_nonce=_RUN_NONCE,
+        attempt_nonce=_ATTEMPT_NONCE,
+        attempt_index=1,
+        dashboard_manual_command=lambda **kwargs: calls.append(kwargs)
+        or {"primitive_success": True, "task_success": False},
+    )
+
+    acquired, reason = arbiter.try_acquire_manual("current-command")
+    assert acquired is True
+    assert reason is None
+    with pytest.raises(RuntimeError, match="exact command permit"):
+        toolkit.dashboard_manual_command(
+            target="chassis",
+            action="observe",
+            camera="head",
+            permit_command_id="borrowed-command",
+        )
+    assert calls == []
+
+    result = toolkit.dashboard_manual_command(
+        target="chassis",
+        action="observe",
+        camera="head",
+        permit_command_id="current-command",
+    )
+    assert result["primitive_success"] is True
+    assert len(calls) == 1
+
+    arbiter.release_manual("current-command")
+    with pytest.raises(RuntimeError, match="exact command permit"):
+        toolkit.dashboard_manual_command(
+            target="chassis",
+            action="observe",
+            camera="head",
+            permit_command_id="current-command",
+        )
+    assert len(calls) == 1
 
 
 def test_failed_manual_motion_blocks_explore_memory_publication(
@@ -528,6 +704,7 @@ def test_failed_manual_motion_blocks_explore_memory_publication(
             target="chassis",
             action="forward",
             camera="head",
+            permit_command_id="test-command",
         )
     recipe_path = toolkit.write_recipe("picking_up_trash_s0")
 
@@ -563,6 +740,7 @@ def test_partial_manual_motion_sets_monotonic_intervention_latch(
         target="left_arm",
         action="forward",
         camera="head",
+        permit_command_id="test-command",
     )
 
     assert toolkit._manual_intervention_latch.is_set()
@@ -584,6 +762,7 @@ def test_observe_only_keeps_explore_memory_publication_eligible(
         target="chassis",
         action="observe",
         camera="head",
+        permit_command_id="test-command",
     )
     recipe_path = toolkit.write_recipe("picking_up_trash_s0")
 

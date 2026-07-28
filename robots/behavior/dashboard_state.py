@@ -196,12 +196,23 @@ class State:
             "head" if self.environment == "behavior" else frame_kinds[0]
         )
         self._control_controller: Any = None
+        self._control_capture_generation = 0
         self._control_snapshot: dict[str, Any] = {
+            "control_revision": 0,
             "available": False,
             "motion_available": False,
             "observe_available": False,
             "busy": False,
             "owner": None,
+            "agent_waiters": 0,
+            "current_command": None,
+            "planning_command": None,
+            "queue": [],
+            "queue_depth": 0,
+            "queue_capacity": 5,
+            "last_terminal": None,
+            "pending_cleared_count": 0,
+            "capture": {"phase": "idle", "revision": 0, "error": None},
             "phase": "idle",
             "selected_camera": self._last_selected_camera,
             "unavailable_reason": "controller_not_bound",
@@ -549,6 +560,13 @@ class State:
                 raise RuntimeError("a different Dashboard controller is already bound")
             self._control_controller = controller
             self._control_snapshot = dict(_json_safe(snapshot))
+            capture = self._control_snapshot.get("capture")
+            self._control_capture_generation = (
+                int(capture.get("revision"))
+                if isinstance(capture, Mapping)
+                and _is_int(capture.get("revision"))
+                else 0
+            )
 
     def unbind_controller(self, controller: Any = None) -> None:
         with self._lock:
@@ -557,18 +575,63 @@ class State:
                 and self._control_controller is not controller
             ):
                 return
+            previous = dict(self._control_snapshot)
+            preserve_success_terminal = bool(
+                previous.get("success_latched") is True
+                and previous.get("command_id")
+                and previous.get("phase") in {"completed", "failed", "cancelled"}
+            )
             self._control_controller = None
+            self._control_capture_generation += 1
             selected_camera = self._last_selected_camera
             self._control_snapshot = {
+                "control_revision": int(previous.get("control_revision") or 0) + 1,
                 "available": False,
                 "motion_available": False,
                 "observe_available": False,
                 "busy": False,
                 "owner": None,
+                "agent_waiters": 0,
+                "current_command": None,
+                "planning_command": None,
+                "queue": [],
+                "queue_depth": 0,
+                "queue_capacity": 5,
+                "last_terminal": None,
+                "pending_cleared_count": int(
+                    previous.get("pending_cleared_count") or 0
+                ),
+                "capture": {
+                    "phase": "idle",
+                    "revision": self._control_capture_generation,
+                    "error": None,
+                },
                 "phase": "idle",
                 "selected_camera": selected_camera,
                 "unavailable_reason": "controller_not_bound",
             }
+            if preserve_success_terminal:
+                terminal = previous.get("last_terminal")
+                for key in (
+                    "command_id",
+                    "lease_id",
+                    "sequence",
+                    "target",
+                    "action",
+                    "phase",
+                    "error",
+                    "capture_error",
+                    "stop_reason",
+                    "success_latched",
+                    "lease_status",
+                ):
+                    if key in previous:
+                        self._control_snapshot[key] = previous[key]
+                if isinstance(terminal, Mapping):
+                    self._control_snapshot["last_terminal"] = dict(terminal)
+                self._control_snapshot["unavailable_reason"] = (
+                    "official_success_latched"
+                )
 
     def control_controller(self) -> Any:
         """Return the binding only; callers must invoke it after this lock exits."""
@@ -576,13 +639,38 @@ class State:
         with self._lock:
             return self._control_controller
 
-    def update_control_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+    def update_control_snapshot(
+        self,
+        snapshot: Mapping[str, Any],
+        *,
+        controller: Any = None,
+    ) -> bool:
         safe = _json_safe(snapshot)
         if not isinstance(safe, dict):
-            return
+            return False
         with self._lock:
+            if self._control_controller is not controller:
+                return False
+            incoming_revision = safe.get("control_revision")
+            current_revision = self._control_snapshot.get("control_revision")
+            if (
+                _is_int(incoming_revision)
+                and _is_int(current_revision)
+                and int(incoming_revision) < int(current_revision)
+            ):
+                return False
+            capture = safe.get("capture")
+            if (
+                isinstance(capture, Mapping)
+                and _is_int(capture.get("revision"))
+            ):
+                self._control_capture_generation = max(
+                    self._control_capture_generation,
+                    int(capture["revision"]),
+                )
             safe["selected_camera"] = self._last_selected_camera
             self._control_snapshot = safe
+            return True
 
     def control_admission_snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -673,30 +761,22 @@ class State:
         *,
         official_success_latched: bool,
     ) -> None:
-        """Atomically merge a manual receipt, final frames and Timeline result."""
+        """Publish only the immutable manual action receipt and Timeline result."""
 
         if not isinstance(result, Mapping):
             return
         safe_result = _json_safe(result)
         if not isinstance(safe_result, dict):
             safe_result = {}
-        command_id = str(command.get("command_id") or "")
-        frames = result.get("_frames_bytes")
-        capture_group_id = result.get("capture_group_id")
-        simulator_step = result.get(
+        for key in (
+            "_frames_bytes",
+            "capture_group_id",
             "simulator_step",
-            self._env_step(dict(result)),
-        )
+            "capture_error",
+        ):
+            safe_result.pop(key, None)
+        command_id = str(command.get("command_id") or "")
         with self._lock:
-            frame_group_committed = bool(
-                isinstance(frames, Mapping)
-                and set(frames) == {"head", "left_wrist", "right_wrist"}
-                and self.on_frame_group(
-                    frames,
-                    capture_group_id=capture_group_id,
-                    simulator_step=simulator_step,
-                )
-            )
             item = next(
                 (
                     candidate
@@ -735,26 +815,91 @@ class State:
                     and metrics.get("partial_motion")
                 )
             )
-            item["capture_group_id"] = (
-                capture_group_id
-                if frame_group_committed
-                and capture_group_id == self._capture_group_id
-                else None
-            )
+            item["capture_group_id"] = None
             item["status"] = "failed" if failed else "completed"
             if official_success_latched:
                 self._progress["official_task_success"] = True
                 self._terminated = True
-                self._control_snapshot["available"] = False
-                self._control_snapshot["motion_available"] = False
-                self._control_snapshot["observe_available"] = False
-                self._control_snapshot["success_latched"] = True
-                self._control_snapshot["unavailable_reason"] = (
-                    "official_success_latched"
+                # Persist the accepted command's exact terminal receipt in State
+                # before lifecycle admission flips to 410.  This makes the
+                # terminal result readable even if cleanup immediately unbinds
+                # and closes the controller.
+                self._control_snapshot.update(
+                    {
+                        "available": False,
+                        "motion_available": False,
+                        "observe_available": False,
+                        "command_id": command_id,
+                        "lease_id": str(command.get("lease_id") or ""),
+                        "target": str(command.get("target") or ""),
+                        "action": str(command.get("action") or ""),
+                        "phase": "failed" if failed else "completed",
+                        "error": result.get("error"),
+                        "capture_error": None,
+                        "stop_reason": result.get("stop_reason")
+                        or "official_task_success",
+                        "success_latched": True,
+                        "unavailable_reason": "official_success_latched",
+                        "current_command": None,
+                        "planning_command": None,
+                        "queue": [],
+                        "queue_depth": 0,
+                        "last_terminal": {
+                            **dict(_json_safe(command)),
+                            "phase": "failed" if failed else "completed",
+                            "result": safe_result,
+                            "error": result.get("error"),
+                            "stop_reason": result.get("stop_reason")
+                            or "official_task_success",
+                            "primitive_success": result.get(
+                                "primitive_success"
+                            ),
+                            "task_success": result.get("task_success"),
+                        },
+                    }
                 )
             item["terminated"] = bool(self._progress["official_task_success"])
             self._update_progress_from_payload_locked(dict(result))
             self._timeline_revision += 1
+
+    def on_dashboard_capture_result(
+        self,
+        result: Mapping[str, Any],
+        *,
+        controller: Any,
+        generation: int,
+    ) -> bool:
+        """Publish one current-controller capture without changing action state."""
+
+        if not isinstance(result, Mapping) or not _is_int(generation):
+            return False
+        generation = int(generation)
+        frames = result.get("_frames_bytes")
+        capture_group_id = result.get("capture_group_id")
+        simulator_step = result.get(
+            "simulator_step",
+            self._env_step(dict(result)),
+        )
+        with self._lock:
+            if (
+                self._control_controller is not controller
+                or generation < self._control_capture_generation
+            ):
+                return False
+            self._control_capture_generation = generation
+            if (
+                result.get("capture_error") not in (None, "", False)
+                or result.get("error") not in (None, "", False)
+            ):
+                return True
+            return bool(
+                isinstance(frames, Mapping)
+                and self.on_frame_group(
+                    frames,
+                    capture_group_id=capture_group_id,
+                    simulator_step=simulator_step,
+                )
+            )
 
     def set_metadata(self, metadata: dict[str, Any]) -> None:
         """Attach public run identity and budget metadata."""

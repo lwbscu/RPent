@@ -13,7 +13,8 @@ import threading
 import time
 import types
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -48,15 +49,86 @@ WHOLE_BODY_BASE_XY_WAYPOINT_TOLERANCE_M = 0.02
 WHOLE_BODY_BASE_YAW_WAYPOINT_TOLERANCE_RAD = math.radians(1.0)
 WHOLE_BODY_ARTICULATION_WAYPOINT_TOLERANCE_RAD = 0.02
 WHOLE_BODY_DENSE_COLLISION_STEP = 0.0075
-WHOLE_BODY_EXECUTION_BASE_XY_STEP_M = 0.02
+WHOLE_BODY_EXECUTION_BASE_XY_STEP_M = WHOLE_BODY_DENSE_COLLISION_STEP
 WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD = math.radians(1.0)
-WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD = 0.02
+WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD = 0.030
+BASE_EXECUTION_XY_STEP_M = 0.015
+BASE_EXECUTION_YAW_STEP_RAD = math.radians(1.5)
+DASHBOARD_BASE_EXECUTION_XY_STEP_M = 0.010
+DASHBOARD_BASE_EXECUTION_YAW_STEP_RAD = math.radians(1.0)
 WHOLE_BODY_TOTAL_DEADLINE_S = 240.0
 WHOLE_BODY_PLANNING_DEADLINE_S = 60.0
 WHOLE_BODY_FAST_TRAJOPT_DEADLINE_S = 12.0
 WHOLE_BODY_EXECUTION_DEADLINE_S = 180.0
+WHOLE_BODY_SEARCH_PROFILE_DEFAULT = "default"
+WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG = "dashboard_jog"
+WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S = 12.0
+WHOLE_BODY_DASHBOARD_JOG_PLANNING_DEADLINE_S = 12.0
+WHOLE_BODY_DASHBOARD_JOG_FAST_TRAJOPT_DEADLINE_S = 4.0
+WHOLE_BODY_DASHBOARD_JOG_LOCAL_IK_DEADLINE_S = 0.5
+WHOLE_BODY_DASHBOARD_JOG_REPLAN_POSITION_IMPROVEMENT_M = 0.010
+DASHBOARD_PREPARED_BASE_PLANNING_PROFILE = "dashboard_base_fast"
+PREPARED_DASHBOARD_EEF_EXECUTION_POLICY = (
+    "prepared_dashboard_eef_first_sample_transient_v1"
+)
+PREPARED_DASHBOARD_BASE_EXECUTION_POLICY = (
+    "prepared_dashboard_base_terminal_tilt_settle_v1"
+)
+RESET_IDENTITY_WARMUP_PROFILE = "reset_identity_warmup"
+RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S = 120.0
 WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M = 0.002
 WHOLE_BODY_REPLAN_TRACKING_IMPROVEMENT_RATIO = 0.05
+WHOLE_BODY_EEF_START_FK_TOLERANCE_M = 0.001
+WHOLE_BODY_EEF_TERMINAL_TOLERANCE_M = 0.005
+WHOLE_BODY_EEF_SHORT_TARGET_DISTANCE_M = 0.036
+WHOLE_BODY_EEF_SHORT_CORRIDOR_MARGIN_M = 0.005
+WHOLE_BODY_EEF_SHORT_MAX_LATERAL_M = 0.005
+WHOLE_BODY_EEF_SHORT_MAX_CARTESIAN_STEP_M = 0.0022
+WHOLE_BODY_EEF_MAX_CARTESIAN_STEP_M = 0.0029
+WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M = 0.006
+WHOLE_BODY_EEF_SHORT_MAX_ORIENTATION_ERROR_RAD = math.radians(1.0)
+WHOLE_BODY_EEF_SHORT_MAX_REVERSE_STEP_M = 0.001
+WHOLE_BODY_EEF_SHORT_MAX_CUMULATIVE_EXCESS_M = 0.010
+WHOLE_BODY_EEF_WRIST_MAX_ORIENTATION_STEP_RAD = math.radians(1.25)
+WHOLE_BODY_EEF_WRIST_MAX_REVERSE_PROGRESS_RAD = math.radians(0.25)
+WHOLE_BODY_EEF_WRIST_MAX_CUMULATIVE_EXCESS_RAD = math.radians(1.0)
+WHOLE_BODY_EEF_LIVE_WAYPOINT_POSITION_TOLERANCE_M = 0.005
+WHOLE_BODY_EEF_LIVE_WAYPOINT_ORIENTATION_TOLERANCE_RAD = math.radians(1.0)
+WHOLE_BODY_EEF_WAYPOINT_SETTLE_POSITION_TOLERANCE_M = 0.002
+WHOLE_BODY_EEF_SHORT_WAYPOINT_SETTLE_POSITION_TOLERANCE_M = 0.004
+WHOLE_BODY_EEF_WAYPOINT_SETTLE_ORIENTATION_TOLERANCE_RAD = math.radians(0.5)
+WHOLE_BODY_EEF_CONTROLLER_RESPONSE_MARGIN_M = 0.001
+WHOLE_BODY_EEF_NUMERICAL_MARGIN_M = 1e-6
+WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M = (
+    WHOLE_BODY_EEF_CONTROLLER_RESPONSE_MARGIN_M
+    + WHOLE_BODY_EEF_NUMERICAL_MARGIN_M
+)
+WHOLE_BODY_EEF_FIRST_SAMPLE_REVERSE_TRANSIENT_MAX_M = (
+    WHOLE_BODY_EEF_SHORT_MAX_REVERSE_STEP_M
+    + WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M
+)
+DYNAMICS_NOMINAL_SAMPLE_RATE_HZ = 60.0
+BASE_TRANSLATION_STATIONARY_MAX_ACTUAL_VELOCITY_M_S = 0.001
+BASE_YAW_STATIONARY_MAX_ACTUAL_VELOCITY_RAD_S = 0.001
+WHOLE_BODY_ARTICULATION_STATIONARY_MAX_ACTUAL_VELOCITY_RAD_S = 0.005
+WHOLE_BODY_ARTICULATION_STATIONARY_MAX_STEP_RAD = (
+    WHOLE_BODY_ARTICULATION_STATIONARY_MAX_ACTUAL_VELOCITY_RAD_S
+    / DYNAMICS_NOMINAL_SAMPLE_RATE_HZ
+)
+NAVIGATION_TERMINAL_STATIONARY_POLICY = (
+    "base_groups_stationary_all_groups_limits_v2"
+)
+WHOLE_BODY_WAYPOINT_STATIONARY_POLICY = "r1pro_grouped_stationary_60hz_v2"
+NAVIGATION_TERMINAL_SETTLE_MAX_HOLDS = 240
+NAVIGATION_TERMINAL_SETTLE_DEADLINE_S = 5.0
+TRACKING_HARD_BASE_XY_ERROR_M = 0.05
+TRACKING_HARD_BASE_YAW_ERROR_RAD = math.radians(5.0)
+TRACKING_HARD_ARTICULATION_ERROR_RAD = 0.15
+EEF_TERMINAL_POSITION_TOLERANCE_M = 0.015
+EEF_TERMINAL_ORIENTATION_TOLERANCE_RAD = math.radians(5.0)
+BASE_TERMINAL_POSITION_TOLERANCE_M = 0.020
+BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD = math.radians(3.0)
+TERMINAL_COMMAND_LIMIT = 6
 MANUAL_EEF_FALLBACK_OFFSETS_M = (0.0025, -0.0025, 0.005, -0.005)
 WRIST_POSITION_DRIFT_LIMIT_M = 0.005
 BASE_ACTIVE_JOINT_NAMES = (
@@ -71,7 +143,9 @@ GRIPPER_CONTACT_SETTLE_STEPS = 10
 LOCKED_BASE_XY_MAX_DRIFT_M = 0.01
 LOCKED_BASE_Z_MAX_DRIFT_M = 0.01
 LOCKED_BASE_RPY_MAX_DRIFT_RAD = math.radians(1.0)
+DASHBOARD_BASE_TERMINAL_SETTLE_RPY_MAX_RAD = math.radians(1.5)
 LOCKED_ARTICULATION_MAX_DRIFT_RAD = 0.01
+DASHBOARD_BASE_INTERMEDIATE_TRUNK_MAX_DRIFT_RAD = 0.015
 LOCKED_GRIPPER_COMMAND_MAX_DRIFT = 1e-6
 TRUNK_ASSIST_MAX_STEP_RAD = 0.01
 TRUNK_ASSIST_MAX_TOTAL_RAD = 0.12
@@ -87,6 +161,16 @@ WHOLE_BODY_ACTIVE_JOINT_NAMES = (
     *tuple(f"left_arm_joint{i}" for i in range(1, 8)),
     *tuple(f"right_arm_joint{i}" for i in range(1, 8)),
 )
+DYNAMICS_VELOCITY_GROUP_JOINTS = {
+    "base_translation": BASE_ACTIVE_JOINT_NAMES[:2],
+    "base_yaw": BASE_ACTIVE_JOINT_NAMES[2:],
+    "articulation": WHOLE_BODY_ACTIVE_JOINT_NAMES[3:],
+}
+DYNAMICS_VELOCITY_GROUP_UNITS = {
+    "base_translation": "m/s",
+    "base_yaw": "rad/s",
+    "articulation": "rad/s",
+}
 WHOLE_BODY_LOCKED_JOINT_NAMES = (
     "base_footprint_z_joint",
     "base_footprint_rx_joint",
@@ -100,6 +184,54 @@ MAX_BASE_STATION_SHORTLIST = 9
 MAX_BASE_PLAN_CANDIDATES = 6
 BASE_PLAN_ATTEMPT_TIMEOUT_S = 8.0
 _ATTACHMENT_UNSET = object()
+
+
+def _whole_body_search_profile(profile: str) -> dict[str, Any]:
+    """Resolve one internal-only whole-body solver policy."""
+
+    normalized = str(profile)
+    if normalized == WHOLE_BODY_SEARCH_PROFILE_DEFAULT:
+        return {
+            "name": WHOLE_BODY_SEARCH_PROFILE_DEFAULT,
+            "planning_deadline_s": WHOLE_BODY_PLANNING_DEADLINE_S,
+            "fast_trajopt_deadline_s": WHOLE_BODY_FAST_TRAJOPT_DEADLINE_S,
+            "max_attempts": 5,
+            "ik_fail_return": 5,
+            "finetune_attempts": 2,
+            "first_safe_candidate": False,
+        }
+    if normalized == WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG:
+        return {
+            "name": WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG,
+            "planning_deadline_s": (
+                WHOLE_BODY_DASHBOARD_JOG_PLANNING_DEADLINE_S
+            ),
+            "fast_trajopt_deadline_s": (
+                WHOLE_BODY_DASHBOARD_JOG_FAST_TRAJOPT_DEADLINE_S
+            ),
+            "local_ik_deadline_s": (
+                WHOLE_BODY_DASHBOARD_JOG_LOCAL_IK_DEADLINE_S
+            ),
+            "max_attempts": 3,
+            "ik_fail_return": 3,
+            "finetune_attempts": 1,
+            "first_safe_candidate": True,
+        }
+    if normalized == RESET_IDENTITY_WARMUP_PROFILE:
+        return {
+            "name": RESET_IDENTITY_WARMUP_PROFILE,
+            "planning_deadline_s": (
+                WHOLE_BODY_DASHBOARD_JOG_PLANNING_DEADLINE_S
+            ),
+            "fast_trajopt_deadline_s": (
+                WHOLE_BODY_DASHBOARD_JOG_FAST_TRAJOPT_DEADLINE_S
+            ),
+            "max_attempts": 3,
+            "ik_fail_return": 3,
+            "finetune_attempts": 1,
+            "first_safe_candidate": True,
+        }
+    raise ValueError(f"unsupported whole-body search profile {profile!r}")
 
 
 class _WholeBodyCertificationError(RuntimeError):
@@ -156,13 +288,6 @@ def _wall_clock_deadline(timeout_s: float, operation: str):
 
 
 def _jsonable(value: Any) -> Any:
-    try:
-        import torch
-
-        if torch.is_tensor(value):
-            value = value.detach().cpu().numpy()
-    except Exception:
-        pass
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):
@@ -173,6 +298,13 @@ def _jsonable(value: Any) -> Any:
         return [_jsonable(v) for v in value]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
+    try:
+        import torch
+
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy().tolist()
+    except Exception:
+        pass
     return repr(value)
 
 
@@ -689,6 +821,231 @@ def _quat_angle_error_rad(a: Any | None, b: Any | None) -> float | None:
     return 2.0 * math.acos(dot)
 
 
+def _eef_pose_path_admission_report(
+    positions: Any,
+    quaternions_xyzw: Any,
+    *,
+    call_start_xyz: Any,
+    target_xyz: Any,
+    target_quat_xyzw: Any | None,
+    short_cartesian_step_limit_m: float = (
+        WHOLE_BODY_EEF_SHORT_MAX_CARTESIAN_STEP_M
+    ),
+) -> dict[str, Any]:
+    """Recompute the short-jog Cartesian/orientation contract from EEF poses."""
+
+    start = _as_xyz(call_start_xyz, name="call_start_xyz")
+    target = _as_xyz(target_xyz)
+    target_quat = _quat_xyzw(target_quat_xyzw)
+    points = np.asarray(positions, dtype=np.float64)
+    quaternions = np.asarray(quaternions_xyzw, dtype=np.float64)
+    if (
+        points.ndim != 2
+        or points.shape[1:] != (3,)
+        or len(points) < 1
+        or quaternions.shape != (len(points), 4)
+        or not np.isfinite(points).all()
+        or not np.isfinite(quaternions).all()
+    ):
+        raise ValueError("EEF path poses must be finite [T,3] and [T,4] arrays")
+    quat_norms = np.linalg.norm(quaternions, axis=1)
+    if np.any(quat_norms <= 1e-9):
+        raise ValueError("EEF path contains an invalid quaternion")
+    normalized_quats = quaternions / quat_norms[:, None]
+
+    start_fk_error = float(np.linalg.norm(points[0] - start))
+    terminal_error = float(np.linalg.norm(points[-1] - target))
+    target_errors = np.linalg.norm(points - target, axis=1)
+    relative = points - points[0]
+    start_excursions = np.linalg.norm(relative, axis=1)
+    cartesian_steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative_cartesian_path = float(np.sum(cartesian_steps))
+    direct = target - points[0]
+    direct_distance = float(np.linalg.norm(direct))
+    if direct_distance > 1e-9:
+        axis = direct / direct_distance
+        along = relative @ axis
+        lateral = np.linalg.norm(relative - along[:, None] * axis, axis=1)
+    else:
+        along = np.zeros((len(points),), dtype=np.float64)
+        lateral = start_excursions
+    along_steps = np.diff(along)
+    max_excursion = float(np.max(start_excursions, initial=0.0))
+    max_lateral = float(np.max(lateral, initial=0.0))
+    min_along = float(np.min(along, initial=0.0))
+    max_along = float(np.max(along, initial=0.0))
+    max_reverse_step = float(np.max(-along_steps, initial=0.0))
+    max_cartesian_step = float(np.max(cartesian_steps, initial=0.0))
+
+    max_orientation_error = 0.0
+    start_orientation_error = 0.0
+    terminal_orientation_error = 0.0
+    max_orientation_step = 0.0
+    max_orientation_reverse_progress = 0.0
+    cumulative_orientation_path = 0.0
+    intentional_orientation_change = False
+    if target_quat is not None:
+        dots = np.clip(
+            np.abs(normalized_quats @ target_quat),
+            0.0,
+            1.0,
+        )
+        orientation_errors = 2.0 * np.arccos(dots)
+        max_orientation_error = float(np.max(orientation_errors, initial=0.0))
+        start_orientation_error = float(orientation_errors[0])
+        terminal_orientation_error = float(orientation_errors[-1])
+        intentional_orientation_change = (
+            start_orientation_error
+            > WHOLE_BODY_EEF_SHORT_MAX_ORIENTATION_ERROR_RAD + 1e-9
+        )
+        if len(normalized_quats) > 1:
+            adjacent_dots = np.clip(
+                np.abs(
+                    np.sum(
+                        normalized_quats[:-1] * normalized_quats[1:],
+                        axis=1,
+                    )
+                ),
+                0.0,
+                1.0,
+            )
+            orientation_steps = 2.0 * np.arccos(adjacent_dots)
+            cumulative_orientation_path = float(np.sum(orientation_steps))
+            max_orientation_step = float(
+                np.max(orientation_steps, initial=0.0)
+            )
+            max_orientation_reverse_progress = float(
+                np.max(np.diff(orientation_errors), initial=0.0)
+            )
+
+    short_target = (
+        direct_distance <= WHOLE_BODY_EEF_SHORT_TARGET_DISTANCE_M + 1e-9
+    )
+    short_step_limit = float(short_cartesian_step_limit_m)
+    if not math.isfinite(short_step_limit) or short_step_limit <= 0.0:
+        raise ValueError("short EEF Cartesian step limit must be positive")
+    all_target_step_limit = (
+        max(WHOLE_BODY_EEF_MAX_CARTESIAN_STEP_M, short_step_limit)
+        if short_target
+        else WHOLE_BODY_EEF_MAX_CARTESIAN_STEP_M
+    )
+    max_excursion_limit = (
+        direct_distance + WHOLE_BODY_EEF_SHORT_CORRIDOR_MARGIN_M
+    )
+    checks = {
+        "start_fk_matches_call_start": (
+            start_fk_error <= WHOLE_BODY_EEF_START_FK_TOLERANCE_M + 1e-9
+        ),
+        "terminal_reaches_target": (
+            terminal_error <= WHOLE_BODY_EEF_TERMINAL_TOLERANCE_M + 1e-9
+        ),
+        "all_target_cartesian_step": (
+            max_cartesian_step <= all_target_step_limit + 1e-9
+        ),
+        "short_target_start_excursion": (
+            not short_target or max_excursion <= max_excursion_limit + 1e-9
+        ),
+        "short_target_segment_lateral": (
+            not short_target
+            or max_lateral <= WHOLE_BODY_EEF_SHORT_MAX_LATERAL_M + 1e-9
+        ),
+        "short_target_no_reverse_or_overshoot": (
+            not short_target
+            or (
+                min_along >= -WHOLE_BODY_EEF_SHORT_CORRIDOR_MARGIN_M - 1e-9
+                and max_along
+                <= direct_distance + WHOLE_BODY_EEF_SHORT_CORRIDOR_MARGIN_M + 1e-9
+            )
+        ),
+        "short_target_cartesian_step": (
+            not short_target
+            or max_cartesian_step
+            <= short_step_limit + 1e-9
+        ),
+        "short_target_axis_monotonic": (
+            not short_target
+            or direct_distance <= 1e-9
+            or max_reverse_step
+            <= WHOLE_BODY_EEF_SHORT_MAX_REVERSE_STEP_M + 1e-9
+        ),
+        "short_target_cumulative_path": (
+            not short_target
+            or cumulative_cartesian_path
+            <= direct_distance
+            + WHOLE_BODY_EEF_SHORT_MAX_CUMULATIVE_EXCESS_M
+            + 1e-9
+        ),
+        "short_target_orientation_preserved": (
+            not short_target
+            or target_quat is None
+            or intentional_orientation_change
+            or max_orientation_error
+            <= WHOLE_BODY_EEF_SHORT_MAX_ORIENTATION_ERROR_RAD + 1e-9
+        ),
+        "short_target_rotation_terminal": (
+            not short_target
+            or target_quat is None
+            or not intentional_orientation_change
+            or terminal_orientation_error
+            <= WHOLE_BODY_EEF_SHORT_MAX_ORIENTATION_ERROR_RAD + 1e-9
+        ),
+        "short_target_rotation_step": (
+            not short_target
+            or target_quat is None
+            or not intentional_orientation_change
+            or max_orientation_step
+            <= WHOLE_BODY_EEF_WRIST_MAX_ORIENTATION_STEP_RAD + 1e-9
+        ),
+        "short_target_rotation_monotonic": (
+            not short_target
+            or target_quat is None
+            or not intentional_orientation_change
+            or max_orientation_reverse_progress
+            <= WHOLE_BODY_EEF_WRIST_MAX_REVERSE_PROGRESS_RAD + 1e-9
+        ),
+        "short_target_rotation_cumulative_path": (
+            not short_target
+            or target_quat is None
+            or not intentional_orientation_change
+            or cumulative_orientation_path
+            <= start_orientation_error
+            + WHOLE_BODY_EEF_WRIST_MAX_CUMULATIVE_EXCESS_RAD
+            + 1e-9
+        ),
+    }
+    return {
+        "admitted": all(checks.values()),
+        "checks": checks,
+        "waypoint_count": int(len(points)),
+        "start_fk_error_m": start_fk_error,
+        "terminal_error_m": terminal_error,
+        "call_start_to_target_distance_m": direct_distance,
+        "short_target": short_target,
+        "max_start_excursion_m": max_excursion,
+        "max_start_excursion_limit_m": max_excursion_limit,
+        "max_segment_lateral_m": max_lateral,
+        "min_segment_along_m": min_along,
+        "max_segment_along_m": max_along,
+        "max_cartesian_step_m": max_cartesian_step,
+        "all_target_cartesian_step_limit_m": all_target_step_limit,
+        "short_target_cartesian_step_limit_m": short_step_limit,
+        "max_reverse_step_m": max_reverse_step,
+        "cumulative_cartesian_path_m": cumulative_cartesian_path,
+        "max_orientation_error_rad": max_orientation_error,
+        "intentional_orientation_change": intentional_orientation_change,
+        "start_orientation_error_rad": start_orientation_error,
+        "terminal_orientation_error_rad": terminal_orientation_error,
+        "max_orientation_step_rad": max_orientation_step,
+        "max_orientation_reverse_progress_rad": (
+            max_orientation_reverse_progress
+        ),
+        "cumulative_orientation_path_rad": cumulative_orientation_path,
+        "nominal_max_target_error_m": float(
+            np.max(target_errors, initial=0.0)
+        ),
+    }
+
+
 def _segment_array(value: Any) -> np.ndarray:
     array = np.asarray(_jsonable(value), dtype=np.int64).reshape(-1)
     return array
@@ -725,7 +1082,17 @@ class RealCuroboBackend:
         self._guarded_seed_counter = 1
 
     def on_runtime_state_changed(self) -> None:
-        """Invalidate live feedback caches after a controller or q-state change."""
+        """Invalidate controller-dependent feedback after a q-state change.
+
+        A controller reload does not mutate scene mesh geometry.  Generator
+        obstacle baselines therefore remain valid and every subsequent plan
+        still refreshes all robot-relative poses before collision checking.
+        Keeping the baseline also preserves reset-time identity warmup for the
+        first Dashboard jog instead of forcing another multi-second full world
+        rebuild.  Actual generator quarantine/rebuild and scene reset create a
+        fresh wrapper, while topology/storage/scale mismatches independently
+        fail back to a cleared full rebuild.
+        """
 
         self._attached_objects_by_hand.clear()
         self._last_actual_velocity = None
@@ -737,6 +1104,1204 @@ class RealCuroboBackend:
     def _generator_key(*, kind: str, hand: str = "left") -> str:
         hand_kinds = {"arm", "attached_arm", "arm_with_trunk", "whole_body"}
         return f"{kind}:{_normalize_hand(hand) if kind in hand_kinds else 'left'}"
+
+    @staticmethod
+    def _mesh_topology_component(
+        value: Any,
+        *,
+        full_digest: bool,
+        exact_values: bool = False,
+    ) -> tuple[Any, ...]:
+        """Fingerprint mesh storage, optionally including exact values.
+
+        OmniGibson's rigid ``GeomPrim.points`` and ``faces`` are
+        ``functools.cached_property`` tensors.  Their object identity plus the
+        Torch mutation version is therefore an exact, constant-time topology
+        revision for the lifetime of that wrapper: replacement changes the
+        identity and in-place edits increment ``_version``.  Non-Torch storage
+        has no equivalent mutation counter, so it continues to use an exact
+        content digest.
+
+        ``full_digest`` validates the storage contents separately, but must
+        not change the shape of the topology key.  Otherwise the first full
+        snapshot can never compare equal to the following pose-only snapshot.
+        """
+
+        try:
+            import torch
+        except ImportError:
+            torch = None
+        if torch is not None and torch.is_tensor(value):
+            component: tuple[Any, ...] = (
+                "torch",
+                str(value.dtype),
+                str(value.device),
+                tuple(int(size) for size in value.shape),
+                tuple(int(stride) for stride in value.stride()),
+                int(getattr(value, "_version")),
+            )
+            if not exact_values:
+                return (*component, id(value))
+            array = value.detach().cpu().numpy()
+        else:
+            array = np.asarray(value)
+            if array.dtype == object:
+                raise RuntimeError("collision mesh topology is not numeric")
+            component = (
+                "numpy",
+                str(array.dtype),
+                tuple(int(size) for size in array.shape),
+                tuple(int(stride) for stride in array.strides),
+            )
+        contiguous = np.ascontiguousarray(array)
+        return (
+            *component,
+            hashlib.sha256(contiguous.tobytes()).hexdigest(),
+        )
+
+    @staticmethod
+    def _mesh_content_digest(value: Any) -> str:
+        """Return an exact geometry digest for full-refresh validation only."""
+
+        try:
+            import torch
+        except ImportError:
+            torch = None
+        if torch is not None and torch.is_tensor(value):
+            array = value.detach().cpu().numpy()
+        else:
+            array = np.asarray(value)
+        if array.dtype == object:
+            raise RuntimeError("collision mesh geometry is not numeric")
+        contiguous = np.ascontiguousarray(array)
+        return hashlib.sha256(contiguous.tobytes()).hexdigest()
+
+    @staticmethod
+    def _physics_tensor_array(value: Any) -> np.ndarray:
+        """Copy one Physics Tensor result to a numeric host array."""
+
+        try:
+            import torch
+        except ImportError:
+            torch = None
+        if torch is not None and torch.is_tensor(value):
+            array = value.detach().cpu().numpy()
+        else:
+            to_numpy = getattr(value, "numpy", None)
+            array = to_numpy() if callable(to_numpy) else value
+        result = np.asarray(array)
+        if result.dtype == object:
+            raise RuntimeError("Physics Tensor transforms are not numeric")
+        return result
+
+    @classmethod
+    def _collision_link_pose_batch(
+        cls,
+        *,
+        physics_sim_view: Any,
+        requested_prim_paths: tuple[str, ...],
+        pose_batch_cache: Mapping[str, Any] | None,
+        create: bool,
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+        """Read exact dynamic-link poses through one validated Physics Tensor view."""
+
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError(
+                "Physics Tensor collision pose reads require main-thread dispatch"
+            )
+        import omnigibson as og
+
+        if bool(getattr(og.sim, "currently_stepping", False)):
+            raise RuntimeError(
+                "Physics Tensor collision pose reads are unavailable during a physics step"
+            )
+        if physics_sim_view is None:
+            raise RuntimeError("Physics Tensor simulation view is unavailable")
+        paths = tuple(str(path) for path in requested_prim_paths)
+        if not paths or paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
+            raise RuntimeError(
+                "Physics Tensor collision link paths must be non-empty, sorted, and unique"
+            )
+
+        if pose_batch_cache is None:
+            if not create:
+                raise RuntimeError("Physics Tensor collision pose cache is unavailable")
+            create_view = getattr(physics_sim_view, "create_rigid_body_view", None)
+            if not callable(create_view):
+                raise RuntimeError(
+                    "Physics Tensor rigid-body view API is unavailable"
+                )
+            view = create_view(list(paths))
+            cached_mapping = None
+        else:
+            if pose_batch_cache.get("physics_sim_view") is not physics_sim_view:
+                raise RuntimeError("Physics Tensor simulation view identity changed")
+            if tuple(pose_batch_cache.get("prim_paths", ())) != paths:
+                raise RuntimeError("Physics Tensor collision link path registry changed")
+            view = pose_batch_cache.get("view")
+            cached_mapping = pose_batch_cache.get("index_by_prim_path")
+            if not isinstance(cached_mapping, Mapping):
+                raise RuntimeError(
+                    "Physics Tensor rigid-body view row mapping is unavailable"
+                )
+
+        check = getattr(view, "check", None)
+        if not callable(check) or not bool(check()):
+            raise RuntimeError("Physics Tensor rigid-body view is invalid")
+        try:
+            count = int(view.count)
+            actual_paths = tuple(str(path) for path in view.prim_paths)
+        except Exception as exc:
+            raise RuntimeError(
+                "Physics Tensor rigid-body view registry is unavailable"
+            ) from exc
+        if (
+            count != len(paths)
+            or len(actual_paths) != count
+            or len(actual_paths) != len(set(actual_paths))
+            or set(actual_paths) != set(paths)
+        ):
+            raise RuntimeError(
+                "Physics Tensor rigid-body view did not bind the exact requested paths"
+            )
+        index_by_prim_path = {
+            prim_path: index for index, prim_path in enumerate(actual_paths)
+        }
+        if cached_mapping is not None and dict(cached_mapping) != index_by_prim_path:
+            raise RuntimeError("Physics Tensor rigid-body view row mapping changed")
+
+        get_transforms = getattr(view, "get_transforms", None)
+        if not callable(get_transforms):
+            raise RuntimeError("Physics Tensor transform read API is unavailable")
+        transforms = cls._physics_tensor_array(get_transforms())
+        if transforms.shape != (count, 7):
+            raise RuntimeError(
+                "Physics Tensor transforms must have exact shape [N,7]"
+            )
+        transforms = np.asarray(transforms, dtype=np.float64)
+        if not np.isfinite(transforms).all():
+            raise RuntimeError("Physics Tensor transforms are not finite")
+        quaternion_norms = np.linalg.norm(transforms[:, 3:], axis=1)
+        if not np.allclose(
+            quaternion_norms,
+            np.ones(count, dtype=np.float64),
+            rtol=0.0,
+            atol=1e-3,
+        ):
+            raise RuntimeError(
+                "Physics Tensor transforms contain a non-unit quaternion"
+            )
+
+        poses_by_path = {
+            path: transforms[index_by_prim_path[path]].copy() for path in paths
+        }
+        cache = {
+            # Strong references bind the view to the exact simulator instance
+            # and prevent identity reuse while the fast-refresh state is live.
+            "physics_sim_view": physics_sim_view,
+            "prim_paths": paths,
+            "view": view,
+            "index_by_prim_path": index_by_prim_path,
+        }
+        return poses_by_path, cache
+
+    @classmethod
+    def _current_collision_mesh_snapshot(
+        cls,
+        generator: Any,
+        ignore_objects: Any = None,
+        *,
+        full_digest: bool = False,
+        kinematic_cache: Mapping[str, Any] | None = None,
+        pose_batch_cache: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read every live collision mesh and its fresh robot-relative pose."""
+
+        snapshot_started_ns = time.monotonic_ns()
+        import omnigibson as og
+        import omnigibson.lazy as lazy
+        import omnigibson.utils.transform_utils as transform_utils
+
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError(
+                "collision mesh snapshot requires main-thread dispatch"
+            )
+        if bool(getattr(og.sim, "currently_stepping", False)):
+            raise RuntimeError(
+                "collision mesh snapshot is unavailable during a physics step"
+            )
+        pose_elapsed_ns = 0
+        ignored = set(ignore_objects or ())
+        robot = generator.robot
+        robot_pose_started_ns = time.monotonic_ns()
+        try:
+            robot_transform = transform_utils.pose_inv(
+                transform_utils.pose2mat(
+                    robot.root_link.get_position_orientation()
+                )
+            )
+        finally:
+            pose_elapsed_ns += time.monotonic_ns() - robot_pose_started_ns
+        meshes: list[dict[str, Any]] = []
+        storage_refs: list[tuple[str, Any, Any]] = []
+        next_kinematic_cache: dict[str, dict[str, Any]] = {}
+        link_pose_cache: dict[int, Any] = {}
+        scalar_link_poses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        batch_link_poses: dict[int, np.ndarray] = {}
+
+        content_digests: list[str] = []
+        topology_elapsed_ns = 0
+
+        link_entries: list[tuple[Any, Any, Mapping[str, Any]]] = []
+        dynamic_links_by_path: dict[str, Any] = {}
+        batch_setup_error: str | None = None
+
+        scene = getattr(robot, "scene", None)
+        objects = getattr(scene, "objects", None)
+        if objects is None:
+            raise RuntimeError("robot scene collision objects are unavailable")
+        for obj in objects:
+            if obj is robot or obj in ignored or bool(getattr(obj, "visual_only", False)):
+                continue
+            links = getattr(obj, "links", None)
+            if not isinstance(links, Mapping):
+                raise RuntimeError("collision object links are unavailable")
+            for link in links.values():
+                collision_meshes = getattr(link, "collision_meshes", None)
+                if not isinstance(collision_meshes, Mapping):
+                    raise RuntimeError("collision link mesh registry is unavailable")
+                link_entries.append((obj, link, collision_meshes))
+                if not collision_meshes:
+                    continue
+                if getattr(obj, "kinematic_only", None) is not False:
+                    continue
+                link_path = str(getattr(link, "prim_path", ""))
+                if not link_path:
+                    batch_setup_error = (
+                        "dynamic collision link prim path is unavailable"
+                    )
+                    continue
+                existing = dynamic_links_by_path.get(link_path)
+                if existing is not None and existing is not link:
+                    batch_setup_error = (
+                        "dynamic collision link prim paths are not unique"
+                    )
+                    continue
+                dynamic_links_by_path[link_path] = link
+
+        dynamic_paths = tuple(sorted(dynamic_links_by_path))
+        next_pose_batch_cache: dict[str, Any] | None = None
+        batch_fallback_reason = batch_setup_error
+        batch_read_count = 0
+        if not full_digest and dynamic_paths and batch_fallback_reason is None:
+            if pose_batch_cache is None:
+                batch_fallback_reason = (
+                    "Physics Tensor collision pose cache is unavailable"
+                )
+            else:
+                batch_pose_started_ns = time.monotonic_ns()
+                try:
+                    poses_by_path, next_pose_batch_cache = (
+                        cls._collision_link_pose_batch(
+                            physics_sim_view=getattr(
+                                og.sim,
+                                "physics_sim_view",
+                                None,
+                            ),
+                            requested_prim_paths=dynamic_paths,
+                            pose_batch_cache=pose_batch_cache,
+                            create=False,
+                        )
+                    )
+                    batch_link_poses = {
+                        id(dynamic_links_by_path[path]): pose
+                        for path, pose in poses_by_path.items()
+                    }
+                    batch_read_count = len(poses_by_path)
+                except Exception as exc:
+                    batch_fallback_reason = f"{type(exc).__name__}: {exc}"
+                    next_pose_batch_cache = None
+                    batch_link_poses.clear()
+                finally:
+                    pose_elapsed_ns += (
+                        time.monotonic_ns() - batch_pose_started_ns
+                    )
+
+        def pose_to_transform(pose: np.ndarray) -> Any:
+            position: Any = pose[:3]
+            orientation: Any = pose[3:]
+            try:
+                import torch
+            except ImportError:
+                torch = None
+            if torch is not None and torch.is_tensor(robot_transform):
+                position = torch.as_tensor(
+                    position,
+                    dtype=robot_transform.dtype,
+                    device=robot_transform.device,
+                )
+                orientation = torch.as_tensor(
+                    orientation,
+                    dtype=robot_transform.dtype,
+                    device=robot_transform.device,
+                )
+            return transform_utils.pose2mat((position, orientation))
+
+        def link_world_transform(link: Any) -> Any:
+            nonlocal pose_elapsed_ns
+            key = id(link)
+            transform = link_pose_cache.get(key)
+            if transform is not None:
+                return transform
+            pose_started_ns = time.monotonic_ns()
+            batch_pose = batch_link_poses.get(key)
+            if batch_pose is not None:
+                transform = pose_to_transform(batch_pose)
+            else:
+                scalar_pose = link.get_position_orientation()
+                transform = transform_utils.pose2mat(scalar_pose)
+                scalar_link_poses[key] = (
+                    np.asarray(_jsonable(scalar_pose[0]), dtype=np.float64),
+                    np.asarray(_jsonable(scalar_pose[1]), dtype=np.float64),
+                )
+            pose_elapsed_ns += time.monotonic_ns() - pose_started_ns
+            link_pose_cache[key] = transform
+            return transform
+
+        def append_mesh(mesh: Any, *, static_floor: bool = False) -> None:
+            nonlocal topology_elapsed_ns
+            topology_started_ns = time.monotonic_ns()
+            name = str(getattr(mesh, "name", ""))
+            pose = np.asarray(_jsonable(getattr(mesh, "pose", None)), dtype=np.float64)
+            if (
+                not name
+                or pose.shape != (7,)
+                or not np.isfinite(pose).all()
+                or float(np.linalg.norm(pose[3:])) <= 1e-9
+            ):
+                raise RuntimeError("collision mesh name or pose is unavailable")
+            if static_floor:
+                topology = (
+                    name,
+                    "static_floor",
+                    cls._mesh_topology_component(
+                        mesh.scale,
+                        full_digest=True,
+                        exact_values=True,
+                    ),
+                    cls._mesh_content_digest(mesh.vertices),
+                    cls._mesh_content_digest(mesh.faces),
+                )
+                if full_digest:
+                    content_digests.append(
+                        hashlib.sha256(
+                            repr(
+                                (
+                                    cls._mesh_content_digest(mesh.vertices),
+                                    cls._mesh_content_digest(mesh.faces),
+                                )
+                            ).encode("utf-8")
+                        ).hexdigest()
+                    )
+            else:
+                # Rigid OmniGibson mesh vertices/faces are cached-property
+                # tensors.  Identity + Torch _version detects replacement and
+                # in-place edits without copying all scene geometry back to
+                # CPU on every 5 cm / 5 degree Dashboard jog.  The first full
+                # refresh still records an exact content digest, while
+                # non-Torch providers remain exact-content keyed.
+                vertices = mesh.vertices
+                faces = mesh.faces
+                topology = (
+                    name,
+                    cls._mesh_topology_component(
+                        vertices,
+                        full_digest=True,
+                        exact_values=False,
+                    ),
+                    cls._mesh_topology_component(
+                        faces,
+                        full_digest=True,
+                        exact_values=False,
+                    ),
+                    cls._mesh_topology_component(
+                        mesh.scale,
+                        full_digest=True,
+                        exact_values=True,
+                    ),
+                )
+                if full_digest:
+                    content_digests.append(
+                        hashlib.sha256(
+                            repr(
+                                (
+                                    cls._mesh_content_digest(vertices),
+                                    cls._mesh_content_digest(faces),
+                                )
+                            ).encode("utf-8")
+                        ).hexdigest()
+                    )
+                storage_refs.append((name, vertices, faces))
+            meshes.append(
+                {
+                    "name": name,
+                    "pose": pose.tolist(),
+                    "topology": topology,
+                }
+            )
+            topology_elapsed_ns += time.monotonic_ns() - topology_started_ns
+
+        floor_plane = og.sim.floor_plane
+        if floor_plane is not None:
+            prim = getattr(floor_plane, "prim", None)
+            children = list(prim.GetChildren()) if prim is not None else []
+            mesh_reader = getattr(
+                lazy.curobo.util.usd_helper,
+                "get_mesh_attrs",
+                None,
+            )
+            xform_cache = getattr(
+                getattr(generator, "usd_help", None),
+                "_xform_cache",
+                None,
+            )
+            if len(children) != 1 or not callable(mesh_reader) or xform_cache is None:
+                raise RuntimeError("unsupported floor plane collision mesh API")
+            floor_prim = children[0]
+            # The floor is only one mesh, so verify its exact immutable
+            # geometry even on a pose-only refresh.  This closes the otherwise
+            # silent case where a same-name floor changes vertices in place.
+            floor_mesh = mesh_reader(
+                floor_prim,
+                cache=xform_cache,
+                transform=robot_transform.numpy(),
+            )
+            append_mesh(floor_mesh, static_floor=True)
+
+        for _obj, link, collision_meshes in link_entries:
+            for collision_mesh in collision_meshes.values():
+                if str(getattr(collision_mesh, "geom_type", "")) != "Mesh":
+                    raise RuntimeError(
+                        "unsupported non-mesh collision geometry "
+                        f"{getattr(collision_mesh, 'prim_path', None)!r}"
+                    )
+                name = str(collision_mesh.prim_path)
+                cached = (
+                    kinematic_cache.get(name)
+                    if isinstance(kinematic_cache, Mapping)
+                    else None
+                )
+                link_pose = link_world_transform(link)
+                pose_started_ns = time.monotonic_ns()
+                if full_digest or not isinstance(cached, Mapping):
+                    obj_pose = transform_utils.pose2mat(
+                        collision_mesh.get_position_orientation()
+                    )
+                    mesh_in_link = transform_utils.pose_inv(link_pose) @ obj_pose
+                else:
+                    if (
+                        cached.get("link") is not link
+                        or cached.get("mesh") is not collision_mesh
+                    ):
+                        raise RuntimeError(
+                            "collision mesh kinematic registry changed"
+                        )
+                    mesh_in_link = cached.get("mesh_in_link")
+                    if mesh_in_link is None:
+                        raise RuntimeError(
+                            "collision mesh local transform is unavailable"
+                        )
+                    obj_pose = link_pose @ mesh_in_link
+                pose = robot_transform @ obj_pose
+                position, orientation_xyzw = transform_utils.mat2pose(pose)
+                orientation_wxyz = orientation_xyzw[[3, 0, 1, 2]]
+                pose_elapsed_ns += time.monotonic_ns() - pose_started_ns
+                next_kinematic_cache[name] = {
+                    "link": link,
+                    "mesh": collision_mesh,
+                    "mesh_in_link": mesh_in_link,
+                }
+                append_mesh(
+                    types.SimpleNamespace(
+                        name=name,
+                        pose=np.concatenate(
+                            [
+                                np.asarray(_jsonable(position), dtype=np.float64),
+                                np.asarray(
+                                    _jsonable(orientation_wxyz),
+                                    dtype=np.float64,
+                                ),
+                            ]
+                        ),
+                        vertices=collision_mesh.points,
+                        faces=collision_mesh.faces,
+                        scale=collision_mesh.get_world_scale(),
+                    )
+                )
+
+        rebuild_pose_batch_cache = (
+            dynamic_paths
+            and batch_setup_error is None
+            and (full_digest or pose_batch_cache is None)
+        )
+        if rebuild_pose_batch_cache:
+            batch_pose_started_ns = time.monotonic_ns()
+            try:
+                poses_by_path, candidate_cache = cls._collision_link_pose_batch(
+                    physics_sim_view=getattr(
+                        og.sim,
+                        "physics_sim_view",
+                        None,
+                    ),
+                    requested_prim_paths=dynamic_paths,
+                    pose_batch_cache=None,
+                    create=True,
+                )
+                for path, batch_pose in poses_by_path.items():
+                    link = dynamic_links_by_path[path]
+                    scalar_pose = scalar_link_poses.get(id(link))
+                    if scalar_pose is None:
+                        raise RuntimeError(
+                            "authoritative scalar dynamic-link pose is unavailable"
+                        )
+                    scalar_position, scalar_quaternion = scalar_pose
+                    batch_position = batch_pose[:3]
+                    batch_quaternion = batch_pose[3:]
+                    normalized_scalar = scalar_quaternion / np.linalg.norm(
+                        scalar_quaternion
+                    )
+                    normalized_batch = batch_quaternion / np.linalg.norm(
+                        batch_quaternion
+                    )
+                    if not np.allclose(
+                        scalar_position,
+                        batch_position,
+                        rtol=1e-5,
+                        atol=1e-4,
+                    ) or not math.isclose(
+                        abs(float(np.dot(normalized_scalar, normalized_batch))),
+                        1.0,
+                        rel_tol=0.0,
+                        abs_tol=1e-4,
+                    ):
+                        raise RuntimeError(
+                            f"Physics Tensor shadow pose parity failed for {path!r}"
+                        )
+                next_pose_batch_cache = candidate_cache
+                batch_read_count = len(poses_by_path)
+                batch_fallback_reason = None
+            except Exception as exc:
+                batch_fallback_reason = f"{type(exc).__name__}: {exc}"
+                next_pose_batch_cache = None
+            finally:
+                pose_elapsed_ns += time.monotonic_ns() - batch_pose_started_ns
+
+        meshes.sort(key=lambda item: item["name"])
+        names = [item["name"] for item in meshes]
+        if len(names) != len(set(names)):
+            raise RuntimeError("collision mesh names are not unique")
+        if not dynamic_paths:
+            pose_read_mode = "scalar_only"
+        elif rebuild_pose_batch_cache and batch_fallback_reason is None:
+            pose_read_mode = (
+                "scalar_authoritative_shadow_batch"
+                if full_digest
+                else "scalar_authoritative_shadow_batch_rebuild"
+            )
+        elif full_digest:
+            pose_read_mode = "scalar_authoritative_fallback"
+        elif batch_fallback_reason is None:
+            pose_read_mode = (
+                "batch_dynamic_scalar_residual"
+                if scalar_link_poses
+                else "batch_dynamic"
+            )
+        else:
+            pose_read_mode = "scalar_fallback"
+        pose_read_metrics = {
+            "mode": pose_read_mode,
+            "count": int(batch_read_count),
+            "fallback": batch_fallback_reason is not None,
+            "fallback_reason": batch_fallback_reason,
+            "dynamic_link_count": len(dynamic_paths),
+            "scalar_link_count": len(scalar_link_poses),
+        }
+        return {
+            "topology": tuple(item["topology"] for item in meshes),
+            "poses": tuple((item["name"], item["pose"]) for item in meshes),
+            "mesh_count": len(meshes),
+            # Strong references prevent Python object-id ABA while the fast
+            # topology token is live.  They are intentionally private to the
+            # in-process refresh wrapper and never enter public artifacts.
+            "storage_refs": tuple(storage_refs),
+            "kinematic_cache": next_kinematic_cache,
+            "pose_batch_cache": next_pose_batch_cache,
+            "pose_read": pose_read_metrics,
+            "snapshot_timings": {
+                "pose_collection_s": round(pose_elapsed_ns / 1_000_000_000, 6),
+                "topology_collection_s": round(
+                    topology_elapsed_ns / 1_000_000_000,
+                    6,
+                ),
+                "total_s": round(
+                    (time.monotonic_ns() - snapshot_started_ns) / 1_000_000_000,
+                    6,
+                ),
+                "unique_link_count": len(link_pose_cache),
+            },
+            "content_sha256": (
+                hashlib.sha256(
+                    repr(tuple(content_digests)).encode("utf-8")
+                ).hexdigest()
+                if full_digest
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _obstacle_refresh_metrics(generator: Any) -> dict[str, Any] | None:
+        metrics = getattr(generator, "_rpent_obstacle_refresh_metrics", None)
+        return deepcopy(metrics) if isinstance(metrics, dict) else None
+
+    def _install_fast_obstacle_refresh(
+        self,
+        generator: Any,
+        *,
+        snapshot_provider: Any = None,
+        world_collision_type: Any = None,
+        pose_factory: Any = None,
+        pose_batch_factory: Any = None,
+    ) -> None:
+        """Wrap OG obstacle rebuilds with an exact CuRobo mesh-pose fast path."""
+
+        if getattr(generator, "_rpent_fast_obstacle_refresh_installed", False):
+            return
+        original_update = generator.update_obstacles
+        provider = snapshot_provider or self._current_collision_mesh_snapshot
+        if world_collision_type is None:
+            from curobo.geom.sdf.world_mesh import WorldMeshCollision
+
+            world_collision_type = WorldMeshCollision
+        if pose_factory is None:
+            from curobo.types.math import Pose
+
+            def pose_factory(pose: Any, tensor_args: Any) -> Any:
+                return Pose.from_list(
+                    pose,
+                    tensor_args=tensor_args,
+                )
+
+            def pose_batch_factory(poses: Any, tensor_args: Any) -> Any:
+                return Pose.from_batch_list(
+                    poses,
+                    tensor_args=tensor_args,
+                )
+
+        state: dict[str, Any] = {
+            "topology": None,
+            "storage_refs": None,
+            "kinematic_cache": None,
+            "pose_batch_cache": None,
+            "count": 0,
+            "initialized": False,
+        }
+        refresh_lock = threading.RLock()
+
+        try:
+            provider_parameters = inspect.signature(provider).parameters
+        except (TypeError, ValueError):
+            provider_parameters = {}
+        provider_accepts_full_digest = (
+            "full_digest" in provider_parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in provider_parameters.values()
+            )
+        )
+        provider_accepts_kinematic_cache = (
+            "kinematic_cache" in provider_parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in provider_parameters.values()
+            )
+        )
+        provider_accepts_pose_batch_cache = (
+            "pose_batch_cache" in provider_parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in provider_parameters.values()
+            )
+        )
+
+        def capture_snapshot(
+            ignore_objects: Any,
+            *,
+            full_digest: bool,
+        ) -> dict[str, Any]:
+            kwargs: dict[str, Any] = {}
+            if provider_accepts_full_digest:
+                kwargs["full_digest"] = full_digest
+            if provider_accepts_kinematic_cache:
+                kwargs["kinematic_cache"] = state.get("kinematic_cache")
+            if provider_accepts_pose_batch_cache:
+                kwargs["pose_batch_cache"] = state.get("pose_batch_cache")
+            return provider(generator, ignore_objects, **kwargs)
+
+        def motion_generators() -> list[Any]:
+            by_id = {id(value): value for value in generator.mg.values()}
+            return list(by_id.values())
+
+        def reset_all_graph_buffers() -> int:
+            resets = [
+                getattr(
+                    getattr(value, "graph_planner", None),
+                    "reset_buffer",
+                    None,
+                )
+                for value in motion_generators()
+            ]
+            if not all(callable(reset) for reset in resets):
+                raise RuntimeError(
+                    "CuRobo graph planner reset API is unavailable"
+                )
+            for reset in resets:
+                reset()
+            return len(resets)
+
+        def clear_collision_world() -> None:
+            motion_gen_values = motion_generators()
+            checkers = {
+                id(getattr(value, "world_coll_checker", None)): getattr(
+                    value,
+                    "world_coll_checker",
+                    None,
+                )
+                for value in motion_gen_values
+            }
+            if len(checkers) != 1:
+                raise RuntimeError("generator does not share one collision world")
+            clear_world = getattr(motion_gen_values[0], "clear_world_cache", None)
+            if not callable(clear_world):
+                raise RuntimeError("CuRobo collision cache clear API is unavailable")
+            clear_world()
+
+        def call_full(ignore_objects: Any) -> None:
+            if ignore_objects is None:
+                original_update()
+            else:
+                original_update(ignore_objects=ignore_objects)
+
+        def record(
+            *,
+            started_ns: int,
+            mode: str,
+            reason: str,
+            mesh_count: int | None,
+            fallback: bool,
+            fallback_reason: str | None,
+            graph_reset_count: int,
+            pose_update_mode: str | None = None,
+            pose_read: Mapping[str, Any] | None = None,
+            snapshot_timings: Mapping[str, Any] | None = None,
+            error: str | None = None,
+        ) -> None:
+            payload = {
+                "clock": "time.monotonic",
+                "completed_monotonic_ns": time.monotonic_ns(),
+                "count": int(state["count"]),
+                "mode": str(mode),
+                "reason": str(reason),
+                "mesh_count": mesh_count,
+                "elapsed_s": round(
+                    max(0, time.monotonic_ns() - started_ns) / 1_000_000_000,
+                    6,
+                ),
+                "fallback": bool(fallback),
+                "fallback_reason": fallback_reason,
+                "fresh_robot_relative_poses": True,
+                "stale_pose_ttl_s": None,
+                "collision_checks_skipped": False,
+                "topology_verified": mode == "pose_only",
+                "graph_buffer_reset": graph_reset_count > 0,
+                "graph_buffer_reset_count": int(graph_reset_count),
+                "pose_update_mode": pose_update_mode,
+                "pose_read": (
+                    _jsonable(dict(pose_read))
+                    if isinstance(pose_read, Mapping)
+                    else None
+                ),
+                "snapshot_timings": (
+                    _jsonable(dict(snapshot_timings))
+                    if isinstance(snapshot_timings, Mapping)
+                    else None
+                ),
+            }
+            if error is not None:
+                payload["error"] = str(error)
+            generator._rpent_obstacle_refresh_metrics = payload
+
+        def full_refresh(
+            *,
+            started_ns: int,
+            snapshot: dict[str, Any] | None,
+            ignore_objects: Any,
+            reason: str,
+            fallback: bool,
+            fallback_reason: str | None,
+            clear_cache: bool = False,
+        ) -> None:
+            try:
+                if (
+                    isinstance(snapshot, dict)
+                    and snapshot.get("content_sha256") is None
+                ):
+                    snapshot = capture_snapshot(
+                        ignore_objects,
+                        full_digest=True,
+                    )
+                if clear_cache:
+                    clear_collision_world()
+                call_full(ignore_objects)
+                graph_reset_count = reset_all_graph_buffers()
+            except Exception as exc:
+                state["topology"] = None
+                state["storage_refs"] = None
+                state["kinematic_cache"] = None
+                state["pose_batch_cache"] = None
+                record(
+                    started_ns=started_ns,
+                    mode="full",
+                    reason=reason,
+                    mesh_count=(
+                        int(snapshot["mesh_count"])
+                        if isinstance(snapshot, dict)
+                        else None
+                    ),
+                    fallback=fallback,
+                    fallback_reason=fallback_reason,
+                    graph_reset_count=0,
+                    pose_update_mode="full_rebuild",
+                    pose_read=(
+                        snapshot.get("pose_read")
+                        if isinstance(snapshot, dict)
+                        else None
+                    ),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise
+            state["topology"] = (
+                snapshot["topology"] if isinstance(snapshot, dict) else None
+            )
+            state["storage_refs"] = (
+                snapshot.get("storage_refs")
+                if isinstance(snapshot, dict)
+                else None
+            )
+            state["kinematic_cache"] = (
+                snapshot.get("kinematic_cache")
+                if isinstance(snapshot, dict)
+                else None
+            )
+            state["pose_batch_cache"] = (
+                snapshot.get("pose_batch_cache")
+                if isinstance(snapshot, dict)
+                else None
+            )
+            state["initialized"] = True
+            record(
+                started_ns=started_ns,
+                mode="full",
+                reason=reason,
+                mesh_count=(
+                    int(snapshot["mesh_count"])
+                    if isinstance(snapshot, dict)
+                    else None
+                ),
+                fallback=fallback,
+                fallback_reason=fallback_reason,
+                graph_reset_count=graph_reset_count,
+                pose_update_mode="full_rebuild",
+                pose_read=(
+                    snapshot.get("pose_read")
+                    if isinstance(snapshot, dict)
+                    else None
+                ),
+                snapshot_timings=(
+                    snapshot.get("snapshot_timings")
+                    if isinstance(snapshot, dict)
+                    else None
+                ),
+            )
+
+        def fast_update_locked(ignore_objects: Any = None) -> None:
+            started_ns = time.monotonic_ns()
+            state["count"] += 1
+            snapshot: dict[str, Any] | None = None
+            snapshot_error: str | None = None
+            try:
+                snapshot = capture_snapshot(
+                    ignore_objects,
+                    full_digest=(
+                        state["topology"] is None or ignore_objects is not None
+                    ),
+                )
+                if not isinstance(snapshot, dict):
+                    raise RuntimeError("collision mesh snapshot is not a mapping")
+            except Exception as exc:
+                snapshot_error = f"{type(exc).__name__}: {exc}"
+
+            if not state["initialized"]:
+                full_refresh(
+                    started_ns=started_ns,
+                    snapshot=snapshot,
+                    ignore_objects=ignore_objects,
+                    reason="first_refresh",
+                    fallback=False,
+                    fallback_reason=snapshot_error,
+                )
+                return
+            if state["topology"] is None:
+                full_refresh(
+                    started_ns=started_ns,
+                    snapshot=snapshot,
+                    ignore_objects=ignore_objects,
+                    reason="fallback_full",
+                    fallback=True,
+                    fallback_reason=(
+                        snapshot_error
+                        or "fast refresh topology is unavailable"
+                    ),
+                )
+                return
+            if ignore_objects is not None:
+                full_refresh(
+                    started_ns=started_ns,
+                    snapshot=snapshot,
+                    ignore_objects=ignore_objects,
+                    reason="ignore_objects",
+                    fallback=False,
+                    fallback_reason=snapshot_error,
+                )
+                return
+            if snapshot is None:
+                full_refresh(
+                    started_ns=started_ns,
+                    snapshot=None,
+                    ignore_objects=None,
+                    reason="fallback_full",
+                    fallback=True,
+                    fallback_reason=snapshot_error,
+                )
+                return
+            if snapshot["topology"] != state["topology"]:
+                full_refresh(
+                    started_ns=started_ns,
+                    snapshot=snapshot,
+                    ignore_objects=None,
+                    reason="topology_change",
+                    fallback=False,
+                    fallback_reason=None,
+                    clear_cache=True,
+                )
+                return
+            baseline_refs = state.get("storage_refs")
+            current_refs = snapshot.get("storage_refs")
+            if baseline_refs is not None or current_refs is not None:
+                if (
+                    not isinstance(baseline_refs, tuple)
+                    or not isinstance(current_refs, tuple)
+                    or len(baseline_refs) != len(current_refs)
+                    or any(
+                        str(old[0]) != str(new[0])
+                        or old[1] is not new[1]
+                        or old[2] is not new[2]
+                        for old, new in zip(
+                            baseline_refs,
+                            current_refs,
+                            strict=True,
+                        )
+                    )
+                ):
+                    full_refresh(
+                        started_ns=started_ns,
+                        snapshot=snapshot,
+                        ignore_objects=None,
+                        reason="mesh_storage_replaced",
+                        fallback=False,
+                        fallback_reason=None,
+                        clear_cache=True,
+                    )
+                    return
+
+            try:
+                motion_gen_values = motion_generators()
+                checkers = {
+                    id(getattr(value, "world_coll_checker", None)): getattr(
+                        value,
+                        "world_coll_checker",
+                        None,
+                    )
+                    for value in motion_gen_values
+                }
+                if len(checkers) != 1:
+                    raise RuntimeError(
+                        "generator does not share one collision world"
+                    )
+                checker = next(iter(checkers.values()))
+                if not isinstance(checker, world_collision_type):
+                    raise RuntimeError(
+                        "collision world is not WorldMeshCollision"
+                    )
+                update_pose = getattr(checker, "update_obstacle_pose", None)
+                env_mesh_names = getattr(checker, "_env_mesh_names", None)
+                env_n_mesh = getattr(checker, "_env_n_mesh", None)
+                if (
+                    not callable(update_pose)
+                    or env_mesh_names is None
+                    or env_n_mesh is None
+                ):
+                    raise RuntimeError(
+                        "WorldMeshCollision pose-update API is unavailable"
+                    )
+                mesh_count = int(_jsonable(env_n_mesh[0]))
+                loaded_names = tuple(
+                    sorted(str(name) for name in env_mesh_names[0][:mesh_count])
+                )
+                current_names = tuple(
+                    sorted(str(name) for name, _pose in snapshot["poses"])
+                )
+                if loaded_names != current_names:
+                    raise RuntimeError(
+                        "WorldMeshCollision mesh registry topology changed"
+                    )
+                graph_planners = [
+                    getattr(value, "graph_planner", None)
+                    for value in motion_gen_values
+                ]
+                if not all(
+                    callable(getattr(planner, "reset_buffer", None))
+                    for planner in graph_planners
+                ):
+                    raise RuntimeError("CuRobo graph planner reset API is unavailable")
+                pose_update_mode = "per_obstacle"
+                update_mesh_pose = getattr(checker, "update_mesh_pose", None)
+                world_model = getattr(checker, "world_model", None)
+                if (
+                    callable(update_mesh_pose)
+                    and callable(pose_batch_factory)
+                    and world_model is not None
+                ):
+                    import torch
+
+                    loaded_order = tuple(
+                        str(name) for name in env_mesh_names[0][:mesh_count]
+                    )
+                    loaded_index = {
+                        name: index for index, name in enumerate(loaded_order)
+                    }
+                    if len(loaded_index) != mesh_count:
+                        raise RuntimeError(
+                            "WorldMeshCollision mesh registry contains duplicate names"
+                        )
+                    pose_rows = [
+                        list(pose) for _name, pose in snapshot["poses"]
+                    ]
+                    pose_names = [
+                        str(name) for name, _pose in snapshot["poses"]
+                    ]
+                    pose_indices = torch.as_tensor(
+                        [loaded_index[name] for name in pose_names],
+                        device=checker.tensor_args.device,
+                        dtype=torch.int64,
+                    )
+                    update_mesh_pose(
+                        w_obj_pose=pose_batch_factory(
+                            pose_rows,
+                            checker.tensor_args,
+                        ),
+                        env_obj_idx=pose_indices,
+                        env_idx=0,
+                    )
+                    cpu_world = (
+                        world_model[0]
+                        if isinstance(world_model, list)
+                        else world_model
+                    )
+                    cpu_objects = list(getattr(cpu_world, "objects", ()))
+                    cpu_by_name = {
+                        str(getattr(obstacle, "name", "")): obstacle
+                        for obstacle in cpu_objects
+                    }
+                    if any(name not in cpu_by_name for name in pose_names):
+                        raise RuntimeError(
+                            "CuRobo CPU world model mesh registry changed"
+                        )
+                    for name, pose in zip(
+                        pose_names,
+                        pose_rows,
+                        strict=True,
+                    ):
+                        cpu_by_name[name].pose = list(pose)
+                    pose_update_mode = "batch_tensor_and_linear_cpu"
+                else:
+                    poses = [
+                        (
+                            str(name),
+                            pose_factory(pose, checker.tensor_args),
+                        )
+                        for name, pose in snapshot["poses"]
+                    ]
+                    for name, pose in poses:
+                        update_pose(
+                            name=name,
+                            w_obj_pose=pose,
+                            env_idx=0,
+                            update_cpu_reference=True,
+                        )
+                graph_reset_count = reset_all_graph_buffers()
+            except Exception as exc:
+                full_refresh(
+                    started_ns=started_ns,
+                    snapshot=snapshot,
+                    ignore_objects=None,
+                    reason="fallback_full",
+                    fallback=True,
+                    fallback_reason=f"{type(exc).__name__}: {exc}",
+                    clear_cache=True,
+                )
+                return
+            state["topology"] = snapshot["topology"]
+            state["storage_refs"] = snapshot.get("storage_refs")
+            state["kinematic_cache"] = snapshot.get("kinematic_cache")
+            state["pose_batch_cache"] = snapshot.get("pose_batch_cache")
+            record(
+                started_ns=started_ns,
+                mode="pose_only",
+                reason="unchanged_rigid_mesh_topology",
+                mesh_count=int(snapshot["mesh_count"]),
+                fallback=False,
+                fallback_reason=None,
+                graph_reset_count=graph_reset_count,
+                pose_update_mode=pose_update_mode,
+                pose_read=snapshot.get("pose_read"),
+                snapshot_timings=snapshot.get("snapshot_timings"),
+            )
+
+        def fast_update(_generator: Any, ignore_objects: Any = None) -> None:
+            with refresh_lock:
+                fast_update_locked(ignore_objects)
+
+        def invalidate_fast_refresh() -> None:
+            with refresh_lock:
+                state["topology"] = None
+                state["storage_refs"] = None
+                state["kinematic_cache"] = None
+                state["pose_batch_cache"] = None
+                state["initialized"] = False
+
+        generator.update_obstacles = types.MethodType(fast_update, generator)
+        generator._rpent_invalidate_obstacle_refresh = invalidate_fast_refresh
+        generator._rpent_fast_obstacle_refresh_installed = True
 
     def _record_generator_recovery(self, event: dict[str, Any]) -> None:
         path = self.output_dir / "planner_generator_recovery.jsonl"
@@ -775,12 +2340,53 @@ class RealCuroboBackend:
         gc.collect()
         return event
 
+    def plan_base_identity_trajectory(
+        self,
+        *,
+        timeout_s: float = RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S,
+    ) -> dict[str, Any]:
+        """Plan and collision-certify BASE at its current pose without acting."""
+
+        warmup_wall_clock_s = min(
+            float(timeout_s),
+            RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S,
+        )
+        if not math.isfinite(warmup_wall_clock_s) or warmup_wall_clock_s <= 0.0:
+            raise ValueError("BASE identity warmup timeout must be positive")
+        robot = self._find_robot()
+        current = np.asarray(
+            self._base_xy_yaw(robot), dtype=np.float64
+        ).reshape(-1)
+        if current.shape not in {(3,), (4,)} or not np.isfinite(current).all():
+            raise RuntimeError("R1Pro BASE pose unavailable during warmup")
+        result = self._compute_base_plan(
+            target_xyyaw=current[:3],
+            timeout_s=warmup_wall_clock_s,
+            skip_obstacle_update=False,
+            attempt_timeout_cap_s=BASE_PLAN_ATTEMPT_TIMEOUT_S,
+            solver_timeout_cap_s=BASE_PLAN_ATTEMPT_TIMEOUT_S - 2.0,
+            planning_profile=RESET_IDENTITY_WARMUP_PROFILE,
+            wall_clock_timeout_s=warmup_wall_clock_s,
+        )
+        if isinstance(result, dict):
+            metrics = dict(result.get("metrics") or {})
+            metrics.update(
+                {
+                    "identity_plan": True,
+                    "env_actions_sent": 0,
+                    "simulator_advanced": False,
+                }
+            )
+            result["metrics"] = metrics
+        return result
+
     def warmup(self) -> dict[str, Any]:
-        """Compile the whole-body planner kernels used by analytic primitives.
+        """Compile BASE and whole-body planner kernels used by analytic primitives.
 
         This runs before any public planner-tool deadline starts.  It performs
-        one collision-certified identity query per hand, but never executes an
-        action or advances the simulator.
+        one BASE identity query plus one selected-EEF collision-certified
+        identity query per hand, but never executes an action or advances the
+        simulator.
         """
         started = time.monotonic()
         report: dict[str, Any] = {
@@ -789,10 +2395,12 @@ class RealCuroboBackend:
             "identity_warmup": {
                 "env_actions_sent": 0,
                 "simulator_advanced": False,
+                "base": None,
                 "hands": [],
             },
         }
         path = self.output_dir / "planner_curobo_warmup.json"
+        report["artifact"] = str(path)
 
         def save() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -801,7 +2409,11 @@ class RealCuroboBackend:
         def stage(name: str, call: Any) -> Any:
             stage_started = time.monotonic()
             try:
-                value = call()
+                with _wall_clock_deadline(
+                    RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S,
+                    f"reset identity warmup stage {name}",
+                ):
+                    value = call()
             except Exception as exc:
                 report["stages"][name] = {
                     "ok": False,
@@ -819,18 +2431,58 @@ class RealCuroboBackend:
             }
             return value
 
+        base_plan = stage(
+            "base_current_pose_identity_trajectory",
+            lambda: self.plan_base_identity_trajectory(
+                timeout_s=RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S
+            ),
+        )
+        if not bool(base_plan.get("ok", False)):
+            report["status"] = "error"
+            report["elapsed_s"] = round(time.monotonic() - started, 3)
+            save()
+            raise RuntimeError(
+                "BASE current-pose cuRobo warmup failed closed: "
+                f"{base_plan.get('stop_reason', 'unknown')}"
+            )
+        base_metrics = (
+            dict(base_plan.get("metrics"))
+            if isinstance(base_plan.get("metrics"), dict)
+            else {}
+        )
+        report["identity_warmup"]["base"] = {
+            "query": "current_pose_identity_trajectory",
+            "ok": True,
+            "stop_reason": base_plan.get("stop_reason"),
+            "trajectory_waypoints": base_metrics.get("trajectory_waypoints"),
+            "collision_admitted": (
+                base_metrics.get("collision_admission", {}).get("admitted") is True
+            ),
+        }
+
         for hand in ("left", "right"):
-            eef_pose = self.get_eef_pose(hand)
-            if eef_pose is None:
-                raise RuntimeError(f"R1Pro {hand} EEF pose unavailable during warmup")
-            whole_body_plan = stage(
-                f"whole_body_{hand}_identity_trajectory",
-                lambda hand=hand, eef_pose=eef_pose: self.plan_whole_body_trajectory(
+            def warm_whole_body(hand: str = hand) -> dict[str, Any]:
+                eef_pose = self.get_eef_pose(hand)
+                if eef_pose is None:
+                    raise RuntimeError(
+                        f"R1Pro {hand} EEF pose unavailable during warmup"
+                    )
+                return self.plan_whole_body_trajectory(
                     hand=hand,
                     target_xyz=np.asarray(eef_pose[0], dtype=np.float64),
-                    target_quat_xyzw=np.asarray(eef_pose[1], dtype=np.float64),
-                    timeout_s=WHOLE_BODY_PLANNING_DEADLINE_S,
-                ),
+                    target_quat_xyzw=np.asarray(
+                        eef_pose[1], dtype=np.float64
+                    ),
+                    timeout_s=WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S,
+                    search_profile=RESET_IDENTITY_WARMUP_PROFILE,
+                    wall_clock_timeout_s=(
+                        RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S
+                    ),
+                )
+
+            whole_body_plan = stage(
+                f"whole_body_{hand}_identity_trajectory",
+                warm_whole_body,
             )
             if not bool(whole_body_plan.get("ok", False)):
                 report["status"] = "error"
@@ -865,7 +2517,6 @@ class RealCuroboBackend:
         report["status"] = "complete"
         report["elapsed_s"] = round(time.monotonic() - started, 3)
         save()
-        report["artifact"] = str(path)
         return report
 
     def warmup_attached_arm(
@@ -1440,6 +3091,8 @@ class RealCuroboBackend:
             use_cuda_graph=False,
             use_default_embodiment_only=use_default_embodiment_only,
         )
+        if kind in {"base", "whole_body"}:
+            self._install_fast_obstacle_refresh(generator)
         self._generators[key] = generator
         if key in self._invalid_generators:
             self._invalid_generators.remove(key)
@@ -1830,26 +3483,54 @@ class RealCuroboBackend:
         target_quat_xyzw: np.ndarray | None,
         timeout_s: float,
         attached_obj: Any = None,
+        search_profile: str = WHOLE_BODY_SEARCH_PROFILE_DEFAULT,
+        start_q: Any | None = None,
+        start_eef_pose: Any | None = None,
+        background: bool = False,
+        wall_clock_timeout_s: float | None = None,
     ) -> dict[str, Any]:
         """Plan and independently certify one selected-EEF 21-DOF trajectory."""
 
         hand = _normalize_hand(hand)
+        profile = _whole_body_search_profile(search_profile)
         started = time.monotonic()
         hard_timeout_s = min(
             float(timeout_s),
-            WHOLE_BODY_PLANNING_DEADLINE_S,
+            float(profile["planning_deadline_s"]),
         )
+        wall_clock_timeout = (
+            hard_timeout_s
+            if wall_clock_timeout_s is None
+            else float(wall_clock_timeout_s)
+        )
+        if (
+            not math.isfinite(wall_clock_timeout)
+            or wall_clock_timeout <= 0.0
+            or wall_clock_timeout + 1e-12 < hard_timeout_s
+        ):
+            raise ValueError(
+                "whole-body wall-clock timeout must be finite, positive, and "
+                "at least the solver planning budget"
+            )
         try:
-            with _wall_clock_deadline(
-                hard_timeout_s,
-                f"{hand} whole-body planning transaction",
-            ):
+            deadline_scope = (
+                nullcontext()
+                if background
+                else _wall_clock_deadline(
+                    wall_clock_timeout,
+                    f"{hand} whole-body planning transaction",
+                )
+            )
+            with deadline_scope:
                 result = self._compute_whole_body_plan(
                     hand=hand,
                     target_xyz=target_xyz,
                     target_quat_xyzw=target_quat_xyzw,
                     timeout_s=hard_timeout_s,
                     selected_expected_attachment=attached_obj,
+                    search_profile=str(profile["name"]),
+                    start_q=start_q,
+                    start_eef_pose=start_eef_pose,
                 )
             metrics = (
                 dict(result.get("metrics"))
@@ -1859,6 +3540,17 @@ class RealCuroboBackend:
             metrics["planning_elapsed_s"] = round(
                 time.monotonic() - started, 3
             )
+            metrics["deadline_enforcement"] = {
+                "solver_timeout_enforced": True,
+                "hard_wall_clock_enforced": not bool(background),
+                "hard_wall_clock_deadline_s": (
+                    wall_clock_timeout if not background else None
+                ),
+                "soft_deadline_s": (
+                    wall_clock_timeout if background else None
+                ),
+                "solver_planning_budget_s": hard_timeout_s,
+            }
             result["metrics"] = metrics
             return result
         except Exception as exc:
@@ -1881,6 +3573,17 @@ class RealCuroboBackend:
                     "planning_elapsed_s": round(
                         time.monotonic() - started, 3
                     ),
+                    "deadline_enforcement": {
+                        "solver_timeout_enforced": True,
+                        "hard_wall_clock_enforced": not bool(background),
+                        "hard_wall_clock_deadline_s": (
+                            wall_clock_timeout if not background else None
+                        ),
+                        "soft_deadline_s": (
+                            wall_clock_timeout if background else None
+                        ),
+                        "solver_planning_budget_s": hard_timeout_s,
+                    },
                     "generator_quarantine": quarantine,
                     "collision_admission": {
                         "available": False,
@@ -1898,8 +3601,12 @@ class RealCuroboBackend:
         target_quat_xyzw: np.ndarray | None,
         timeout_s: float,
         selected_expected_attachment: Any = None,
+        search_profile: str = WHOLE_BODY_SEARCH_PROFILE_DEFAULT,
+        start_q: Any | None = None,
+        start_eef_pose: Any | None = None,
     ) -> dict[str, Any]:
         hand = _normalize_hand(hand)
+        profile = _whole_body_search_profile(search_profile)
         inactive = "right" if hand == "left" else "left"
         generator = self._generator(kind="whole_body", hand=hand)
         robot = self._find_robot()
@@ -1918,7 +3625,11 @@ class RealCuroboBackend:
         if torch is None:
             import torch as torch  # type: ignore[no-redef]
 
-        selected_pose = self.get_eef_pose(hand)
+        selected_pose = (
+            start_eef_pose
+            if start_eef_pose is not None
+            else self.get_eef_pose(hand)
+        )
         if selected_pose is None:
             raise RuntimeError(f"R1Pro {hand} EEF pose is unavailable")
         selected_target = np.asarray(target_xyz, dtype=np.float64).reshape(3)
@@ -1956,17 +3667,22 @@ class RealCuroboBackend:
             .reshape(1, 4)
             .repeat(batch_size, 1)
         }
-        start_q = np.asarray(
-            _jsonable(robot.get_joint_positions()), dtype=np.float32
+        start_q_array = np.asarray(
+            _jsonable(
+                robot.get_joint_positions()
+                if start_q is None
+                else start_q
+            ),
+            dtype=np.float32,
         ).reshape(-1)
-        initial_joint_pos = torch.as_tensor(start_q, dtype=torch.float32)
+        initial_joint_pos = torch.as_tensor(start_q_array, dtype=torch.float32)
         robot_joint_names = list((getattr(robot, "joints", {}) or {}).keys())
-        if len(robot_joint_names) != len(start_q):
+        if len(robot_joint_names) != len(start_q_array):
             raise RuntimeError(
                 "R1Pro live joint names do not match the whole-body start state"
             )
         start_by_name = {
-            str(name): float(start_q[index])
+            str(name): float(start_q_array[index])
             for index, name in enumerate(robot_joint_names)
         }
         active_retract = torch.as_tensor(
@@ -2060,9 +3776,31 @@ class RealCuroboBackend:
                 "source": "CuRoboMotionGenerator.compute_trajectories+check_collisions",
             },
             "planning_policy": {
-                "fast_trajopt_s": WHOLE_BODY_FAST_TRAJOPT_DEADLINE_S,
+                "search_profile": str(profile["name"]),
+                "fast_trajopt_s": float(
+                    profile["fast_trajopt_deadline_s"]
+                ),
+                "local_ik_s": (
+                    float(profile["local_ik_deadline_s"])
+                    if "local_ik_deadline_s" in profile
+                    else None
+                ),
+                "local_ik_enabled": bool(
+                    profile["name"] == WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG
+                    and not position_only
+                ),
                 "graph_fallback": True,
-                "planning_hard_limit_s": WHOLE_BODY_PLANNING_DEADLINE_S,
+                "planning_hard_limit_s": float(
+                    profile["planning_deadline_s"]
+                ),
+                "compute_max_attempts": int(profile["max_attempts"]),
+                "ik_fail_return": int(profile["ik_fail_return"]),
+                "finetune_attempts": int(profile["finetune_attempts"]),
+                "candidate_certification": (
+                    "first_fully_certified"
+                    if bool(profile["first_safe_candidate"])
+                    else "certify_all_solver_successes_then_rank"
+                ),
                 "single_arm_fallback": False,
                 "probe_env_actions": 0,
             },
@@ -2074,65 +3812,271 @@ class RealCuroboBackend:
         full_index = {name: index for index, name in enumerate(full_joint_names)}
         active_indices = [full_index[name] for name in WHOLE_BODY_ACTIVE_JOINT_NAMES]
         planning_deadline = time.monotonic() + min(
-            float(timeout_s), WHOLE_BODY_PLANNING_DEADLINE_S
+            float(timeout_s), float(profile["planning_deadline_s"])
         )
+        world_refresh_started = time.monotonic()
+        generator.update_obstacles()
+        world_refresh_elapsed_s = max(
+            0.0,
+            time.monotonic() - world_refresh_started,
+        )
+        obstacle_refresh = RealCuroboBackend._obstacle_refresh_metrics(generator)
+        if obstacle_refresh is None:
+            raise RuntimeError(
+                "whole-body obstacle refresh metrics are unavailable"
+            )
+        metrics["obstacle_refresh"] = obstacle_refresh
+        metrics["world_refresh_count"] = 1
+        metrics["world_refresh_s"] = world_refresh_elapsed_s
         safe_candidates: list[dict[str, Any]] = []
         any_solver_success = False
-        for stage_name, enable_graph in (
-            ("fast_trajopt", False),
-            ("graph_trajopt", True),
+        any_eef_path_admitted = False
+        collision_check_performed_candidate_count = 0
+        eef_fk_cache: dict[
+            str,
+            tuple[np.ndarray, np.ndarray, np.ndarray],
+        ] = {}
+        eef_fk_cache_metrics = {
+            "schema_version": 1,
+            "scope": "single_candidate",
+            "identity": "float32-c-order-sha256+array_equal",
+            "queries": 0,
+            "hits": 0,
+            "backend_calls": 0,
+            "backend_elapsed_s": 0.0,
+        }
+        metrics["selected_eef_fk_cache"] = eef_fk_cache_metrics
+
+        def exact_eef_fk(
+            q_trajectory: Any,
+        ) -> tuple[np.ndarray, np.ndarray, bool]:
+            """Reuse FK only for an exact canonical full-q path in this call."""
+
+            q_canonical = np.ascontiguousarray(
+                np.asarray(
+                    _jsonable(q_trajectory),
+                    dtype=np.float32,
+                )
+            )
+            q_digest = hashlib.sha256(q_canonical.tobytes()).hexdigest()
+            eef_fk_cache_metrics["queries"] += 1
+            cached = eef_fk_cache.get(q_digest)
+            if (
+                cached is not None
+                and cached[0].shape == q_canonical.shape
+                and np.array_equal(cached[0], q_canonical)
+            ):
+                eef_fk_cache_metrics["hits"] += 1
+                return cached[1].copy(), cached[2].copy(), True
+            fk_started = time.monotonic()
+            positions, quaternions = self._curobo_eef_poses(
+                generator,
+                q_canonical,
+            )
+            eef_fk_cache_metrics["backend_elapsed_s"] += max(
+                0.0,
+                time.monotonic() - fk_started,
+            )
+            eef_fk_cache_metrics["backend_calls"] += 1
+            positions_array = np.asarray(positions).copy()
+            quaternions_array = np.asarray(quaternions).copy()
+            eef_fk_cache[q_digest] = (
+                q_canonical.copy(),
+                positions_array.copy(),
+                quaternions_array.copy(),
+            )
+            return positions_array, quaternions_array, False
+
+        def dense_eef_certificate(
+            q_path_with_start: np.ndarray,
+            *,
+            initial_joint_step: float = WHOLE_BODY_DENSE_COLLISION_STEP,
+        ) -> tuple[np.ndarray, dict[str, Any]]:
+            """Densify planning-only until all Cartesian step gates are decidable."""
+
+            joint_step = min(
+                float(initial_joint_step),
+                WHOLE_BODY_DENSE_COLLISION_STEP,
+            )
+            if not math.isfinite(joint_step) or joint_step <= 0.0:
+                raise ValueError(
+                    "whole-body dense certification step must be positive"
+                )
+            attempts: list[dict[str, Any]] = []
+            dense = np.asarray(q_path_with_start, dtype=np.float32)
+            report: dict[str, Any] = {}
+            for attempt in range(8):
+                dense = _interpolate_joint_trajectory(
+                    q_path_with_start,
+                    max_inter_dist=joint_step,
+                )
+                positions, quaternions, _reused = exact_eef_fk(dense)
+                report = self._whole_body_eef_path_report(
+                    generator,
+                    dense,
+                    call_start_xyz=selected_pose[0],
+                    target_xyz=selected_target,
+                    target_quat_xyzw=(
+                        None if position_only else selected_quat
+                    ),
+                    precomputed_eef_poses=(positions, quaternions),
+                )
+                report["checks"]["all_target_orientation_step"] = (
+                    report.get("max_orientation_step_rad", float("inf"))
+                    <= WHOLE_BODY_EEF_WRIST_MAX_ORIENTATION_STEP_RAD + 1e-9
+                )
+                report["admitted"] = all(report["checks"].values())
+                failed = sorted(
+                    name
+                    for name, passed in dict(
+                        report.get("checks") or {}
+                    ).items()
+                    if not passed
+                )
+                attempts.append(
+                    {
+                        "attempt": attempt + 1,
+                        "joint_step_rad": joint_step,
+                        "dense_waypoints": int(len(dense)),
+                        "failed_checks": failed,
+                    }
+                )
+                if report.get("admitted") is True or not (
+                    failed
+                    and set(failed).issubset(
+                        {
+                            "all_target_cartesian_step",
+                            "all_target_orientation_step",
+                            "short_target_cartesian_step",
+                            "short_target_rotation_step",
+                        }
+                    )
+                ):
+                    break
+                joint_step *= 0.5
+            report["adaptive_densification"] = {
+                "planning_only": True,
+                "attempts": attempts,
+                "final_joint_step_rad": attempts[-1]["joint_step_rad"],
+                "probe_env_actions": 0,
+            }
+            return dense, report
+
+        solver_stages = []
+        if (
+            profile["name"] == WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG
+            and not position_only
         ):
+            solver_stages.append(
+                {
+                    "name": "local_ik",
+                    "enable_graph": False,
+                    "ik_only": True,
+                    "max_attempts": 1,
+                    "ik_fail_return": 1,
+                    "finetune_attempts": 0,
+                }
+            )
+        solver_stages.extend(
+            [
+                {
+                    "name": "fast_trajopt",
+                    "enable_graph": False,
+                    "ik_only": False,
+                    "max_attempts": int(profile["max_attempts"]),
+                    "ik_fail_return": int(profile["ik_fail_return"]),
+                    "finetune_attempts": int(profile["finetune_attempts"]),
+                },
+                {
+                    "name": "graph_trajopt",
+                    "enable_graph": True,
+                    "ik_only": False,
+                    "max_attempts": int(profile["max_attempts"]),
+                    "ik_fail_return": int(profile["ik_fail_return"]),
+                    "finetune_attempts": int(profile["finetune_attempts"]),
+                },
+            ]
+        )
+        for stage in solver_stages:
+            stage_name = str(stage["name"])
+            enable_graph = bool(stage["enable_graph"])
+            ik_only = bool(stage["ik_only"])
             remaining = planning_deadline - time.monotonic()
             if remaining <= 0.0:
                 break
-            stage_budget = (
-                min(WHOLE_BODY_FAST_TRAJOPT_DEADLINE_S, remaining)
-                if not enable_graph
-                else remaining
-            )
+            if ik_only:
+                stage_budget = min(
+                    float(profile["local_ik_deadline_s"]),
+                    remaining,
+                )
+            elif not enable_graph:
+                stage_budget = min(
+                    float(profile["fast_trajopt_deadline_s"]),
+                    remaining,
+                )
+            else:
+                stage_budget = remaining
             stage_started = time.monotonic()
-            with self._whole_body_plan_policy(
-                generator,
-                enable_graph=enable_graph,
-                position_only=position_only,
-                timeout_s=stage_budget,
-            ):
+            stage_policy = (
+                nullcontext()
+                if ik_only
+                else self._whole_body_plan_policy(
+                    generator,
+                    enable_graph=enable_graph,
+                    position_only=position_only,
+                    timeout_s=stage_budget,
+                )
+            )
+            with stage_policy:
                 successes, paths = generator.compute_trajectories(
                     target_positions,
                     target_quaternions,
                     initial_joint_pos=initial_joint_pos,
-                    max_attempts=5,
+                    max_attempts=int(stage["max_attempts"]),
                     timeout=stage_budget,
-                    ik_fail_return=5,
-                    enable_finetune_trajopt=True,
-                    finetune_attempts=2,
+                    ik_fail_return=int(stage["ik_fail_return"]),
+                    enable_finetune_trajopt=not ik_only,
+                    finetune_attempts=int(stage["finetune_attempts"]),
                     return_full_result=False,
                     success_ratio=1.0 / batch_size,
                     attached_obj=attachments,
                     attached_obj_scale=attachment_scales,
-                    ik_only=False,
+                    ik_only=ik_only,
                     is_local=False,
-                    skip_obstacle_update=False,
+                    skip_obstacle_update=True,
                     ik_world_collision_check=True,
                 )
+            solver_finished = time.monotonic()
             success_array = np.asarray(_jsonable(successes), dtype=bool).reshape(-1)
             success_indices = np.flatnonzero(success_array)
             any_solver_success = any_solver_success or bool(success_indices.size)
             stage_report = {
                 "name": stage_name,
                 "enable_graph": enable_graph,
+                "ik_only": ik_only,
                 "timeout_s": float(stage_budget),
-                "elapsed_s": round(time.monotonic() - stage_started, 3),
+                "elapsed_s": round(solver_finished - stage_started, 3),
                 "successes": success_array.tolist(),
                 "successful_candidate_indices": success_indices.tolist(),
                 "certified_candidate_indices": [],
             }
+            certificate_started = solver_finished
             for candidate_index in success_indices:
+                eef_fk_cache.clear()
                 audit: dict[str, Any] = {
                     "stage": stage_name,
                     "candidate_index": int(candidate_index),
                     "solver_success": True,
                     "certified": False,
+                }
+                candidate_started = time.monotonic()
+                certificate_timing = {
+                    "clock": "time.monotonic",
+                    "source_dense_certificate_s": 0.0,
+                    "subset_selection_s": 0.0,
+                    "collision_recertification_s": 0.0,
+                    "collision_check_s": 0.0,
+                    "total_s": 0.0,
                 }
                 try:
                     candidate_q, path_merge = (
@@ -2140,84 +4084,469 @@ class RealCuroboBackend:
                             generator,
                             robot,
                             paths[int(candidate_index)],
-                            start_q=start_q,
+                            start_q=start_q_array,
                         )
                     )
+                    candidate_q, yaw_continuity = (
+                        _canonicalize_whole_body_base_yaw_trajectory(
+                            candidate_q,
+                            joint_names=full_joint_names,
+                            call_start_q=start_q_array,
+                        )
+                    )
+                    path_merge["base_yaw_continuity"] = yaw_continuity
                     if (
                         candidate_q.ndim != 2
-                        or candidate_q.shape[1] != start_q.shape[0]
+                        or candidate_q.shape[1] != start_q_array.shape[0]
                     ):
                         raise RuntimeError(
                             "whole-body candidate shape does not match R1Pro q"
                         )
-                    candidate_with_start = (
-                        candidate_q
-                        if np.allclose(
-                            candidate_q[0],
-                            start_q,
-                            atol=1e-7,
-                            rtol=0.0,
+                    if np.allclose(
+                        candidate_q[0],
+                        start_q_array,
+                        atol=1e-7,
+                        rtol=0.0,
+                    ):
+                        candidate_with_start = candidate_q.copy()
+                        candidate_with_start[0] = start_q_array
+                    else:
+                        candidate_with_start = np.vstack(
+                            [start_q_array.reshape(1, -1), candidate_q]
                         )
-                        else np.vstack([start_q.reshape(1, -1), candidate_q])
+                    source_dense_started = time.monotonic()
+                    dense_q, eef_path_report = dense_eef_certificate(
+                        candidate_with_start
                     )
-                    dense_q = _interpolate_joint_trajectory(
-                        candidate_with_start,
-                        max_inter_dist=WHOLE_BODY_DENSE_COLLISION_STEP,
+                    certificate_timing["source_dense_certificate_s"] += max(
+                        0.0,
+                        time.monotonic() - source_dense_started,
                     )
-                    execution_with_start = (
-                        _interpolate_whole_body_execution_trajectory(
-                            candidate_with_start,
-                            joint_names=full_joint_names,
-                        )
-                    )
-                    execution_q = (
-                        execution_with_start[1:]
-                        if len(execution_with_start) > 1
-                        and np.allclose(
-                            execution_with_start[0],
-                            start_q,
-                            atol=1e-7,
-                            rtol=0.0,
-                        )
-                        else execution_with_start
-                    )
-                    if len(execution_q) < 1:
-                        execution_q = execution_with_start
                     if (
                         len(dense_q) < 1
-                        or len(execution_q) < 1
                         or not np.isfinite(dense_q).all()
-                        or not np.isfinite(execution_q).all()
                     ):
                         raise RuntimeError(
                             "whole-body candidate interpolation is empty or non-finite"
                         )
-                    try:
-                        collision_flags = generator.check_collisions(
-                            torch.as_tensor(dense_q, dtype=torch.float32),
-                            initial_joint_pos=torch.as_tensor(
-                                start_q, dtype=torch.float32
+                    path_merge["path_variant"] = "solver_trajectory"
+                    audit["solver_trajectory_eef_path"] = eef_path_report
+                    if eef_path_report.get("admitted") is not True:
+                        # CuRobo's endpoint-only whole-body objective may reach a
+                        # local 3 cm goal through a large Cartesian loop.  The
+                        # solver endpoint is still useful: construct one direct
+                        # call-start -> endpoint 21-DOF candidate, then subject
+                        # the *derived* trajectory to the same FK, yaw, dense
+                        # collision, attachment, and certificate gates.  This
+                        # is never a single-arm or unchecked execution fallback.
+                        if (
+                            eef_path_report.get("short_target") is True
+                            and len(candidate_q) >= 1
+                        ):
+                            direct_candidate = np.vstack(
+                                [
+                                    start_q_array.reshape(1, -1),
+                                    candidate_q[-1].reshape(1, -1),
+                                ]
+                            )
+                            direct_candidate, direct_yaw = (
+                                _canonicalize_whole_body_base_yaw_trajectory(
+                                    direct_candidate,
+                                    joint_names=full_joint_names,
+                                    call_start_q=start_q_array,
+                                )
+                            )
+                            candidate_with_start = direct_candidate
+                            source_dense_started = time.monotonic()
+                            dense_q, eef_path_report = dense_eef_certificate(
+                                candidate_with_start
+                            )
+                            certificate_timing[
+                                "source_dense_certificate_s"
+                            ] += max(
+                                0.0,
+                                time.monotonic() - source_dense_started,
+                            )
+                            path_merge = {
+                                **path_merge,
+                                "path_variant": (
+                                    "call_start_to_solver_endpoint"
+                                ),
+                                "base_yaw_continuity": direct_yaw,
+                                "solver_trajectory_replaced": True,
+                            }
+                            audit["direct_endpoint_eef_path"] = eef_path_report
+                    audit["selected_eef_path"] = eef_path_report
+                    if eef_path_report.get("admitted") is not True:
+                        audit["rejection_reason"] = "selected_eef_path_rejected"
+                        metrics["candidate_audit"].append(audit)
+                        continue
+                    any_eef_path_admitted = True
+                    execution_cap_refinements: list[dict[str, Any]] = []
+                    for cap_refinement in range(8):
+                        source_dense_q = np.asarray(dense_q, dtype=np.float32)
+                        source_positions, source_quaternions, source_fk_reused = (
+                            exact_eef_fk(source_dense_q)
+                        )
+                        source_positions = np.asarray(
+                            source_positions, dtype=np.float32
+                        ).reshape(-1, 3)
+                        source_quaternions = np.asarray(
+                            source_quaternions, dtype=np.float32
+                        ).reshape(-1, 4)
+                        if (
+                            source_positions.shape != (len(source_dense_q), 3)
+                            or source_quaternions.shape
+                            != (len(source_dense_q), 4)
+                            or not np.isfinite(source_positions).all()
+                            or not np.isfinite(source_quaternions).all()
+                            or hashlib.sha256(
+                                np.ascontiguousarray(
+                                    source_positions, dtype=np.float32
+                                ).tobytes()
+                            ).hexdigest()
+                            != eef_path_report.get("positions_sha256")
+                            or hashlib.sha256(
+                                np.ascontiguousarray(
+                                    source_quaternions, dtype=np.float32
+                                ).tobytes()
+                            ).hexdigest()
+                            != eef_path_report.get("quaternions_sha256")
+                        ):
+                            raise _WholeBodyCertificationError(
+                                "whole-body source dense EEF lineage is invalid"
+                            )
+                        source_step_report = (
+                            _whole_body_execution_step_report(
+                                source_dense_q,
+                                source_positions,
+                                source_quaternions,
+                                joint_names=full_joint_names,
+                                short_target=bool(
+                                    eef_path_report["short_target"]
+                                ),
+                            )
+                        )
+                        try:
+                            subset_started = time.monotonic()
+                            proposed_indices = (
+                                _whole_body_execution_subset_indices(
+                                    source_dense_q,
+                                    source_positions,
+                                    source_quaternions,
+                                    joint_names=full_joint_names,
+                                    short_target=bool(
+                                        eef_path_report["short_target"]
+                                    ),
+                                )
+                            )
+                            certificate_timing["subset_selection_s"] += max(
+                                0.0,
+                                time.monotonic() - subset_started,
+                            )
+                            break
+                        except RuntimeError as exc:
+                            if (
+                                "no execution subset satisfying step limits"
+                                not in str(exc)
+                                or cap_refinement >= 7
+                            ):
+                                raise
+                            prior_step = float(
+                                eef_path_report[
+                                    "adaptive_densification"
+                                ]["final_joint_step_rad"]
+                            )
+                            refined_step = prior_step * 0.5
+                            execution_cap_refinements.append(
+                                {
+                                    "attempt": cap_refinement + 1,
+                                    "source_dense_waypoints": int(
+                                        len(source_dense_q)
+                                    ),
+                                    "joint_step_rad": prior_step,
+                                    "failed_checks": sorted(
+                                        name
+                                        for name, passed in dict(
+                                            source_step_report.get(
+                                                "checks"
+                                            )
+                                            or {}
+                                        ).items()
+                                        if not passed
+                                    ),
+                                    "refined_joint_step_rad": refined_step,
+                                }
+                            )
+                            source_dense_started = time.monotonic()
+                            dense_q, eef_path_report = dense_eef_certificate(
+                                candidate_with_start,
+                                initial_joint_step=refined_step,
+                            )
+                            certificate_timing[
+                                "source_dense_certificate_s"
+                            ] += max(
+                                0.0,
+                                time.monotonic() - source_dense_started,
+                            )
+                            audit["selected_eef_path"] = eef_path_report
+                            if eef_path_report.get("admitted") is not True:
+                                raise _WholeBodyCertificationError(
+                                    "execution-cap source refinement rejected "
+                                    "the selected EEF path"
+                                )
+                    else:
+                        raise _WholeBodyCertificationError(
+                            "whole-body execution-cap densification exhausted"
+                        )
+                    audit["execution_cap_densification"] = {
+                        "planning_only": True,
+                        "refinement_count": len(execution_cap_refinements),
+                        "attempts": execution_cap_refinements,
+                        "final_joint_step_rad": float(
+                            eef_path_report["adaptive_densification"][
+                                "final_joint_step_rad"
+                            ]
+                        ),
+                        "exact_path_fk_recomputed": not source_fk_reused,
+                        "exact_path_fk_reused": source_fk_reused,
+                        "exact_path_fk_identity": (
+                            "float32-c-order-sha256+array_equal"
+                        ),
+                        "collision_recertified_after_subset": True,
+                        "probe_env_actions": 0,
+                    }
+                    full_indices = np.arange(len(source_dense_q), dtype=np.int64)
+                    index_attempts = [proposed_indices]
+                    if not np.array_equal(proposed_indices, full_indices):
+                        index_attempts.append(full_indices)
+
+                    certified_execution: dict[str, Any] | None = None
+                    subset_attempts: list[dict[str, Any]] = []
+                    colliding_count = 0
+                    for source_indices in index_attempts:
+                        execution_with_start = source_dense_q[source_indices]
+                        execution_positions = source_positions[source_indices]
+                        execution_quaternions = source_quaternions[source_indices]
+                        execution_step_report = (
+                            _whole_body_execution_step_report(
+                                execution_with_start,
+                                execution_positions,
+                                execution_quaternions,
+                                joint_names=full_joint_names,
+                                short_target=bool(
+                                    eef_path_report["short_target"]
+                                ),
+                            )
+                        )
+                        execution_path_report = _eef_pose_path_admission_report(
+                            execution_positions,
+                            execution_quaternions,
+                            call_start_xyz=selected_pose[0],
+                            target_xyz=selected_target,
+                            target_quat_xyzw=(
+                                None if position_only else selected_quat
                             ),
-                            self_collision_check=True,
-                            skip_obstacle_update=True,
-                            attached_obj=attachments,
-                            attached_obj_scale=attachment_scales,
+                            short_cartesian_step_limit_m=(
+                                WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M
+                            ),
                         )
-                    except TimeoutError:
-                        raise
-                    except Exception as exc:
-                        raise _WholeBodyCertificationError(
-                            "whole-body collision certification backend failed"
-                        ) from exc
-                    collision_array = np.asarray(
-                        _jsonable(collision_flags), dtype=bool
-                    ).reshape(-1)
-                    if collision_array.shape != (len(dense_q),):
-                        raise _WholeBodyCertificationError(
-                            "whole-body collision checker returned an invalid "
-                            "waypoint count"
+                        attempt_audit: dict[str, Any] = {
+                            "source_dense_indices": source_indices.tolist(),
+                            "execution_waypoints": int(len(source_indices) - 1),
+                            "execution_step_admitted": (
+                                execution_step_report.get("admitted") is True
+                            ),
+                            "execution_path_admitted": (
+                                execution_path_report.get("admitted") is True
+                            ),
+                        }
+                        if (
+                            execution_step_report.get("admitted") is not True
+                            or execution_path_report.get("admitted") is not True
+                        ):
+                            attempt_audit["rejection_reason"] = (
+                                "execution_subset_admission_failed"
+                            )
+                            subset_attempts.append(attempt_audit)
+                            continue
+
+                        collision_recertification_started = time.monotonic()
+                        collision_dense_q, collision_eef_path_report = (
+                            dense_eef_certificate(execution_with_start)
                         )
-                    colliding_count = int(np.count_nonzero(collision_array))
+                        (
+                            collision_positions,
+                            collision_quaternions,
+                            collision_fk_reused,
+                        ) = (
+                            exact_eef_fk(collision_dense_q)
+                        )
+                        collision_positions = np.asarray(
+                            collision_positions, dtype=np.float32
+                        ).reshape(-1, 3)
+                        collision_quaternions = np.asarray(
+                            collision_quaternions, dtype=np.float32
+                        ).reshape(-1, 4)
+                        collision_step_report = (
+                            _whole_body_execution_step_report(
+                                collision_dense_q,
+                                collision_positions,
+                                collision_quaternions,
+                                joint_names=full_joint_names,
+                                short_target=bool(
+                                    eef_path_report["short_target"]
+                                ),
+                            )
+                        )
+                        collision_fk_lineage_matches = (
+                            hashlib.sha256(
+                                np.ascontiguousarray(
+                                    collision_positions, dtype=np.float32
+                                ).tobytes()
+                            ).hexdigest()
+                            == collision_eef_path_report.get(
+                                "positions_sha256"
+                            )
+                            and hashlib.sha256(
+                                np.ascontiguousarray(
+                                    collision_quaternions, dtype=np.float32
+                                ).tobytes()
+                            ).hexdigest()
+                            == collision_eef_path_report.get(
+                                "quaternions_sha256"
+                            )
+                        )
+                        attempt_audit.update(
+                            {
+                                "collision_dense_waypoints": int(
+                                    len(collision_dense_q)
+                                ),
+                                "collision_eef_path_admitted": (
+                                    collision_eef_path_report.get("admitted")
+                                    is True
+                                ),
+                                "collision_step_admitted": (
+                                    collision_step_report.get("admitted") is True
+                                ),
+                                "collision_fk_lineage_matches": (
+                                    collision_fk_lineage_matches
+                                ),
+                                "collision_fk_reused": collision_fk_reused,
+                            }
+                        )
+                        if (
+                            collision_eef_path_report.get("admitted") is not True
+                            or collision_step_report.get("admitted") is not True
+                            or not collision_fk_lineage_matches
+                        ):
+                            attempt_audit["rejection_reason"] = (
+                                "shortcut_dense_admission_failed"
+                            )
+                            subset_attempts.append(attempt_audit)
+                            continue
+                        collision_execution_indices = (
+                            _whole_body_ordered_row_indices(
+                                collision_dense_q, execution_with_start
+                            )
+                        )
+                        certificate_timing[
+                            "collision_recertification_s"
+                        ] += max(
+                            0.0,
+                            time.monotonic()
+                            - collision_recertification_started,
+                        )
+                        try:
+                            collision_check_started = time.monotonic()
+                            collision_flags = generator.check_collisions(
+                                torch.as_tensor(
+                                    collision_dense_q, dtype=torch.float32
+                                ),
+                                initial_joint_pos=torch.as_tensor(
+                                    start_q_array, dtype=torch.float32
+                                ),
+                                self_collision_check=True,
+                                skip_obstacle_update=True,
+                                attached_obj=attachments,
+                                attached_obj_scale=attachment_scales,
+                            )
+                            certificate_timing["collision_check_s"] += max(
+                                0.0,
+                                time.monotonic() - collision_check_started,
+                            )
+                            collision_check_performed_candidate_count += 1
+                        except TimeoutError:
+                            raise
+                        except Exception as exc:
+                            raise _WholeBodyCertificationError(
+                                "whole-body collision certification backend failed"
+                            ) from exc
+                        collision_array = np.asarray(
+                            _jsonable(collision_flags), dtype=bool
+                        ).reshape(-1)
+                        if collision_array.shape != (len(collision_dense_q),):
+                            raise _WholeBodyCertificationError(
+                                "whole-body collision checker returned an invalid "
+                                "waypoint count"
+                            )
+                        colliding_count = int(
+                            np.count_nonzero(collision_array)
+                        )
+                        attempt_audit["colliding_waypoint_count"] = (
+                            colliding_count
+                        )
+                        if colliding_count:
+                            attempt_audit["rejection_reason"] = "collision"
+                            subset_attempts.append(attempt_audit)
+                            continue
+                        attempt_audit["certified"] = True
+                        subset_attempts.append(attempt_audit)
+                        certified_execution = {
+                            "joint_trajectory": execution_with_start[1:],
+                            "source_dense_trajectory": source_dense_q,
+                            "execution_source_dense_indices": source_indices,
+                            "dense_collision_trajectory": collision_dense_q,
+                            "execution_collision_dense_indices": (
+                                collision_execution_indices
+                            ),
+                            "execution_step_report": execution_step_report,
+                            "execution_eef_path": execution_path_report,
+                            "dense_collision_eef_path": (
+                                collision_eef_path_report
+                            ),
+                            "dense_collision_positions": collision_positions,
+                            "dense_collision_quaternions": collision_quaternions,
+                            "collision_densification_joint_step_rad": (
+                                collision_eef_path_report[
+                                    "adaptive_densification"
+                                ]["final_joint_step_rad"]
+                            ),
+                        }
+                        break
+                    audit["execution_subset_attempts"] = subset_attempts
+                    if certified_execution is None:
+                        audit["colliding_waypoint_count"] = sum(
+                            int(
+                                attempt.get(
+                                    "colliding_waypoint_count", 0
+                                )
+                            )
+                            for attempt in subset_attempts
+                        )
+                        audit["rejection_reason"] = (
+                            "execution_subset_collision_admission_failed"
+                        )
+                        metrics["candidate_audit"].append(audit)
+                        continue
+                    execution_q = np.asarray(
+                        certified_execution["joint_trajectory"],
+                        dtype=np.float32,
+                    )
+                    dense_q = np.asarray(
+                        certified_execution["dense_collision_trajectory"],
+                        dtype=np.float32,
+                    )
                     path_length = float(
                         np.sum(
                             np.linalg.norm(
@@ -2232,52 +4561,93 @@ class RealCuroboBackend:
                     audit.update(
                         {
                             "path_joint_merge": path_merge,
+                            "source_dense_waypoints": int(len(source_dense_q)),
                             "dense_collision_waypoints": int(len(dense_q)),
                             "execution_waypoints": int(len(execution_q)),
                             "full_21d_path_length": path_length,
                             "colliding_waypoint_count": colliding_count,
                         }
                     )
-                    if colliding_count:
-                        audit["rejection_reason"] = "collision"
-                    else:
-                        audit["certified"] = True
-                        stage_report["certified_candidate_indices"].append(
-                            int(candidate_index)
-                        )
-                        safe_candidates.append(
-                            {
-                                "stage": stage_name,
-                                "candidate_index": int(candidate_index),
-                                "joint_trajectory": execution_q,
-                                "dense_collision_trajectory": dense_q,
-                                "path_joint_merge": path_merge,
-                                "full_21d_path_length": path_length,
-                            }
-                        )
+                    audit["certified"] = True
+                    stage_report["certified_candidate_indices"].append(
+                        int(candidate_index)
+                    )
+                    safe_candidates.append(
+                        {
+                            "stage": stage_name,
+                            "candidate_index": int(candidate_index),
+                            **certified_execution,
+                            "path_joint_merge": path_merge,
+                            "full_21d_path_length": path_length,
+                            "selected_eef_path": (
+                                certified_execution[
+                                    "dense_collision_eef_path"
+                                ]
+                            ),
+                        }
+                    )
                 except TimeoutError:
                     raise
                 except _WholeBodyCertificationError:
                     raise
                 except Exception as exc:
                     audit["rejection_reason"] = f"{type(exc).__name__}: {exc}"
+                finally:
+                    certificate_timing["total_s"] = max(
+                        0.0,
+                        time.monotonic() - candidate_started,
+                    )
+                    audit["certificate_timing_s"] = certificate_timing
                 metrics["candidate_audit"].append(audit)
+                if (
+                    bool(profile["first_safe_candidate"])
+                    and audit.get("certified") is True
+                ):
+                    stage_report["certification_short_circuit"] = {
+                        "enabled": True,
+                        "candidate_index": int(candidate_index),
+                        "remaining_successes_not_certified": int(
+                            np.count_nonzero(success_indices > candidate_index)
+                        ),
+                    }
+                    break
+            stage_finished = time.monotonic()
+            stage_report["timing_s"] = {
+                "clock": "time.monotonic",
+                "solver_s": max(0.0, solver_finished - stage_started),
+                "certificate_s": max(
+                    0.0,
+                    stage_finished - certificate_started,
+                ),
+                "total_s": max(0.0, stage_finished - stage_started),
+            }
             metrics["solver_stages"].append(stage_report)
             if safe_candidates:
                 break
 
         if not safe_candidates:
             metrics["collision_admission"]["post_interpolation_check"] = bool(
-                any_solver_success
+                collision_check_performed_candidate_count
             )
-            metrics["collision_admission"]["colliding_waypoint_count"] = sum(
-                int(candidate.get("colliding_waypoint_count", 0))
-                for candidate in metrics["candidate_audit"]
+            metrics["collision_admission"][
+                "collision_check_performed_candidate_count"
+            ] = collision_check_performed_candidate_count
+            metrics["collision_admission"]["colliding_waypoint_count"] = (
+                sum(
+                    int(candidate.get("colliding_waypoint_count", 0))
+                    for candidate in metrics["candidate_audit"]
+                )
+                if collision_check_performed_candidate_count
+                else None
             )
             return {
                 "ok": False,
                 "stop_reason": (
-                    "collision_admission_failed"
+                    (
+                        "eef_path_admission_failed"
+                        if not any_eef_path_admitted
+                        else "collision_admission_failed"
+                    )
                     if any_solver_success
                     else "unreachable"
                 ),
@@ -2293,10 +4663,61 @@ class RealCuroboBackend:
         )
         selected = safe_candidates[0]
         q_traj = np.asarray(selected["joint_trajectory"], dtype=np.float32)
+        source_dense_q = np.asarray(
+            selected["source_dense_trajectory"], dtype=np.float32
+        )
+        source_dense_indices = np.asarray(
+            selected["execution_source_dense_indices"], dtype=np.int64
+        )
         dense_q = np.asarray(
             selected["dense_collision_trajectory"], dtype=np.float32
         )
+        collision_dense_indices = np.asarray(
+            selected["execution_collision_dense_indices"], dtype=np.int64
+        )
+        dense_eef_positions = np.asarray(
+            selected["dense_collision_positions"], dtype=np.float32
+        ).reshape(-1, 3)
+        dense_eef_quaternions = np.asarray(
+            selected["dense_collision_quaternions"], dtype=np.float32
+        ).reshape(-1, 4)
+        execution_eef_positions = dense_eef_positions[
+            collision_dense_indices[1:]
+        ].copy()
+        execution_eef_quaternions = dense_eef_quaternions[
+            collision_dense_indices[1:]
+        ].copy()
+        if (
+            execution_eef_positions.shape != (len(q_traj), 3)
+            or execution_eef_quaternions.shape != (len(q_traj), 4)
+            or source_dense_indices.shape != (len(q_traj) + 1,)
+            or collision_dense_indices.shape != (len(q_traj) + 1,)
+            or dense_eef_positions.shape != (len(dense_q), 3)
+            or dense_eef_quaternions.shape != (len(dense_q), 4)
+            or not np.isfinite(execution_eef_positions).all()
+            or not np.isfinite(execution_eef_quaternions).all()
+            or not np.isfinite(dense_eef_positions).all()
+            or not np.isfinite(dense_eef_quaternions).all()
+            or not np.array_equal(
+                source_dense_q[source_dense_indices[1:]], q_traj
+            )
+            or not np.array_equal(
+                dense_q[collision_dense_indices[1:]], q_traj
+            )
+            or not np.array_equal(
+                dense_eef_positions[collision_dense_indices[1:]],
+                execution_eef_positions,
+            )
+            or not np.array_equal(
+                dense_eef_quaternions[collision_dense_indices[1:]],
+                execution_eef_quaternions,
+            )
+        ):
+            raise _WholeBodyCertificationError(
+                "whole-body execution EEF waypoint lineage is invalid"
+            )
         metrics["path_joint_merge"] = selected["path_joint_merge"]
+        metrics["selected_eef_path"] = selected["selected_eef_path"]
 
         post_attachments, post_by_hand = self._all_attached_objects(
             selected_hand=hand,
@@ -2319,14 +4740,30 @@ class RealCuroboBackend:
                 }
 
         trajectory_bytes = np.ascontiguousarray(q_traj, dtype=np.float32).tobytes()
+        source_dense_bytes = np.ascontiguousarray(
+            source_dense_q, dtype=np.float32
+        ).tobytes()
+        dense_bytes = np.ascontiguousarray(dense_q, dtype=np.float32).tobytes()
         certificate = {
-            "schema_version": 1,
+            "schema_version": 3,
+            "collision_lineage_mode": (
+                "source_dense_execution_subset_recertified_v1"
+            ),
+            "q_encoding": "float32-c-order",
             "trajectory_sha256": hashlib.sha256(trajectory_bytes).hexdigest(),
+            "execution_trajectory_sha256": hashlib.sha256(
+                trajectory_bytes
+            ).hexdigest(),
             "start_q_sha256": hashlib.sha256(
-                np.ascontiguousarray(start_q, dtype=np.float32).tobytes()
+                np.ascontiguousarray(start_q_array, dtype=np.float32).tobytes()
             ).hexdigest(),
             "waypoint_count": int(len(q_traj)),
+            "execution_waypoint_count": int(len(q_traj)),
+            "execution_includes_start": False,
             "q_dimension": int(q_traj.shape[1]),
+            "joint_name_layout_sha256": _joint_name_layout_sha256(
+                full_joint_names
+            ),
             "active_dof_count": 21,
             "selected_eef_goal_count": 1,
             "inactive_eef_goal_count": 0,
@@ -2335,19 +4772,142 @@ class RealCuroboBackend:
             "self_collision_check": True,
             "post_interpolation_check": True,
             "collision_free_waypoints": int(len(dense_q)),
+            "dense_collision_waypoint_count": int(len(dense_q)),
+            "dense_collision_checked_waypoint_count": int(len(dense_q)),
+            "dense_collision_includes_start": True,
             "dense_collision_trajectory_sha256": hashlib.sha256(
-                np.ascontiguousarray(dense_q, dtype=np.float32).tobytes()
+                dense_bytes
             ).hexdigest(),
+            "dense_collision_trajectory": dense_q.tolist(),
+            "collision_densification_method": "joint_linear_max_inter_dist",
+            "collision_densification_joint_step_rad": float(
+                selected["collision_densification_joint_step_rad"]
+            ),
+            "source_dense_waypoint_count": int(len(source_dense_q)),
+            "source_dense_includes_start": True,
+            "source_dense_trajectory_sha256": hashlib.sha256(
+                source_dense_bytes
+            ).hexdigest(),
+            "source_dense_trajectory": source_dense_q.tolist(),
+            "execution_source_dense_indices": source_dense_indices.tolist(),
+            "execution_source_dense_indices_sha256": (
+                _whole_body_indices_sha256(source_dense_indices)
+            ),
+            "execution_source_terminal_index": int(source_dense_indices[-1]),
+            "execution_collision_dense_indices": (
+                collision_dense_indices.tolist()
+            ),
+            "execution_collision_dense_indices_sha256": (
+                _whole_body_indices_sha256(collision_dense_indices)
+            ),
+            "execution_collision_terminal_index": int(
+                collision_dense_indices[-1]
+            ),
+            "selected_hand": hand,
+            "selected_target_xyz_sha256": _whole_body_target_sha256(
+                selected_target
+            ),
+            "selected_target_quat_xyzw_sha256": (
+                None
+                if position_only
+                else hashlib.sha256(
+                    np.ascontiguousarray(
+                        selected_quat, dtype=np.float32
+                    ).tobytes()
+                ).hexdigest()
+            ),
+            "selected_eef_path_admitted": True,
+            "selected_eef_short_target": selected["selected_eef_path"][
+                "short_target"
+            ],
+            "selected_eef_positions_sha256": selected["selected_eef_path"][
+                "positions_sha256"
+            ],
+            "selected_eef_dense_positions_sha256": hashlib.sha256(
+                np.ascontiguousarray(
+                    dense_eef_positions, dtype=np.float32
+                ).tobytes()
+            ).hexdigest(),
+            "selected_eef_dense_quaternions_sha256": hashlib.sha256(
+                np.ascontiguousarray(
+                    dense_eef_quaternions, dtype=np.float32
+                ).tobytes()
+            ).hexdigest(),
+            "selected_eef_dense_positions": dense_eef_positions.tolist(),
+            "selected_eef_dense_quaternions_xyzw": (
+                dense_eef_quaternions.tolist()
+            ),
+            "selected_eef_nominal_max_target_error_m": selected[
+                "selected_eef_path"
+            ]["nominal_max_target_error_m"],
+            "selected_eef_execution_positions_sha256": hashlib.sha256(
+                np.ascontiguousarray(
+                    execution_eef_positions, dtype=np.float32
+                ).tobytes()
+            ).hexdigest(),
+            "selected_eef_execution_quaternions_sha256": hashlib.sha256(
+                np.ascontiguousarray(
+                    execution_eef_quaternions, dtype=np.float32
+                ).tobytes()
+            ).hexdigest(),
+            "selected_eef_execution_positions": execution_eef_positions.tolist(),
+            "selected_eef_execution_quaternions_xyzw": (
+                execution_eef_quaternions.tolist()
+            ),
+            "selected_eef_live_waypoint_position_tolerance_m": (
+                WHOLE_BODY_EEF_LIVE_WAYPOINT_POSITION_TOLERANCE_M
+            ),
+            "selected_eef_live_waypoint_orientation_tolerance_rad": (
+                WHOLE_BODY_EEF_LIVE_WAYPOINT_ORIENTATION_TOLERANCE_RAD
+            ),
+            "selected_eef_controller_response_margin_m": (
+                WHOLE_BODY_EEF_CONTROLLER_RESPONSE_MARGIN_M
+            ),
+            "selected_eef_numerical_margin_m": (
+                WHOLE_BODY_EEF_NUMERICAL_MARGIN_M
+            ),
+            "selected_eef_prospective_guard_margin_m": (
+                WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M
+            ),
+            "execution_base_xy_step_limit_m": (
+                WHOLE_BODY_EXECUTION_BASE_XY_STEP_M
+            ),
+            "execution_base_yaw_step_limit_rad": (
+                WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD
+            ),
+            "execution_articulation_step_limit_rad": (
+                WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD
+            ),
+            "terminal_command_limit": TERMINAL_COMMAND_LIMIT,
+            "terminal_eef_position_tolerance_m": (
+                EEF_TERMINAL_POSITION_TOLERANCE_M
+            ),
+            "terminal_eef_orientation_tolerance_rad": (
+                EEF_TERMINAL_ORIENTATION_TOLERANCE_RAD
+            ),
         }
         metrics["selected_solver_stage"] = selected["stage"]
         metrics["selected_full_trajectory_candidate"] = selected["candidate_index"]
         metrics["full_trajectory_selection"] = (
-            "fewest_execution_waypoints_then_shortest_full_21d_path"
+            "first_fully_certified_candidate"
+            if bool(profile["first_safe_candidate"])
+            else "fewest_execution_waypoints_then_shortest_full_21d_path"
         )
         metrics["selected_full_21d_path_length"] = selected[
             "full_21d_path_length"
         ]
         metrics["trajectory_waypoints"] = int(len(q_traj))
+        metrics["source_dense_waypoints"] = int(len(source_dense_q))
+        metrics["execution_source_dense_indices"] = (
+            source_dense_indices.tolist()
+        )
+        metrics["execution_collision_dense_indices"] = (
+            collision_dense_indices.tolist()
+        )
+        metrics["execution_step_admission"] = selected[
+            "execution_step_report"
+        ]
+        metrics["execution_eef_path"] = selected["execution_eef_path"]
         metrics["execution_mode"] = "online_robot_q_to_action"
         metrics["collision_admission"].update(
             {
@@ -3712,6 +6272,360 @@ class RealCuroboBackend:
         quaternions_xyzw = quaternions_wxyz[:, [1, 2, 3, 0]]
         return positions, quaternions_xyzw
 
+    def whole_body_eef_poses(
+        self,
+        hand: str,
+        q_trajectory: Any,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return selected-EEF FK for a certificate-bound full-q trajectory."""
+
+        generator = self._generator(
+            kind="whole_body",
+            hand=_normalize_hand(hand),
+        )
+        return self._curobo_eef_poses(generator, q_trajectory)
+
+    def whole_body_joint_names(self, hand: str) -> tuple[str, ...]:
+        """Return the ordered full-q layout shared by planning and execution."""
+
+        generator = self._generator(
+            kind="whole_body",
+            hand=_normalize_hand(hand),
+        )
+        generator_names = tuple(
+            str(name) for name in generator.robot_joint_names
+        )
+        robot = self._find_robot()
+        live_names = tuple(
+            str(name)
+            for name in (getattr(robot, "joints", {}) or {}).keys()
+        )
+        live_q = np.asarray(
+            _jsonable(robot.get_joint_positions()),
+            dtype=np.float32,
+        ).reshape(-1)
+        if (
+            live_names != generator_names
+            or len(live_names) != len(live_q)
+            or not np.isfinite(live_q).all()
+        ):
+            raise RuntimeError(
+                "live R1Pro q/action joint layout diverged from whole-body generator"
+            )
+        return live_names
+
+    def _whole_body_eef_path_report(
+        self,
+        generator: Any,
+        dense_q: Any,
+        *,
+        call_start_xyz: Any,
+        target_xyz: Any,
+        target_quat_xyzw: Any | None = None,
+        precomputed_eef_poses: tuple[Any, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Certify the selected EEF Cartesian path before admitting actions."""
+
+        start = np.asarray(call_start_xyz, dtype=np.float64).reshape(3)
+        target = np.asarray(target_xyz, dtype=np.float64).reshape(3)
+        target_quat = (
+            None
+            if target_quat_xyzw is None
+            else np.asarray(target_quat_xyzw, dtype=np.float64).reshape(4)
+        )
+        q = np.asarray(_jsonable(dense_q), dtype=np.float32)
+        try:
+            positions, quaternions = (
+                self._curobo_eef_poses(generator, q)
+                if precomputed_eef_poses is None
+                else precomputed_eef_poses
+            )
+            positions = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
+            quaternions = np.asarray(quaternions, dtype=np.float64).reshape(-1, 4)
+            if (
+                q.ndim != 2
+                or len(q) < 1
+                or positions.shape != (len(q), 3)
+                or quaternions.shape != (len(q), 4)
+                or not np.isfinite(q).all()
+                or not np.isfinite(positions).all()
+                or not np.isfinite(quaternions).all()
+                or not np.isfinite(start).all()
+                or not np.isfinite(target).all()
+                or (target_quat is not None and not np.isfinite(target_quat).all())
+            ):
+                raise RuntimeError("selected EEF FK path is invalid")
+            start_fk_error = float(np.linalg.norm(positions[0] - start))
+            terminal_error = float(np.linalg.norm(positions[-1] - target))
+            target_errors = np.linalg.norm(positions - target, axis=1)
+            start_excursions = np.linalg.norm(positions - positions[0], axis=1)
+            cartesian_steps = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+            cumulative_cartesian_path = float(np.sum(cartesian_steps))
+            direct = target - positions[0]
+            direct_distance = float(np.linalg.norm(direct))
+            if direct_distance > 1e-9:
+                axis = direct / direct_distance
+                relative = positions - positions[0]
+                along = relative @ axis
+                lateral = np.linalg.norm(
+                    relative - along[:, None] * axis,
+                    axis=1,
+                )
+            else:
+                along = np.zeros((len(positions),), dtype=np.float64)
+                lateral = start_excursions
+            max_excursion = float(np.max(start_excursions, initial=0.0))
+            max_lateral = float(np.max(lateral, initial=0.0))
+            min_along = float(np.min(along, initial=0.0))
+            max_along = float(np.max(along, initial=0.0))
+            along_steps = np.diff(along)
+            max_reverse_step = float(
+                np.max(-along_steps, initial=0.0)
+            )
+            max_cartesian_step = float(np.max(cartesian_steps, initial=0.0))
+            max_orientation_error = 0.0
+            start_orientation_error = 0.0
+            terminal_orientation_error = 0.0
+            max_orientation_step = 0.0
+            max_orientation_reverse_progress = 0.0
+            cumulative_orientation_path = 0.0
+            intentional_orientation_change = False
+            if target_quat is not None:
+                target_norm = float(np.linalg.norm(target_quat))
+                quat_norms = np.linalg.norm(quaternions, axis=1)
+                if target_norm <= 1e-9 or np.any(quat_norms <= 1e-9):
+                    raise RuntimeError("selected EEF FK quaternion path is invalid")
+                normalized_target = target_quat / target_norm
+                normalized_quats = quaternions / quat_norms[:, None]
+                dots = np.clip(
+                    np.abs(normalized_quats @ normalized_target),
+                    0.0,
+                    1.0,
+                )
+                orientation_errors = 2.0 * np.arccos(dots)
+                max_orientation_error = float(
+                    np.max(orientation_errors, initial=0.0)
+                )
+                start_orientation_error = float(orientation_errors[0])
+                terminal_orientation_error = float(orientation_errors[-1])
+                intentional_orientation_change = (
+                    start_orientation_error
+                    > WHOLE_BODY_EEF_SHORT_MAX_ORIENTATION_ERROR_RAD + 1e-9
+                )
+                if len(normalized_quats) > 1:
+                    adjacent_dots = np.clip(
+                        np.abs(
+                            np.sum(
+                                normalized_quats[:-1] * normalized_quats[1:],
+                                axis=1,
+                            )
+                        ),
+                        0.0,
+                        1.0,
+                    )
+                    orientation_steps = 2.0 * np.arccos(adjacent_dots)
+                    cumulative_orientation_path = float(
+                        np.sum(orientation_steps)
+                    )
+                    max_orientation_step = float(
+                        np.max(orientation_steps, initial=0.0)
+                    )
+                    max_orientation_reverse_progress = float(
+                        np.max(np.diff(orientation_errors), initial=0.0)
+                    )
+            short_target = direct_distance <= (
+                WHOLE_BODY_EEF_SHORT_TARGET_DISTANCE_M + 1e-9
+            )
+            max_excursion_limit = (
+                direct_distance + WHOLE_BODY_EEF_SHORT_CORRIDOR_MARGIN_M
+            )
+            checks = {
+                "start_fk_matches_call_start": (
+                    start_fk_error <= WHOLE_BODY_EEF_START_FK_TOLERANCE_M + 1e-9
+                ),
+                "terminal_reaches_target": (
+                    terminal_error <= WHOLE_BODY_EEF_TERMINAL_TOLERANCE_M + 1e-9
+                ),
+                "all_target_cartesian_step": (
+                    max_cartesian_step
+                    <= WHOLE_BODY_EEF_MAX_CARTESIAN_STEP_M + 1e-9
+                ),
+                "short_target_start_excursion": (
+                    not short_target
+                    or max_excursion
+                    <= max_excursion_limit + 1e-9
+                ),
+                "short_target_segment_lateral": (
+                    not short_target
+                    or max_lateral <= WHOLE_BODY_EEF_SHORT_MAX_LATERAL_M + 1e-9
+                ),
+                "short_target_no_reverse_or_overshoot": (
+                    not short_target
+                    or (
+                        min_along
+                        >= -WHOLE_BODY_EEF_SHORT_CORRIDOR_MARGIN_M - 1e-9
+                        and max_along
+                        <= direct_distance
+                        + WHOLE_BODY_EEF_SHORT_CORRIDOR_MARGIN_M
+                        + 1e-9
+                    )
+                ),
+                "short_target_cartesian_step": (
+                    not short_target
+                    or max_cartesian_step
+                    <= WHOLE_BODY_EEF_SHORT_MAX_CARTESIAN_STEP_M + 1e-9
+                ),
+                "short_target_axis_monotonic": (
+                    not short_target
+                    or direct_distance <= 1e-9
+                    or max_reverse_step
+                    <= WHOLE_BODY_EEF_SHORT_MAX_REVERSE_STEP_M + 1e-9
+                ),
+                "short_target_cumulative_path": (
+                    not short_target
+                    or cumulative_cartesian_path
+                    <= direct_distance
+                    + WHOLE_BODY_EEF_SHORT_MAX_CUMULATIVE_EXCESS_M
+                    + 1e-9
+                ),
+                "short_target_orientation_preserved": (
+                    not short_target
+                    or target_quat is None
+                    or intentional_orientation_change
+                    or max_orientation_error
+                    <= WHOLE_BODY_EEF_SHORT_MAX_ORIENTATION_ERROR_RAD + 1e-9
+                ),
+                "short_target_rotation_terminal": (
+                    not short_target
+                    or target_quat is None
+                    or not intentional_orientation_change
+                    or terminal_orientation_error
+                    <= WHOLE_BODY_EEF_SHORT_MAX_ORIENTATION_ERROR_RAD + 1e-9
+                ),
+                "short_target_rotation_step": (
+                    not short_target
+                    or target_quat is None
+                    or not intentional_orientation_change
+                    or max_orientation_step
+                    <= WHOLE_BODY_EEF_WRIST_MAX_ORIENTATION_STEP_RAD + 1e-9
+                ),
+                "short_target_rotation_monotonic": (
+                    not short_target
+                    or target_quat is None
+                    or not intentional_orientation_change
+                    or max_orientation_reverse_progress
+                    <= WHOLE_BODY_EEF_WRIST_MAX_REVERSE_PROGRESS_RAD + 1e-9
+                ),
+                "short_target_rotation_cumulative_path": (
+                    not short_target
+                    or target_quat is None
+                    or not intentional_orientation_change
+                    or cumulative_orientation_path
+                    <= start_orientation_error
+                    + WHOLE_BODY_EEF_WRIST_MAX_CUMULATIVE_EXCESS_RAD
+                    + 1e-9
+                ),
+            }
+            shared_admission = _eef_pose_path_admission_report(
+                positions,
+                quaternions,
+                call_start_xyz=start,
+                target_xyz=target,
+                target_quat_xyzw=target_quat,
+            )
+            if checks != shared_admission["checks"]:
+                raise RuntimeError(
+                    "planner and runtime EEF admission checks diverged"
+                )
+            checks = dict(shared_admission["checks"])
+            positions_f32 = np.ascontiguousarray(positions, dtype=np.float32)
+            quaternions_f32 = np.ascontiguousarray(quaternions, dtype=np.float32)
+            return {
+                "available": True,
+                "admitted": all(checks.values()),
+                "checks": checks,
+                "waypoint_count": int(len(positions)),
+                "start_fk_error_m": start_fk_error,
+                "start_fk_tolerance_m": WHOLE_BODY_EEF_START_FK_TOLERANCE_M,
+                "terminal_error_m": terminal_error,
+                "terminal_tolerance_m": WHOLE_BODY_EEF_TERMINAL_TOLERANCE_M,
+                "call_start_to_target_distance_m": direct_distance,
+                "short_target": short_target,
+                "short_target_distance_limit_m": (
+                    WHOLE_BODY_EEF_SHORT_TARGET_DISTANCE_M
+                ),
+                "max_start_excursion_m": max_excursion,
+                "max_start_excursion_limit_m": max_excursion_limit,
+                "max_segment_lateral_m": max_lateral,
+                "max_segment_lateral_limit_m": (
+                    WHOLE_BODY_EEF_SHORT_MAX_LATERAL_M
+                ),
+                "min_segment_along_m": min_along,
+                "min_segment_along_limit_m": (
+                    -WHOLE_BODY_EEF_SHORT_CORRIDOR_MARGIN_M
+                ),
+                "max_segment_along_m": max_along,
+                "max_segment_along_limit_m": (
+                    direct_distance + WHOLE_BODY_EEF_SHORT_CORRIDOR_MARGIN_M
+                ),
+                "max_cartesian_step_m": max_cartesian_step,
+                "all_target_cartesian_step_limit_m": (
+                    WHOLE_BODY_EEF_MAX_CARTESIAN_STEP_M
+                ),
+                "max_cartesian_step_limit_m": (
+                    WHOLE_BODY_EEF_SHORT_MAX_CARTESIAN_STEP_M
+                ),
+                "max_reverse_step_m": max_reverse_step,
+                "max_reverse_step_limit_m": (
+                    WHOLE_BODY_EEF_SHORT_MAX_REVERSE_STEP_M
+                ),
+                "cumulative_cartesian_path_m": cumulative_cartesian_path,
+                "cumulative_cartesian_path_limit_m": (
+                    direct_distance
+                    + WHOLE_BODY_EEF_SHORT_MAX_CUMULATIVE_EXCESS_M
+                ),
+                "max_orientation_error_rad": max_orientation_error,
+                "max_orientation_error_limit_rad": (
+                    WHOLE_BODY_EEF_SHORT_MAX_ORIENTATION_ERROR_RAD
+                ),
+                "intentional_orientation_change": (
+                    intentional_orientation_change
+                ),
+                "start_orientation_error_rad": start_orientation_error,
+                "terminal_orientation_error_rad": terminal_orientation_error,
+                "max_orientation_step_rad": max_orientation_step,
+                "max_orientation_step_limit_rad": (
+                    WHOLE_BODY_EEF_WRIST_MAX_ORIENTATION_STEP_RAD
+                ),
+                "max_orientation_reverse_progress_rad": (
+                    max_orientation_reverse_progress
+                ),
+                "max_orientation_reverse_progress_limit_rad": (
+                    WHOLE_BODY_EEF_WRIST_MAX_REVERSE_PROGRESS_RAD
+                ),
+                "cumulative_orientation_path_rad": cumulative_orientation_path,
+                "cumulative_orientation_path_limit_rad": (
+                    start_orientation_error
+                    + WHOLE_BODY_EEF_WRIST_MAX_CUMULATIVE_EXCESS_RAD
+                ),
+                "nominal_max_target_error_m": float(
+                    np.max(target_errors, initial=0.0)
+                ),
+                "positions_sha256": hashlib.sha256(
+                    positions_f32.tobytes()
+                ).hexdigest(),
+                "quaternions_sha256": hashlib.sha256(
+                    quaternions_f32.tobytes()
+                ).hexdigest(),
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "admitted": False,
+                "checks": {},
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+
     def _select_guarded_candidate_path(
         self,
         generator: Any,
@@ -3919,7 +6833,7 @@ class RealCuroboBackend:
                     }
                 )
                 if attempt.get("ok"):
-                    best = candidate["xyyaw"]
+                    best = _canonical_base_xyyaw(candidate["xyyaw"])
                     best_candidate = candidate
                     base_plan = attempt
                     break
@@ -4131,6 +7045,14 @@ class RealCuroboBackend:
         )[1:].astype(np.float32)
         if q_path.ndim != 2 or len(q_path) < 1 or not np.isfinite(q_path).all():
             raise RuntimeError("navigation q trajectory is unavailable")
+        base_goal = np.asarray(
+            [
+                q_path[-1, base_indices[0]],
+                q_path[-1, base_indices[1]],
+                _wrap_angle(float(q_path[-1, base_indices[5]])),
+            ],
+            dtype=np.float64,
+        )
         try:
             (
                 q_path,
@@ -4139,6 +7061,7 @@ class RealCuroboBackend:
             ) = self._certify_base_trajectory(
                 q_path,
                 start_q=start_q,
+                base_goal_xyyaw=base_goal,
                 skip_obstacle_update=False,
             )
         except _WholeBodyCertificationError as exc:
@@ -4153,14 +7076,6 @@ class RealCuroboBackend:
                     "elapsed_s": round(time.monotonic() - started, 3),
                 },
             }
-        base_goal = np.asarray(
-            [
-                q_path[-1, base_indices[0]],
-                q_path[-1, base_indices[1]],
-                _wrap_angle(float(q_path[-1, base_indices[5]])),
-            ],
-            dtype=np.float64,
-        )
         metrics = {
             **collision_metrics,
             "candidate_count": len(candidates),
@@ -4203,6 +7118,7 @@ class RealCuroboBackend:
         joint_trajectory: Any,
         *,
         start_q: Any,
+        base_goal_xyyaw: Any,
         skip_obstacle_update: bool,
     ) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
         """Independently certify a full-q BASE path before any env action.
@@ -4217,6 +7133,7 @@ class RealCuroboBackend:
         generator = self._generator(kind="base")
         q_start = np.asarray(_jsonable(start_q), dtype=np.float32).reshape(-1)
         q_path = np.asarray(_jsonable(joint_trajectory), dtype=np.float32)
+        base_goal = _canonical_base_xyyaw(base_goal_xyyaw)
         if (
             q_start.size < 1
             or q_path.ndim != 2
@@ -4224,6 +7141,8 @@ class RealCuroboBackend:
             or len(q_path) < 1
             or not np.isfinite(q_start).all()
             or not np.isfinite(q_path).all()
+            or base_goal.shape != (3,)
+            or not np.isfinite(base_goal).all()
         ):
             raise RuntimeError("BASE trajectory certification received invalid q")
         base_idx = _indices(getattr(robot, "base_idx", []))
@@ -4238,6 +7157,27 @@ class RealCuroboBackend:
             rtol=0.0,
         ):
             raise RuntimeError("BASE trajectory changed a locked non-base joint")
+        terminal_base = np.asarray(
+            [
+                q_path[-1, base_idx[0]],
+                q_path[-1, base_idx[1]],
+                q_path[-1, base_idx[5]],
+            ],
+            dtype=np.float64,
+        )
+        if (
+            not np.allclose(
+                terminal_base[:2],
+                base_goal[:2],
+                atol=1e-6,
+                rtol=0.0,
+            )
+            or abs(_wrap_angle(float(terminal_base[2] - base_goal[2])))
+            > 1e-6
+        ):
+            raise RuntimeError(
+                "BASE trajectory terminal q does not match its canonical goal"
+            )
 
         with_start = (
             q_path
@@ -4295,6 +7235,15 @@ class RealCuroboBackend:
             "post_interpolation_check": True,
             "attachment_hand_count": 2,
             "colliding_waypoint_count": colliding,
+            "base_goal_xyyaw_sha256": _whole_body_target_sha256(base_goal),
+            "terminal_q_sha256": hashlib.sha256(
+                np.ascontiguousarray(q_path[-1], dtype=np.float32).tobytes()
+            ).hexdigest(),
+            "terminal_command_limit": TERMINAL_COMMAND_LIMIT,
+            "terminal_position_tolerance_m": BASE_TERMINAL_POSITION_TOLERANCE_M,
+            "terminal_orientation_tolerance_rad": (
+                BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD
+            ),
         }
         metrics = {
             "collision_admission": {
@@ -4315,6 +7264,15 @@ class RealCuroboBackend:
                 for side in ("left", "right")
             },
         }
+        obstacle_refresh = RealCuroboBackend._obstacle_refresh_metrics(generator)
+        if obstacle_refresh is not None:
+            metrics["obstacle_refresh"] = obstacle_refresh
+            metrics["world_refresh_count"] = (
+                0 if bool(skip_obstacle_update) else 1
+            )
+            metrics["world_refresh_s"] = float(
+                obstacle_refresh.get("elapsed_s", 0.0)
+            )
         if colliding:
             raise _WholeBodyCertificationError(
                 f"BASE dense trajectory contains {colliding} colliding waypoints"
@@ -4326,6 +7284,12 @@ class RealCuroboBackend:
         *,
         relative_motion: Any,
         timeout_s: float,
+        start_q: Any | None = None,
+        start_base_xyyaw: Any | None = None,
+        background: bool = False,
+        base_attempt_timeout_cap_s: float | None = None,
+        base_solver_timeout_cap_s: float | None = None,
+        base_planning_profile: str | None = None,
     ) -> dict[str, Any]:
         """Plan one exact straight translation or in-place BASE rotation."""
 
@@ -4347,7 +7311,14 @@ class RealCuroboBackend:
                 "metrics": {"elapsed_s": round(time.monotonic() - started, 3)},
             }
 
-        current = self._base_xy_yaw(robot)
+        current = np.asarray(
+            self._base_xy_yaw(robot)
+            if start_base_xyyaw is None
+            else _jsonable(start_base_xyyaw),
+            dtype=np.float64,
+        ).reshape(-1)
+        if current.shape not in {(3,), (4,)} or not np.isfinite(current).all():
+            raise ValueError("relative navigation start BASE pose is invalid")
         floor = self._current_floor(scene, current)
         if floor < 0 or floor >= len(floor_maps):
             return {
@@ -4356,14 +7327,17 @@ class RealCuroboBackend:
                 "metrics": {"elapsed_s": round(time.monotonic() - started, 3)},
             }
         try:
-            import torch
-
             source_map = floor_maps[floor]
-            source_tensor = (
-                torch.clone(source_map)
-                if torch.is_tensor(source_map)
-                else torch.as_tensor(np.asarray(_jsonable(source_map))).clone()
-            )
+            try:
+                import torch
+            except ImportError:
+                source_tensor = np.asarray(_jsonable(source_map)).copy()
+            else:
+                source_tensor = (
+                    torch.clone(source_map)
+                    if torch.is_tensor(source_map)
+                    else torch.as_tensor(np.asarray(_jsonable(source_map))).clone()
+                )
             eroded_map = np.asarray(
                 _jsonable(erode(source_tensor, robot=robot)),
                 dtype=np.float64,
@@ -4388,21 +7362,26 @@ class RealCuroboBackend:
                 "metrics": {"elapsed_s": round(time.monotonic() - started, 3)},
             }
 
-        start_q = np.asarray(
-            _jsonable(robot.get_joint_positions()), dtype=np.float64
+        start_q_array = np.asarray(
+            _jsonable(
+                robot.get_joint_positions()
+                if start_q is None
+                else start_q
+            ),
+            dtype=np.float64,
         ).reshape(-1)
         base_indices = _indices(getattr(robot, "base_idx", []))
         if (
-            start_q.size < 1
-            or not np.isfinite(start_q).all()
+            start_q_array.size < 1
+            or not np.isfinite(start_q_array).all()
             or len(base_indices) != 6
         ):
             raise RuntimeError("R1Pro base joint feedback is unavailable")
         q_pose = np.asarray(
             [
-                start_q[base_indices[0]],
-                start_q[base_indices[1]],
-                start_q[base_indices[5]],
+                start_q_array[base_indices[0]],
+                start_q_array[base_indices[1]],
+                start_q_array[base_indices[5]],
             ],
             dtype=np.float64,
         )
@@ -4456,6 +7435,7 @@ class RealCuroboBackend:
                 }
             checked_cells = [(int(start_cell[0]), int(start_cell[1]))]
 
+        base_goal = _canonical_base_xyyaw(base_goal)
         if any(
             row < 0
             or column < 0
@@ -4483,11 +7463,26 @@ class RealCuroboBackend:
                     "elapsed_s": round(time.monotonic() - started, 3),
                 },
             }
-        exact_plan = self._compute_base_plan(
-            target_xyyaw=np.asarray(base_goal, dtype=np.float64),
-            timeout_s=remaining_s,
-            skip_obstacle_update=False,
-        )
+        base_plan_kwargs: dict[str, Any] = {
+            "target_xyyaw": base_goal,
+            "timeout_s": remaining_s,
+            "skip_obstacle_update": False,
+            "start_q": start_q_array,
+            "background": background,
+        }
+        if base_attempt_timeout_cap_s is not None:
+            base_plan_kwargs["attempt_timeout_cap_s"] = float(
+                base_attempt_timeout_cap_s
+            )
+        if base_solver_timeout_cap_s is not None:
+            base_plan_kwargs["solver_timeout_cap_s"] = float(
+                base_solver_timeout_cap_s
+            )
+        if base_planning_profile is not None:
+            base_plan_kwargs["planning_profile"] = str(
+                base_planning_profile
+            )
+        exact_plan = self._compute_base_plan(**base_plan_kwargs)
         if exact_plan.get("ok") is not True:
             return {
                 "ok": False,
@@ -4507,19 +7502,22 @@ class RealCuroboBackend:
         )
         if (
             q_path.ndim != 2
-            or q_path.shape[1] != start_q.size
+            or q_path.shape[1] != start_q_array.size
             or len(q_path) < 1
             or not np.isfinite(q_path).all()
         ):
             raise RuntimeError("exact relative BASE planner returned invalid q")
         exact_metrics = dict(exact_plan.get("metrics") or {})
+        base_solver_deadline = dict(
+            exact_metrics.get("deadline_enforcement") or {}
+        )
         metrics = {
             **exact_metrics,
             "relative_motion": dict(motion),
             "base_goal": [
                 float(base_goal[0]),
                 float(base_goal[1]),
-                _wrap_angle(float(base_goal[2])),
+                float(base_goal[2]),
             ],
             "navigation_path": {
                 "source": "official_robot_eroded_traversability",
@@ -4529,6 +7527,12 @@ class RealCuroboBackend:
                 "execution_waypoint_count": int(len(q_path)),
             },
             "elapsed_s": round(time.monotonic() - started, 3),
+            "base_solver_deadline_enforcement": base_solver_deadline,
+            "deadline_enforcement": {
+                "solver_timeout_enforced": True,
+                "hard_wall_clock_enforced": not bool(background),
+                "soft_deadline_s": timeout if background else None,
+            },
         }
         self._record_base_phase(
             {
@@ -4540,7 +7544,7 @@ class RealCuroboBackend:
             "ok": True,
             "joint_trajectory": q_path.astype(np.float32),
             "base_goal": np.asarray(
-                [base_goal[0], base_goal[1], _wrap_angle(float(base_goal[2]))],
+                [base_goal[0], base_goal[1], base_goal[2]],
                 dtype=np.float64,
             ),
             "expected_attachments_by_hand": exact_plan.get(
@@ -4838,15 +7842,36 @@ class RealCuroboBackend:
         target_xyyaw: np.ndarray,
         timeout_s: float,
         skip_obstacle_update: bool = False,
+        start_q: Any | None = None,
+        background: bool = False,
+        attempt_timeout_cap_s: float = BASE_PLAN_ATTEMPT_TIMEOUT_S,
+        solver_timeout_cap_s: float | None = None,
+        planning_profile: str = "default",
+        wall_clock_timeout_s: float | None = None,
     ) -> dict[str, Any]:
+        target_xyyaw = _canonical_base_xyyaw(target_xyyaw)
+        analytic_dashboard_fast = (
+            planning_profile == DASHBOARD_PREPARED_BASE_PLANNING_PROFILE
+        )
         generator = self._generator(kind="base")
+        prior_obstacle_refresh = (
+            RealCuroboBackend._obstacle_refresh_metrics(generator) or {}
+        )
+        prior_obstacle_refresh_count = int(
+            prior_obstacle_refresh.get("count", 0)
+        )
         emb_sel = self._embodiment_cls.BASE
         torch = self._torch
         if torch is None:
             import torch as torch  # type: ignore[no-redef]
         robot = self._find_robot()
         current_q = np.asarray(
-            _jsonable(robot.get_joint_positions()), dtype=np.float32
+            _jsonable(
+                robot.get_joint_positions()
+                if start_q is None
+                else start_q
+            ),
+            dtype=np.float32,
         ).reshape(1, -1)
         pos, quat = self._base_target_world_pose(robot, target_xyyaw)
         batch_size = max(int(generator.batch_size), 1)
@@ -4866,61 +7891,183 @@ class RealCuroboBackend:
                 1,
             )
         )
-        hard_attempt_timeout_s = min(float(timeout_s), BASE_PLAN_ATTEMPT_TIMEOUT_S)
-        attempt_timeout_s = max(0.1, hard_attempt_timeout_s - 2.0)
-        with _wall_clock_deadline(hard_attempt_timeout_s, "BASE cuRobo candidate"):
-            successes, paths = generator.compute_trajectories(
-                planner_targets,
-                planner_quats,
-                max_attempts=5,
-                timeout=attempt_timeout_s,
-                ik_fail_return=5,
-                enable_finetune_trajopt=False,
-                finetune_attempts=0,
-                return_full_result=False,
-                success_ratio=1.0 / batch_size,
-                ik_only=True,
-                skip_obstacle_update=bool(skip_obstacle_update),
-                ik_world_collision_check=True,
-                emb_sel=emb_sel,
+        attempt_timeout_cap = float(attempt_timeout_cap_s)
+        if not math.isfinite(attempt_timeout_cap) or attempt_timeout_cap <= 0.0:
+            raise ValueError(
+                "BASE attempt timeout cap must be finite and positive"
             )
+        attempt_timeout_budget_s = min(float(timeout_s), attempt_timeout_cap)
+        if solver_timeout_cap_s is None:
+            solver_timeout_cap = max(
+                0.1,
+                BASE_PLAN_ATTEMPT_TIMEOUT_S - 2.0,
+            )
+            attempt_timeout_s = max(0.1, attempt_timeout_budget_s - 2.0)
+        else:
+            solver_timeout_cap = float(solver_timeout_cap_s)
+            if (
+                not math.isfinite(solver_timeout_cap)
+                or solver_timeout_cap <= 0.0
+            ):
+                raise ValueError(
+                    "BASE solver timeout cap must be finite and positive"
+                )
+            attempt_timeout_s = min(
+                attempt_timeout_budget_s,
+                solver_timeout_cap,
+            )
+        wall_clock_timeout = (
+            attempt_timeout_budget_s
+            if wall_clock_timeout_s is None
+            else float(wall_clock_timeout_s)
+        )
+        if (
+            not math.isfinite(wall_clock_timeout)
+            or wall_clock_timeout <= 0.0
+            or wall_clock_timeout + 1e-12 < attempt_timeout_s
+        ):
+            raise ValueError(
+                "BASE wall-clock timeout must be finite, positive, and "
+                "at least the solver timeout"
+            )
+        deadline_scope = (
+            nullcontext()
+            if background
+            else _wall_clock_deadline(
+                wall_clock_timeout,
+                "BASE cuRobo candidate",
+            )
+        )
+        with deadline_scope:
+            if analytic_dashboard_fast:
+                successes, paths = np.zeros((0,), dtype=bool), []
+            else:
+                successes, paths = generator.compute_trajectories(
+                    planner_targets,
+                    planner_quats,
+                    initial_joint_pos=torch.as_tensor(
+                        current_q[0], dtype=torch.float32
+                    ),
+                    max_attempts=5,
+                    timeout=attempt_timeout_s,
+                    ik_fail_return=5,
+                    enable_finetune_trajopt=False,
+                    finetune_attempts=0,
+                    return_full_result=False,
+                    success_ratio=1.0 / batch_size,
+                    ik_only=True,
+                    skip_obstacle_update=bool(skip_obstacle_update),
+                    ik_world_collision_check=True,
+                    emb_sel=emb_sel,
+                )
         success_array = np.asarray(_jsonable(successes), dtype=bool).reshape(-1)
         success_indices = np.flatnonzero(success_array)
         metrics = {
             "successes": success_array.tolist(),
-            "ik_only": True,
+            "ik_only": not analytic_dashboard_fast,
+            "solver_invoked": not analytic_dashboard_fast,
             "curobo_config": str(self._base_config_path()),
-            "curobo_api": "CuRoboMotionGenerator.compute_trajectories",
+            "curobo_api": (
+                "CuRoboMotionGenerator.check_collisions"
+                if analytic_dashboard_fast
+                else "CuRoboMotionGenerator.compute_trajectories"
+            ),
             "success_ratio": 1.0 / batch_size,
-            "planner_seed_count": batch_size,
-            "max_attempts": 5,
-            "ik_fail_return": 5,
+            "planner_seed_count": 0 if analytic_dashboard_fast else batch_size,
+            "max_attempts": 0 if analytic_dashboard_fast else 5,
+            "ik_fail_return": 0 if analytic_dashboard_fast else 5,
             "attempt_timeout_s": attempt_timeout_s,
-            "hard_attempt_timeout_s": hard_attempt_timeout_s,
+            "solver_timeout_s": attempt_timeout_s,
+            "attempt_timeout_budget_s": attempt_timeout_budget_s,
+            "attempt_timeout_cap_s": attempt_timeout_cap,
+            "solver_timeout_cap_s": solver_timeout_cap,
+            "planning_profile": str(planning_profile),
             "base_prismatic_workspace_limit_m": self._base_workspace_limit_m,
             "base_prismatic_workspace_limit_source": "scene_envelope_plus_2m",
             "collision_admission_enabled": True,
             "obstacle_update": not bool(skip_obstacle_update),
+            "deadline_enforcement": {
+                "solver_timeout_enforced": True,
+                "hard_wall_clock_enforced": not bool(background),
+                "hard_wall_clock_deadline_s": (
+                    wall_clock_timeout if not background else None
+                ),
+                "soft_deadline_s": (
+                    wall_clock_timeout if background else None
+                ),
+            },
         }
-        if success_indices.size == 0:
-            return {"ok": False, "stop_reason": "base_plan_failed", "metrics": metrics}
-        path = paths[int(success_indices[0])]
-        q_goal, merge_report = self._merge_base_ik_solution_into_full_q(
-            generator,
-            robot,
-            path,
-            call_start_q=current_q[0],
-        )
-        metrics["base_ik_solution_merge"] = merge_report
+        obstacle_refresh = RealCuroboBackend._obstacle_refresh_metrics(generator)
+        if obstacle_refresh is not None:
+            metrics["obstacle_refresh"] = obstacle_refresh
+            metrics["world_refresh_count"] = max(
+                0,
+                int(obstacle_refresh.get("count", 0))
+                - prior_obstacle_refresh_count,
+            )
+            metrics["world_refresh_s"] = float(
+                obstacle_refresh.get("elapsed_s", 0.0)
+            )
+        base_indices = _indices(getattr(robot, "base_idx", []))
+        if len(base_indices) != 6:
+            raise RuntimeError("R1Pro six-axis virtual base indices are unavailable")
+        if analytic_dashboard_fast:
+            q_goal = current_q.copy()
+            q_goal[0, base_indices[0]] = float(target_xyyaw[0])
+            q_goal[0, base_indices[1]] = float(target_xyyaw[1])
+            q_goal[0, base_indices[5]] = float(current_q[0, base_indices[5]]) + (
+                _wrap_angle(
+                    float(target_xyyaw[2])
+                    - float(current_q[0, base_indices[5]])
+                )
+            )
+            metrics["base_goal_construction"] = {
+                "method": "analytic_full_q_base_assignment",
+                "active_base_indices": [
+                    int(base_indices[0]),
+                    int(base_indices[1]),
+                    int(base_indices[5]),
+                ],
+                "nonbase_locked_to_call_start": True,
+                "continuous_shortest_yaw_arc": True,
+            }
+        else:
+            if success_indices.size == 0:
+                return {
+                    "ok": False,
+                    "stop_reason": "base_plan_failed",
+                    "metrics": metrics,
+                }
+            path = paths[int(success_indices[0])]
+            q_goal, merge_report = self._merge_base_ik_solution_into_full_q(
+                generator,
+                robot,
+                path,
+                call_start_q=current_q[0],
+            )
+            metrics["base_ik_solution_merge"] = merge_report
         if q_goal.ndim != 2 or q_goal.shape[1] != current_q.shape[1]:
             raise RuntimeError(
                 "BASE IK goal does not match the live robot joint layout: "
                 f"goal={q_goal.shape} current={current_q.shape}"
             )
-        execution_q_traj = _interpolate_joint_trajectory(
-            np.vstack([current_q, q_goal[-1:]]),
-            max_inter_dist=0.01,
-        )[1:]
+        execution_with_start, resampling_metrics = (
+            _minimum_jerk_base_execution_trajectory(
+                np.vstack([current_q, q_goal[-1:]]),
+                base_indices=base_indices,
+                max_xy_step_m=(
+                    DASHBOARD_BASE_EXECUTION_XY_STEP_M
+                    if analytic_dashboard_fast
+                    else BASE_EXECUTION_XY_STEP_M
+                ),
+                max_yaw_step_rad=(
+                    DASHBOARD_BASE_EXECUTION_YAW_STEP_RAD
+                    if analytic_dashboard_fast
+                    else BASE_EXECUTION_YAW_STEP_RAD
+                ),
+            )
+        )
+        execution_q_traj = execution_with_start[1:]
         try:
             (
                 execution_q_traj,
@@ -4929,9 +8076,14 @@ class RealCuroboBackend:
             ) = self._certify_base_trajectory(
                 execution_q_traj,
                 start_q=current_q[0],
+                base_goal_xyyaw=target_xyyaw,
                 # compute_trajectories above already refreshed the world when
                 # this call owns obstacle admission.
-                skip_obstacle_update=True,
+                skip_obstacle_update=(
+                    bool(skip_obstacle_update)
+                    if analytic_dashboard_fast
+                    else True
+                ),
             )
         except _WholeBodyCertificationError as exc:
             return {
@@ -4949,18 +8101,33 @@ class RealCuroboBackend:
                 "trajectory_waypoints": int(len(execution_q_traj)),
                 "execution_waypoints": int(len(execution_q_traj)),
                 "execution_resampling": {
-                    "source": "base_ik_linear_joint_interpolation",
-                    "execution_max_joint_step": 0.01,
+                    **resampling_metrics,
+                    "source": (
+                        "analytic_full_q_minimum_jerk_execution_resampling"
+                        if analytic_dashboard_fast
+                        else "base_ik_minimum_jerk_execution_resampling"
+                    ),
                     "controller": "official_position_holonomic_base",
                     "planner_base_isaac_kp": 2_000_000.0,
                     "planner_base_isaac_kd": 100_000.0,
                 },
             }
         )
+        obstacle_refresh = RealCuroboBackend._obstacle_refresh_metrics(generator)
+        if obstacle_refresh is not None:
+            metrics["obstacle_refresh"] = obstacle_refresh
+            metrics["world_refresh_count"] = max(
+                0,
+                int(obstacle_refresh.get("count", 0))
+                - prior_obstacle_refresh_count,
+            )
+            metrics["world_refresh_s"] = float(
+                obstacle_refresh.get("elapsed_s", 0.0)
+            )
         return {
             "ok": True,
             "joint_trajectory": execution_q_traj,
-            "base_goal": np.asarray(target_xyyaw, dtype=np.float64).reshape(3),
+            "base_goal": target_xyyaw.copy(),
             "expected_attachments_by_hand": expected_attachments_by_hand,
             "metrics": metrics,
         }
@@ -5084,8 +8251,12 @@ class RealCuroboBackend:
                 "reached": False,
             }
         diff = target - current
+        tracking_diff = diff.copy()
+        tracking_diff[base_idx[2]] = _wrap_angle(
+            float(tracking_diff[base_idx[2]])
+        )
         base_xy_error = float(np.max(np.abs(diff[base_idx[:2]])))
-        base_yaw_error = abs(_wrap_angle(float(diff[base_idx[2]])))
+        base_yaw_error = abs(float(tracking_diff[base_idx[2]]))
         articulation_error = float(np.max(np.abs(diff[sorted(set(articulation_idx))])))
         if hand is None:
             normalized_components = np.concatenate(
@@ -5094,7 +8265,7 @@ class RealCuroboBackend:
                     / WHOLE_BODY_BASE_XY_WAYPOINT_TOLERANCE_M,
                     np.asarray(
                         [
-                            _wrap_angle(float(diff[base_idx[2]]))
+                            float(tracking_diff[base_idx[2]])
                             / WHOLE_BODY_BASE_YAW_WAYPOINT_TOLERANCE_RAD
                         ],
                         dtype=np.float64,
@@ -5138,7 +8309,11 @@ class RealCuroboBackend:
                 else None
             ),
             "active_joint_l2_error": float(
-                np.linalg.norm(diff[active_idx if hand is None else articulation_idx])
+                np.linalg.norm(
+                    tracking_diff[
+                        active_idx if hand is None else articulation_idx
+                    ]
+                )
             ),
         }
 
@@ -6462,18 +9637,38 @@ class RealCuroboBackend:
             velocity_limits = np.asarray(
                 _jsonable(robot.control_limits["velocity"][1]), dtype=np.float64
             ).reshape(-1)
-            controlled = _indices(getattr(robot, "base_control_idx", []))
-            controlled.extend(_indices(getattr(robot, "trunk_control_idx", [])))
+            base_controlled = _indices(getattr(robot, "base_control_idx", []))
+            trunk_controlled = _indices(getattr(robot, "trunk_control_idx", []))
             arm_control_idx = getattr(robot, "arm_control_idx", {}) or {}
-            for side in ("left", "right"):
-                controlled.extend(_indices(arm_control_idx.get(side, [])))
-            controlled = sorted(set(controlled))
-            if not controlled or velocity.shape != velocity_limits.shape:
+            left_arm_controlled = _indices(arm_control_idx.get("left", []))
+            right_arm_controlled = _indices(arm_control_idx.get("right", []))
+            source_groups = (
+                base_controlled,
+                trunk_controlled,
+                left_arm_controlled,
+                right_arm_controlled,
+            )
+            controlled_unsorted = [
+                index for group in source_groups for index in group
+            ]
+            if (
+                velocity.shape != velocity_limits.shape
+                or [len(group) for group in source_groups] != [3, 4, 7, 7]
+                or len(controlled_unsorted) != 21
+                or len(set(controlled_unsorted)) != 21
+                or min(controlled_unsorted, default=-1) < 0
+                or max(controlled_unsorted, default=-1) >= velocity.size
+            ):
                 raise RuntimeError("controlled velocity limits unavailable")
+            controlled = sorted(controlled_unsorted)
             actual = np.abs(velocity[controlled])
             limits = np.abs(velocity_limits[controlled])
-            if not np.isfinite(actual).all() or not np.isfinite(limits).all():
-                raise RuntimeError("non-finite actual velocity or limit")
+            if (
+                not np.isfinite(actual).all()
+                or not np.isfinite(limits).all()
+                or bool(np.any(limits <= 0.0))
+            ):
+                raise RuntimeError("invalid actual velocity or control limit")
             velocity_ratio = float(np.max(actual / np.maximum(limits, 1e-9)))
             velocity_peak_index = int(np.argmax(actual))
             dof_names = list(getattr(robot, "dof_names_ordered", []))
@@ -6481,6 +9676,64 @@ class RealCuroboBackend:
                 str(dof_names[idx]) if idx < len(dof_names) else f"dof_{idx}"
                 for idx in controlled
             ]
+            expected_controlled_names = set(WHOLE_BODY_ACTIVE_JOINT_NAMES)
+            if (
+                len(controlled_names) != len(expected_controlled_names)
+                or set(controlled_names) != expected_controlled_names
+            ):
+                raise RuntimeError(
+                    "R1Pro dynamics grouping requires the exact 21 controlled "
+                    "base, trunk, and arm joints"
+                )
+            controlled_name_to_offset = {
+                name: index for index, name in enumerate(controlled_names)
+            }
+
+            def velocity_group(
+                *,
+                names: tuple[str, ...],
+                unit: str,
+            ) -> dict[str, Any]:
+                offsets = np.asarray(
+                    [controlled_name_to_offset[name] for name in names],
+                    dtype=np.int64,
+                )
+                group_actual = actual[offsets]
+                group_limits = limits[offsets]
+                peak_index = int(np.argmax(group_actual))
+                group_ratio = float(
+                    np.max(group_actual / np.maximum(group_limits, 1e-9))
+                )
+                return {
+                    "available": True,
+                    "unit": unit,
+                    "dof_count": int(len(names)),
+                    "joint_names": list(names),
+                    "dof_indices": [
+                        int(controlled[controlled_name_to_offset[name]])
+                        for name in names
+                    ],
+                    "max_actual_velocity": float(group_actual[peak_index]),
+                    "max_actual_velocity_joint": names[peak_index],
+                    "max_velocity_limit": float(np.max(group_limits)),
+                    "max_velocity_ratio": group_ratio,
+                    "within_control_limit": bool(group_ratio <= 1.0 + 1e-3),
+                }
+
+            velocity_groups = {
+                "base_translation": velocity_group(
+                    names=DYNAMICS_VELOCITY_GROUP_JOINTS["base_translation"],
+                    unit=DYNAMICS_VELOCITY_GROUP_UNITS["base_translation"],
+                ),
+                "base_yaw": velocity_group(
+                    names=DYNAMICS_VELOCITY_GROUP_JOINTS["base_yaw"],
+                    unit=DYNAMICS_VELOCITY_GROUP_UNITS["base_yaw"],
+                ),
+                "articulation": velocity_group(
+                    names=DYNAMICS_VELOCITY_GROUP_JOINTS["articulation"],
+                    unit=DYNAMICS_VELOCITY_GROUP_UNITS["articulation"],
+                ),
+            }
             step = int(getattr(self.env_facade, "_env_steps", -1))
             acceleration_max = None
             acceleration_peak_joint = None
@@ -6507,7 +9760,10 @@ class RealCuroboBackend:
             return {
                 "available": True,
                 "ok": bool(
-                    velocity_ratio <= 1.0 + 1e-3
+                    all(
+                        group.get("within_control_limit") is True
+                        for group in velocity_groups.values()
+                    )
                     and (acceleration_ratio is None or acceleration_ratio <= 1.0 + 1e-3)
                 ),
                 "max_actual_velocity": float(np.max(actual)),
@@ -6518,8 +9774,17 @@ class RealCuroboBackend:
                 "max_actual_acceleration_joint": acceleration_peak_joint,
                 "max_acceleration_limit": acceleration_limit,
                 "max_acceleration_ratio": acceleration_ratio,
+                "acceleration_available": acceleration_ratio is not None,
                 "sample_dt_s": sample_dt_s,
-                "source": "robot.get_joint_velocities+control_limits+curobo_cspace",
+                "velocity_groups": velocity_groups,
+                "group_policy": "r1pro_controlled_joint_velocity_groups_v1",
+                "control_limit_ratio_tolerance": 1e-3,
+                "mixed_unit_top_level_fields_are_diagnostics_only": True,
+                "nominal_sample_rate_hz": DYNAMICS_NOMINAL_SAMPLE_RATE_HZ,
+                "source": (
+                    "robot.get_joint_velocities+control_limits+"
+                    "curobo_cspace_grouped"
+                ),
             }
         except Exception as exc:
             return {
@@ -6674,6 +9939,8 @@ class RealCuroboBackend:
             "target_finger_contact_slots": sorted(
                 finger_slots[path] for path in target_finger_paths
             ),
+            "target_finger_paths": sorted(target_finger_paths),
+            "target_root": target_root or None,
             "target_two_finger_contact": target_two_finger_contact,
             "assisted_grasp_raycast_available": raycast_available,
             "assisted_grasp_raycast_target_match": raycast_target_match,
@@ -6793,6 +10060,7 @@ class RealCuroboBackend:
         *,
         baseline: dict[str, Any],
         expected_attachments_by_hand: dict[str, Any],
+        allowed_expected_contact: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Reject any contact pair not present at trajectory start."""
 
@@ -6825,7 +10093,40 @@ class RealCuroboBackend:
                 if self._is_r1pro_wheel_floor_support_pair(pair)
             }
             monitored_current_pairs = current_pairs - support_pairs
-            unexpected = sorted(monitored_current_pairs - baseline_pairs)
+            new_pairs = monitored_current_pairs - baseline_pairs
+            allowed_expected_pairs: set[tuple[str, str]] = set()
+            if (
+                isinstance(allowed_expected_contact, dict)
+                and allowed_expected_contact.get("expected_contact") is True
+            ):
+                target_root = str(
+                    allowed_expected_contact.get("target_root") or ""
+                ).rstrip("/")
+                finger_paths = {
+                    str(path).rstrip("/")
+                    for path in allowed_expected_contact.get(
+                        "target_finger_paths", ()
+                    )
+                    if str(path).rstrip("/")
+                }
+                if target_root and finger_paths:
+                    for pair in new_pairs:
+                        finger_path = next(
+                            (path for path in pair if path in finger_paths),
+                            None,
+                        )
+                        target_path = next(
+                            (
+                                path
+                                for path in pair
+                                if path == target_root
+                                or path.startswith(f"{target_root}/")
+                            ),
+                            None,
+                        )
+                        if finger_path is not None and target_path is not None:
+                            allowed_expected_pairs.add(pair)
+            unexpected = sorted(new_pairs - allowed_expected_pairs)
             continuous_pairs = baseline_pairs & monitored_current_pairs
             baseline["continuous_pairs"] = [
                 list(pair) for pair in sorted(continuous_pairs)
@@ -6834,6 +10135,9 @@ class RealCuroboBackend:
                 "available": True,
                 "unexpected_contact": bool(unexpected),
                 "unexpected_pairs": [list(pair) for pair in unexpected],
+                "allowed_expected_contact_pairs": [
+                    list(pair) for pair in sorted(allowed_expected_pairs)
+                ],
                 "current_pairs": [list(pair) for pair in sorted(current_pairs)],
                 "monitored_current_pairs": [
                     list(pair) for pair in sorted(monitored_current_pairs)
@@ -6964,6 +10268,20 @@ def _verify_env_action_segments() -> None:
 
 def _wrap_angle(angle: float) -> float:
     return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _canonical_base_xyyaw(value: Any) -> np.ndarray:
+    """Return one finite BASE pose with yaw canonicalized to [-pi, pi)."""
+
+    base_xyyaw = np.asarray(_jsonable(value), dtype=np.float64).reshape(-1)
+    if base_xyyaw.shape != (3,) or not np.isfinite(base_xyyaw).all():
+        raise ValueError("BASE xyyaw must contain three finite values")
+    canonical = base_xyyaw.copy()
+    yaw = float(canonical[2])
+    canonical[2] = (
+        _wrap_angle(yaw) if yaw < -math.pi or yaw >= math.pi else yaw
+    )
+    return canonical
 
 
 def _supercover_grid_cells(
@@ -7138,6 +10456,8 @@ class PlannerExecutor:
         self._isolation_context_counter = 0
         self._active_isolation_report: dict[str, Any] | None = None
         self._last_guarded_retreat_paths: dict[str, np.ndarray] = {}
+        self._prepared_motion_lock = threading.RLock()
+        self._prepared_motions: dict[str, dict[str, Any]] = {}
 
     def on_runtime_state_changed(self) -> None:
         """Reset executor-local state after a controller or q-state change."""
@@ -7145,6 +10465,11 @@ class PlannerExecutor:
         self.last_info = None
         self._active_isolation_report = None
         self._last_guarded_retreat_paths.clear()
+        with self._prepared_motion_lock:
+            for entry in self._prepared_motions.values():
+                if entry.get("status") in {"prepared", "executing"}:
+                    entry["status"] = "invalidated"
+                    entry["invalidated_reason"] = "runtime_state_changed"
         changed = getattr(self.backend, "on_runtime_state_changed", None)
         if callable(changed):
             changed()
@@ -7208,11 +10533,17 @@ class PlannerExecutor:
         aggregate: dict[str, Any] | None,
         report: dict[str, Any],
     ) -> dict[str, Any]:
-        """Retain the latest checks and maximum privacy-safe drift metrics."""
+        """Retain latest checks plus truthful all-step isolation evidence."""
 
         merged = dict(report)
+        report_checks = dict(report.get("checks") or {})
+        report_failed_checks = {
+            str(name) for name, passed in report_checks.items() if passed is not True
+        }
         if not isinstance(aggregate, dict):
             merged["checks_performed"] = 1
+            merged["all_steps_strict_ok"] = report.get("ok") is True
+            merged["failed_checks_observed"] = sorted(report_failed_checks)
             return merged
         maxima = dict(aggregate.get("max_observed", {}))
         for key, value in dict(report.get("max_observed", {})).items():
@@ -7225,6 +10556,17 @@ class PlannerExecutor:
                 )
         merged["max_observed"] = maxima
         merged["checks_performed"] = int(aggregate.get("checks_performed", 0)) + 1
+        merged["all_steps_strict_ok"] = bool(
+            aggregate.get("all_steps_strict_ok", aggregate.get("ok") is True)
+            and report.get("ok") is True
+        )
+        merged["failed_checks_observed"] = sorted(
+            {
+                str(name)
+                for name in aggregate.get("failed_checks_observed", ())
+            }
+            | report_failed_checks
+        )
         return merged
 
     @_planner_tool("observe")
@@ -7420,17 +10762,18 @@ class PlannerExecutor:
         trajectory = np.asarray(
             _jsonable(plan.get("joint_trajectory")), dtype=np.float32
         )
-        base_goal = np.asarray(
-            _jsonable(plan.get("base_goal")), dtype=np.float64
-        ).reshape(-1)
+        try:
+            base_goal = _canonical_base_xyyaw(plan.get("base_goal"))
+        except ValueError as exc:
+            raise RuntimeError(
+                "navigation planner omitted a finite BASE goal"
+            ) from exc
         if (
             trajectory.ndim != 2
             or len(trajectory) < 1
             or not np.isfinite(trajectory).all()
         ):
             raise RuntimeError("navigation planner omitted a finite q trajectory")
-        if base_goal.shape != (3,) or not np.isfinite(base_goal).all():
-            raise RuntimeError("navigation planner omitted a finite BASE goal")
         remaining = timeout - (time.monotonic() - started)
         if remaining <= 0.0:
             raise TimeoutError("navigation planning consumed the tool deadline")
@@ -7582,11 +10925,858 @@ class PlannerExecutor:
             "gripper": callable(getattr(self.backend, "hold_action", None)),
         }
 
+    @staticmethod
+    def _dashboard_base_motion(action: str) -> dict[str, Any]:
+        if action in {"forward", "backward"}:
+            return {
+                "kind": "translation",
+                "direction": action,
+                "distance_m": BASE_TRANSLATION_STEP_M,
+            }
+        if action in {"turn_left", "turn_right"}:
+            return {
+                "kind": "rotation",
+                "direction": action.removeprefix("turn_"),
+                "angle_deg": math.degrees(BASE_ROTATION_STEP_RAD),
+            }
+        raise ValueError(
+            "BASE prepared motion must be forward, backward, turn_left, or turn_right"
+        )
+
+    def _prepared_predicted_eef_pose(
+        self,
+        *,
+        hand: str,
+        start_q: np.ndarray,
+        predecessor: dict[str, Any] | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        predicted = (
+            predecessor.get("predicted_terminal")
+            if isinstance(predecessor, dict)
+            else None
+        )
+        eef_by_hand = (
+            predicted.get("eef_by_hand")
+            if isinstance(predicted, dict)
+            else None
+        )
+        cached = (
+            eef_by_hand.get(hand)
+            if isinstance(eef_by_hand, dict)
+            else None
+        )
+        if isinstance(cached, dict):
+            return (
+                np.asarray(cached["xyz"], dtype=np.float64).reshape(3),
+                np.asarray(cached["quat_xyzw"], dtype=np.float64).reshape(4),
+            )
+        poses = _call_optional_kw(
+            self.backend,
+            "whole_body_eef_poses",
+            hand=hand,
+            q_trajectory=np.asarray(start_q, dtype=np.float32).reshape(1, -1),
+        )
+        if isinstance(poses, (tuple, list)) and len(poses) == 2:
+            positions = np.asarray(poses[0], dtype=np.float64).reshape(-1, 3)
+            quaternions = np.asarray(poses[1], dtype=np.float64).reshape(-1, 4)
+            if len(positions) == 1 and len(quaternions) == 1:
+                quat = _quat_xyzw(quaternions[0])
+                if quat is not None and np.isfinite(positions[0]).all():
+                    return positions[0], quat
+        live = _call_optional_arg(self.backend, "get_eef_pose", hand)
+        if predecessor is None and isinstance(live, (tuple, list)) and len(live) == 2:
+            quat = _quat_xyzw(live[1])
+            position = np.asarray(live[0], dtype=np.float64).reshape(-1)
+            if quat is not None and position.shape == (3,) and np.isfinite(
+                position
+            ).all():
+                return position, quat
+        raise RuntimeError(
+            f"{hand} predicted EEF start pose is unavailable for prepared motion"
+        )
+
+    def prepare_dashboard_motion(
+        self,
+        target: str,
+        action: str,
+        predecessor_plan_id: str | None = None,
+        background: bool = False,
+    ) -> dict[str, Any]:
+        """Plan one repeatable Dashboard motion and cache its exact trajectory."""
+
+        target = str(target)
+        action = str(action)
+        predecessor_plan_id = (
+            None
+            if predecessor_plan_id is None
+            else str(predecessor_plan_id).strip()
+        )
+        if action in {"observe", "open", "close"}:
+            raise ValueError(f"{action} is one-shot and cannot enter the prepared queue")
+        if target not in {"chassis", "left_arm", "right_arm"}:
+            raise ValueError(f"unsupported Dashboard motion target {target!r}")
+        if target == "chassis" and action in {"up", "down"}:
+            raise RuntimeError("torso_control_unsupported")
+
+        with self._prepared_motion_lock:
+            predecessor = (
+                self._prepared_motions.get(predecessor_plan_id)
+                if predecessor_plan_id is not None
+                else None
+            )
+            if predecessor_plan_id is not None and predecessor is None:
+                raise KeyError(f"unknown predecessor plan {predecessor_plan_id!r}")
+            if predecessor is not None and predecessor.get("status") in {
+                "discarded",
+                "invalidated",
+                "failed",
+            }:
+                raise RuntimeError("predecessor plan is not usable")
+            predecessor_terminal = (
+                predecessor.get("predicted_terminal")
+                if isinstance(predecessor, dict)
+                else None
+            )
+
+        start_q_value = (
+            predecessor_terminal.get("joint_positions")
+            if isinstance(predecessor_terminal, dict)
+            else _call_optional(self.backend, "get_joint_positions")
+        )
+        start_q = np.asarray(
+            _jsonable(start_q_value), dtype=np.float32
+        ).reshape(-1)
+        if start_q.size < 1 or not np.isfinite(start_q).all():
+            raise RuntimeError("prepared motion start joint state is unavailable")
+        base_pose_value = (
+            predecessor_terminal.get("base_xyyaw")
+            if isinstance(predecessor_terminal, dict)
+            else _call_optional(self.backend, "get_base_pose")
+        )
+        base_pose = np.asarray(
+            _jsonable(base_pose_value), dtype=np.float64
+        ).reshape(-1)
+        if base_pose.shape != (3,) or not np.isfinite(base_pose).all():
+            raise RuntimeError("prepared motion start BASE pose is unavailable")
+
+        started = time.monotonic()
+        motion_kind: str
+        hand: str | None = None
+        plan: dict[str, Any]
+        target_xyz: np.ndarray | None = None
+        target_quat: np.ndarray | None = None
+        if target == "chassis":
+            motion_kind = "base"
+            planner = getattr(
+                self.backend, "plan_relative_navigation_trajectory", None
+            )
+            if not callable(planner):
+                raise RuntimeError("relative_navigation_planner_unavailable")
+            base_planner_kwargs = {
+                "relative_motion": self._dashboard_base_motion(action),
+                "timeout_s": WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S,
+                "start_q": start_q,
+                "start_base_xyyaw": base_pose,
+                "background": bool(background),
+                "base_attempt_timeout_cap_s": (
+                    WHOLE_BODY_DASHBOARD_JOG_FAST_TRAJOPT_DEADLINE_S
+                ),
+                "base_solver_timeout_cap_s": (
+                    WHOLE_BODY_DASHBOARD_JOG_FAST_TRAJOPT_DEADLINE_S
+                ),
+                "base_planning_profile": (
+                    DASHBOARD_PREPARED_BASE_PLANNING_PROFILE
+                ),
+            }
+            if background:
+                plan = planner(**base_planner_kwargs)
+            else:
+                with _wall_clock_deadline(
+                    WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S,
+                    "prepared Dashboard BASE planning transaction",
+                ):
+                    plan = planner(**base_planner_kwargs)
+        else:
+            motion_kind = "eef"
+            hand = "left" if target == "left_arm" else "right"
+            start_xyz, start_quat = self._prepared_predicted_eef_pose(
+                hand=hand,
+                start_q=start_q,
+                predecessor=predecessor,
+            )
+            if action in {"rotate_left", "rotate_right"}:
+                calibration = self._wrist_camera_rotation_calibration(hand)
+                if calibration.get("verified") is not True:
+                    raise RuntimeError("wrist_calibration_unavailable")
+                axis_eef = np.asarray(
+                    calibration["optical_axis_eef"], dtype=np.float64
+                ).reshape(3)
+                signed_angle = (
+                    float(calibration["clockwise_angle_sign"])
+                    * WRIST_ROTATION_STEP_RAD
+                    * (1.0 if action == "rotate_left" else -1.0)
+                )
+                target_xyz = start_xyz.copy()
+                target_quat = _quat_multiply_xyzw(
+                    start_quat,
+                    _axis_angle_to_quat_xyzw([*axis_eef, signed_angle]),
+                )
+            else:
+                local_by_action = {
+                    "forward": np.array([1.0, 0.0, 0.0]),
+                    "backward": np.array([-1.0, 0.0, 0.0]),
+                    "turn_left": np.array([0.0, 1.0, 0.0]),
+                    "turn_right": np.array([0.0, -1.0, 0.0]),
+                    "up": np.array([0.0, 0.0, 1.0]),
+                    "down": np.array([0.0, 0.0, -1.0]),
+                }
+                if action not in local_by_action:
+                    raise ValueError(
+                        f"unsupported repeatable arm action {action!r}"
+                    )
+                local_delta = local_by_action[action] * EEF_TRANSLATION_STEP_M
+                yaw = float(base_pose[2])
+                world_delta = np.asarray(
+                    [
+                        math.cos(yaw) * local_delta[0]
+                        - math.sin(yaw) * local_delta[1],
+                        math.sin(yaw) * local_delta[0]
+                        + math.cos(yaw) * local_delta[1],
+                        local_delta[2],
+                    ],
+                    dtype=np.float64,
+                )
+                target_xyz = start_xyz + world_delta
+                target_quat = start_quat
+            planner = getattr(self.backend, "plan_whole_body_trajectory", None)
+            if not callable(planner):
+                raise RuntimeError("whole_body_planner_unavailable")
+            plan = planner(
+                hand=hand,
+                target_xyz=target_xyz,
+                target_quat_xyzw=target_quat,
+                timeout_s=WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S,
+                search_profile=WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG,
+                start_q=start_q,
+                start_eef_pose=(start_xyz, start_quat),
+                background=bool(background),
+            )
+        elapsed = time.monotonic() - started
+        if (
+            not background
+            and elapsed > WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S + 1e-9
+        ):
+            raise TimeoutError(
+                "prepared Dashboard motion exceeded its hard deadline"
+            )
+        if not isinstance(plan, dict) or plan.get("ok") is not True:
+            reason = (
+                plan.get("stop_reason", "planning_failed")
+                if isinstance(plan, dict)
+                else "planner_returned_non_mapping"
+            )
+            raise RuntimeError(f"prepared Dashboard motion failed closed: {reason}")
+        q_path = np.asarray(
+            _jsonable(plan.get("joint_trajectory")), dtype=np.float32
+        )
+        if (
+            q_path.ndim != 2
+            or len(q_path) < 1
+            or q_path.shape[1] != start_q.size
+            or not np.isfinite(q_path).all()
+        ):
+            raise RuntimeError("prepared Dashboard plan omitted a finite trajectory")
+        if motion_kind == "base":
+            plan["base_goal"] = _canonical_base_xyyaw(
+                plan.get("base_goal")
+            )
+        predicted_q = np.ascontiguousarray(q_path[-1], dtype=np.float32)
+        predicted_base = (
+            _canonical_base_xyyaw(plan.get("base_goal"))
+            if motion_kind == "base"
+            else np.asarray(
+                [
+                    predicted_q[0],
+                    predicted_q[1],
+                    predicted_q[5],
+                ],
+                dtype=np.float64,
+            )
+        )
+        eef_by_hand: dict[str, Any] = {}
+        for side in ("left", "right"):
+            pose_value = _call_optional_kw(
+                self.backend,
+                "whole_body_eef_poses",
+                hand=side,
+                q_trajectory=predicted_q.reshape(1, -1),
+            )
+            if isinstance(pose_value, (tuple, list)) and len(pose_value) == 2:
+                positions = np.asarray(pose_value[0], dtype=np.float64).reshape(-1, 3)
+                quaternions = np.asarray(
+                    pose_value[1], dtype=np.float64
+                ).reshape(-1, 4)
+                if len(positions) == 1 and len(quaternions) == 1:
+                    eef_by_hand[side] = {
+                        "xyz": positions[0].tolist(),
+                        "quat_xyzw": quaternions[0].tolist(),
+                    }
+        if hand is not None and hand not in eef_by_hand:
+            assert target_xyz is not None and target_quat is not None
+            eef_by_hand[hand] = {
+                "xyz": target_xyz.tolist(),
+                "quat_xyzw": target_quat.tolist(),
+            }
+
+        plan_id = os.urandom(16).hex()
+        predicted_terminal = {
+            "joint_positions": predicted_q.tolist(),
+            "joint_positions_sha256": hashlib.sha256(
+                predicted_q.tobytes()
+            ).hexdigest(),
+            "base_xyyaw": predicted_base.tolist(),
+            "eef_by_hand": eef_by_hand,
+        }
+        plan_metrics = (
+            dict(plan.get("metrics"))
+            if isinstance(plan.get("metrics"), dict)
+            else {}
+        )
+        planning_profile = WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG
+        fast_solver_deadline_s = (
+            WHOLE_BODY_DASHBOARD_JOG_FAST_TRAJOPT_DEADLINE_S
+        )
+        deadline_enforcement = {
+            "solver_timeout_enforced": True,
+            "hard_wall_clock_enforced": not bool(background),
+            "hard_wall_clock_deadline_s": (
+                WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S
+                if not background
+                else None
+            ),
+            "soft_deadline_s": (
+                WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S
+                if background
+                else None
+            ),
+            "soft_deadline_exceeded": bool(
+                background
+                and elapsed > WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S
+            ),
+        }
+        if motion_kind == "base":
+            expected_fast_cap = (
+                WHOLE_BODY_DASHBOARD_JOG_FAST_TRAJOPT_DEADLINE_S
+            )
+            try:
+                attempt_cap = float(
+                    plan_metrics["attempt_timeout_cap_s"]
+                )
+                solver_cap = float(
+                    plan_metrics["solver_timeout_cap_s"]
+                )
+                actual_attempt = float(
+                    plan_metrics["attempt_timeout_budget_s"]
+                )
+                actual_solver = float(plan_metrics["solver_timeout_s"])
+                plan_deadline = plan_metrics[
+                    "base_solver_deadline_enforcement"
+                ]
+                if not isinstance(plan_deadline, dict):
+                    raise TypeError("BASE solver deadline must be a mapping")
+                inner_hard_deadline = plan_deadline.get(
+                    "hard_wall_clock_deadline_s"
+                )
+                inner_soft_deadline = plan_deadline.get("soft_deadline_s")
+                if inner_hard_deadline is not None:
+                    inner_hard_deadline = float(inner_hard_deadline)
+                if inner_soft_deadline is not None:
+                    inner_soft_deadline = float(inner_soft_deadline)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "prepared BASE plan omitted deadline metrics"
+                ) from exc
+            planning_profile = str(
+                plan_metrics.get("planning_profile", "")
+            )
+            deadline_contract_ok = bool(
+                math.isclose(
+                    attempt_cap,
+                    expected_fast_cap,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                and math.isclose(
+                    solver_cap,
+                    expected_fast_cap,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                and 0.0 < actual_attempt <= expected_fast_cap
+                and 0.0 < actual_solver <= expected_fast_cap
+                and actual_solver <= actual_attempt + 1e-12
+                and planning_profile
+                == DASHBOARD_PREPARED_BASE_PLANNING_PROFILE
+                and plan_deadline.get("solver_timeout_enforced") is True
+                and plan_deadline.get("hard_wall_clock_enforced")
+                == (not bool(background))
+                and (
+                    (
+                        not background
+                        and inner_hard_deadline is not None
+                        and math.isclose(
+                            inner_hard_deadline,
+                            actual_attempt,
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        )
+                        and inner_soft_deadline is None
+                    )
+                    or (
+                        background
+                        and inner_hard_deadline is None
+                        and inner_soft_deadline is not None
+                        and math.isclose(
+                            inner_soft_deadline,
+                            actual_attempt,
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        )
+                    )
+                )
+            )
+            if not deadline_contract_ok:
+                raise RuntimeError(
+                    "prepared BASE plan violated its 4s solver deadline contract"
+                )
+            fast_solver_deadline_s = solver_cap
+            deadline_enforcement.update(
+                {
+                    "solver_timeout_enforced": True,
+                    "base_attempt_timeout_budget_s": actual_attempt,
+                    "base_solver_timeout_s": actual_solver,
+                    "base_attempt_timeout_cap_s": attempt_cap,
+                    "base_solver_timeout_cap_s": solver_cap,
+                    "base_solver_deadline_enforcement": dict(plan_deadline),
+                }
+            )
+        execution_policy = (
+            PREPARED_DASHBOARD_EEF_EXECUTION_POLICY
+            if motion_kind == "eef"
+            else PREPARED_DASHBOARD_BASE_EXECUTION_POLICY
+        )
+        bounded_plan_metrics = {
+            key: deepcopy(plan_metrics[key])
+            for key in ("obstacle_refresh", "selected_solver_stage")
+            if key in plan_metrics
+        }
+        solver_stages = plan_metrics.get("solver_stages")
+        if isinstance(solver_stages, list):
+            bounded_plan_metrics["solver_stages"] = [
+                {
+                    key: deepcopy(stage[key])
+                    for key in (
+                        "name",
+                        "enable_graph",
+                        "ik_only",
+                        "timeout_s",
+                        "elapsed_s",
+                        "successes",
+                        "successful_candidate_indices",
+                        "certified_candidate_indices",
+                    )
+                    if isinstance(stage, dict) and key in stage
+                }
+                for stage in solver_stages
+                if isinstance(stage, dict)
+            ]
+        metadata = {
+            "schema_version": 1,
+            "plan_id": plan_id,
+            "target": target,
+            "action": action,
+            "predecessor_plan_id": predecessor_plan_id,
+            "motion_kind": motion_kind,
+            "status": "prepared",
+            "predicted_terminal": predicted_terminal,
+            "planning_profile": planning_profile,
+            "execution_policy": execution_policy,
+            "planning_deadline_s": (
+                WHOLE_BODY_DASHBOARD_JOG_PLANNING_DEADLINE_S
+            ),
+            "fast_solver_deadline_s": fast_solver_deadline_s,
+            "background": bool(background),
+            "deadline_enforcement": deadline_enforcement,
+            "planning_elapsed_s": elapsed,
+            "plan_metrics": bounded_plan_metrics,
+            "picklable": True,
+        }
+        entry = {
+            **metadata,
+            "metadata": metadata,
+            "status": "prepared",
+            "hand": hand,
+            "execution_policy": execution_policy,
+            "start_q": start_q.copy(),
+            "joint_trajectory": np.ascontiguousarray(q_path, dtype=np.float32),
+            "plan": plan,
+            "target_xyz": None if target_xyz is None else target_xyz.copy(),
+            "target_quat_xyzw": (
+                None if target_quat is None else target_quat.copy()
+            ),
+            "predicted_terminal": predicted_terminal,
+            "execution_command_id": None,
+            "execution_result": None,
+            "execution_event": threading.Event(),
+        }
+        with self._prepared_motion_lock:
+            self._prepared_motions[plan_id] = entry
+        return deepcopy(metadata)
+
+    def execute_dashboard_motion(
+        self,
+        plan_id: str,
+        command_id: str,
+    ) -> dict[str, Any]:
+        """Consume one cached Dashboard plan with exactly-once command binding."""
+
+        plan_id = str(plan_id).strip()
+        command_id = str(command_id).strip()
+        if not plan_id or not command_id:
+            raise ValueError("plan_id and command_id are required")
+        wait_event: threading.Event | None = None
+        with self._prepared_motion_lock:
+            entry = self._prepared_motions.get(plan_id)
+            if entry is None:
+                raise KeyError(f"unknown prepared plan {plan_id!r}")
+            existing_command_id = entry.get("execution_command_id")
+            if existing_command_id is not None:
+                if existing_command_id != command_id:
+                    raise RuntimeError(
+                        "prepared plan is already bound to a different command"
+                    )
+                if isinstance(entry.get("execution_result"), dict):
+                    return deepcopy(entry["execution_result"])
+                wait_event = entry["execution_event"]
+            else:
+                if entry.get("status") != "prepared":
+                    raise RuntimeError(
+                        f"prepared plan is not executable: {entry.get('status')}"
+                    )
+                predecessor_id = entry.get("predecessor_plan_id")
+                predecessor = (
+                    self._prepared_motions.get(predecessor_id)
+                    if predecessor_id
+                    else None
+                )
+                if predecessor_id and (
+                    predecessor is None
+                    or predecessor.get("status") != "completed"
+                    or dict(predecessor.get("execution_result") or {}).get(
+                        "primitive_success"
+                    )
+                    is not True
+                ):
+                    raise RuntimeError(
+                        "prepared predecessor has not completed successfully"
+                    )
+                entry["execution_command_id"] = command_id
+                entry["status"] = "executing"
+        if wait_event is not None:
+            wait_event.wait()
+            with self._prepared_motion_lock:
+                result = self._prepared_motions[plan_id].get("execution_result")
+                if not isinstance(result, dict):
+                    raise RuntimeError("prepared motion execution has no terminal result")
+                return deepcopy(result)
+
+        try:
+            with self._prepared_motion_lock:
+                entry = self._prepared_motions[plan_id]
+                q_path = np.ascontiguousarray(
+                    entry["joint_trajectory"], dtype=np.float32
+                )
+                plan = entry["plan"]
+                planned_start_q = np.ascontiguousarray(
+                    entry["start_q"], dtype=np.float32
+                )
+            if hashlib.sha256(q_path.tobytes()).hexdigest() != hashlib.sha256(
+                np.ascontiguousarray(
+                    np.asarray(plan.get("joint_trajectory"), dtype=np.float32)
+                ).tobytes()
+            ).hexdigest():
+                raise RuntimeError("prepared plan integrity check failed")
+            motion_kind = str(entry["motion_kind"])
+            certificate = (
+                dict(plan.get("metrics") or {}).get(
+                    "base_trajectory_certificate"
+                )
+                if motion_kind == "base"
+                else plan.get("whole_body_certificate")
+            )
+            certificate_start_digest = (
+                certificate.get("start_q_sha256")
+                if isinstance(certificate, dict)
+                else None
+            )
+            planned_start_digest = hashlib.sha256(
+                planned_start_q.tobytes()
+            ).hexdigest()
+            live_start_value: Any | None = None
+            live_start_error: str | None = None
+            try:
+                live_start_value = _call_optional(
+                    self.backend,
+                    "get_joint_positions",
+                )
+            except Exception as exc:
+                live_start_error = f"{type(exc).__name__}: {exc}"
+            live_start_q: np.ndarray | None = None
+            if live_start_value is not None:
+                try:
+                    live_start_q = np.ascontiguousarray(
+                        np.asarray(
+                            _jsonable(live_start_value),
+                            dtype=np.float32,
+                        ).reshape(-1)
+                    )
+                except (TypeError, ValueError) as exc:
+                    live_start_error = f"{type(exc).__name__}: {exc}"
+            live_start_available = live_start_q is not None
+            live_start_shape_match = bool(
+                live_start_q is not None
+                and live_start_q.shape == planned_start_q.shape
+            )
+            live_start_finite = bool(
+                live_start_q is not None
+                and np.isfinite(live_start_q).all()
+            )
+            live_start_digest = (
+                hashlib.sha256(live_start_q.tobytes()).hexdigest()
+                if live_start_q is not None
+                and live_start_shape_match
+                and live_start_finite
+                else None
+            )
+            planned_start_certificate_bound = bool(
+                isinstance(certificate_start_digest, str)
+                and certificate_start_digest == planned_start_digest
+            )
+            prepared_start_strict_equal = bool(
+                planned_start_certificate_bound
+                and live_start_digest == certificate_start_digest
+            )
+            max_abs_joint_drift = (
+                float(
+                    np.max(
+                        np.abs(
+                            live_start_q.astype(np.float64)
+                            - planned_start_q.astype(np.float64)
+                        )
+                    )
+                )
+                if live_start_q is not None
+                and live_start_shape_match
+                and live_start_finite
+                else None
+            )
+            start_metrics = {
+                "live_start_checked": True,
+                "live_start_equality_skipped": False,
+                "prepared_start_strict_float32_equal": (
+                    prepared_start_strict_equal
+                ),
+                "prepared_start_comparison": "float32-c-order-sha256",
+                "prepared_start_tolerance": 0.0,
+                "prepared_start_q_dimension": int(planned_start_q.size),
+                "planned_start_q_sha256": planned_start_digest,
+                "certificate_start_q_sha256": certificate_start_digest,
+                "live_start_q_sha256": live_start_digest,
+                "live_start_available": live_start_available,
+                "live_start_shape_match": live_start_shape_match,
+                "live_start_finite": live_start_finite,
+                "max_abs_joint_drift": max_abs_joint_drift,
+            }
+            if live_start_error is not None:
+                start_metrics["live_start_error"] = live_start_error
+            if not prepared_start_strict_equal:
+                result = primitive_result(
+                    primitive_success=False,
+                    task_success=self._task_success(),
+                    stop_reason="prepared_start_drift",
+                    recoverable=True,
+                    suggested_next_tool="observe",
+                    metrics={
+                        "prepared_plan_reused": True,
+                        "prepared_plan_id": plan_id,
+                        "prepared_command_id": command_id,
+                        "predecessor_plan_id": entry.get(
+                            "predecessor_plan_id"
+                        ),
+                        "replan_required": True,
+                        "env_actions_sent": 0,
+                        "env_actions_confirmed": 0,
+                        "partial_motion": False,
+                        "post_stop_env_actions": 0,
+                        "collision_revalidated": False,
+                        "collision_revalidation_skipped": True,
+                        **start_metrics,
+                    },
+                )
+            elif motion_kind == "base":
+                assert live_start_q is not None
+                plan_metrics = dict(plan.get("metrics") or {})
+                result = self._execute_navigation_trajectory(
+                    q_path,
+                    base_goal_xyyaw=_canonical_base_xyyaw(
+                        plan["base_goal"]
+                    ),
+                    timeout_s=WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S,
+                    plan_metrics=plan_metrics,
+                    expected_attachments_by_hand=plan.get(
+                        "expected_attachments_by_hand"
+                    ),
+                    prepared_start_q=live_start_q,
+                    execution_policy=str(entry["execution_policy"]),
+                )
+            else:
+                assert live_start_q is not None
+                wrist_rotation = entry.get("action") in {
+                    "rotate_left",
+                    "rotate_right",
+                }
+                result = self._execute_actions(
+                    None,
+                    hand=str(entry["hand"]),
+                    target_xyz=np.asarray(
+                        entry["target_xyz"], dtype=np.float64
+                    ).reshape(3),
+                    target_quat_xyzw=np.asarray(
+                        entry["target_quat_xyzw"], dtype=np.float64
+                    ).reshape(4),
+                    position_tolerance_m=(
+                        WRIST_POSITION_DRIFT_LIMIT_M
+                        if wrist_rotation
+                        else EEF_TERMINAL_POSITION_TOLERANCE_M
+                    ),
+                    orientation_tolerance_rad=(
+                        EEF_TERMINAL_ORIENTATION_TOLERANCE_RAD
+                    ),
+                    timeout_s=WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S,
+                    require_pose=True,
+                    hold_steps_required=0,
+                    joint_trajectory=q_path,
+                    expected_attachments_by_hand=plan.get(
+                        "expected_attachments_by_hand"
+                    ),
+                    motion_scope="whole_body",
+                    whole_body_certificate=plan.get("whole_body_certificate"),
+                    prepared_start_q=live_start_q,
+                    execution_policy=str(entry["execution_policy"]),
+                )
+            if prepared_start_strict_equal:
+                result = self._manual_result_metrics(
+                    result,
+                    prepared_plan_reused=True,
+                    prepared_plan_id=plan_id,
+                    prepared_command_id=command_id,
+                    replan_required=False,
+                    collision_revalidated=False,
+                    collision_revalidation_skipped=True,
+                    tracking_policy="wide_hard_deviation",
+                    **start_metrics,
+                )
+        except Exception as exc:
+            result = primitive_result(
+                primitive_success=False,
+                task_success=self._task_success(),
+                stop_reason="prepared_execution_error",
+                recoverable=False,
+                suggested_next_tool="observe",
+                metrics={
+                    "prepared_plan_reused": True,
+                    "prepared_plan_id": plan_id,
+                    "prepared_command_id": command_id,
+                    "post_stop_env_actions": 0,
+                },
+                diagnostics={"error": f"{type(exc).__name__}: {exc}"},
+            )
+        with self._prepared_motion_lock:
+            entry = self._prepared_motions[plan_id]
+            entry["execution_result"] = deepcopy(result)
+            entry["status"] = (
+                "completed"
+                if result.get("primitive_success") is True
+                or result.get("task_success") is True
+                else "failed"
+            )
+            entry["execution_event"].set()
+        return deepcopy(result)
+
+    def discard_dashboard_motion(self, plan_id: str) -> dict[str, Any]:
+        """Discard one unexecuted cached plan and invalidate its descendants."""
+
+        plan_id = str(plan_id).strip()
+        if not plan_id:
+            raise ValueError("plan_id is required")
+        with self._prepared_motion_lock:
+            entry = self._prepared_motions.get(plan_id)
+            if entry is None:
+                return {
+                    "schema_version": 1,
+                    "plan_id": plan_id,
+                    "discarded": False,
+                    "status": "unknown",
+                }
+            if entry.get("status") == "executing":
+                raise RuntimeError("cannot discard an executing prepared plan")
+            if entry.get("status") in {"completed", "failed"}:
+                return {
+                    "schema_version": 1,
+                    "plan_id": plan_id,
+                    "discarded": False,
+                    "status": str(entry["status"]),
+                    "reason": "prepared plan was already consumed",
+                }
+            already_discarded = entry.get("status") == "discarded"
+            invalidated_descendants: list[str] = []
+            if not already_discarded:
+                entry["status"] = "discarded"
+                entry["joint_trajectory"] = None
+                entry["plan"] = None
+                invalidated_ancestors = {plan_id}
+                changed = True
+                while changed:
+                    changed = False
+                    for descendant_id, descendant in self._prepared_motions.items():
+                        if (
+                            descendant.get("predecessor_plan_id")
+                            in invalidated_ancestors
+                            and descendant.get("status") == "prepared"
+                        ):
+                            descendant["status"] = "invalidated"
+                            descendant["invalidated_reason"] = (
+                                "predecessor_discarded"
+                            )
+                            descendant["joint_trajectory"] = None
+                            descendant["plan"] = None
+                            invalidated_ancestors.add(descendant_id)
+                            invalidated_descendants.append(descendant_id)
+                            changed = True
+            return {
+                "schema_version": 1,
+                "plan_id": plan_id,
+                "discarded": True,
+                "already_discarded": already_discarded,
+                "status": "discarded",
+                "invalidated_descendant_plan_ids": invalidated_descendants,
+            }
+
     def jog_base(
         self,
         action: str,
         *,
-        timeout_s: float = 45.0,
+        timeout_s: float = WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S,
     ) -> dict[str, Any]:
         """Execute exactly one fixed-size body-local BASE jog."""
 
@@ -7629,7 +11819,7 @@ class PlannerExecutor:
         hand: str,
         action: str,
         *,
-        timeout_s: float = WHOLE_BODY_TOTAL_DEADLINE_S,
+        timeout_s: float = WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S,
     ) -> dict[str, Any]:
         """Execute one fixed 3 cm selected-EEF jog with bounded compensation."""
 
@@ -7649,9 +11839,20 @@ class PlannerExecutor:
                 "turn_right, up, or down"
             )
         started = time.monotonic()
-        total_timeout = self._validated_timeout(timeout_s)
-        base_pose = _call_optional(self.backend, "get_base_pose")
-        eef_pose = _call_optional_arg(self.backend, "get_eef_pose", hand)
+        total_timeout = min(
+            self._validated_timeout(timeout_s),
+            WHOLE_BODY_DASHBOARD_JOG_TOTAL_DEADLINE_S,
+        )
+        remaining_planning_budget = (
+            WHOLE_BODY_DASHBOARD_JOG_PLANNING_DEADLINE_S
+        )
+        remaining_execution_budget = WHOLE_BODY_EXECUTION_DEADLINE_S
+        with _wall_clock_deadline(
+            total_timeout,
+            "EEF jog call-start pose transaction",
+        ):
+            base_pose = _call_optional(self.backend, "get_base_pose")
+            eef_pose = _call_optional_arg(self.backend, "get_eef_pose", hand)
         if base_pose is None or eef_pose is None:
             return primitive_result(
                 primitive_success=False,
@@ -7688,18 +11889,79 @@ class PlannerExecutor:
         strict_target = current_position + requested_world
         attempts: list[dict[str, Any]] = []
 
-        def plan_candidate(target: np.ndarray, offset: np.ndarray) -> dict[str, Any]:
+        def execute_candidate(
+            target: np.ndarray,
+            offset: np.ndarray,
+        ) -> dict[str, Any]:
+            nonlocal remaining_execution_budget
+            nonlocal remaining_planning_budget
             remaining = total_timeout - (time.monotonic() - started)
             if remaining <= 0.0:
-                raise TimeoutError("EEF jog planning deadline exhausted")
-            candidate = self.move_to(
-                hand=hand,
-                target_xyz=target,
-                target_quat_xyzw=current_quat,
-                plan_only=True,
-                position_tolerance_m=WRIST_POSITION_DRIFT_LIMIT_M,
-                orientation_tolerance_rad=math.radians(1.0),
-                timeout_s=remaining,
+                raise TimeoutError("EEF jog deadline exhausted")
+            if remaining_planning_budget <= 0.0:
+                return primitive_result(
+                    primitive_success=False,
+                    task_success=self._task_success(),
+                    stop_reason="planning_budget_exhausted",
+                    recoverable=True,
+                    suggested_next_tool=None,
+                    metrics={
+                        "planning_spent_s": (
+                            WHOLE_BODY_DASHBOARD_JOG_PLANNING_DEADLINE_S
+                        ),
+                        "execution_spent_s": (
+                            WHOLE_BODY_EXECUTION_DEADLINE_S
+                            - remaining_execution_budget
+                        ),
+                        "env_actions_sent": 0,
+                    },
+                )
+            try:
+                with _wall_clock_deadline(
+                    remaining,
+                    "EEF jog candidate transaction",
+                ):
+                    candidate = self._move_to_whole_body_impl(
+                        hand=hand,
+                        target_xyz=target,
+                        frame="world",
+                        target_quat_xyzw=current_quat,
+                        plan_only=False,
+                        position_tolerance_m=WRIST_POSITION_DRIFT_LIMIT_M,
+                        orientation_tolerance_rad=math.radians(1.0),
+                        timeout_s=remaining,
+                        planning_budget_s=remaining_planning_budget,
+                        execution_budget_s=max(
+                            remaining_execution_budget,
+                            1e-9,
+                        ),
+                        allow_replan_checkpoint=True,
+                        search_profile=(
+                            WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG
+                        ),
+                        replan_checkpoint_position_improvement_m=(
+                            WHOLE_BODY_DASHBOARD_JOG_REPLAN_POSITION_IMPROVEMENT_M
+                        ),
+                    )
+            except Exception as exc:
+                candidate = self._exception_result(
+                    exc,
+                    suggested_next_tool=None,
+                )
+            candidate_metrics = dict(candidate.get("metrics") or {})
+            planning_spent = float(
+                candidate_metrics.get("planning_spent_s", 0.0) or 0.0
+            )
+            execution_spent = float(
+                candidate_metrics.get("execution_spent_s", 0.0) or 0.0
+            )
+            remaining_planning_budget = max(
+                0.0,
+                remaining_planning_budget - max(planning_spent, 0.0),
+            )
+            remaining_execution_budget = max(
+                0.0,
+                remaining_execution_budget - max(execution_spent, 0.0),
             )
             attempts.append(
                 {
@@ -7709,108 +11971,121 @@ class PlannerExecutor:
                     "task_success": candidate.get("task_success"),
                     "stop_reason": candidate.get("stop_reason"),
                     "env_actions_sent": int(
-                        dict(candidate.get("metrics") or {}).get(
+                        candidate_metrics.get(
                             "env_actions_sent", 0
                         )
+                    ),
+                    "planning_spent_s": planning_spent,
+                    "execution_spent_s": execution_spent,
+                    "remaining_planning_budget_s": (
+                        remaining_planning_budget
+                    ),
+                    "remaining_execution_budget_s": (
+                        remaining_execution_budget
                     ),
                 }
             )
             return candidate
 
-        selected_target = strict_target
-        selected_offset = np.zeros(3, dtype=np.float64)
-        planned = plan_candidate(selected_target, selected_offset)
-        if planned.get("task_success") is True:
+        def explicitly_unreachable(candidate: dict[str, Any]) -> bool:
+            metrics = dict(candidate.get("metrics") or {})
+            if int(metrics.get("env_actions_sent", 0)) != 0:
+                return False
+            if (
+                candidate.get("partial_motion") is True
+                or dict(candidate.get("metrics") or {}).get("partial_motion") is True
+            ):
+                return False
+            if str(candidate.get("stop_reason")) == "unreachable":
+                return True
+            if str(candidate.get("stop_reason")) != "replan_no_progress":
+                return False
+            rounds = metrics.get("replan_rounds")
+            return bool(
+                isinstance(rounds, list)
+                and rounds
+                and all(
+                    isinstance(item, dict)
+                    and item.get("plan_ok") is False
+                    and item.get("plan_stop_reason") == "unreachable"
+                    for item in rounds
+                )
+            )
+
+        def manual_result(
+            candidate: dict[str, Any],
+            *,
+            target: np.ndarray,
+            offset: np.ndarray,
+            **extra: Any,
+        ) -> dict[str, Any]:
             return self._manual_result_metrics(
-                planned,
+                candidate,
                 manual_primitive="jog_eef",
                 requested_delta=local_requested.tolist(),
                 requested_delta_frame="base_call_start",
-                actual_target=selected_target.tolist(),
-                fallback_offset=selected_offset.tolist(),
+                requested_delta_world=requested_world.tolist(),
+                actual_target=target.tolist(),
+                fallback_offset=offset.tolist(),
                 candidate_attempts=attempts,
+                fixed_server_step=True,
+                **extra,
             )
-        if planned.get("primitive_success") is not True:
-            if str(planned.get("stop_reason")) != "unreachable":
-                return self._manual_result_metrics(
-                    planned,
-                    manual_primitive="jog_eef",
-                    requested_delta=local_requested.tolist(),
-                    requested_delta_frame="base_call_start",
-                    actual_target=strict_target.tolist(),
-                    fallback_offset=[0.0, 0.0, 0.0],
-                    candidate_attempts=attempts,
-                )
-            command_axis = int(np.argmax(np.abs(local_requested)))
-            orthogonal_axes = [axis for axis in range(3) if axis != command_axis]
-            selected_target = None
-            for axis in orthogonal_axes:
-                for amount in MANUAL_EEF_FALLBACK_OFFSETS_M:
-                    local_offset = np.zeros(3, dtype=np.float64)
-                    local_offset[axis] = amount
-                    world_offset = local_to_world(local_offset)
-                    target = strict_target + world_offset
-                    candidate = plan_candidate(target, world_offset)
-                    if candidate.get("task_success") is True:
-                        return self._manual_result_metrics(
-                            candidate,
-                            manual_primitive="jog_eef",
-                            requested_delta=local_requested.tolist(),
-                            requested_delta_frame="base_call_start",
-                            actual_target=target.tolist(),
-                            fallback_offset=world_offset.tolist(),
-                            candidate_attempts=attempts,
-                        )
-                    if candidate.get("primitive_success") is True:
-                        selected_target = target
-                        selected_offset = world_offset
-                        break
-                    if str(candidate.get("stop_reason")) != "unreachable":
-                        return self._manual_result_metrics(
-                            candidate,
-                            manual_primitive="jog_eef",
-                            requested_delta=local_requested.tolist(),
-                            requested_delta_frame="base_call_start",
-                            actual_target=target.tolist(),
-                            fallback_offset=world_offset.tolist(),
-                            candidate_attempts=attempts,
-                        )
-                if selected_target is not None:
-                    break
-            if selected_target is None:
-                return self._manual_result_metrics(
-                    planned,
-                    manual_primitive="jog_eef",
-                    requested_delta=local_requested.tolist(),
-                    requested_delta_frame="base_call_start",
-                    actual_target=strict_target.tolist(),
-                    fallback_offset=[0.0, 0.0, 0.0],
-                    candidate_attempts=attempts,
-                    fallback_exhausted=True,
-                )
 
-        remaining = total_timeout - (time.monotonic() - started)
-        if remaining <= 0.0:
-            raise TimeoutError("EEF jog execution deadline exhausted")
-        executed = self.move_to(
-            hand=hand,
-            target_xyz=selected_target,
-            target_quat_xyzw=current_quat,
-            plan_only=False,
-            position_tolerance_m=WRIST_POSITION_DRIFT_LIMIT_M,
-            orientation_tolerance_rad=math.radians(1.0),
-            timeout_s=remaining,
-        )
-        return self._manual_result_metrics(
-            executed,
-            manual_primitive="jog_eef",
-            requested_delta=local_requested.tolist(),
-            requested_delta_frame="base_call_start",
-            requested_delta_world=requested_world.tolist(),
-            actual_target=np.asarray(selected_target).tolist(),
-            fallback_offset=selected_offset.tolist(),
-            candidate_attempts=attempts,
-            fixed_server_step=True,
+        selected_target = strict_target
+        selected_offset = np.zeros(3, dtype=np.float64)
+        executed = execute_candidate(selected_target, selected_offset)
+        if (
+            executed.get("task_success") is True
+            or executed.get("primitive_success") is True
+        ):
+            return manual_result(
+                executed,
+                target=selected_target,
+                offset=selected_offset,
+            )
+        if not explicitly_unreachable(executed):
+            return manual_result(
+                executed,
+                target=strict_target,
+                offset=np.zeros(3, dtype=np.float64),
+            )
+
+        command_axis = int(np.argmax(np.abs(local_requested)))
+        orthogonal_axes = [axis for axis in range(3) if axis != command_axis]
+        last_result = executed
+        last_target = strict_target
+        last_offset = np.zeros(3, dtype=np.float64)
+        for axis in orthogonal_axes:
+            for amount in MANUAL_EEF_FALLBACK_OFFSETS_M:
+                local_offset = np.zeros(3, dtype=np.float64)
+                local_offset[axis] = amount
+                world_offset = local_to_world(local_offset)
+                target = strict_target + world_offset
+                candidate = execute_candidate(target, world_offset)
+                last_result = candidate
+                last_target = target
+                last_offset = world_offset
+                if (
+                    candidate.get("task_success") is True
+                    or candidate.get("primitive_success") is True
+                ):
+                    return manual_result(
+                        candidate,
+                        target=target,
+                        offset=world_offset,
+                    )
+                if not explicitly_unreachable(candidate):
+                    return manual_result(
+                        candidate,
+                        target=target,
+                        offset=world_offset,
+                    )
+        return manual_result(
+            last_result,
+            target=last_target,
+            offset=last_offset,
+            fallback_exhausted=True,
         )
 
     def jog_torso(
@@ -7912,20 +12187,27 @@ class PlannerExecutor:
         drift_m: float | None = None
         final = _call_optional_arg(self.backend, "get_eef_pose", hand)
         if final is not None:
-            drift_m = float(
-                np.linalg.norm(
-                    np.asarray(final[0], dtype=np.float64).reshape(3)
-                    - start_position
-                )
-            )
-        if (
-            result.get("primitive_success") is True
-            and (drift_m is None or drift_m > WRIST_POSITION_DRIFT_LIMIT_M + 1e-9)
+            try:
+                final_position = np.asarray(
+                    final[0], dtype=np.float64
+                ).reshape(-1)
+            except (TypeError, ValueError):
+                final_position = np.asarray([], dtype=np.float64)
+            if final_position.shape == (3,) and np.isfinite(
+                final_position
+            ).all():
+                drift_m = float(np.linalg.norm(final_position - start_position))
+        if result.get("primitive_success") is True and (
+            drift_m is None or drift_m > WRIST_POSITION_DRIFT_LIMIT_M + 1e-9
         ):
             result = primitive_result(
                 primitive_success=False,
                 task_success=self._task_success(),
-                stop_reason="wrist_position_drift",
+                stop_reason=(
+                    "pose_feedback_unavailable"
+                    if drift_m is None
+                    else "wrist_position_drift"
+                ),
                 recoverable=True,
                 suggested_next_tool="observe",
                 metrics={
@@ -8010,10 +12292,28 @@ class PlannerExecutor:
         position_tolerance_m: float,
         orientation_tolerance_rad: float,
         timeout_s: float,
+        planning_budget_s: float = WHOLE_BODY_PLANNING_DEADLINE_S,
+        execution_budget_s: float = WHOLE_BODY_EXECUTION_DEADLINE_S,
+        allow_replan_checkpoint: bool = False,
+        search_profile: str = WHOLE_BODY_SEARCH_PROFILE_DEFAULT,
+        replan_checkpoint_position_improvement_m: float = (
+            WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M
+        ),
     ) -> dict[str, Any]:
         started = time.monotonic()
+        profile = _whole_body_search_profile(search_profile)
         total_budget = min(
             self._validated_timeout(timeout_s), WHOLE_BODY_TOTAL_DEADLINE_S
+        )
+        planning_budget = min(
+            self._validated_timeout(planning_budget_s),
+            float(profile["planning_deadline_s"]),
+            total_budget,
+        )
+        execution_budget = min(
+            self._validated_timeout(execution_budget_s),
+            WHOLE_BODY_EXECUTION_DEADLINE_S,
+            total_budget,
         )
         deadline = started + total_budget
         hand = _normalize_hand(hand)
@@ -8104,7 +12404,10 @@ class PlannerExecutor:
 
         planning_spent_s = 0.0
         execution_spent_s = 0.0
-        previous_eligible_failure: dict[str, float | None] | None = None
+        previous_checkpoint_position_error: float | None = None
+        planning_retry_used = False
+        cumulative_env_actions_sent = 0
+        cumulative_partial_motion = False
         rounds: list[dict[str, Any]] = []
         last_plan_metrics: dict[str, Any] = {}
         while True:
@@ -8121,6 +12424,8 @@ class PlannerExecutor:
                         "planning_spent_s": planning_spent_s,
                         "execution_spent_s": execution_spent_s,
                         "replan_rounds": rounds,
+                        "env_actions_sent": cumulative_env_actions_sent,
+                        "partial_motion": cumulative_partial_motion,
                         "post_success_env_actions": 0,
                     },
                 )
@@ -8142,12 +12447,14 @@ class PlannerExecutor:
                             "planning_spent_s": planning_spent_s,
                             "execution_spent_s": execution_spent_s,
                             "replan_rounds": rounds,
+                            "env_actions_sent": cumulative_env_actions_sent,
+                            "partial_motion": cumulative_partial_motion,
                         },
                     )
 
             total_remaining = deadline - time.monotonic()
             plan_allowance = min(
-                WHOLE_BODY_PLANNING_DEADLINE_S - planning_spent_s,
+                planning_budget - planning_spent_s,
                 total_remaining,
             )
             if plan_allowance <= 0.0:
@@ -8163,6 +12470,8 @@ class PlannerExecutor:
                         "execution_spent_s": execution_spent_s,
                         "replan_rounds": rounds,
                         "total_deadline_s": total_budget,
+                        "env_actions_sent": cumulative_env_actions_sent,
+                        "partial_motion": cumulative_partial_motion,
                     },
                 )
 
@@ -8178,6 +12487,7 @@ class PlannerExecutor:
                         target_quat_xyzw=effective_quat,
                         timeout_s=plan_allowance,
                         attached_obj=expected_attachments[hand],
+                        search_profile=str(profile["name"]),
                     )
             except TimeoutError as exc:
                 planning_spent_s += time.monotonic() - plan_started
@@ -8193,7 +12503,12 @@ class PlannerExecutor:
                         "execution_spent_s": execution_spent_s,
                         "replan_rounds": rounds,
                         "total_deadline_s": total_budget,
-                        "planning_hard_limit_s": WHOLE_BODY_PLANNING_DEADLINE_S,
+                        "planning_hard_limit_s": float(
+                            profile["planning_deadline_s"]
+                        ),
+                        "call_planning_budget_s": planning_budget,
+                        "env_actions_sent": cumulative_env_actions_sent,
+                        "partial_motion": cumulative_partial_motion,
                     },
                     diagnostics={"error": f"{type(exc).__name__}: {exc}"},
                 )
@@ -8215,6 +12530,50 @@ class PlannerExecutor:
             rounds.append(round_report)
             if not plan.get("ok"):
                 stop_reason = str(plan.get("stop_reason", "whole_body_plan_failed"))
+                eligible_plan_failure = stop_reason in {
+                    "unreachable",
+                    "timeout",
+                    "collision_admission_failed",
+                    "eef_path_admission_failed",
+                }
+                if eligible_plan_failure and not planning_retry_used:
+                    # The first qualifying planning failure gets one fresh,
+                    # unconditional retry without moving the simulator.
+                    # A second planning-only failure exhausts that independent
+                    # retry; execution checkpoint progress is not consulted.
+                    planning_retry_used = True
+                    round_report["eligible_plan_failure"] = {
+                        "stop_reason": stop_reason,
+                        "env_actions_sent": 0,
+                        "unconditional_replan": True,
+                    }
+                    continue
+                if eligible_plan_failure and planning_retry_used:
+                    round_report["eligible_plan_failure"] = {
+                        "stop_reason": stop_reason,
+                        "env_actions_sent": 0,
+                        "unconditional_replan": False,
+                        "physical_progress_available": False,
+                    }
+                    return primitive_result(
+                        primitive_success=False,
+                        task_success=self._task_success(),
+                        stop_reason="replan_no_progress",
+                        recoverable=True,
+                        suggested_next_tool=None,
+                        metrics={
+                            **plan_metrics,
+                            "planning_spent_s": planning_spent_s,
+                            "execution_spent_s": execution_spent_s,
+                            "replan_rounds": rounds,
+                            "last_plan_stop_reason": stop_reason,
+                            "post_stop_action_policy": "no_additional_env_action",
+                            "post_stop_env_actions": 0,
+                            "env_actions_sent": cumulative_env_actions_sent,
+                            "partial_motion": cumulative_partial_motion,
+                        },
+                        diagnostics=plan,
+                    )
                 return primitive_result(
                     primitive_success=False,
                     task_success=self._task_success(),
@@ -8225,6 +12584,7 @@ class PlannerExecutor:
                         "timeout",
                         "planner_unavailable",
                         "collision_admission_failed",
+                        "eef_path_admission_failed",
                     },
                     suggested_next_tool=None,
                     metrics={
@@ -8232,6 +12592,8 @@ class PlannerExecutor:
                         "planning_spent_s": planning_spent_s,
                         "execution_spent_s": execution_spent_s,
                         "replan_rounds": rounds,
+                        "env_actions_sent": cumulative_env_actions_sent,
+                        "partial_motion": cumulative_partial_motion,
                     },
                     diagnostics=plan,
                 )
@@ -8265,6 +12627,8 @@ class PlannerExecutor:
                         "planning_spent_s": planning_spent_s,
                         "execution_spent_s": execution_spent_s,
                         "replan_rounds": rounds,
+                        "env_actions_sent": cumulative_env_actions_sent,
+                        "partial_motion": cumulative_partial_motion,
                     },
                     diagnostics=plan,
                 )
@@ -8286,6 +12650,8 @@ class PlannerExecutor:
                             "planning_spent_s": planning_spent_s,
                             "execution_spent_s": execution_spent_s,
                             "replan_rounds": rounds,
+                            "env_actions_sent": cumulative_env_actions_sent,
+                            "partial_motion": cumulative_partial_motion,
                         },
                     )
             if plan_only:
@@ -8300,6 +12666,8 @@ class PlannerExecutor:
                         "execution_spent_s": 0.0,
                         "replan_rounds": rounds,
                         "elapsed_s": round(time.monotonic() - started, 3),
+                        "env_actions_sent": cumulative_env_actions_sent,
+                        "partial_motion": cumulative_partial_motion,
                     },
                 )
             trajectory = plan.get("joint_trajectory")
@@ -8314,12 +12682,14 @@ class PlannerExecutor:
                         "planning_spent_s": planning_spent_s,
                         "execution_spent_s": execution_spent_s,
                         "replan_rounds": rounds,
+                        "env_actions_sent": cumulative_env_actions_sent,
+                        "partial_motion": cumulative_partial_motion,
                     },
                 )
 
             total_remaining = deadline - time.monotonic()
             execution_allowance = min(
-                WHOLE_BODY_EXECUTION_DEADLINE_S - execution_spent_s,
+                execution_budget - execution_spent_s,
                 total_remaining,
             )
             if execution_allowance <= 0.0:
@@ -8334,10 +12704,13 @@ class PlannerExecutor:
                         "planning_spent_s": planning_spent_s,
                         "execution_spent_s": execution_spent_s,
                         "replan_rounds": rounds,
+                        "env_actions_sent": cumulative_env_actions_sent,
+                        "partial_motion": cumulative_partial_motion,
                     },
                 )
 
             execution_started = time.monotonic()
+            execution_action_counter = {"attempted": 0, "confirmed": 0}
             try:
                 with _wall_clock_deadline(
                     execution_allowance,
@@ -8359,10 +12732,25 @@ class PlannerExecutor:
                         expected_attachments_by_hand=expected_attachments,
                         motion_scope="whole_body",
                         whole_body_certificate=certificate,
+                        action_counter=execution_action_counter,
+                        allow_replan_checkpoint=allow_replan_checkpoint,
+                        replan_checkpoint_position_improvement_m=(
+                            replan_checkpoint_position_improvement_m
+                        ),
                     )
             except TimeoutError as exc:
                 execution_elapsed = time.monotonic() - execution_started
                 execution_spent_s += execution_elapsed
+                timed_out_action_attempts = int(
+                    execution_action_counter["attempted"]
+                )
+                timed_out_confirmed_actions = int(
+                    execution_action_counter["confirmed"]
+                )
+                cumulative_env_actions_sent += timed_out_action_attempts
+                cumulative_partial_motion = bool(
+                    cumulative_partial_motion or timed_out_action_attempts > 0
+                )
                 return primitive_result(
                     primitive_success=False,
                     task_success=self._task_success(),
@@ -8378,6 +12766,24 @@ class PlannerExecutor:
                         "execution_hard_limit_s": (
                             WHOLE_BODY_EXECUTION_DEADLINE_S
                         ),
+                        "call_execution_budget_s": execution_budget,
+                        "env_actions_sent": cumulative_env_actions_sent,
+                        "env_actions_sent_exact": (
+                            timed_out_action_attempts
+                            == timed_out_confirmed_actions
+                        ),
+                        "env_actions_confirmed": (
+                            cumulative_env_actions_sent
+                            - timed_out_action_attempts
+                            + timed_out_confirmed_actions
+                        ),
+                        "timed_out_round_action_attempts": (
+                            timed_out_action_attempts
+                        ),
+                        "timed_out_round_confirmed_actions": (
+                            timed_out_confirmed_actions
+                        ),
+                        "partial_motion": cumulative_partial_motion,
                     },
                     diagnostics={"error": f"{type(exc).__name__}: {exc}"},
                 )
@@ -8388,6 +12794,19 @@ class PlannerExecutor:
                 if isinstance(execution.get("metrics"), dict)
                 else {}
             )
+            round_env_actions = max(
+                int(execution_metrics.get("env_actions_sent", 0) or 0),
+                int(execution_metrics.get("executed_waypoints", 0) or 0),
+            )
+            cumulative_env_actions_sent += round_env_actions
+            cumulative_partial_motion = bool(
+                cumulative_partial_motion
+                or execution_metrics.get("partial_motion") is True
+                or (
+                    execution.get("primitive_success") is not True
+                    and round_env_actions > 0
+                )
+            )
             round_report.update(
                 {
                     "execution_allowance_s": execution_allowance,
@@ -8395,6 +12814,7 @@ class PlannerExecutor:
                     "execution_stop_reason": execution.get("stop_reason"),
                     "primitive_success": execution.get("primitive_success"),
                     "task_success": execution.get("task_success"),
+                    "env_actions_sent": round_env_actions,
                 }
             )
             combined_metrics = {
@@ -8404,9 +12824,22 @@ class PlannerExecutor:
                 "planning_spent_s": planning_spent_s,
                 "execution_spent_s": execution_spent_s,
                 "total_deadline_s": total_budget,
-                "planning_hard_limit_s": WHOLE_BODY_PLANNING_DEADLINE_S,
+                "planning_hard_limit_s": float(profile["planning_deadline_s"]),
                 "execution_hard_limit_s": WHOLE_BODY_EXECUTION_DEADLINE_S,
+                "call_planning_budget_s": planning_budget,
+                "call_execution_budget_s": execution_budget,
+                "whole_body_search_profile": str(profile["name"]),
+                "replan_checkpoint_trigger_position_improvement_m": float(
+                    replan_checkpoint_position_improvement_m
+                ),
                 "replan_rounds": rounds,
+                "env_actions_sent": cumulative_env_actions_sent,
+                "partial_motion": bool(
+                    cumulative_partial_motion
+                    and execution.get("primitive_success") is not True
+                    and execution.get("task_success") is not True
+                ),
+                "motion_occurred_before_replan": cumulative_partial_motion,
                 "whole_body_execution": {
                     "available": True,
                     "ok": bool(execution.get("primitive_success")),
@@ -8433,13 +12866,171 @@ class PlannerExecutor:
                 )
 
             stop_reason = str(execution.get("stop_reason", "execution_failed"))
-            eligible = stop_reason in {"stalled_tracking", "waypoint_tracking_lag"}
-            if (
-                stop_reason == "target_tolerance_not_met"
-                and execution_metrics.get("trajectory_complete") is True
-            ):
-                eligible = True
-            if not eligible:
+            replan_checkpoint = execution_metrics.get(
+                "whole_body_replan_checkpoint"
+            )
+            checkpoint_progress_proved = False
+            if stop_reason == "whole_body_replan_checkpoint":
+                checkpoint_commanded_index = (
+                    replan_checkpoint.get("commanded_index")
+                    if isinstance(replan_checkpoint, dict)
+                    else None
+                )
+                checkpoint_post_step_index = (
+                    replan_checkpoint.get("post_step_index")
+                    if isinstance(replan_checkpoint, dict)
+                    else None
+                )
+                checkpoint_start_error = (
+                    replan_checkpoint.get("call_start_position_error_m")
+                    if isinstance(replan_checkpoint, dict)
+                    else None
+                )
+                checkpoint_final_error = (
+                    replan_checkpoint.get("final_position_error_m")
+                    if isinstance(replan_checkpoint, dict)
+                    else None
+                )
+                checkpoint_improvement = (
+                    replan_checkpoint.get("position_improvement_m")
+                    if isinstance(replan_checkpoint, dict)
+                    else None
+                )
+                checkpoint_minimum_improvement = (
+                    replan_checkpoint.get("minimum_position_improvement_m")
+                    if isinstance(replan_checkpoint, dict)
+                    else None
+                )
+                checkpoint_trigger_improvement = (
+                    replan_checkpoint.get("trigger_position_improvement_m")
+                    if isinstance(replan_checkpoint, dict)
+                    else None
+                )
+                checkpoint_q_sha256 = (
+                    replan_checkpoint.get("q_sha256")
+                    if isinstance(replan_checkpoint, dict)
+                    else None
+                )
+                checkpoint_trajectory_sha256 = (
+                    replan_checkpoint.get("trajectory_sha256")
+                    if isinstance(replan_checkpoint, dict)
+                    else None
+                )
+                checkpoint_q_matches_trajectory = False
+                try:
+                    checkpoint_trajectory = np.ascontiguousarray(
+                        trajectory, dtype=np.float32
+                    )
+                    if (
+                        isinstance(checkpoint_commanded_index, int)
+                        and checkpoint_trajectory.ndim == 2
+                        and 0
+                        <= checkpoint_commanded_index
+                        < checkpoint_trajectory.shape[0] - 1
+                    ):
+                        checkpoint_q_matches_trajectory = (
+                            hashlib.sha256(
+                                np.ascontiguousarray(
+                                    checkpoint_trajectory[
+                                        checkpoint_commanded_index
+                                    ],
+                                    dtype=np.float32,
+                                ).tobytes()
+                            ).hexdigest()
+                            == checkpoint_q_sha256
+                        )
+                except (TypeError, ValueError):
+                    checkpoint_q_matches_trajectory = False
+                checkpoint_progress_proved = bool(
+                    isinstance(replan_checkpoint, dict)
+                    and allow_replan_checkpoint
+                    and round_env_actions > 0
+                    and all(
+                        value is None for value in expected_attachments.values()
+                    )
+                    and replan_checkpoint.get("eef_pose_settled") is True
+                    and replan_checkpoint.get("joint_waypoint_reached") is True
+                    and isinstance(checkpoint_commanded_index, int)
+                    and checkpoint_commanded_index >= 0
+                    and isinstance(checkpoint_post_step_index, int)
+                    and checkpoint_post_step_index
+                    == checkpoint_commanded_index + 1
+                    and isinstance(checkpoint_q_sha256, str)
+                    and len(checkpoint_q_sha256) == 64
+                    and checkpoint_q_matches_trajectory
+                    and isinstance(checkpoint_trajectory_sha256, str)
+                    and checkpoint_trajectory_sha256
+                    == certificate.get("trajectory_sha256")
+                    and isinstance(checkpoint_start_error, (int, float))
+                    and math.isfinite(float(checkpoint_start_error))
+                    and isinstance(checkpoint_final_error, (int, float))
+                    and math.isfinite(float(checkpoint_final_error))
+                    and isinstance(checkpoint_improvement, (int, float))
+                    and math.isfinite(float(checkpoint_improvement))
+                    and abs(
+                        float(checkpoint_start_error)
+                        - float(checkpoint_final_error)
+                        - float(checkpoint_improvement)
+                    )
+                    <= 1e-9
+                    and float(checkpoint_improvement)
+                    + WHOLE_BODY_EEF_NUMERICAL_MARGIN_M
+                    >= WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M
+                    and isinstance(
+                        checkpoint_minimum_improvement, (int, float)
+                    )
+                    and math.isclose(
+                        float(checkpoint_minimum_improvement),
+                        WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    and isinstance(
+                        checkpoint_trigger_improvement, (int, float)
+                    )
+                    and math.isclose(
+                        float(checkpoint_trigger_improvement),
+                        float(replan_checkpoint_position_improvement_m),
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    and float(checkpoint_improvement)
+                    + WHOLE_BODY_EEF_NUMERICAL_MARGIN_M
+                    >= float(replan_checkpoint_position_improvement_m)
+                    and isinstance(
+                        execution_metrics.get("final_position_error_m"),
+                        (int, float),
+                    )
+                    and math.isfinite(
+                        float(execution_metrics["final_position_error_m"])
+                    )
+                    and abs(
+                        float(checkpoint_final_error)
+                        - float(execution_metrics["final_position_error_m"])
+                    )
+                    <= 1e-9
+                    and execution_metrics.get("post_stop_env_actions") == 0
+                )
+                if not checkpoint_progress_proved:
+                    return primitive_result(
+                        primitive_success=False,
+                        task_success=self._task_success(),
+                        stop_reason="whole_body_replan_checkpoint_invalid",
+                        recoverable=False,
+                        suggested_next_tool="observe",
+                        metrics={
+                            **combined_metrics,
+                            "post_stop_action_policy": (
+                                "no_additional_env_action"
+                            ),
+                            "post_stop_env_actions": 0,
+                        },
+                        diagnostics=execution.get("diagnostics"),
+                    )
+                round_report["whole_body_replan_checkpoint"] = dict(
+                    replan_checkpoint
+                )
+            if stop_reason != "whole_body_replan_checkpoint":
                 return primitive_result(
                     primitive_success=False,
                     task_success=self._task_success(),
@@ -8451,12 +13042,6 @@ class PlannerExecutor:
                 )
 
             position_error = execution_metrics.get("final_position_error_m")
-            tracking = execution_metrics.get("final_joint_tracking")
-            tracking_error = (
-                tracking.get("normalized_21d_tracking_error")
-                if isinstance(tracking, dict)
-                else None
-            )
             current_failure = {
                 "position_error_m": (
                     float(position_error)
@@ -8464,50 +13049,48 @@ class PlannerExecutor:
                     and math.isfinite(float(position_error))
                     else None
                 ),
-                "tracking_error_21d": (
-                    float(tracking_error)
-                    if isinstance(tracking_error, (int, float))
-                    and math.isfinite(float(tracking_error))
-                    else None
-                ),
             }
             round_report["eligible_replan_failure"] = current_failure
-            if previous_eligible_failure is not None:
-                previous_position = previous_eligible_failure["position_error_m"]
-                previous_tracking = previous_eligible_failure["tracking_error_21d"]
-                position_improved = bool(
-                    previous_position is not None
-                    and current_failure["position_error_m"] is not None
-                    and previous_position - current_failure["position_error_m"]
-                    >= WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M
-                )
-                tracking_improved = bool(
-                    previous_tracking is not None
-                    and previous_tracking > 0.0
-                    and current_failure["tracking_error_21d"] is not None
-                    and current_failure["tracking_error_21d"]
-                    <= previous_tracking
-                    * (1.0 - WHOLE_BODY_REPLAN_TRACKING_IMPROVEMENT_RATIO)
-                )
-                round_report["replan_progress"] = {
-                    "position_improved_at_least_2mm": position_improved,
-                    "tracking_improved_at_least_5pct": tracking_improved,
+            current_position_error = current_failure["position_error_m"]
+            assert current_position_error is not None
+            if previous_checkpoint_position_error is None:
+                previous_checkpoint_position_error = current_position_error
+                round_report["eligible_replan_failure"] = {
+                    **current_failure,
+                    "first_checkpoint": True,
                 }
-                if not (position_improved or tracking_improved):
-                    return primitive_result(
-                        primitive_success=False,
-                        task_success=self._task_success(),
-                        stop_reason="replan_no_progress",
-                        recoverable=True,
-                        suggested_next_tool=None,
-                        metrics={
-                            **combined_metrics,
-                            "post_stop_action_policy": "no_additional_env_action",
-                            "post_stop_env_actions": 0,
-                        },
-                        diagnostics=execution.get("diagnostics"),
-                    )
-            previous_eligible_failure = current_failure
+                continue
+
+            position_improved = bool(
+                previous_checkpoint_position_error
+                - current_position_error
+                + WHOLE_BODY_EEF_NUMERICAL_MARGIN_M
+                >= WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M
+            )
+            round_report["eligible_replan_failure"] = {
+                **current_failure,
+                "first_checkpoint": False,
+            }
+            round_report["replan_progress"] = {
+                "baseline_available": True,
+                "position_improved_at_least_2mm": position_improved,
+                "fresh_plan_tracking_comparison_used": False,
+            }
+            if not position_improved:
+                return primitive_result(
+                    primitive_success=False,
+                    task_success=self._task_success(),
+                    stop_reason="replan_no_progress",
+                    recoverable=True,
+                    suggested_next_tool=None,
+                    metrics={
+                        **combined_metrics,
+                        "post_stop_action_policy": "no_additional_env_action",
+                        "post_stop_env_actions": 0,
+                    },
+                    diagnostics=execution.get("diagnostics"),
+                )
+            previous_checkpoint_position_error = current_position_error
 
     @_planner_tool("move_to")
     def move_to(
@@ -8532,6 +13115,7 @@ class PlannerExecutor:
                 position_tolerance_m=position_tolerance_m,
                 orientation_tolerance_rad=orientation_tolerance_rad,
                 timeout_s=timeout_s,
+                allow_replan_checkpoint=True,
             )
         except Exception as exc:
             return self._exception_result(exc, suggested_next_tool=None)
@@ -9307,20 +13891,26 @@ class PlannerExecutor:
         timeout_s: float,
         plan_metrics: dict[str, Any],
         expected_attachments_by_hand: dict[str, Any] | None = None,
+        prepared_start_q: Any | None = None,
+        execution_policy: str = "default",
     ) -> dict[str, Any]:
         """Execute a BASE-only q path with fail-closed per-step isolation."""
 
         started = time.monotonic()
-        q_path = np.asarray(_jsonable(joint_trajectory), dtype=np.float32)
+        q_path = np.asarray(
+            _jsonable(joint_trajectory), dtype=np.float32
+        ).copy()
         if q_path.ndim != 2 or len(q_path) < 1 or not np.isfinite(q_path).all():
             raise ValueError(
                 f"navigation joint trajectory must be finite [T,D], got {q_path.shape}"
             )
-        base_goal = np.asarray(base_goal_xyyaw, dtype=np.float64).reshape(-1)
-        if base_goal.shape != (3,) or not np.isfinite(base_goal).all():
-            raise ValueError("base_goal_xyyaw must contain three finite values")
+        base_goal = _canonical_base_xyyaw(base_goal_xyyaw)
         certificate = plan_metrics.get("base_trajectory_certificate")
-        current_q = _call_optional(self.backend, "get_joint_positions")
+        current_q = (
+            prepared_start_q
+            if prepared_start_q is not None
+            else _call_optional(self.backend, "get_joint_positions")
+        )
         current_q = (
             None
             if current_q is None
@@ -9328,6 +13918,9 @@ class PlannerExecutor:
         )
         trajectory_digest = hashlib.sha256(
             np.ascontiguousarray(q_path, dtype=np.float32).tobytes()
+        ).hexdigest()
+        terminal_q_digest = hashlib.sha256(
+            np.ascontiguousarray(q_path[-1], dtype=np.float32).tobytes()
         ).hexdigest()
         current_digest = (
             hashlib.sha256(
@@ -9348,6 +13941,15 @@ class PlannerExecutor:
             and certificate.get("post_interpolation_check") is True
             and certificate.get("attachment_hand_count") == 2
             and certificate.get("colliding_waypoint_count") == 0
+            and certificate.get("terminal_q_sha256") == terminal_q_digest
+            and certificate.get("base_goal_xyyaw_sha256")
+            == _whole_body_target_sha256(base_goal)
+            and certificate.get("terminal_command_limit")
+            == TERMINAL_COMMAND_LIMIT
+            and certificate.get("terminal_position_tolerance_m")
+            == BASE_TERMINAL_POSITION_TOLERANCE_M
+            and certificate.get("terminal_orientation_tolerance_rad")
+            == BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD
         )
         if not certificate_ok:
             return self._execution_result(
@@ -9405,6 +14007,30 @@ class PlannerExecutor:
                         "whole_body_attachment": {"hand": side, **identity},
                     },
                 )
+        contact_baseline = _call_optional_kw(
+            self.backend,
+            "capture_whole_body_contact_baseline",
+            expected_attachments_by_hand=expected_attachments_by_hand,
+        )
+        if (
+            not isinstance(contact_baseline, dict)
+            or contact_baseline.get("available") is not True
+        ):
+            return self._execution_result(
+                primitive_success=False,
+                stop_reason="contact_feedback_unavailable",
+                recoverable=False,
+                suggested_next_tool="observe",
+                executed=0,
+                trace=[],
+                final_pos_err=None,
+                final_ori_err=None,
+                started=started,
+                extra_metrics={
+                    **plan_metrics,
+                    "whole_body_contact_baseline": contact_baseline,
+                },
+            )
         deadline = time.monotonic() + self._validated_timeout(timeout_s)
         capture_hold = getattr(
             self.backend,
@@ -9483,10 +14109,55 @@ class PlannerExecutor:
         aggregate_isolation: dict[str, Any] | None = None
         executed = 0
         waypoint_index = 0
-        stalled_steps = 0
-        best_error = float("inf")
         final_pos_err: float | None = None
         final_ori_err: float | None = None
+        terminal_commands_sent = 0
+        dashboard_terminal_tilt_policy = bool(
+            prepared_start_q is not None
+            and execution_policy
+            == PREPARED_DASHBOARD_BASE_EXECUTION_POLICY
+            and plan_metrics.get("planning_profile")
+            == DASHBOARD_PREPARED_BASE_PLANNING_PROFILE
+        )
+        terminal_tilt_settle_pending = False
+        terminal_tilt_settle_attempted = False
+        terminal_tilt_settle_metrics = {
+            "enabled": dashboard_terminal_tilt_policy,
+            "eligible": False,
+            "hold_sent": False,
+            "maximum_holds": 1,
+            "initial_base_roll_pitch_drift_rad": None,
+            "settled_base_roll_pitch_drift_rad": None,
+            "settled": False,
+            "normal_limit_rad": LOCKED_BASE_RPY_MAX_DRIFT_RAD,
+            "transient_limit_rad": (
+                DASHBOARD_BASE_TERMINAL_SETTLE_RPY_MAX_RAD
+            ),
+            "drift_frame": "relative_to_navigation_isolation_reference",
+            "collision_revalidated_for_transient": False,
+            "nominal_certificate_covers_transient_tilt": False,
+            "intermediate_transient_count": 0,
+            "maximum_intermediate_base_roll_pitch_drift_rad": None,
+            "normal_articulation_limit_rad": (
+                LOCKED_ARTICULATION_MAX_DRIFT_RAD
+            ),
+            "transient_trunk_limit_rad": (
+                DASHBOARD_BASE_INTERMEDIATE_TRUNK_MAX_DRIFT_RAD
+            ),
+            "intermediate_trunk_transient_count": 0,
+            "maximum_intermediate_trunk_drift_rad": None,
+        }
+        navigation_check_names = {
+            "base_z_locked",
+            "base_roll_pitch_locked",
+            "trunk_locked",
+            "left_arm_locked",
+            "right_arm_locked",
+            "left_gripper_command_locked",
+            "right_gripper_command_locked",
+            "left_attachment_identity_unchanged",
+            "right_attachment_identity_unchanged",
+        }
 
         def finish(
             *,
@@ -9525,6 +14196,24 @@ class PlannerExecutor:
                     "final_yaw_error_rad": final_ori_err,
                     "certificate_verified_before_first_action": True,
                     "navigation_isolation": isolation,
+                    "navigation_terminal": {
+                        "command_limit": TERMINAL_COMMAND_LIMIT,
+                        "commands_sent": terminal_commands_sent,
+                        "position_tolerance_m": (
+                            BASE_TERMINAL_POSITION_TOLERANCE_M
+                        ),
+                        "orientation_tolerance_rad": (
+                            BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD
+                        ),
+                        "terminal_q_sha256": terminal_q_digest,
+                    },
+                    "dashboard_base_terminal_tilt_settle": (
+                        terminal_tilt_settle_metrics
+                    ),
+                    "live_start_equality_checked": (
+                        prepared_start_q is None
+                    ),
+                    "collision_revalidated": False,
                     **(
                         {"terminal_step_receipt": dict(terminal_step_receipt)}
                         if terminal_step_receipt is not None
@@ -9533,15 +14222,29 @@ class PlannerExecutor:
                 },
             )
 
-        max_steps = len(q_path) * (self.max_stall_steps + 1)
+        max_steps = max(len(q_path) - 1, 0) + TERMINAL_COMMAND_LIMIT
         while executed < max_steps:
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline:
                 return finish(
                     primitive_success=False,
                     stop_reason="timeout",
                     recoverable=True,
                 )
             target_q = q_path[min(waypoint_index, len(q_path) - 1)]
+            terminal_command = waypoint_index == len(q_path) - 1
+            terminal_tilt_settle_command = bool(
+                terminal_command and terminal_tilt_settle_pending
+            )
+            if terminal_tilt_settle_command:
+                terminal_tilt_settle_pending = False
+            if terminal_command:
+                if terminal_commands_sent >= TERMINAL_COMMAND_LIMIT:
+                    return finish(
+                        primitive_success=False,
+                        stop_reason="target_tolerance_not_met",
+                        recoverable=True,
+                    )
             try:
                 action = self.backend.joint_target_to_action(
                     target_q,
@@ -9565,8 +14268,18 @@ class PlannerExecutor:
                     recoverable=True,
                 )
 
+            if time.monotonic() >= deadline:
+                return finish(
+                    primitive_success=False,
+                    stop_reason="timeout",
+                    recoverable=True,
+                )
             step_receipt = self._step_env_action(action)
             executed += 1
+            if terminal_tilt_settle_command:
+                terminal_tilt_settle_metrics["hold_sent"] = True
+            if terminal_command:
+                terminal_commands_sent += 1
             terminal_outcome = _terminal_step_outcome(step_receipt)
             if terminal_outcome is not None:
                 primitive_success, stop_reason = terminal_outcome
@@ -9574,6 +14287,10 @@ class PlannerExecutor:
                     {
                         "step": executed,
                         "waypoint_index": waypoint_index,
+                        "terminal_command": terminal_command,
+                        "terminal_command_index": (
+                            terminal_commands_sent if terminal_command else None
+                        ),
                         "step_receipt": dict(step_receipt),
                     }
                 )
@@ -9618,13 +14335,19 @@ class PlannerExecutor:
                     "reason": "navigation isolation reporter returned no mapping",
                 }
             aggregate_isolation = self._merge_isolation_report(
-                aggregate_isolation,
-                isolation_report,
+                aggregate_isolation, isolation_report
             )
             trace_entry: dict[str, Any] = {
                 "step": executed,
                 "waypoint_index": waypoint_index,
+                "terminal_command": terminal_command,
+                "terminal_command_index": (
+                    terminal_commands_sent if terminal_command else None
+                ),
                 "navigation_isolation": isolation_report,
+                "dashboard_base_terminal_tilt_settle_command": (
+                    terminal_tilt_settle_command
+                ),
             }
             if isolation_report.get("available") is not True:
                 trace.append(trace_entry)
@@ -9633,12 +14356,195 @@ class PlannerExecutor:
                     stop_reason="navigation_isolation_feedback_unavailable",
                     recoverable=True,
                 )
-            if isolation_report.get("ok") is not True:
+            isolation_checks = dict(isolation_report.get("checks") or {})
+            failed_isolation_checks = {
+                name
+                for name, passed in isolation_checks.items()
+                if passed is not True
+            }
+            roll_pitch_drift_raw = dict(
+                isolation_report.get("max_observed") or {}
+            ).get("base_roll_pitch_drift_rad")
+            roll_pitch_threshold_raw = dict(
+                isolation_report.get("thresholds") or {}
+            ).get("base_roll_pitch_rad")
+            roll_pitch_drift = (
+                float(roll_pitch_drift_raw)
+                if isinstance(roll_pitch_drift_raw, (int, float))
+                and not isinstance(roll_pitch_drift_raw, bool)
+                and math.isfinite(float(roll_pitch_drift_raw))
+                else None
+            )
+            roll_pitch_threshold_matches = bool(
+                isinstance(roll_pitch_threshold_raw, (int, float))
+                and not isinstance(roll_pitch_threshold_raw, bool)
+                and math.isfinite(float(roll_pitch_threshold_raw))
+                and math.isclose(
+                    float(roll_pitch_threshold_raw),
+                    LOCKED_BASE_RPY_MAX_DRIFT_RAD,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            )
+            trunk_drift_raw = dict(
+                isolation_report.get("max_observed") or {}
+            ).get("trunk_drift_rad")
+            articulation_threshold_raw = dict(
+                isolation_report.get("thresholds") or {}
+            ).get("articulation_rad")
+            trunk_drift = (
+                float(trunk_drift_raw)
+                if isinstance(trunk_drift_raw, (int, float))
+                and not isinstance(trunk_drift_raw, bool)
+                and math.isfinite(float(trunk_drift_raw))
+                else None
+            )
+            articulation_threshold_matches = bool(
+                isinstance(articulation_threshold_raw, (int, float))
+                and not isinstance(articulation_threshold_raw, bool)
+                and math.isfinite(float(articulation_threshold_raw))
+                and math.isclose(
+                    float(articulation_threshold_raw),
+                    LOCKED_ARTICULATION_MAX_DRIFT_RAD,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            )
+            terminal_tilt_eligible = bool(
+                dashboard_terminal_tilt_policy
+                and terminal_command
+                and terminal_commands_sent == 1
+                and not terminal_tilt_settle_attempted
+                and set(isolation_checks) == navigation_check_names
+                and failed_isolation_checks == {"base_roll_pitch_locked"}
+                and roll_pitch_threshold_matches
+                and roll_pitch_drift is not None
+                and roll_pitch_drift > LOCKED_BASE_RPY_MAX_DRIFT_RAD + 1e-9
+                and roll_pitch_drift
+                <= DASHBOARD_BASE_TERMINAL_SETTLE_RPY_MAX_RAD + 1e-9
+            )
+            intermediate_tilt_eligible = bool(
+                dashboard_terminal_tilt_policy
+                and not terminal_command
+                and set(isolation_checks) == navigation_check_names
+                and failed_isolation_checks == {"base_roll_pitch_locked"}
+                and roll_pitch_threshold_matches
+                and roll_pitch_drift is not None
+                and roll_pitch_drift > LOCKED_BASE_RPY_MAX_DRIFT_RAD + 1e-9
+                and roll_pitch_drift
+                <= DASHBOARD_BASE_TERMINAL_SETTLE_RPY_MAX_RAD + 1e-9
+            )
+            intermediate_trunk_eligible = bool(
+                dashboard_terminal_tilt_policy
+                and not terminal_command
+                and set(isolation_checks) == navigation_check_names
+                and failed_isolation_checks == {"trunk_locked"}
+                and articulation_threshold_matches
+                and trunk_drift is not None
+                and trunk_drift > LOCKED_ARTICULATION_MAX_DRIFT_RAD + 1e-9
+                and trunk_drift
+                <= DASHBOARD_BASE_INTERMEDIATE_TRUNK_MAX_DRIFT_RAD + 1e-9
+            )
+            if (
+                terminal_tilt_settle_command
+                and isolation_report.get("ok") is True
+                and (
+                    set(isolation_checks) != navigation_check_names
+                    or roll_pitch_drift is None
+                )
+            ):
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="navigation_isolation_feedback_unavailable",
+                    recoverable=True,
+                )
+            if (
+                isolation_report.get("ok") is not True
+                and not terminal_tilt_eligible
+                and not intermediate_tilt_eligible
+                and not intermediate_trunk_eligible
+            ):
                 trace.append(trace_entry)
                 return finish(
                     primitive_success=False,
                     stop_reason="navigation_isolation_violation",
                     recoverable=True,
+                )
+            if terminal_tilt_eligible:
+                trace_entry["navigation_isolation_deferred"] = (
+                    "dashboard_base_terminal_roll_pitch_settle"
+                )
+            elif intermediate_tilt_eligible:
+                trace_entry["navigation_isolation_deferred"] = (
+                    "dashboard_base_intermediate_roll_pitch_transient"
+                )
+                terminal_tilt_settle_metrics["intermediate_transient_count"] = (
+                    int(
+                        terminal_tilt_settle_metrics[
+                            "intermediate_transient_count"
+                        ]
+                    )
+                    + 1
+                )
+                prior_intermediate_drift = terminal_tilt_settle_metrics[
+                    "maximum_intermediate_base_roll_pitch_drift_rad"
+                ]
+                terminal_tilt_settle_metrics[
+                    "maximum_intermediate_base_roll_pitch_drift_rad"
+                ] = (
+                    roll_pitch_drift
+                    if prior_intermediate_drift is None
+                    else max(float(prior_intermediate_drift), roll_pitch_drift)
+                )
+            elif intermediate_trunk_eligible:
+                trace_entry["navigation_isolation_deferred"] = (
+                    "dashboard_base_intermediate_trunk_transient"
+                )
+                terminal_tilt_settle_metrics[
+                    "intermediate_trunk_transient_count"
+                ] = (
+                    int(
+                        terminal_tilt_settle_metrics[
+                            "intermediate_trunk_transient_count"
+                        ]
+                    )
+                    + 1
+                )
+                prior_trunk_drift = terminal_tilt_settle_metrics[
+                    "maximum_intermediate_trunk_drift_rad"
+                ]
+                terminal_tilt_settle_metrics[
+                    "maximum_intermediate_trunk_drift_rad"
+                ] = (
+                    trunk_drift
+                    if prior_trunk_drift is None
+                    else max(float(prior_trunk_drift), trunk_drift)
+                )
+            contact = _call_optional_kw(
+                self.backend,
+                "whole_body_contact_report",
+                baseline=contact_baseline,
+                expected_attachments_by_hand=expected_attachments_by_hand,
+                allowed_expected_contact=None,
+            )
+            trace_entry["whole_body_contact"] = contact
+            if (
+                not isinstance(contact, dict)
+                or contact.get("available") is not True
+            ):
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="contact_feedback_unavailable",
+                    recoverable=False,
+                )
+            if contact.get("unexpected_contact") is True:
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="unexpected_contact",
+                    recoverable=False,
                 )
 
             tracking = _call_optional_kw(
@@ -9656,6 +14562,33 @@ class PlannerExecutor:
                     recoverable=True,
                 )
             trace_entry["joint_tracking"] = tracking
+            hard_tracking, hard_tracking_available = (
+                _tracking_hard_deviation_report(tracking)
+            )
+            trace_entry["tracking_hard_deviation"] = hard_tracking
+            if not hard_tracking_available:
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="joint_tracking_feedback_unavailable",
+                    recoverable=True,
+                )
+            if hard_tracking["hard_deviation"] is True:
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="tracking_hard_deviation",
+                    recoverable=False,
+                )
+            if (
+                terminal_tilt_eligible or terminal_tilt_settle_command
+            ) and tracking.get("reached") is not True:
+                trace.append(trace_entry)
+                return finish(
+                    primitive_success=False,
+                    stop_reason="target_tolerance_not_met",
+                    recoverable=True,
+                )
             base_pose = _call_optional(self.backend, "get_base_pose")
             if base_pose is None:
                 trace.append(trace_entry)
@@ -9674,37 +14607,58 @@ class PlannerExecutor:
                 )
             final_pos_err = float(np.linalg.norm(base_pose[:2] - base_goal[:2]))
             final_ori_err = abs(_wrap_angle(float(base_pose[2]) - float(base_goal[2])))
+
             trace.append(trace_entry)
-
-            if bool(tracking.get("reached", False)):
+            if not terminal_command:
                 waypoint_index += 1
-                stalled_steps = 0
-                best_error = float("inf")
-                if waypoint_index >= len(q_path):
-                    if (
-                        final_pos_err <= 0.01 + 1e-9
-                        and final_ori_err <= math.radians(1.0) + 1e-9
-                    ):
-                        return finish(
-                            primitive_success=True,
-                            stop_reason="reached",
-                            recoverable=True,
-                        )
-                    waypoint_index = len(q_path) - 1
                 continue
-
-            tracking_error = float(tracking.get("max_base_xy_error_m", 0.0)) + float(
-                tracking.get("base_yaw_error_rad", 0.0)
+            terminal_pose_reached = bool(
+                final_pos_err <= BASE_TERMINAL_POSITION_TOLERANCE_M + 1e-9
+                and final_ori_err
+                <= BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD + 1e-9
             )
-            if tracking_error + 1e-9 < best_error:
-                best_error = tracking_error
-                stalled_steps = 0
-            else:
-                stalled_steps += 1
-            if stalled_steps >= self.max_stall_steps:
+            if terminal_tilt_eligible:
+                if not terminal_pose_reached:
+                    return finish(
+                        primitive_success=False,
+                        stop_reason="navigation_isolation_violation",
+                        recoverable=True,
+                    )
+                terminal_tilt_settle_attempted = True
+                terminal_tilt_settle_pending = True
+                terminal_tilt_settle_metrics.update(
+                    {
+                        "eligible": True,
+                        "initial_base_roll_pitch_drift_rad": (
+                            roll_pitch_drift
+                        ),
+                    }
+                )
+                continue
+            if terminal_tilt_settle_command:
+                terminal_tilt_settle_metrics.update(
+                    {
+                        "settled_base_roll_pitch_drift_rad": (
+                            roll_pitch_drift
+                        ),
+                        "settled": bool(
+                            terminal_pose_reached
+                            and roll_pitch_drift is not None
+                            and roll_pitch_drift
+                            <= LOCKED_BASE_RPY_MAX_DRIFT_RAD + 1e-9
+                        ),
+                    }
+                )
+                if not terminal_tilt_settle_metrics["settled"]:
+                    return finish(
+                        primitive_success=False,
+                        stop_reason="navigation_isolation_violation",
+                        recoverable=True,
+                    )
+            if terminal_pose_reached:
                 return finish(
-                    primitive_success=False,
-                    stop_reason="stalled_tracking",
+                    primitive_success=True,
+                    stop_reason="reached",
                     recoverable=True,
                 )
         return finish(
@@ -9741,9 +14695,46 @@ class PlannerExecutor:
         isolation_reference: dict[str, Any] | None = None,
         motion_scope: str = "arm_only",
         whole_body_certificate: dict[str, Any] | None = None,
+        action_counter: dict[str, int] | None = None,
+        allow_replan_checkpoint: bool = False,
+        replan_checkpoint_position_improvement_m: float = (
+            WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M
+        ),
+        prepared_start_q: Any | None = None,
+        execution_policy: str = "default",
     ) -> dict[str, Any]:
         del allow_expected_contact, eef_to_contact_vector
         started = time.monotonic()
+        execution_policy = str(execution_policy)
+        if execution_policy not in {
+            "default",
+            PREPARED_DASHBOARD_EEF_EXECUTION_POLICY,
+        }:
+            raise ValueError(
+                f"unsupported whole-body execution policy {execution_policy!r}"
+            )
+        if (
+            execution_policy == PREPARED_DASHBOARD_EEF_EXECUTION_POLICY
+            and motion_scope != "whole_body"
+        ):
+            raise ValueError(
+                "prepared Dashboard EEF execution policy requires whole_body scope"
+            )
+        checkpoint_trigger_position_improvement_m = float(
+            replan_checkpoint_position_improvement_m
+        )
+        if (
+            not math.isfinite(checkpoint_trigger_position_improvement_m)
+            or checkpoint_trigger_position_improvement_m
+            < WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M
+        ):
+            raise ValueError(
+                "replan checkpoint trigger must be finite and at least "
+                f"{WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M} m"
+            )
+        if action_counter is not None:
+            action_counter.setdefault("attempted", 0)
+            action_counter.setdefault("confirmed", 0)
         if motion_scope not in _MOTION_SCOPES:
             raise ValueError(f"unsupported analytic motion scope {motion_scope!r}")
         if bool(static_gripper_only) != (motion_scope == "gripper_only"):
@@ -9922,52 +14913,953 @@ class PlannerExecutor:
             if joint_trajectory is not None
             else None
         )
-        if q_chunk is not None and (q_chunk.ndim != 2 or q_chunk.shape[0] < 1):
-            raise ValueError(f"joint trajectory must be [T,D], got {q_chunk.shape}")
+        if q_chunk is not None and (
+            q_chunk.ndim != 2
+            or q_chunk.shape[0] < 1
+            or not np.isfinite(q_chunk).all()
+        ):
+            raise ValueError(
+                f"joint trajectory must be a finite [T,D] array, got {q_chunk.shape}"
+            )
+        whole_body_eef_guard: dict[str, Any] | None = None
+
+        def eef_guard_snapshot() -> dict[str, Any] | None:
+            if whole_body_eef_guard is None:
+                return None
+            return {
+                key: _jsonable(value)
+                for key, value in whole_body_eef_guard.items()
+                if key
+                not in {
+                    "nominal_positions",
+                    "nominal_quaternions",
+                    "call_start_xyz",
+                    "call_start_quat_xyzw",
+                    "target_xyz",
+                    "direct_axis",
+                    "previous_live_position",
+                    "previous_live_quat_xyzw",
+                }
+            }
+
         if motion_scope == "whole_body":
             if not isinstance(whole_body_certificate, dict):
                 raise ValueError(
                     "whole-body execution requires a collision certificate"
                 )
+            if q_chunk is None:
+                raise ValueError(
+                    "whole-body execution requires a finite joint trajectory"
+                )
             digest = hashlib.sha256(
                 np.ascontiguousarray(q_chunk, dtype=np.float32).tobytes()
             ).hexdigest()
-            current_q = _call_optional(self.backend, "get_joint_positions")
-            current_q_digest = (
-                hashlib.sha256(
-                    np.ascontiguousarray(
-                        np.asarray(current_q, dtype=np.float32).reshape(-1),
-                        dtype=np.float32,
-                    ).tobytes()
-                ).hexdigest()
+            current_q = (
+                prepared_start_q
+                if prepared_start_q is not None
+                else _call_optional(self.backend, "get_joint_positions")
+            )
+            current_q_array = (
+                np.asarray(current_q, dtype=np.float32).reshape(-1)
                 if current_q is not None
                 else None
             )
-            if current_q is not None and int(q_chunk.shape[1]) != int(
-                np.asarray(current_q).reshape(-1).shape[0]
+            current_q_digest = (
+                hashlib.sha256(
+                    np.ascontiguousarray(
+                        current_q_array,
+                        dtype=np.float32,
+                    ).tobytes()
+                ).hexdigest()
+                if current_q_array is not None
+                and current_q_array.shape == (q_chunk.shape[1],)
+                and np.isfinite(current_q_array).all()
+                else None
+            )
+            if current_q_array is not None and int(q_chunk.shape[1]) != int(
+                current_q_array.shape[0]
             ):
                 raise ValueError(
                     "whole-body joint trajectory dimension "
                     f"{q_chunk.shape[1]} does not match live robot dimension "
-                    f"{np.asarray(current_q).reshape(-1).shape[0]}"
+                    f"{current_q_array.shape[0]}"
                 )
+            joint_name_layout = _call_optional_arg(
+                self.backend,
+                "whole_body_joint_names",
+                _normalize_hand(hand),
+            )
+            joint_name_layout_digest = (
+                _joint_name_layout_sha256(joint_name_layout)
+                if isinstance(joint_name_layout, (tuple, list))
+                and len(joint_name_layout) == q_chunk.shape[1]
+                else None
+            )
+            source_dense_q = np.asarray(
+                whole_body_certificate.get("source_dense_trajectory"),
+                dtype=np.float32,
+            )
+            certified_dense_q = np.asarray(
+                whole_body_certificate.get("dense_collision_trajectory"),
+                dtype=np.float32,
+            )
+            source_dense_row_count = (
+                int(source_dense_q.shape[0]) if source_dense_q.ndim == 2 else 0
+            )
+            certified_dense_row_count = (
+                int(certified_dense_q.shape[0])
+                if certified_dense_q.ndim == 2
+                else 0
+            )
+
+            def certified_indices(name: str) -> np.ndarray:
+                raw = whole_body_certificate.get(name)
+                if (
+                    not isinstance(raw, (tuple, list))
+                    or not raw
+                    or any(type(value) is not int for value in raw)
+                ):
+                    return np.zeros((0,), dtype=np.int64)
+                return np.asarray(raw, dtype=np.int64).reshape(-1)
+
+            source_dense_indices = certified_indices(
+                "execution_source_dense_indices"
+            )
+            collision_dense_indices = certified_indices(
+                "execution_collision_dense_indices"
+            )
+            densification_step_raw = whole_body_certificate.get(
+                "collision_densification_joint_step_rad"
+            )
+            densification_step = (
+                float(densification_step_raw)
+                if isinstance(densification_step_raw, (int, float))
+                and not isinstance(densification_step_raw, bool)
+                else float("nan")
+            )
+            allowed_densification_steps = tuple(
+                WHOLE_BODY_DENSE_COLLISION_STEP * (0.5**attempt)
+                for attempt in range(8)
+            )
+            densification_step_allowed = (
+                math.isfinite(densification_step)
+                and any(
+                    abs(densification_step - allowed) <= 1e-12
+                    for allowed in allowed_densification_steps
+                )
+            )
+            reconstructed_dense_q: np.ndarray | None = None
+            reconstructed_collision_indices = np.zeros((0,), dtype=np.int64)
             if (
-                whole_body_certificate.get("trajectory_sha256") != digest
-                or current_q_digest is None
-                or whole_body_certificate.get("start_q_sha256") != current_q_digest
-                or whole_body_certificate.get("waypoint_count") != int(len(q_chunk))
-                or whole_body_certificate.get("q_dimension") != int(q_chunk.shape[1])
-                or whole_body_certificate.get("active_dof_count") != 21
-                or whole_body_certificate.get("selected_eef_goal_count") != 1
-                or whole_body_certificate.get("inactive_eef_goal_count") != 0
-                or whole_body_certificate.get("attachment_hand_count") != 2
-                or whole_body_certificate.get("world_collision_check") is not True
-                or whole_body_certificate.get("self_collision_check") is not True
-                or whole_body_certificate.get("post_interpolation_check") is not True
+                current_q_array is not None
+                and source_dense_q.ndim == 2
+                and certified_dense_q.ndim == 2
+                and source_dense_q.shape[1:] == (q_chunk.shape[1],)
+                and certified_dense_q.shape[1:] == (q_chunk.shape[1],)
+                and len(source_dense_q) >= 2
+                and len(certified_dense_q) >= 2
+                and np.isfinite(source_dense_q).all()
+                and np.isfinite(certified_dense_q).all()
+                and densification_step_allowed
             ):
-                raise RuntimeError(
-                    "whole-body trajectory does not match its collision certificate"
+                execution_with_start = np.vstack(
+                    [current_q_array.reshape(1, -1), q_chunk]
+                ).astype(np.float32)
+                reconstructed_dense_q = _interpolate_joint_trajectory(
+                    execution_with_start,
+                    max_inter_dist=densification_step,
                 )
+                try:
+                    reconstructed_collision_indices = (
+                        _whole_body_ordered_row_indices(
+                            reconstructed_dense_q, execution_with_start
+                        )
+                    )
+                except (RuntimeError, ValueError):
+                    reconstructed_collision_indices = np.zeros(
+                        (0,), dtype=np.int64
+                    )
+            source_indices_valid = (
+                source_dense_indices.shape == (len(q_chunk) + 1,)
+                and source_dense_indices[0] == 0
+                and source_dense_indices[-1] == source_dense_row_count - 1
+                and bool(np.all(np.diff(source_dense_indices) > 0))
+            )
+            collision_indices_valid = (
+                collision_dense_indices.shape == (len(q_chunk) + 1,)
+                and collision_dense_indices[0] == 0
+                and collision_dense_indices[-1]
+                == certified_dense_row_count - 1
+                and bool(np.all(np.diff(collision_dense_indices) > 0))
+            )
+            lineage_checks = {
+                "schema": whole_body_certificate.get("schema_version") == 3,
+                "lineage_mode": whole_body_certificate.get(
+                    "collision_lineage_mode"
+                )
+                == "source_dense_execution_subset_recertified_v1",
+                "q_encoding": whole_body_certificate.get("q_encoding")
+                == "float32-c-order",
+                "execution_digest": (
+                    whole_body_certificate.get("trajectory_sha256") == digest
+                    and whole_body_certificate.get(
+                        "execution_trajectory_sha256"
+                    )
+                    == digest
+                ),
+                "live_start": (
+                    current_q_digest is not None
+                    and whole_body_certificate.get("start_q_sha256")
+                    == current_q_digest
+                ),
+                "execution_count": (
+                    whole_body_certificate.get("waypoint_count")
+                    == int(len(q_chunk))
+                    and whole_body_certificate.get(
+                        "execution_waypoint_count"
+                    )
+                    == int(len(q_chunk))
+                    and whole_body_certificate.get("execution_includes_start")
+                    is False
+                ),
+                "q_dimension": whole_body_certificate.get("q_dimension")
+                == int(q_chunk.shape[1]),
+                "joint_layout": (
+                    joint_name_layout_digest is not None
+                    and whole_body_certificate.get(
+                        "joint_name_layout_sha256"
+                    )
+                    == joint_name_layout_digest
+                ),
+                "active_dof_count": whole_body_certificate.get(
+                    "active_dof_count"
+                )
+                == 21,
+                "selected_eef_goal_count": whole_body_certificate.get(
+                    "selected_eef_goal_count"
+                )
+                == 1,
+                "inactive_eef_goal_count": whole_body_certificate.get(
+                    "inactive_eef_goal_count"
+                )
+                == 0,
+                "attachment_hand_count": whole_body_certificate.get(
+                    "attachment_hand_count"
+                )
+                == 2,
+                "world_collision_check": whole_body_certificate.get(
+                    "world_collision_check"
+                )
+                is True,
+                "self_collision_check": whole_body_certificate.get(
+                    "self_collision_check"
+                )
+                is True,
+                "post_interpolation_check": whole_body_certificate.get(
+                    "post_interpolation_check"
+                )
+                is True,
+                "densification_method": whole_body_certificate.get(
+                    "collision_densification_method"
+                )
+                == "joint_linear_max_inter_dist",
+                "densification_step": densification_step_allowed,
+                "source_dense_shape": (
+                    source_dense_q.ndim == 2
+                    and source_dense_q.shape[1:] == (q_chunk.shape[1],)
+                    and len(source_dense_q) >= 2
+                    and np.isfinite(source_dense_q).all()
+                ),
+                "source_dense_count": whole_body_certificate.get(
+                    "source_dense_waypoint_count"
+                )
+                == source_dense_row_count,
+                "source_dense_start": (
+                    current_q_array is not None
+                    and source_dense_q.ndim == 2
+                    and len(source_dense_q)
+                    and np.array_equal(source_dense_q[0], current_q_array)
+                    and whole_body_certificate.get(
+                        "source_dense_includes_start"
+                    )
+                    is True
+                ),
+                "source_dense_digest": (
+                    source_dense_q.ndim == 2
+                    and whole_body_certificate.get(
+                        "source_dense_trajectory_sha256"
+                    )
+                    == hashlib.sha256(
+                        np.ascontiguousarray(
+                            source_dense_q, dtype=np.float32
+                        ).tobytes()
+                    ).hexdigest()
+                ),
+                "source_indices": (
+                    source_indices_valid
+                    and whole_body_certificate.get(
+                        "execution_source_dense_indices_sha256"
+                    )
+                    == _whole_body_indices_sha256(source_dense_indices)
+                    and whole_body_certificate.get(
+                        "execution_source_terminal_index"
+                    )
+                    == source_dense_row_count - 1
+                ),
+                "source_subset_q": (
+                    source_indices_valid
+                    and np.array_equal(
+                        source_dense_q[source_dense_indices[1:]], q_chunk
+                    )
+                ),
+                "dense_shape": (
+                    certified_dense_q.ndim == 2
+                    and certified_dense_q.shape[1:] == (q_chunk.shape[1],)
+                    and len(certified_dense_q) >= 2
+                    and np.isfinite(certified_dense_q).all()
+                ),
+                "dense_count": (
+                    whole_body_certificate.get("collision_free_waypoints")
+                    == certified_dense_row_count
+                    and whole_body_certificate.get(
+                        "dense_collision_waypoint_count"
+                    )
+                    == certified_dense_row_count
+                    and whole_body_certificate.get(
+                        "dense_collision_checked_waypoint_count"
+                    )
+                    == certified_dense_row_count
+                    and whole_body_certificate.get(
+                        "dense_collision_includes_start"
+                    )
+                    is True
+                ),
+                "dense_digest": (
+                    certified_dense_q.ndim == 2
+                    and whole_body_certificate.get(
+                        "dense_collision_trajectory_sha256"
+                    )
+                    == hashlib.sha256(
+                        np.ascontiguousarray(
+                            certified_dense_q, dtype=np.float32
+                        ).tobytes()
+                    ).hexdigest()
+                ),
+                "dense_reconstruction": (
+                    reconstructed_dense_q is not None
+                    and np.array_equal(
+                        certified_dense_q, reconstructed_dense_q
+                    )
+                ),
+                "collision_indices": (
+                    collision_indices_valid
+                    and whole_body_certificate.get(
+                        "execution_collision_dense_indices_sha256"
+                    )
+                    == _whole_body_indices_sha256(collision_dense_indices)
+                    and whole_body_certificate.get(
+                        "execution_collision_terminal_index"
+                    )
+                    == certified_dense_row_count - 1
+                    and np.array_equal(
+                        collision_dense_indices,
+                        reconstructed_collision_indices,
+                    )
+                ),
+                "collision_subset_q": (
+                    collision_indices_valid
+                    and np.array_equal(
+                        certified_dense_q[collision_dense_indices[1:]],
+                        q_chunk,
+                    )
+                ),
+            }
+            if not all(lineage_checks.values()):
+                failed_lineage_checks = sorted(
+                    name
+                    for name, passed in lineage_checks.items()
+                    if not passed
+                )
+                raise RuntimeError(
+                    "whole-body trajectory does not match its collision "
+                    f"certificate: {failed_lineage_checks}"
+                )
+            if target_xyz is not None:
+                certified_positions = np.asarray(
+                    whole_body_certificate.get(
+                        "selected_eef_execution_positions"
+                    ),
+                    dtype=np.float32,
+                )
+                certified_quaternions = np.asarray(
+                    whole_body_certificate.get(
+                        "selected_eef_execution_quaternions_xyzw"
+                    ),
+                    dtype=np.float32,
+                )
+                certified_dense_positions = np.asarray(
+                    whole_body_certificate.get(
+                        "selected_eef_dense_positions"
+                    ),
+                    dtype=np.float32,
+                )
+                certified_dense_quaternions = np.asarray(
+                    whole_body_certificate.get(
+                        "selected_eef_dense_quaternions_xyzw"
+                    ),
+                    dtype=np.float32,
+                )
+                if (
+                    certified_positions.shape != (len(q_chunk), 3)
+                    or certified_quaternions.shape != (len(q_chunk), 4)
+                    or certified_dense_positions.shape
+                    != (len(certified_dense_q), 3)
+                    or certified_dense_quaternions.shape
+                    != (len(certified_dense_q), 4)
+                    or not np.isfinite(certified_positions).all()
+                    or not np.isfinite(certified_quaternions).all()
+                    or not np.isfinite(certified_dense_positions).all()
+                    or not np.isfinite(certified_dense_quaternions).all()
+                ):
+                    raise RuntimeError(
+                        "whole-body EEF certificate payload shape or finiteness "
+                        "is invalid"
+                    )
+                positions_digest = hashlib.sha256(
+                    np.ascontiguousarray(
+                        certified_positions, dtype=np.float32
+                    ).tobytes()
+                ).hexdigest()
+                quaternions_digest = hashlib.sha256(
+                    np.ascontiguousarray(
+                        certified_quaternions, dtype=np.float32
+                    ).tobytes()
+                ).hexdigest()
+                dense_positions_digest = hashlib.sha256(
+                    np.ascontiguousarray(
+                        certified_dense_positions, dtype=np.float32
+                    ).tobytes()
+                ).hexdigest()
+                dense_quaternions_digest = hashlib.sha256(
+                    np.ascontiguousarray(
+                        certified_dense_quaternions, dtype=np.float32
+                    ).tobytes()
+                ).hexdigest()
+                recomputed = _call_optional_kw(
+                    self.backend,
+                    "whole_body_eef_poses",
+                    hand=hand,
+                    q_trajectory=q_chunk,
+                )
+                if not isinstance(recomputed, (tuple, list)) or len(recomputed) != 2:
+                    raise RuntimeError(
+                        "whole-body EEF certificate FK verification is unavailable"
+                    )
+                recomputed_positions = np.asarray(
+                    recomputed[0], dtype=np.float32
+                ).reshape(-1, 3)
+                recomputed_quaternions = np.asarray(
+                    recomputed[1], dtype=np.float32
+                ).reshape(-1, 4)
+                recomputed_positions_digest = hashlib.sha256(
+                    np.ascontiguousarray(
+                        recomputed_positions, dtype=np.float32
+                    ).tobytes()
+                ).hexdigest()
+                recomputed_quaternions_digest = hashlib.sha256(
+                    np.ascontiguousarray(
+                        recomputed_quaternions, dtype=np.float32
+                    ).tobytes()
+                ).hexdigest()
+                recomputed_dense = _call_optional_kw(
+                    self.backend,
+                    "whole_body_eef_poses",
+                    hand=hand,
+                    q_trajectory=certified_dense_q,
+                )
+                if (
+                    not isinstance(recomputed_dense, (tuple, list))
+                    or len(recomputed_dense) != 2
+                ):
+                    raise RuntimeError(
+                        "whole-body dense EEF certificate FK verification "
+                        "is unavailable"
+                    )
+                recomputed_dense_positions = np.asarray(
+                    recomputed_dense[0], dtype=np.float32
+                ).reshape(-1, 3)
+                recomputed_dense_quaternions = np.asarray(
+                    recomputed_dense[1], dtype=np.float32
+                ).reshape(-1, 4)
+                recomputed_dense_positions_digest = hashlib.sha256(
+                    np.ascontiguousarray(
+                        recomputed_dense_positions, dtype=np.float32
+                    ).tobytes()
+                ).hexdigest()
+                recomputed_dense_quaternions_digest = hashlib.sha256(
+                    np.ascontiguousarray(
+                        recomputed_dense_quaternions, dtype=np.float32
+                    ).tobytes()
+                ).hexdigest()
+                target_array = np.asarray(
+                    target_xyz, dtype=np.float64
+                ).reshape(-1)
+                target_quat_array = (
+                    _quat_xyzw(target_quat_xyzw)
+                    if target_quat_xyzw is not None
+                    else None
+                )
+                target_quat_digest = (
+                    hashlib.sha256(
+                        np.ascontiguousarray(
+                            target_quat_array, dtype=np.float32
+                        ).tobytes()
+                    ).hexdigest()
+                    if target_quat_array is not None
+                    else None
+                )
+                certified_terminal_position_error = (
+                    float(
+                        np.linalg.norm(
+                            certified_positions[-1].astype(np.float64)
+                            - target_array
+                        )
+                    )
+                    if target_array.shape == (3,) and len(certified_positions)
+                    else float("inf")
+                )
+                certified_terminal_orientation_error = (
+                    _quat_angle_error_rad(
+                        certified_quaternions[-1],
+                        target_quat_array,
+                    )
+                    if target_quat_array is not None
+                    and len(certified_quaternions)
+                    else 0.0
+                )
+                assert current_q_array is not None
+                execution_q_with_start = np.vstack(
+                    [current_q_array.reshape(1, -1), q_chunk]
+                ).astype(np.float32)
+                execution_positions_with_start = np.vstack(
+                    [
+                        certified_dense_positions[0].reshape(1, 3),
+                        certified_positions,
+                    ]
+                )
+                execution_quaternions_with_start = np.vstack(
+                    [
+                        certified_dense_quaternions[0].reshape(1, 4),
+                        certified_quaternions,
+                    ]
+                )
+                certified_short_target = whole_body_certificate.get(
+                    "selected_eef_short_target"
+                )
+                execution_step_report = _whole_body_execution_step_report(
+                    execution_q_with_start,
+                    execution_positions_with_start,
+                    execution_quaternions_with_start,
+                    joint_names=tuple(str(name) for name in joint_name_layout),
+                    short_target=bool(certified_short_target),
+                )
+                dense_step_report = _whole_body_execution_step_report(
+                    certified_dense_q,
+                    certified_dense_positions,
+                    certified_dense_quaternions,
+                    joint_names=tuple(str(name) for name in joint_name_layout),
+                    short_target=bool(certified_short_target),
+                )
+                certificate_checks = {
+                    "schema": whole_body_certificate.get("schema_version") == 3,
+                    "hand": whole_body_certificate.get("selected_hand")
+                    == _normalize_hand(hand),
+                    "target_xyz": whole_body_certificate.get(
+                        "selected_target_xyz_sha256"
+                    )
+                    == _whole_body_target_sha256(target_xyz),
+                    "target_quat": whole_body_certificate.get(
+                        "selected_target_quat_xyzw_sha256"
+                    )
+                    == target_quat_digest,
+                    "admitted": whole_body_certificate.get(
+                        "selected_eef_path_admitted"
+                    )
+                    is True,
+                    "short_target_type": isinstance(
+                        whole_body_certificate.get("selected_eef_short_target"),
+                        bool,
+                    ),
+                    "position_shape": certified_positions.shape
+                    == (len(q_chunk), 3),
+                    "quaternion_shape": certified_quaternions.shape
+                    == (len(q_chunk), 4),
+                    "position_finite": bool(
+                        np.isfinite(certified_positions).all()
+                    ),
+                    "quaternion_finite": bool(
+                        np.isfinite(certified_quaternions).all()
+                    ),
+                    "position_digest": whole_body_certificate.get(
+                        "selected_eef_execution_positions_sha256"
+                    )
+                    == positions_digest,
+                    "quaternion_digest": whole_body_certificate.get(
+                        "selected_eef_execution_quaternions_sha256"
+                    )
+                    == quaternions_digest,
+                    "recomputed_position_shape": recomputed_positions.shape
+                    == certified_positions.shape,
+                    "recomputed_quaternion_shape": recomputed_quaternions.shape
+                    == certified_quaternions.shape,
+                    "recomputed_position_digest": (
+                        recomputed_positions_digest == positions_digest
+                    ),
+                    "recomputed_quaternion_digest": (
+                        recomputed_quaternions_digest == quaternions_digest
+                    ),
+                    "dense_position_shape": certified_dense_positions.shape
+                    == (len(certified_dense_q), 3),
+                    "dense_quaternion_shape": certified_dense_quaternions.shape
+                    == (len(certified_dense_q), 4),
+                    "dense_position_finite": bool(
+                        np.isfinite(certified_dense_positions).all()
+                    ),
+                    "dense_quaternion_finite": bool(
+                        np.isfinite(certified_dense_quaternions).all()
+                    ),
+                    "dense_position_digest": whole_body_certificate.get(
+                        "selected_eef_dense_positions_sha256"
+                    )
+                    == dense_positions_digest,
+                    "dense_quaternion_digest": whole_body_certificate.get(
+                        "selected_eef_dense_quaternions_sha256"
+                    )
+                    == dense_quaternions_digest,
+                    "dense_position_path_digest": whole_body_certificate.get(
+                        "selected_eef_positions_sha256"
+                    )
+                    == dense_positions_digest,
+                    "recomputed_dense_position_shape": (
+                        recomputed_dense_positions.shape
+                        == certified_dense_positions.shape
+                    ),
+                    "recomputed_dense_quaternion_shape": (
+                        recomputed_dense_quaternions.shape
+                        == certified_dense_quaternions.shape
+                    ),
+                    "recomputed_dense_position_digest": (
+                        recomputed_dense_positions_digest
+                        == dense_positions_digest
+                    ),
+                    "recomputed_dense_quaternion_digest": (
+                        recomputed_dense_quaternions_digest
+                        == dense_quaternions_digest
+                    ),
+                    "execution_dense_position_subset": np.array_equal(
+                        certified_dense_positions[
+                            collision_dense_indices[1:]
+                        ],
+                        certified_positions,
+                    ),
+                    "execution_dense_quaternion_subset": np.array_equal(
+                        certified_dense_quaternions[
+                            collision_dense_indices[1:]
+                        ],
+                        certified_quaternions,
+                    ),
+                    "execution_step_admitted": (
+                        execution_step_report.get("admitted") is True
+                    ),
+                    "dense_step_admitted": (
+                        dense_step_report.get("admitted") is True
+                    ),
+                    "terminal_position": certified_terminal_position_error
+                    <= WHOLE_BODY_EEF_TERMINAL_TOLERANCE_M + 1e-9,
+                    "terminal_orientation": certified_terminal_orientation_error
+                    <= WHOLE_BODY_EEF_SHORT_MAX_ORIENTATION_ERROR_RAD + 1e-9,
+                    "position_tolerance": whole_body_certificate.get(
+                        "selected_eef_live_waypoint_position_tolerance_m"
+                    )
+                    == WHOLE_BODY_EEF_LIVE_WAYPOINT_POSITION_TOLERANCE_M,
+                    "orientation_tolerance": whole_body_certificate.get(
+                        "selected_eef_live_waypoint_orientation_tolerance_rad"
+                    )
+                    == WHOLE_BODY_EEF_LIVE_WAYPOINT_ORIENTATION_TOLERANCE_RAD,
+                    "controller_response_margin": whole_body_certificate.get(
+                        "selected_eef_controller_response_margin_m"
+                    )
+                    == WHOLE_BODY_EEF_CONTROLLER_RESPONSE_MARGIN_M,
+                    "numerical_margin": whole_body_certificate.get(
+                        "selected_eef_numerical_margin_m"
+                    )
+                    == WHOLE_BODY_EEF_NUMERICAL_MARGIN_M,
+                    "prospective_guard_margin": whole_body_certificate.get(
+                        "selected_eef_prospective_guard_margin_m"
+                    )
+                    == WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M,
+                    "execution_base_xy_step_limit": (
+                        whole_body_certificate.get(
+                            "execution_base_xy_step_limit_m"
+                        )
+                        == WHOLE_BODY_EXECUTION_BASE_XY_STEP_M
+                    ),
+                    "execution_base_yaw_step_limit": (
+                        whole_body_certificate.get(
+                            "execution_base_yaw_step_limit_rad"
+                        )
+                        == WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD
+                    ),
+                    "execution_articulation_step_limit": (
+                        whole_body_certificate.get(
+                            "execution_articulation_step_limit_rad"
+                        )
+                        == WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD
+                    ),
+                    "terminal_command_limit": whole_body_certificate.get(
+                        "terminal_command_limit"
+                    )
+                    == TERMINAL_COMMAND_LIMIT,
+                    "terminal_eef_position_tolerance": (
+                        whole_body_certificate.get(
+                            "terminal_eef_position_tolerance_m"
+                        )
+                        == EEF_TERMINAL_POSITION_TOLERANCE_M
+                    ),
+                    "terminal_eef_orientation_tolerance": (
+                        whole_body_certificate.get(
+                            "terminal_eef_orientation_tolerance_rad"
+                        )
+                        == EEF_TERMINAL_ORIENTATION_TOLERANCE_RAD
+                    ),
+                }
+                if not all(certificate_checks.values()):
+                    failed_checks = sorted(
+                        name
+                        for name, passed in certificate_checks.items()
+                        if not passed
+                    )
+                    raise RuntimeError(
+                        "whole-body EEF path does not match its collision "
+                        f"certificate: {failed_checks}"
+                    )
+                pose = (
+                    (
+                        certified_dense_positions[0],
+                        certified_dense_quaternions[0],
+                    )
+                    if prepared_start_q is not None
+                    else _call_optional_arg(self.backend, "get_eef_pose", hand)
+                )
+                if not isinstance(pose, (tuple, list)) or len(pose) != 2:
+                    return self._execution_result(
+                        primitive_success=False,
+                        stop_reason="pose_feedback_unavailable",
+                        recoverable=False,
+                        suggested_next_tool="observe",
+                        executed=0,
+                        trace=[],
+                        final_pos_err=None,
+                        final_ori_err=None,
+                        held_steps=0,
+                        started=started,
+                    )
+                call_start_xyz = np.asarray(pose[0], dtype=np.float64).reshape(-1)
+                call_start_quat = _quat_xyzw(pose[1])
+                if (
+                    call_start_xyz.shape != (3,)
+                    or target_array.shape != (3,)
+                    or not np.isfinite(call_start_xyz).all()
+                    or not np.isfinite(target_array).all()
+                    or call_start_quat is None
+                ):
+                    return self._execution_result(
+                        primitive_success=False,
+                        stop_reason="pose_feedback_unavailable",
+                        recoverable=False,
+                        suggested_next_tool="observe",
+                        executed=0,
+                        trace=[],
+                        final_pos_err=None,
+                        final_ori_err=None,
+                        held_steps=0,
+                        started=started,
+                    )
+                direct = target_array - call_start_xyz
+                direct_distance = float(np.linalg.norm(direct))
+                direct_axis = (
+                    direct / direct_distance
+                    if direct_distance > 1e-9
+                    else np.zeros(3, dtype=np.float64)
+                )
+                certified_path_with_start = np.vstack(
+                    [
+                        call_start_xyz.reshape(1, 3),
+                        certified_positions.astype(np.float64),
+                    ]
+                )
+                certified_quats_with_start = np.vstack(
+                    [
+                        call_start_quat.reshape(1, 4),
+                        certified_quaternions.astype(np.float64),
+                    ]
+                )
+                runtime_admission = _eef_pose_path_admission_report(
+                    certified_path_with_start,
+                    certified_quats_with_start,
+                    call_start_xyz=call_start_xyz,
+                    target_xyz=target_array,
+                    target_quat_xyzw=target_quat_array,
+                    short_cartesian_step_limit_m=(
+                        WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M
+                    ),
+                )
+                dense_runtime_admission = _eef_pose_path_admission_report(
+                    certified_dense_positions,
+                    certified_dense_quaternions,
+                    call_start_xyz=call_start_xyz,
+                    target_xyz=target_array,
+                    target_quat_xyzw=target_quat_array,
+                )
+                runtime_short_target = bool(runtime_admission["short_target"])
+                lineage_checks = {
+                    "short_target_matches_live_call_start": (
+                        certified_short_target is runtime_short_target
+                    ),
+                    "dense_short_target_matches_live_call_start": (
+                        bool(dense_runtime_admission["short_target"])
+                        is runtime_short_target
+                    ),
+                    "runtime_eef_path_admitted": (
+                        runtime_admission.get("admitted") is True
+                    ),
+                    "runtime_dense_eef_path_admitted": (
+                        dense_runtime_admission.get("admitted") is True
+                    ),
+                }
+                if not all(lineage_checks.values()):
+                    failed_lineage_checks = sorted(
+                        name
+                        for name, passed in lineage_checks.items()
+                        if not passed
+                    )
+                    failed_runtime_checks = sorted(
+                        name
+                        for report_name, report in (
+                            ("execution", runtime_admission),
+                            ("dense", dense_runtime_admission),
+                        )
+                        for name, passed in dict(
+                            report.get("checks") or {}
+                        ).items()
+                        if not passed
+                    )
+                    raise RuntimeError(
+                        "whole-body runtime EEF/collision lineage rejected "
+                        f"{failed_lineage_checks}; path={failed_runtime_checks}"
+                    )
+                whole_body_eef_guard = {
+                    "available": True,
+                    "execution_policy": execution_policy,
+                    "first_sample_axis_reverse_transient_enabled": bool(
+                        execution_policy
+                        == PREPARED_DASHBOARD_EEF_EXECUTION_POLICY
+                        and contact_target_xyz is None
+                        and not stop_on_expected_contact
+                        and not stop_on_attachment
+                        and not require_attachment
+                        and expected_attachment is None
+                        and not any(
+                            value is not None
+                            for value in expected_attachments_by_hand.values()
+                        )
+                    ),
+                    "certificate_schema_version": 3,
+                    "collision_lineage_mode": (
+                        "source_dense_execution_subset_recertified_v1"
+                    ),
+                    "selected_hand": _normalize_hand(hand),
+                    "selected_target_xyz_sha256": _whole_body_target_sha256(
+                        target_array
+                    ),
+                    "selected_eef_execution_positions_sha256": positions_digest,
+                    "selected_eef_execution_quaternions_sha256": (
+                        quaternions_digest
+                    ),
+                    "nominal_positions": certified_positions,
+                    "nominal_quaternions": certified_quaternions,
+                    "call_start_xyz": call_start_xyz,
+                    "call_start_quat_xyzw": call_start_quat,
+                    "target_xyz": target_array,
+                    "direct_axis": direct_axis,
+                    "direct_distance_m": direct_distance,
+                    "short_target": runtime_short_target,
+                    "runtime_admission": runtime_admission,
+                    "dense_runtime_admission": dense_runtime_admission,
+                    "execution_step_admission": execution_step_report,
+                    "dense_step_admission": dense_step_report,
+                    "controller_response_margin_m": (
+                        WHOLE_BODY_EEF_CONTROLLER_RESPONSE_MARGIN_M
+                    ),
+                    "numerical_margin_m": (
+                        WHOLE_BODY_EEF_NUMERICAL_MARGIN_M
+                    ),
+                    "prospective_guard_margin_m": (
+                        WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M
+                    ),
+                    "axis_reverse_defer_ledger": {},
+                    "pending_axis_reverse_settle_repeat": None,
+                    "replan_checkpoint_trigger_position_improvement_m": (
+                        checkpoint_trigger_position_improvement_m
+                    ),
+                    "replan_checkpoint_outer_minimum_improvement_m": (
+                        WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M
+                    ),
+                    "terminal_command_limit": TERMINAL_COMMAND_LIMIT,
+                    "terminal_commands_sent": 0,
+                    "live_start_equality_checked": (
+                        prepared_start_q is None
+                    ),
+                    "collision_revalidated": False,
+                    "live_waypoint_position_tolerance_m": (
+                        WHOLE_BODY_EEF_LIVE_WAYPOINT_POSITION_TOLERANCE_M
+                    ),
+                    "live_waypoint_orientation_tolerance_rad": (
+                        WHOLE_BODY_EEF_LIVE_WAYPOINT_ORIENTATION_TOLERANCE_RAD
+                    ),
+                    "waypoint_settle_position_tolerance_m": (
+                        (
+                            WHOLE_BODY_EEF_SHORT_WAYPOINT_SETTLE_POSITION_TOLERANCE_M
+                            if runtime_short_target
+                            else WHOLE_BODY_EEF_WAYPOINT_SETTLE_POSITION_TOLERANCE_M
+                        )
+                    ),
+                    "waypoint_settle_orientation_tolerance_rad": (
+                        WHOLE_BODY_EEF_WAYPOINT_SETTLE_ORIENTATION_TOLERANCE_RAD
+                    ),
+                    "settle_waypoint_index": None,
+                    "settle_previous_normalized_error": None,
+                    "corridor_margin_m": WHOLE_BODY_EEF_SHORT_CORRIDOR_MARGIN_M,
+                    "max_observed_live_waypoint_position_error_m": 0.0,
+                    "max_observed_live_waypoint_orientation_error_rad": 0.0,
+                    "max_observed_live_lateral_m": 0.0,
+                    "max_observed_live_start_excursion_m": 0.0,
+                    "max_observed_live_reverse_step_m": 0.0,
+                    "cumulative_observed_live_path_m": 0.0,
+                    "previous_live_position": call_start_xyz.copy(),
+                    "previous_live_along_m": 0.0,
+                    "previous_live_quat_xyzw": call_start_quat.copy(),
+                    "previous_live_target_orientation_error_rad": (
+                        float(
+                            runtime_admission[
+                                "start_orientation_error_rad"
+                            ]
+                        )
+                    ),
+                    "max_observed_live_orientation_step_rad": 0.0,
+                    "max_observed_live_orientation_reverse_progress_rad": 0.0,
+                    "cumulative_observed_live_orientation_path_rad": 0.0,
+                }
         planned_steps = (
             action_chunk.shape[0] if action_chunk is not None else q_chunk.shape[0]
         )
@@ -10034,13 +15926,82 @@ class PlannerExecutor:
         gripper_contact_hold_action: np.ndarray | None = None
         index = 0
         waypoint_attempts = 0
+        terminal_commands_sent = 0
         final_waypoint_tracking: dict[str, Any] | None = None
         max_steps = (
-            planned_steps * (self.max_stall_steps + 1)
+            max(planned_steps - 1, 0)
+            + TERMINAL_COMMAND_LIMIT
             + int(hold_steps_required)
-            + self.max_stall_steps
+            if whole_body_eef_guard is not None
+            else (
+                planned_steps * (self.max_stall_steps + 1)
+                + int(hold_steps_required)
+                + self.max_stall_steps
+            )
         )
         while executed < max_steps:
+            whole_body_commanded_waypoint_index = (
+                min(index, planned_steps - 1)
+                if whole_body_eef_guard is not None
+                else None
+            )
+            whole_body_waypoint_command = None
+            terminal_command = bool(
+                whole_body_commanded_waypoint_index is not None
+                and whole_body_commanded_waypoint_index == planned_steps - 1
+            )
+            if terminal_command and terminal_commands_sent >= TERMINAL_COMMAND_LIMIT:
+                break
+            if (
+                whole_body_commanded_waypoint_index is not None
+                and q_chunk is not None
+            ):
+                commanded_q = np.ascontiguousarray(
+                    q_chunk[whole_body_commanded_waypoint_index],
+                    dtype=np.float32,
+                )
+                commanded_q_sha256 = hashlib.sha256(
+                    commanded_q.tobytes()
+                ).hexdigest()
+                pending_axis_reverse_repeat = (
+                    whole_body_eef_guard.get(
+                        "pending_axis_reverse_settle_repeat"
+                    )
+                    if whole_body_eef_guard is not None
+                    else None
+                )
+                if pending_axis_reverse_repeat is not None and (
+                    not isinstance(pending_axis_reverse_repeat, dict)
+                    or pending_axis_reverse_repeat.get("index")
+                    != whole_body_commanded_waypoint_index
+                    or pending_axis_reverse_repeat.get("q_sha256")
+                    != commanded_q_sha256
+                ):
+                    raise RuntimeError(
+                        "prepared Dashboard EEF transient repeat lost exact-q lineage"
+                    )
+                whole_body_waypoint_command = {
+                    "index": whole_body_commanded_waypoint_index,
+                    "q_sha256": commanded_q_sha256,
+                    "trajectory_sha256": (
+                        whole_body_certificate.get("trajectory_sha256")
+                        if isinstance(whole_body_certificate, dict)
+                        else None
+                    ),
+                    "settle_repeat": (
+                        (
+                            terminal_command
+                            and terminal_commands_sent > 0
+                        )
+                        or pending_axis_reverse_repeat is not None
+                    ),
+                    "terminal_command": terminal_command,
+                    "terminal_command_index": (
+                        terminal_commands_sent + 1
+                        if terminal_command
+                        else None
+                    ),
+                }
             attachment_confirmed = False
             if time.monotonic() > deadline:
                 return self._execution_result(
@@ -10170,8 +16131,18 @@ class PlannerExecutor:
                 )
                 action = validate_action_chunk(action.reshape(1, ACTION_DIM))[0]
             previous_action = action.copy()
+            if action_counter is not None:
+                action_counter["attempted"] += 1
             step_receipt = self._step_env_action(action)
             executed += 1
+            if terminal_command:
+                terminal_commands_sent += 1
+                assert whole_body_eef_guard is not None
+                whole_body_eef_guard["terminal_commands_sent"] = (
+                    terminal_commands_sent
+                )
+            if action_counter is not None:
+                action_counter["confirmed"] += 1
             if static_gripper_only:
                 # The env receipt proves this exact command was executed once.
                 # Commit the latch before interpreting a terminal raw-success
@@ -10188,6 +16159,7 @@ class PlannerExecutor:
                     {
                         "step": executed,
                         "step_receipt": dict(step_receipt),
+                        "whole_body_waypoint_command": whole_body_waypoint_command,
                     }
                 )
                 return self._execution_result(
@@ -10284,6 +16256,7 @@ class PlannerExecutor:
                         held_steps=held_steps,
                         started=started,
                     )
+            contact: dict[str, Any] | None = None
             if motion_scope == "whole_body":
                 assert expected_attachments_by_hand is not None
                 for side in ("left", "right"):
@@ -10301,6 +16274,9 @@ class PlannerExecutor:
                                     "hand": side,
                                     **identity,
                                 },
+                                "whole_body_waypoint_command": (
+                                    whole_body_waypoint_command
+                                ),
                             }
                         )
                         return self._execution_result(
@@ -10321,11 +16297,49 @@ class PlannerExecutor:
                                 }
                             },
                         )
+                if stop_on_expected_contact and contact_target_xyz is not None:
+                    contact = self._contact_report(
+                        hand=hand,
+                        target_xyz=contact_target_xyz,
+                        allowed_contact_distance_m=max(
+                            float(allowed_contact_distance_m),
+                            float(position_tolerance_m) * 2.0,
+                        ),
+                    )
+                    if not bool(contact.get("available", False)):
+                        trace.append(
+                            {
+                                "step": executed,
+                                "contact_report": contact,
+                                "whole_body_waypoint_command": (
+                                    whole_body_waypoint_command
+                                ),
+                            }
+                        )
+                        return self._execution_result(
+                            primitive_success=False,
+                            stop_reason="contact_feedback_unavailable",
+                            recoverable=True,
+                            suggested_next_tool="observe",
+                            executed=executed,
+                            trace=trace,
+                            final_pos_err=final_pos_err,
+                            final_ori_err=final_ori_err,
+                            held_steps=held_steps,
+                            started=started,
+                            extra_metrics={"contact_report": contact},
+                        )
                 whole_body_contact = _call_optional_kw(
                     self.backend,
                     "whole_body_contact_report",
                     baseline=whole_body_contact_baseline,
                     expected_attachments_by_hand=expected_attachments_by_hand,
+                    allowed_expected_contact=(
+                        contact
+                        if isinstance(contact, dict)
+                        and contact.get("expected_contact") is True
+                        else None
+                    ),
                 )
                 if not isinstance(whole_body_contact, dict) or not bool(
                     whole_body_contact.get("available", False)
@@ -10334,6 +16348,9 @@ class PlannerExecutor:
                         {
                             "step": executed,
                             "whole_body_contact": whole_body_contact,
+                            "whole_body_waypoint_command": (
+                                whole_body_waypoint_command
+                            ),
                         }
                     )
                     return self._execution_result(
@@ -10356,6 +16373,9 @@ class PlannerExecutor:
                         {
                             "step": executed,
                             "whole_body_contact": whole_body_contact,
+                            "whole_body_waypoint_command": (
+                                whole_body_waypoint_command
+                            ),
                         }
                     )
                     return self._execution_result(
@@ -10371,6 +16391,39 @@ class PlannerExecutor:
                         started=started,
                         extra_metrics={
                             "whole_body_contact": whole_body_contact,
+                        },
+                    )
+                if (
+                    isinstance(contact, dict)
+                    and contact.get("expected_contact") is True
+                ):
+                    trace.append(
+                        {
+                            "step": executed,
+                            "contact_report": contact,
+                            "whole_body_contact": whole_body_contact,
+                            "whole_body_waypoint_command": (
+                                whole_body_waypoint_command
+                            ),
+                            "expected_contact_stop": True,
+                        }
+                    )
+                    return self._execution_result(
+                        primitive_success=True,
+                        stop_reason="reached",
+                        recoverable=True,
+                        suggested_next_tool=None,
+                        executed=executed,
+                        trace=trace,
+                        final_pos_err=final_pos_err,
+                        final_ori_err=final_ori_err,
+                        held_steps=0,
+                        started=started,
+                        extra_metrics={
+                            "contact_report": contact,
+                            "whole_body_contact": whole_body_contact,
+                            "expected_contact_seen": True,
+                            "whole_body_eef_path_guard": eef_guard_snapshot(),
                         },
                     )
             if stop_on_attachment or require_attachment:
@@ -10457,6 +16510,10 @@ class PlannerExecutor:
             waypoint_tracking: dict[str, Any] | None = None
             waypoint_advanced = False
             waypoint_stalled = False
+            whole_body_joint_waypoint_reached = False
+            whole_body_eef_waypoint_trace: dict[str, Any] | None = None
+            whole_body_eef_settle_no_progress = False
+            whole_body_replan_checkpoint: dict[str, Any] | None = None
             if q_chunk is not None and index < planned_steps:
                 waypoint_attempts += 1
                 waypoint_tracking = _call_optional_kw(
@@ -10486,11 +16543,61 @@ class PlannerExecutor:
                         extra_metrics={"joint_tracking": waypoint_tracking},
                     )
                 final_waypoint_tracking = waypoint_tracking
+                if whole_body_eef_guard is not None:
+                    hard_tracking, hard_tracking_available = (
+                        _tracking_hard_deviation_report(waypoint_tracking)
+                    )
+                    if not hard_tracking_available:
+                        return self._execution_result(
+                            primitive_success=False,
+                            stop_reason="joint_tracking_feedback_unavailable",
+                            recoverable=True,
+                            suggested_next_tool="observe",
+                            executed=executed,
+                            trace=trace,
+                            final_pos_err=final_pos_err,
+                            final_ori_err=final_ori_err,
+                            held_steps=held_steps,
+                            started=started,
+                            extra_metrics={
+                                "tracking_hard_deviation": hard_tracking,
+                            },
+                        )
+                    if hard_tracking["hard_deviation"] is True:
+                        return self._execution_result(
+                            primitive_success=False,
+                            stop_reason="tracking_hard_deviation",
+                            recoverable=False,
+                            suggested_next_tool="observe",
+                            executed=executed,
+                            trace=trace,
+                            final_pos_err=final_pos_err,
+                            final_ori_err=final_ori_err,
+                            held_steps=held_steps,
+                            started=started,
+                            extra_metrics={
+                                "tracking_hard_deviation": hard_tracking,
+                                "whole_body_waypoint_command": (
+                                    whole_body_waypoint_command
+                                ),
+                            },
+                        )
                 if bool(waypoint_tracking.get("reached", False)):
-                    index += 1
-                    waypoint_advanced = True
-                    waypoint_attempts = 0
-                elif waypoint_attempts >= self.max_stall_steps:
+                    if whole_body_eef_guard is not None:
+                        # A loose 21-DOF joint-space tolerance must not advance
+                        # a whole-body path while the selected EEF is still
+                        # lagging its collision-certified Cartesian waypoint.
+                        # The post-step EEF feedback below is the second half of
+                        # this combined settle gate.
+                        whole_body_joint_waypoint_reached = True
+                    else:
+                        index += 1
+                        waypoint_advanced = True
+                        waypoint_attempts = 0
+                elif (
+                    whole_body_eef_guard is None
+                    and waypoint_attempts >= self.max_stall_steps
+                ):
                     waypoint_stalled = True
             if base_goal_xyyaw is not None:
                 base_pose = _call_optional(self.backend, "get_base_pose")
@@ -10507,7 +16614,25 @@ class PlannerExecutor:
                         held_steps=held_steps,
                         started=started,
                     )
-                base_pose = np.asarray(base_pose, dtype=np.float64).reshape(-1)
+                try:
+                    base_pose = np.asarray(
+                        base_pose, dtype=np.float64
+                    ).reshape(-1)
+                except (TypeError, ValueError):
+                    base_pose = np.asarray([], dtype=np.float64)
+                if base_pose.shape != (3,) or not np.isfinite(base_pose).all():
+                    return self._execution_result(
+                        primitive_success=False,
+                        stop_reason="pose_feedback_unavailable",
+                        recoverable=True,
+                        suggested_next_tool="observe",
+                        executed=executed,
+                        trace=trace,
+                        final_pos_err=final_pos_err,
+                        final_ori_err=final_ori_err,
+                        held_steps=held_steps,
+                        started=started,
+                    )
                 final_pos_err = float(
                     np.linalg.norm(base_pose[:2] - base_goal_xyyaw[:2])
                 )
@@ -10537,24 +16662,711 @@ class PlannerExecutor:
                     final_pos_err = None
                     final_ori_err = None
                 else:
-                    pos, quat = pose
+                    try:
+                        pos = np.asarray(pose[0], dtype=np.float64).reshape(-1)
+                        quat = _quat_xyzw(pose[1])
+                    except (TypeError, ValueError):
+                        pos = np.asarray([], dtype=np.float64)
+                        quat = None
+                    if (
+                        pos.shape != (3,)
+                        or not np.isfinite(pos).all()
+                        or (
+                            (
+                                require_pose
+                                or motion_scope == "whole_body"
+                                or target_quat_xyzw is not None
+                            )
+                            and quat is None
+                        )
+                    ):
+                        return self._execution_result(
+                            primitive_success=False,
+                            stop_reason="pose_feedback_unavailable",
+                            recoverable=True,
+                            suggested_next_tool="observe",
+                            executed=executed,
+                            trace=trace,
+                            final_pos_err=final_pos_err,
+                            final_ori_err=final_ori_err,
+                            held_steps=held_steps,
+                            started=started,
+                        )
                     if target_xyz is not None:
                         final_pos_err = float(np.linalg.norm(pos - target_xyz))
                     if target_quat_xyzw is not None:
                         final_ori_err = _quat_angle_error_rad(quat, target_quat_xyzw)
-            contact: dict[str, Any] | None = None
+            if (
+                motion_scope == "whole_body"
+                and whole_body_eef_guard is not None
+                and pose is not None
+                and whole_body_commanded_waypoint_index is not None
+            ):
+                live_position = np.asarray(pose[0], dtype=np.float64).reshape(3)
+                live_quat = _quat_xyzw(pose[1])
+                nominal_position = np.asarray(
+                    whole_body_eef_guard["nominal_positions"][
+                        whole_body_commanded_waypoint_index
+                    ],
+                    dtype=np.float64,
+                ).reshape(3)
+                nominal_quat = np.asarray(
+                    whole_body_eef_guard["nominal_quaternions"][
+                        whole_body_commanded_waypoint_index
+                    ],
+                    dtype=np.float64,
+                ).reshape(4)
+                configured_position_settle_tolerance = float(
+                    whole_body_eef_guard[
+                        "waypoint_settle_position_tolerance_m"
+                    ]
+                )
+                prospective_next_waypoint_step = 0.0
+                if (
+                    whole_body_commanded_waypoint_index + 1
+                    < len(whole_body_eef_guard["nominal_positions"])
+                ):
+                    next_nominal_position = np.asarray(
+                        whole_body_eef_guard["nominal_positions"][
+                            whole_body_commanded_waypoint_index + 1
+                        ],
+                        dtype=np.float64,
+                    ).reshape(3)
+                    prospective_next_waypoint_step = float(
+                        np.linalg.norm(
+                            next_nominal_position - nominal_position
+                        )
+                    )
+                effective_position_settle_tolerance = min(
+                    configured_position_settle_tolerance,
+                    max(
+                        0.0,
+                        float(
+                            whole_body_eef_guard[
+                                "live_waypoint_position_tolerance_m"
+                            ]
+                        )
+                        - prospective_next_waypoint_step
+                        - WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M,
+                    ),
+                )
+                waypoint_position_error = float(
+                    np.linalg.norm(live_position - nominal_position)
+                )
+                waypoint_orientation_error = (
+                    _quat_angle_error_rad(live_quat, nominal_quat)
+                    if live_quat is not None
+                    else float("inf")
+                )
+                relative = live_position - np.asarray(
+                    whole_body_eef_guard["call_start_xyz"],
+                    dtype=np.float64,
+                )
+                start_excursion = float(np.linalg.norm(relative))
+                direct_axis = np.asarray(
+                    whole_body_eef_guard["direct_axis"],
+                    dtype=np.float64,
+                )
+                along = float(relative @ direct_axis)
+                lateral = float(
+                    np.linalg.norm(relative - along * direct_axis)
+                )
+                previous_live_position = np.asarray(
+                    whole_body_eef_guard["previous_live_position"],
+                    dtype=np.float64,
+                ).reshape(3)
+                live_step_distance = float(
+                    np.linalg.norm(live_position - previous_live_position)
+                )
+                previous_live_along = float(
+                    whole_body_eef_guard["previous_live_along_m"]
+                )
+                live_reverse_step = max(0.0, previous_live_along - along)
+                cumulative_live_path = (
+                    float(
+                        whole_body_eef_guard[
+                            "cumulative_observed_live_path_m"
+                        ]
+                    )
+                    + live_step_distance
+                )
+                previous_live_quat = np.asarray(
+                    whole_body_eef_guard["previous_live_quat_xyzw"],
+                    dtype=np.float64,
+                ).reshape(4)
+                live_orientation_step = float(
+                    _quat_angle_error_rad(previous_live_quat, live_quat) or 0.0
+                )
+                live_target_orientation_error = float(
+                    _quat_angle_error_rad(live_quat, target_quat_xyzw) or 0.0
+                )
+                previous_target_orientation_error = float(
+                    whole_body_eef_guard[
+                        "previous_live_target_orientation_error_rad"
+                    ]
+                )
+                live_orientation_reverse_progress = max(
+                    0.0,
+                    live_target_orientation_error
+                    - previous_target_orientation_error,
+                )
+                cumulative_live_orientation_path = (
+                    float(
+                        whole_body_eef_guard[
+                            "cumulative_observed_live_orientation_path_rad"
+                        ]
+                    )
+                    + live_orientation_step
+                )
+                direct_distance = float(
+                    whole_body_eef_guard["direct_distance_m"]
+                )
+                corridor_margin = float(
+                    whole_body_eef_guard["corridor_margin_m"]
+                )
+                whole_body_eef_guard[
+                    "max_observed_live_waypoint_position_error_m"
+                ] = max(
+                    float(
+                        whole_body_eef_guard[
+                            "max_observed_live_waypoint_position_error_m"
+                        ]
+                    ),
+                    waypoint_position_error,
+                )
+                whole_body_eef_guard[
+                    "max_observed_live_waypoint_orientation_error_rad"
+                ] = max(
+                    float(
+                        whole_body_eef_guard[
+                            "max_observed_live_waypoint_orientation_error_rad"
+                        ]
+                    ),
+                    waypoint_orientation_error,
+                )
+                whole_body_eef_guard["max_observed_live_lateral_m"] = max(
+                    float(
+                        whole_body_eef_guard[
+                            "max_observed_live_lateral_m"
+                        ]
+                    ),
+                    lateral,
+                )
+                whole_body_eef_guard[
+                    "max_observed_live_start_excursion_m"
+                ] = max(
+                    float(
+                        whole_body_eef_guard[
+                            "max_observed_live_start_excursion_m"
+                        ]
+                    ),
+                    start_excursion,
+                )
+                whole_body_eef_guard[
+                    "max_observed_live_reverse_step_m"
+                ] = max(
+                    float(
+                        whole_body_eef_guard[
+                            "max_observed_live_reverse_step_m"
+                        ]
+                    ),
+                    live_reverse_step,
+                )
+                whole_body_eef_guard[
+                    "cumulative_observed_live_path_m"
+                ] = cumulative_live_path
+                whole_body_eef_guard["previous_live_position"] = (
+                    live_position.copy()
+                )
+                whole_body_eef_guard["previous_live_along_m"] = along
+                whole_body_eef_guard["previous_live_quat_xyzw"] = (
+                    live_quat.copy()
+                )
+                whole_body_eef_guard[
+                    "previous_live_target_orientation_error_rad"
+                ] = live_target_orientation_error
+                whole_body_eef_guard[
+                    "max_observed_live_orientation_step_rad"
+                ] = max(
+                    float(
+                        whole_body_eef_guard[
+                            "max_observed_live_orientation_step_rad"
+                        ]
+                    ),
+                    live_orientation_step,
+                )
+                whole_body_eef_guard[
+                    "max_observed_live_orientation_reverse_progress_rad"
+                ] = max(
+                    float(
+                        whole_body_eef_guard[
+                            "max_observed_live_orientation_reverse_progress_rad"
+                        ]
+                    ),
+                    live_orientation_reverse_progress,
+                )
+                whole_body_eef_guard[
+                    "cumulative_observed_live_orientation_path_rad"
+                ] = cumulative_live_orientation_path
+                intentional_rotation = bool(
+                    dict(
+                        whole_body_eef_guard["runtime_admission"]
+                    ).get("intentional_orientation_change")
+                )
+                rotation_path_limit = (
+                    float(
+                        dict(
+                            whole_body_eef_guard["runtime_admission"]
+                        ).get("start_orientation_error_rad", 0.0)
+                    )
+                    + WHOLE_BODY_EEF_WRIST_MAX_CUMULATIVE_EXCESS_RAD
+                )
+                violations = {
+                    "waypoint_position": waypoint_position_error
+                    > TRACKING_HARD_BASE_XY_ERROR_M + 1e-9,
+                    "waypoint_orientation": waypoint_orientation_error
+                    > TRACKING_HARD_BASE_YAW_ERROR_RAD + 1e-9,
+                    "start_excursion": bool(
+                        whole_body_eef_guard["short_target"]
+                        and start_excursion
+                        > direct_distance + corridor_margin + 1e-9
+                    ),
+                    "lateral": bool(
+                        whole_body_eef_guard["short_target"]
+                        and lateral > corridor_margin + 1e-9
+                    ),
+                    "reverse_or_overshoot": (
+                        bool(whole_body_eef_guard["short_target"])
+                        and (
+                            along < -corridor_margin - 1e-9
+                            or along
+                            > direct_distance + corridor_margin + 1e-9
+                        )
+                    ),
+                    "axis_monotonic": bool(
+                        whole_body_eef_guard["short_target"]
+                        and direct_distance > 1e-9
+                        and live_reverse_step
+                        > WHOLE_BODY_EEF_SHORT_MAX_REVERSE_STEP_M + 1e-9
+                    ),
+                    "cumulative_path": bool(
+                        whole_body_eef_guard["short_target"]
+                        and cumulative_live_path
+                        > direct_distance
+                        + WHOLE_BODY_EEF_SHORT_MAX_CUMULATIVE_EXCESS_M
+                        + 1e-9
+                    ),
+                    "orientation_step": bool(
+                        intentional_rotation
+                        and live_orientation_step
+                        > WHOLE_BODY_EEF_WRIST_MAX_ORIENTATION_STEP_RAD + 1e-9
+                    ),
+                    "orientation_monotonic": bool(
+                        intentional_rotation
+                        and live_orientation_reverse_progress
+                        > WHOLE_BODY_EEF_WRIST_MAX_REVERSE_PROGRESS_RAD + 1e-9
+                    ),
+                    "orientation_cumulative_path": bool(
+                        intentional_rotation
+                        and cumulative_live_orientation_path
+                        > rotation_path_limit + 1e-9
+                    ),
+                }
+                eef_pose_settled = bool(
+                    final_pos_err is not None
+                    and final_pos_err
+                    <= min(
+                        float(position_tolerance_m),
+                        EEF_TERMINAL_POSITION_TOLERANCE_M,
+                    )
+                    + 1e-9
+                    and (
+                        final_ori_err is None
+                        or final_ori_err
+                        <= min(
+                            float(orientation_tolerance_rad),
+                            EEF_TERMINAL_ORIENTATION_TOLERANCE_RAD,
+                        )
+                        + 1e-9
+                    )
+                )
+                waypoint_settled = eef_pose_settled
+                waypoint_q_sha256 = (
+                    str(whole_body_waypoint_command["q_sha256"])
+                    if whole_body_waypoint_command is not None
+                    else ""
+                )
+                fatal_violations = dict(violations)
+                deferred_violations: dict[str, str] = {}
+                waypoint_axis_reverse_deferred = False
+                axis_reverse_defer_key = None
+                axis_reverse_settle_repeat_command = bool(
+                    whole_body_waypoint_command is not None
+                    and whole_body_waypoint_command.get("settle_repeat") is True
+                    and whole_body_eef_guard.get(
+                        "pending_axis_reverse_settle_repeat"
+                    )
+                    is not None
+                )
+                if axis_reverse_settle_repeat_command:
+                    whole_body_eef_guard[
+                        "pending_axis_reverse_settle_repeat"
+                    ] = None
+                violation_names = {
+                    name for name, violated in violations.items() if violated
+                }
+                axis_reverse_defer_ledger = whole_body_eef_guard[
+                    "axis_reverse_defer_ledger"
+                ]
+                if (
+                    whole_body_eef_guard[
+                        "first_sample_axis_reverse_transient_enabled"
+                    ]
+                    and executed == 1
+                    and whole_body_commanded_waypoint_index == 0
+                    and waypoint_attempts == 1
+                    and not axis_reverse_defer_ledger
+                    and not axis_reverse_settle_repeat_command
+                    and violation_names == {"axis_monotonic"}
+                    and live_reverse_step
+                    <= WHOLE_BODY_EEF_FIRST_SAMPLE_REVERSE_TRANSIENT_MAX_M
+                    + 1e-9
+                ):
+                    fatal_violations["axis_monotonic"] = False
+                    deferred_violations["axis_monotonic"] = (
+                        "prepared_dashboard_first_sample_controller_transient"
+                    )
+                    waypoint_axis_reverse_deferred = True
+                    axis_reverse_defer_key = (
+                        f"{whole_body_commanded_waypoint_index}:"
+                        f"{waypoint_q_sha256}"
+                    )
+                    axis_reverse_defer_ledger[axis_reverse_defer_key] = {
+                        "index": whole_body_commanded_waypoint_index,
+                        "q_sha256": waypoint_q_sha256,
+                        "executed_sample": executed,
+                        "reverse_step_m": live_reverse_step,
+                        "maximum_reverse_step_m": (
+                            WHOLE_BODY_EEF_FIRST_SAMPLE_REVERSE_TRANSIENT_MAX_M
+                        ),
+                        "exact_same_q_repeat_required": True,
+                    }
+                    whole_body_eef_guard[
+                        "pending_axis_reverse_settle_repeat"
+                    ] = {
+                        "index": whole_body_commanded_waypoint_index,
+                        "q_sha256": waypoint_q_sha256,
+                    }
+                normalized_settle_error = max(
+                    waypoint_position_error
+                    / max(effective_position_settle_tolerance, 1e-12),
+                    waypoint_orientation_error
+                    / float(
+                        whole_body_eef_guard[
+                            "waypoint_settle_orientation_tolerance_rad"
+                        ]
+                    ),
+                )
+                previous_settle_index = whole_body_eef_guard.get(
+                    "settle_waypoint_index"
+                )
+                previous_normalized_settle_error = whole_body_eef_guard.get(
+                    "settle_previous_normalized_error"
+                )
+                settle_progress_ok = True
+                if whole_body_joint_waypoint_reached and not eef_pose_settled:
+                    if (
+                        previous_settle_index
+                        == whole_body_commanded_waypoint_index
+                        and isinstance(
+                            previous_normalized_settle_error,
+                            (int, float),
+                        )
+                    ):
+                        settle_progress_ok = bool(
+                            normalized_settle_error
+                            <= float(previous_normalized_settle_error) * 0.95
+                            + 1e-9
+                        )
+                        whole_body_eef_settle_no_progress = (
+                            not settle_progress_ok
+                        )
+                    if settle_progress_ok:
+                        whole_body_eef_guard["settle_waypoint_index"] = (
+                            whole_body_commanded_waypoint_index
+                        )
+                        whole_body_eef_guard[
+                            "settle_previous_normalized_error"
+                        ] = normalized_settle_error
+                whole_body_eef_guard["last_waypoint"] = {
+                    "index": whole_body_commanded_waypoint_index,
+                    "joint_waypoint_reached": whole_body_joint_waypoint_reached,
+                    "waypoint_settled": waypoint_settled,
+                    "eef_pose_settled": eef_pose_settled,
+                    "dynamics_gate_used": False,
+                    "waypoint_attempts": waypoint_attempts,
+                    "normalized_settle_error": normalized_settle_error,
+                    "settle_progress_ok": settle_progress_ok,
+                    "position_error_m": waypoint_position_error,
+                    "orientation_error_rad": waypoint_orientation_error,
+                    "configured_position_settle_tolerance_m": (
+                        configured_position_settle_tolerance
+                    ),
+                    "effective_position_settle_tolerance_m": (
+                        effective_position_settle_tolerance
+                    ),
+                    "controller_response_margin_m": (
+                        WHOLE_BODY_EEF_CONTROLLER_RESPONSE_MARGIN_M
+                    ),
+                    "numerical_margin_m": (
+                        WHOLE_BODY_EEF_NUMERICAL_MARGIN_M
+                    ),
+                    "prospective_guard_margin_m": (
+                        WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M
+                    ),
+                    "prospective_next_waypoint_step_m": (
+                        prospective_next_waypoint_step
+                    ),
+                    "prospective_position_bound_m": (
+                        waypoint_position_error
+                        + prospective_next_waypoint_step
+                        + WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M
+                    ),
+                    "start_excursion_m": start_excursion,
+                    "along_m": along,
+                    "lateral_m": lateral,
+                    "step_distance_m": live_step_distance,
+                    "reverse_step_m": live_reverse_step,
+                    "cumulative_path_m": cumulative_live_path,
+                    "orientation_step_rad": live_orientation_step,
+                    "target_orientation_error_rad": (
+                        live_target_orientation_error
+                    ),
+                    "orientation_reverse_progress_rad": (
+                        live_orientation_reverse_progress
+                    ),
+                    "cumulative_orientation_path_rad": (
+                        cumulative_live_orientation_path
+                    ),
+                    "violations": violations,
+                    "fatal_violations": fatal_violations,
+                    "deferred_violations": deferred_violations,
+                    "initial_axis_reverse_deferred": (
+                        waypoint_axis_reverse_deferred
+                    ),
+                    "axis_reverse_deferred": (
+                        waypoint_axis_reverse_deferred
+                    ),
+                    "axis_reverse_defer_key": (
+                        axis_reverse_defer_key
+                    ),
+                    "axis_reverse_settle_repeat_command": (
+                        axis_reverse_settle_repeat_command
+                    ),
+                    "initial_axis_reverse_transient_max_m": (
+                        WHOLE_BODY_EEF_FIRST_SAMPLE_REVERSE_TRANSIENT_MAX_M
+                    ),
+                }
+                whole_body_eef_waypoint_trace = {
+                    "commanded_index": whole_body_commanded_waypoint_index,
+                    "post_step_index": index,
+                    "q_sha256": (
+                        whole_body_waypoint_command["q_sha256"]
+                        if whole_body_waypoint_command is not None
+                        else None
+                    ),
+                    "trajectory_sha256": (
+                        whole_body_waypoint_command["trajectory_sha256"]
+                        if whole_body_waypoint_command is not None
+                        else None
+                    ),
+                    "settle_repeat": (
+                        bool(whole_body_waypoint_command["settle_repeat"])
+                        if whole_body_waypoint_command is not None
+                        else False
+                    ),
+                    "joint_waypoint_reached": whole_body_joint_waypoint_reached,
+                    "waypoint_settled": waypoint_settled,
+                    "eef_pose_settled": eef_pose_settled,
+                    "dynamics_gate_used": False,
+                    "waypoint_attempts": waypoint_attempts,
+                    "normalized_settle_error": normalized_settle_error,
+                    "settle_progress_ok": settle_progress_ok,
+                    "position_error_m": waypoint_position_error,
+                    "orientation_error_rad": waypoint_orientation_error,
+                    "configured_position_settle_tolerance_m": (
+                        configured_position_settle_tolerance
+                    ),
+                    "effective_position_settle_tolerance_m": (
+                        effective_position_settle_tolerance
+                    ),
+                    "controller_response_margin_m": (
+                        WHOLE_BODY_EEF_CONTROLLER_RESPONSE_MARGIN_M
+                    ),
+                    "numerical_margin_m": (
+                        WHOLE_BODY_EEF_NUMERICAL_MARGIN_M
+                    ),
+                    "prospective_guard_margin_m": (
+                        WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M
+                    ),
+                    "prospective_next_waypoint_step_m": (
+                        prospective_next_waypoint_step
+                    ),
+                    "prospective_position_bound_m": (
+                        waypoint_position_error
+                        + prospective_next_waypoint_step
+                        + WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M
+                    ),
+                    "live_position": live_position.tolist(),
+                    "nominal_position": nominal_position.tolist(),
+                    "along_m": along,
+                    "lateral_m": lateral,
+                    "step_distance_m": live_step_distance,
+                    "reverse_step_m": live_reverse_step,
+                    "cumulative_path_m": cumulative_live_path,
+                    "violations": dict(violations),
+                    "fatal_violations": dict(fatal_violations),
+                    "deferred_violations": dict(deferred_violations),
+                    "initial_axis_reverse_deferred": (
+                        waypoint_axis_reverse_deferred
+                    ),
+                    "axis_reverse_deferred": (
+                        waypoint_axis_reverse_deferred
+                    ),
+                    "axis_reverse_defer_key": (
+                        axis_reverse_defer_key
+                    ),
+                    "axis_reverse_settle_repeat_command": (
+                        axis_reverse_settle_repeat_command
+                    ),
+                    "initial_axis_reverse_transient_max_m": (
+                        WHOLE_BODY_EEF_FIRST_SAMPLE_REVERSE_TRANSIENT_MAX_M
+                    ),
+                }
+                if any(fatal_violations.values()):
+                    trace.append(
+                        {
+                            "step": executed,
+                            "position_error_m": final_pos_err,
+                            "orientation_error_rad": final_ori_err,
+                            "joint_tracking": waypoint_tracking,
+                            "whole_body_eef_path_guard": eef_guard_snapshot(),
+                            "whole_body_waypoint_command": (
+                                whole_body_waypoint_command
+                            ),
+                        }
+                    )
+                    return self._execution_result(
+                        primitive_success=False,
+                        stop_reason="eef_path_divergence",
+                        recoverable=False,
+                        suggested_next_tool="observe",
+                        executed=executed,
+                        trace=trace,
+                        final_pos_err=final_pos_err,
+                        final_ori_err=final_ori_err,
+                        held_steps=held_steps,
+                        started=started,
+                        extra_metrics={
+                            "whole_body_eef_path_guard": eef_guard_snapshot(),
+                        },
+                    )
+                intermediate_command = bool(
+                    whole_body_commanded_waypoint_index < planned_steps - 1
+                )
+                if (
+                    not waypoint_axis_reverse_deferred
+                    and (intermediate_command or waypoint_settled)
+                ):
+                    checkpoint_position_improvement = (
+                        float(whole_body_eef_guard["direct_distance_m"])
+                        - float(final_pos_err)
+                        if final_pos_err is not None
+                        and math.isfinite(float(final_pos_err))
+                        else None
+                    )
+                    checkpoint_eligible = bool(
+                        allow_replan_checkpoint
+                        and intermediate_command
+                        and eef_pose_settled
+                        and checkpoint_position_improvement is not None
+                        and checkpoint_position_improvement
+                        + WHOLE_BODY_EEF_NUMERICAL_MARGIN_M
+                        >= checkpoint_trigger_position_improvement_m
+                        and contact_target_xyz is None
+                        and not stop_on_expected_contact
+                        and not stop_on_attachment
+                        and not require_attachment
+                        and expected_attachment is None
+                        and not any(
+                            value is not None
+                            for value in (
+                                expected_attachments_by_hand or {}
+                            ).values()
+                        )
+                    )
+                    index += 1
+                    waypoint_advanced = True
+                    waypoint_attempts = 0
+                    whole_body_eef_guard["settle_waypoint_index"] = None
+                    whole_body_eef_guard[
+                        "settle_previous_normalized_error"
+                    ] = None
+                    if checkpoint_eligible:
+                        whole_body_replan_checkpoint = {
+                            "commanded_index": (
+                                whole_body_commanded_waypoint_index
+                            ),
+                            "post_step_index": index,
+                            "q_sha256": waypoint_q_sha256,
+                            "trajectory_sha256": (
+                                whole_body_waypoint_command[
+                                    "trajectory_sha256"
+                                ]
+                            ),
+                            "call_start_position_error_m": float(
+                                whole_body_eef_guard["direct_distance_m"]
+                            ),
+                            "final_position_error_m": float(final_pos_err),
+                            "position_improvement_m": float(
+                                checkpoint_position_improvement
+                            ),
+                            "minimum_position_improvement_m": (
+                                WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M
+                            ),
+                            "trigger_position_improvement_m": (
+                                checkpoint_trigger_position_improvement_m
+                            ),
+                            "eef_pose_settled": eef_pose_settled,
+                            "dynamics_gate_used": False,
+                            "joint_waypoint_reached": (
+                                whole_body_joint_waypoint_reached
+                            ),
+                        }
+                assert whole_body_eef_waypoint_trace is not None
+                whole_body_eef_waypoint_trace["post_step_index"] = index
             if contact_target_xyz is not None and (
                 stop_on_expected_contact or stop_on_attachment
             ):
-                contact = self._contact_report(
-                    hand=hand,
-                    target_xyz=contact_target_xyz,
-                    allowed_contact_distance_m=max(
-                        float(allowed_contact_distance_m),
-                        float(position_tolerance_m) * 2.0,
-                    ),
-                )
+                if contact is None:
+                    contact = self._contact_report(
+                        hand=hand,
+                        target_xyz=contact_target_xyz,
+                        allowed_contact_distance_m=max(
+                            float(allowed_contact_distance_m),
+                            float(position_tolerance_m) * 2.0,
+                        ),
+                    )
                 if not bool(contact.get("available", False)):
+                    trace.append(
+                        {
+                            "step": executed,
+                            "contact_report": contact,
+                            "whole_body_waypoint_command": (
+                                whole_body_waypoint_command
+                            ),
+                        }
+                    )
                     return self._execution_result(
                         primitive_success=False,
                         stop_reason="contact_feedback_unavailable",
@@ -10570,8 +17382,36 @@ class PlannerExecutor:
                     )
                 expected_contact = bool(contact.get("expected_contact", False))
                 if stop_on_expected_contact and expected_contact:
-                    contact_stop_active = True
-                    index = planned_steps
+                    trace.append(
+                        {
+                            "step": executed,
+                            "position_error_m": final_pos_err,
+                            "orientation_error_rad": final_ori_err,
+                            "joint_tracking": waypoint_tracking,
+                            "contact_report": contact,
+                            "whole_body_waypoint_command": (
+                                whole_body_waypoint_command
+                            ),
+                            "expected_contact_stop": True,
+                        }
+                    )
+                    return self._execution_result(
+                        primitive_success=True,
+                        stop_reason="reached",
+                        recoverable=True,
+                        suggested_next_tool=None,
+                        executed=executed,
+                        trace=trace,
+                        final_pos_err=final_pos_err,
+                        final_ori_err=final_ori_err,
+                        held_steps=0,
+                        started=started,
+                        extra_metrics={
+                            "contact_report": contact,
+                            "expected_contact_seen": True,
+                            "whole_body_eef_path_guard": eef_guard_snapshot(),
+                        },
+                    )
                 if (
                     stop_on_attachment
                     and int(gripper_contact_settle_steps) > 0
@@ -10608,9 +17448,37 @@ class PlannerExecutor:
                     "single_arm_isolation": (
                         self._active_isolation_report if isolation_required else None
                     ),
+                    "whole_body_eef_waypoint_tracking": (
+                        whole_body_eef_waypoint_trace
+                    ),
                     "hold_step": index >= planned_steps,
                 }
             )
+            if whole_body_replan_checkpoint is not None:
+                return self._execution_result(
+                    primitive_success=False,
+                    stop_reason="whole_body_replan_checkpoint",
+                    recoverable=True,
+                    suggested_next_tool=None,
+                    executed=executed,
+                    trace=trace,
+                    final_pos_err=final_pos_err,
+                    final_ori_err=final_ori_err,
+                    held_steps=held_steps,
+                    started=started,
+                    extra_metrics={
+                        "final_joint_tracking": final_waypoint_tracking,
+                        "trajectory_complete": False,
+                        "whole_body_replan_checkpoint": (
+                            whole_body_replan_checkpoint
+                        ),
+                        "whole_body_eef_path_guard": eef_guard_snapshot(),
+                        "post_stop_action_policy": (
+                            "fresh_plan_before_next_env_action"
+                        ),
+                        "post_stop_env_actions": 0,
+                    },
+                )
             if stop_on_attachment:
                 if attachment_confirmation_steps >= int(hold_steps_required):
                     return self._execution_result(
@@ -10636,17 +17504,33 @@ class PlannerExecutor:
                             "gripper_contact_settle_steps_executed": (
                                 gripper_contact_settle_executed
                             ),
+                            "whole_body_eef_path_guard": eef_guard_snapshot(),
                         },
                     )
                 # A gripper close succeeds only after the same target root has
                 # remained attached for the complete confirmation window.
                 continue
             if waypoint_stalled:
+                settle_failure = bool(
+                    whole_body_eef_guard is not None
+                    and whole_body_joint_waypoint_reached
+                    and not waypoint_advanced
+                )
                 return self._execution_result(
                     primitive_success=False,
-                    stop_reason="stalled_tracking",
-                    recoverable=True,
-                    suggested_next_tool="move_to",
+                    stop_reason=(
+                        "eef_settle_no_progress"
+                        if whole_body_eef_settle_no_progress
+                        else (
+                            "eef_settle_exhausted"
+                            if settle_failure
+                            else "stalled_tracking"
+                        )
+                    ),
+                    recoverable=not settle_failure,
+                    suggested_next_tool=(
+                        "observe" if settle_failure else "move_to"
+                    ),
                     executed=executed,
                     trace=trace,
                     final_pos_err=final_pos_err,
@@ -10698,6 +17582,7 @@ class PlannerExecutor:
                             "gripper_contact_settle_steps_executed": (
                                 gripper_contact_settle_executed
                             ),
+                            "whole_body_eef_path_guard": eef_guard_snapshot(),
                         },
                     )
                 continue
@@ -10785,6 +17670,7 @@ class PlannerExecutor:
                 "gripper_contact_settle_steps_executed": (
                     gripper_contact_settle_executed
                 ),
+                "whole_body_eef_path_guard": eef_guard_snapshot(),
             },
         )
 
@@ -11094,6 +17980,781 @@ def _interpolate_joint_trajectory(
                 f"interpolated joint delta {max_delta} exceeds {max_inter_dist}"
             )
     return result
+
+
+def _minimum_jerk_base_execution_trajectory(
+    trajectory: Any,
+    *,
+    base_indices: tuple[int, ...] | list[int],
+    max_xy_step_m: float = BASE_EXECUTION_XY_STEP_M,
+    max_yaw_step_rad: float = BASE_EXECUTION_YAW_STEP_RAD,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Resample a BASE-only q path with a bounded quintic motion profile.
+
+    Each input edge follows a straight world-XY segment and the shortest yaw
+    arc. The quintic minimum-jerk profile has zero analytic velocity and
+    acceleration at both endpoints, avoiding the full one-step velocity
+    reversal produced by uniform linear interpolation. Non-BASE joints must
+    already be locked and remain bitwise stable in the returned path.
+    """
+
+    q = np.asarray(_jsonable(trajectory), dtype=np.float64)
+    indices = tuple(int(index) for index in base_indices)
+    xy_limit = float(max_xy_step_m)
+    yaw_limit = float(max_yaw_step_rad)
+    if q.ndim != 2 or q.shape[0] < 1 or not np.isfinite(q).all():
+        raise ValueError(f"BASE trajectory must be finite [T,D], got {q.shape}")
+    if (
+        len(indices) != 6
+        or len(set(indices)) != 6
+        or min(indices) < 0
+        or max(indices) >= q.shape[1]
+    ):
+        raise ValueError("BASE resampling requires six unique in-range base indices")
+    if (
+        not math.isfinite(xy_limit)
+        or not math.isfinite(yaw_limit)
+        or xy_limit <= 0.0
+        or yaw_limit <= 0.0
+    ):
+        raise ValueError("BASE resampling step limits must be finite and positive")
+    if len(q) == 1:
+        return q.astype(np.float32), {
+            "method": "quintic_minimum_jerk",
+            "profile": "10u^3-15u^4+6u^5",
+            "path_geometry": "straight_xy_shortest_yaw_arc",
+            "original_waypoints": 1,
+            "resampled_waypoints": 1,
+            "execution_waypoints": 0,
+            "segment_intervals": [],
+            "xy_step_limit_m": xy_limit,
+            "yaw_step_limit_rad": yaw_limit,
+            "measured_max_xy_step_m": 0.0,
+            "measured_max_yaw_step_rad": 0.0,
+            "analytic_endpoint_velocity_zero": True,
+            "analytic_endpoint_acceleration_zero": True,
+        }
+
+    x_index, y_index, yaw_index = indices[0], indices[1], indices[5]
+    active = {x_index, y_index, yaw_index}
+    locked = [index for index in range(q.shape[1]) if index not in active]
+    rows = [q[0].copy()]
+    segment_intervals: list[int] = []
+    minimum_intervals = 4
+
+    for input_start, input_end in zip(q[:-1], q[1:], strict=True):
+        start = rows[-1]
+        if locked and not np.allclose(
+            input_end[locked],
+            input_start[locked],
+            atol=1e-7,
+            rtol=0.0,
+        ):
+            raise ValueError("BASE resampling received a changed locked joint")
+        end = input_end.copy()
+        end[locked] = start[locked]
+        end[yaw_index] = start[yaw_index] + _wrap_angle(
+            float(input_end[yaw_index] - input_start[yaw_index])
+        )
+        xy_distance = float(
+            np.linalg.norm(end[[x_index, y_index]] - start[[x_index, y_index]])
+        )
+        yaw_distance = abs(_wrap_angle(float(end[yaw_index] - start[yaw_index])))
+        intervals = max(
+            minimum_intervals,
+            int(math.ceil(xy_distance / xy_limit)),
+            int(math.ceil(yaw_distance / yaw_limit)),
+        )
+
+        for _attempt in range(10000):
+            u = np.arange(1, intervals + 1, dtype=np.float64) / intervals
+            progress = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
+            segment = start + progress[:, None] * (end - start)
+            segment[-1] = end
+            with_start = np.vstack([start, segment])
+            xy_steps = np.linalg.norm(
+                np.diff(with_start[:, [x_index, y_index]], axis=0),
+                axis=1,
+            )
+            yaw_steps = np.asarray(
+                [
+                    abs(_wrap_angle(float(delta)))
+                    for delta in np.diff(with_start[:, yaw_index])
+                ],
+                dtype=np.float64,
+            )
+            if (
+                float(np.max(xy_steps, initial=0.0)) <= xy_limit + 1e-9
+                and float(np.max(yaw_steps, initial=0.0)) <= yaw_limit + 1e-9
+            ):
+                break
+            intervals += 1
+        else:
+            raise RuntimeError("minimum-jerk BASE resampling did not converge")
+
+        rows.extend(segment)
+        segment_intervals.append(intervals)
+
+    result = np.stack(rows, axis=0)
+    result[:, locked] = q[0, locked]
+    execution_result = result.astype(np.float32)
+    xy_steps = np.linalg.norm(
+        np.diff(
+            execution_result[:, [x_index, y_index]].astype(np.float64),
+            axis=0,
+        ),
+        axis=1,
+    )
+    yaw_steps = np.asarray(
+        [
+            abs(_wrap_angle(float(delta)))
+            for delta in np.diff(execution_result[:, yaw_index].astype(np.float64))
+        ],
+        dtype=np.float64,
+    )
+    measured_xy = float(np.max(xy_steps, initial=0.0))
+    measured_yaw = float(np.max(yaw_steps, initial=0.0))
+    if measured_xy > xy_limit + 1e-9 or measured_yaw > yaw_limit + 1e-9:
+        raise RuntimeError("minimum-jerk BASE resampling exceeded a step limit")
+    if locked and not bool(
+        np.all(execution_result[:, locked] == execution_result[0, locked])
+    ):
+        raise RuntimeError("minimum-jerk BASE resampling changed a locked joint")
+
+    return execution_result, {
+        "method": "quintic_minimum_jerk",
+        "profile": "10u^3-15u^4+6u^5",
+        "path_geometry": "straight_xy_shortest_yaw_arc",
+        "original_waypoints": int(len(q)),
+        "resampled_waypoints": int(len(execution_result)),
+        "execution_waypoints": int(len(execution_result) - 1),
+        "segment_intervals": segment_intervals,
+        "minimum_intervals_per_segment": minimum_intervals,
+        "xy_step_limit_m": xy_limit,
+        "yaw_step_limit_rad": yaw_limit,
+        "measured_max_xy_step_m": measured_xy,
+        "measured_max_yaw_step_rad": measured_yaw,
+        "analytic_endpoint_velocity_zero": True,
+        "analytic_endpoint_acceleration_zero": True,
+    }
+
+
+def _canonicalize_whole_body_base_yaw_trajectory(
+    trajectory: Any,
+    *,
+    joint_names: tuple[str, ...] | list[str],
+    call_start_q: Any,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Keep whole-body base yaw on the call-start shortest-arc branch."""
+
+    q = np.asarray(_jsonable(trajectory), dtype=np.float32)
+    names = tuple(str(name) for name in joint_names)
+    start = np.asarray(_jsonable(call_start_q), dtype=np.float32).reshape(-1)
+    if (
+        q.ndim != 2
+        or q.shape[0] < 1
+        or q.shape[1] != len(names)
+        or start.shape != (len(names),)
+        or len(names) != len(set(names))
+        or "base_footprint_rz_joint" not in names
+        or not np.isfinite(q).all()
+        or not np.isfinite(start).all()
+    ):
+        raise ValueError(
+            "whole-body yaw canonicalization requires a finite full-q trajectory"
+        )
+
+    yaw_index = names.index("base_footprint_rz_joint")
+    result = q.copy()
+    raw_yaw = result[:, yaw_index].astype(np.float64, copy=True)
+    canonical_yaw = np.empty_like(raw_yaw)
+    previous_yaw = float(start[yaw_index])
+    branch_correction_count = 0
+    for waypoint_index, waypoint_yaw in enumerate(raw_yaw):
+        continuous_yaw = previous_yaw + _wrap_angle(
+            float(waypoint_yaw - previous_yaw)
+        )
+        canonical_yaw[waypoint_index] = continuous_yaw
+        if abs(continuous_yaw - float(waypoint_yaw)) > 1e-6:
+            branch_correction_count += 1
+        previous_yaw = continuous_yaw
+    result[:, yaw_index] = canonical_yaw.astype(np.float32)
+
+    raw_with_start = np.concatenate(
+        [
+            np.asarray([float(start[yaw_index])], dtype=np.float64),
+            raw_yaw,
+        ]
+    )
+    canonical_with_start = np.concatenate(
+        [
+            np.asarray([float(start[yaw_index])], dtype=np.float64),
+            canonical_yaw,
+        ]
+    )
+    canonical_yaw_steps = np.abs(np.diff(canonical_with_start))
+    if bool(np.any(canonical_yaw_steps > math.pi + 1e-6)):
+        raise RuntimeError(
+            "whole-body path yaw continuity exceeded the shortest-arc bound"
+        )
+    wrapped_equivalence_error = np.asarray(
+        [
+            abs(_wrap_angle(float(raw - canonical)))
+            for raw, canonical in zip(raw_yaw, canonical_yaw, strict=True)
+        ],
+        dtype=np.float64,
+    )
+    if float(np.max(wrapped_equivalence_error, initial=0.0)) > 1e-5:
+        raise RuntimeError("whole-body yaw canonicalization changed a target pose")
+
+    return result, {
+        "policy": "call_start_then_previous_plus_wrapped_delta",
+        "branch_correction_count": branch_correction_count,
+        "raw_max_step_rad": float(
+            np.max(np.abs(np.diff(raw_with_start)), initial=0.0)
+        ),
+        "canonical_max_step_rad": float(
+            np.max(canonical_yaw_steps, initial=0.0)
+        ),
+        "wrapped_equivalence_max_error_rad": float(
+            np.max(wrapped_equivalence_error, initial=0.0)
+        ),
+    }
+
+
+def _grouped_stationary_dynamics_status(
+    report: Any,
+    *,
+    stationary_thresholds: dict[str, float],
+    policy: str,
+) -> tuple[dict[str, Any], str | None]:
+    """Validate grouped R1Pro dynamics and derive an auditable stationary gate."""
+
+    if not isinstance(report, dict) or report.get("available") is not True:
+        return (
+            report
+            if isinstance(report, dict)
+            else {
+                "available": False,
+                "ok": None,
+                "reason": "dynamics report unavailable",
+            },
+            "dynamics_feedback_unavailable",
+        )
+    if report.get("ok") is not True:
+        return dict(report), "dynamics_limit_violation"
+    groups = report.get("velocity_groups")
+    if not isinstance(groups, dict) or set(groups) != set(
+        DYNAMICS_VELOCITY_GROUP_JOINTS
+    ):
+        return dict(report), "dynamics_feedback_unavailable"
+
+    stationary_groups: dict[str, Any] = {}
+    grouped_dof_indices: list[int] = []
+    for group_name, expected_names in DYNAMICS_VELOCITY_GROUP_JOINTS.items():
+        group = groups.get(group_name)
+        if not isinstance(group, dict) or group.get("available") is not True:
+            return dict(report), "dynamics_feedback_unavailable"
+        actual_raw = group.get("max_actual_velocity")
+        limit_raw = group.get("max_velocity_limit")
+        ratio_raw = group.get("max_velocity_ratio")
+        peak_joint = group.get("max_actual_velocity_joint")
+        joint_names = group.get("joint_names")
+        dof_indices = group.get("dof_indices")
+        within_control_limit = group.get("within_control_limit")
+        if (
+            not isinstance(actual_raw, (int, float))
+            or isinstance(actual_raw, bool)
+            or not math.isfinite(float(actual_raw))
+            or float(actual_raw) < 0.0
+            or not isinstance(limit_raw, (int, float))
+            or isinstance(limit_raw, bool)
+            or not math.isfinite(float(limit_raw))
+            or float(limit_raw) <= 0.0
+            or not isinstance(ratio_raw, (int, float))
+            or isinstance(ratio_raw, bool)
+            or not math.isfinite(float(ratio_raw))
+            or float(ratio_raw) < 0.0
+            or not isinstance(peak_joint, str)
+            or peak_joint not in expected_names
+            or not isinstance(joint_names, list)
+            or tuple(str(name) for name in joint_names) != expected_names
+            or not isinstance(dof_indices, list)
+            or len(dof_indices) != len(expected_names)
+            or any(
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index < 0
+                for index in dof_indices
+            )
+            or len(set(dof_indices)) != len(dof_indices)
+            or group.get("dof_count") != len(expected_names)
+            or group.get("unit") != DYNAMICS_VELOCITY_GROUP_UNITS[group_name]
+            or not isinstance(within_control_limit, bool)
+        ):
+            return dict(report), "dynamics_feedback_unavailable"
+        if (
+            within_control_limit is not True
+            or float(ratio_raw) > 1.0 + 1e-3
+        ):
+            return dict(report), "dynamics_limit_violation"
+        grouped_dof_indices.extend(dof_indices)
+        threshold = stationary_thresholds.get(group_name)
+        stationary_groups[group_name] = {
+            "used_for_stationary": threshold is not None,
+            "max_actual_velocity": float(actual_raw),
+            "max_actual_velocity_joint": peak_joint,
+            "stationary_threshold": threshold,
+            "stationary": (
+                None
+                if threshold is None
+                else float(actual_raw) <= float(threshold)
+            ),
+        }
+    if (
+        len(grouped_dof_indices) != len(WHOLE_BODY_ACTIVE_JOINT_NAMES)
+        or len(set(grouped_dof_indices)) != len(grouped_dof_indices)
+    ):
+        return dict(report), "dynamics_feedback_unavailable"
+
+    stationary = all(
+        group["stationary"] is True
+        for group in stationary_groups.values()
+        if group["used_for_stationary"]
+    )
+    enriched = {
+        **report,
+        "stationary": stationary,
+        "stationary_groups": stationary_groups,
+        "stationary_policy": policy,
+    }
+    return enriched, None if stationary else "robot_not_stationary"
+
+
+def _tracking_hard_deviation_report(
+    report: Any,
+) -> tuple[dict[str, Any], bool]:
+    """Validate the wide runtime tracking envelope used after every command."""
+
+    if not isinstance(report, dict) or report.get("available") is not True:
+        return {
+            "available": False,
+            "hard_deviation": None,
+            "reason": "joint tracking feedback unavailable",
+        }, False
+    try:
+        base_xy = float(report.get("max_base_xy_error_m", float("inf")))
+        base_yaw = float(report.get("base_yaw_error_rad", float("inf")))
+        articulation = float(
+            report.get("max_articulation_error_rad", float("inf"))
+        )
+    except (TypeError, ValueError):
+        base_xy = base_yaw = articulation = float("inf")
+    finite = all(math.isfinite(value) for value in (base_xy, base_yaw, articulation))
+    checks = {
+        "base_xy": finite
+        and base_xy <= TRACKING_HARD_BASE_XY_ERROR_M,
+        "base_yaw": finite
+        and base_yaw <= TRACKING_HARD_BASE_YAW_ERROR_RAD,
+        "articulation": finite
+        and articulation <= TRACKING_HARD_ARTICULATION_ERROR_RAD,
+    }
+    return {
+        "available": finite,
+        "hard_deviation": not all(checks.values()),
+        "checks": checks,
+        "max_base_xy_error_m": base_xy,
+        "base_yaw_error_rad": base_yaw,
+        "max_articulation_error_rad": articulation,
+        "limits": {
+            "base_xy_m": TRACKING_HARD_BASE_XY_ERROR_M,
+            "base_yaw_rad": TRACKING_HARD_BASE_YAW_ERROR_RAD,
+            "articulation_rad": TRACKING_HARD_ARTICULATION_ERROR_RAD,
+        },
+    }, finite
+
+
+def _whole_body_target_sha256(target_xyz: Any) -> str:
+    target = np.asarray(_jsonable(target_xyz), dtype=np.float32).reshape(3)
+    if not np.isfinite(target).all():
+        raise ValueError("whole-body selected EEF target must be finite")
+    return hashlib.sha256(np.ascontiguousarray(target).tobytes()).hexdigest()
+
+
+def _joint_name_layout_sha256(joint_names: Any) -> str:
+    names = tuple(str(name) for name in joint_names)
+    if not names or len(names) != len(set(names)):
+        raise ValueError("whole-body joint-name layout must be non-empty and unique")
+    payload = json.dumps(
+        list(names),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _whole_body_indices_sha256(indices: Any) -> str:
+    values = np.asarray(indices, dtype="<i8").reshape(-1)
+    return hashlib.sha256(np.ascontiguousarray(values).tobytes()).hexdigest()
+
+
+def _whole_body_ordered_row_indices(
+    dense_trajectory: Any,
+    execution_with_start: Any,
+) -> np.ndarray:
+    """Bind every execution anchor to an exact row in a denser q polyline."""
+
+    dense = np.asarray(_jsonable(dense_trajectory), dtype=np.float32)
+    anchors = np.asarray(_jsonable(execution_with_start), dtype=np.float32)
+    if (
+        dense.ndim != 2
+        or anchors.ndim != 2
+        or dense.shape[1:] != anchors.shape[1:]
+        or len(dense) < 1
+        or len(anchors) < 1
+        or not np.isfinite(dense).all()
+        or not np.isfinite(anchors).all()
+    ):
+        raise ValueError("whole-body row mapping requires finite compatible q paths")
+    if not np.array_equal(dense[0], anchors[0]):
+        raise RuntimeError("whole-body dense path does not start at its first anchor")
+    if not np.array_equal(dense[-1], anchors[-1]):
+        raise RuntimeError("whole-body dense path does not end at its last anchor")
+
+    indices = [0]
+    cursor = 1
+    for anchor_index, anchor in enumerate(anchors[1:], start=1):
+        if anchor_index == len(anchors) - 1:
+            match = len(dense) - 1
+            if match < cursor or not np.array_equal(dense[match], anchor):
+                raise RuntimeError(
+                    "whole-body terminal anchor is absent from the dense path"
+                )
+        else:
+            matches = np.flatnonzero(
+                np.all(dense[cursor:-1] == anchor.reshape(1, -1), axis=1)
+            )
+            if not len(matches):
+                raise RuntimeError(
+                    "whole-body execution anchor is absent from the dense path"
+                )
+            match = cursor + int(matches[0])
+        indices.append(match)
+        cursor = match + 1
+    result = np.asarray(indices, dtype=np.int64)
+    if (
+        result.shape != (len(anchors),)
+        or result[0] != 0
+        or result[-1] != len(dense) - 1
+        or (len(result) > 1 and bool(np.any(np.diff(result) <= 0)))
+    ):
+        raise RuntimeError("whole-body dense anchor mapping is not strictly ordered")
+    return result
+
+
+def _whole_body_execution_step_report(
+    trajectory_with_start: Any,
+    positions: Any,
+    quaternions_xyzw: Any,
+    *,
+    joint_names: tuple[str, ...] | list[str],
+    short_target: bool,
+) -> dict[str, Any]:
+    """Verify command-to-command q, EEF translation, and orientation limits."""
+
+    q = np.asarray(_jsonable(trajectory_with_start), dtype=np.float32)
+    xyz = np.asarray(_jsonable(positions), dtype=np.float64)
+    quaternions = np.asarray(_jsonable(quaternions_xyzw), dtype=np.float64)
+    names = tuple(str(name) for name in joint_names)
+    if (
+        q.ndim != 2
+        or q.shape[0] < 1
+        or q.shape[1] != len(names)
+        or xyz.shape != (len(q), 3)
+        or quaternions.shape != (len(q), 4)
+        or len(names) != len(set(names))
+        or not np.isfinite(q).all()
+        or not np.isfinite(xyz).all()
+        or not np.isfinite(quaternions).all()
+    ):
+        raise ValueError(
+            "whole-body execution step admission requires finite aligned q/EEF paths"
+        )
+    missing = sorted(
+        (set(WHOLE_BODY_ACTIVE_JOINT_NAMES) | set(WHOLE_BODY_LOCKED_JOINT_NAMES))
+        - set(names)
+    )
+    if missing:
+        raise ValueError(
+            f"whole-body execution step admission is missing joints: {missing}"
+        )
+
+    name_to_index = {name: index for index, name in enumerate(names)}
+    q64 = q.astype(np.float64)
+    q_steps = np.diff(q64, axis=0)
+    x_steps = np.abs(q_steps[:, name_to_index["base_footprint_x_joint"]])
+    y_steps = np.abs(q_steps[:, name_to_index["base_footprint_y_joint"]])
+    yaw_steps = np.asarray(
+        [
+            abs(_wrap_angle(float(value)))
+            for value in q_steps[:, name_to_index["base_footprint_rz_joint"]]
+        ],
+        dtype=np.float64,
+    )
+    articulation_indices = [
+        name_to_index[name]
+        for name in WHOLE_BODY_ACTIVE_JOINT_NAMES
+        if name
+        not in {
+            "base_footprint_x_joint",
+            "base_footprint_y_joint",
+            "base_footprint_rz_joint",
+        }
+    ]
+    articulation_steps = (
+        np.abs(q_steps[:, articulation_indices])
+        if articulation_indices
+        else np.zeros((max(len(q) - 1, 0), 0), dtype=np.float64)
+    )
+    locked_indices = [
+        name_to_index[name] for name in WHOLE_BODY_LOCKED_JOINT_NAMES
+    ]
+    locked_delta = (
+        np.abs(q64[:, locked_indices] - q64[0, locked_indices])
+        if locked_indices
+        else np.zeros((len(q), 0), dtype=np.float64)
+    )
+    eef_steps = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
+    quat_norms = np.linalg.norm(quaternions, axis=1)
+    if bool(np.any(quat_norms <= 1e-9)):
+        raise ValueError("whole-body execution path contains an invalid quaternion")
+    normalized_quats = quaternions / quat_norms[:, None]
+    adjacent_dots = (
+        np.clip(
+            np.abs(np.sum(normalized_quats[:-1] * normalized_quats[1:], axis=1)),
+            0.0,
+            1.0,
+        )
+        if len(normalized_quats) > 1
+        else np.zeros((0,), dtype=np.float64)
+    )
+    orientation_steps = 2.0 * np.arccos(adjacent_dots)
+    eef_step_limit = (
+        WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M
+        if bool(short_target)
+        else WHOLE_BODY_EEF_MAX_CARTESIAN_STEP_M
+    )
+    measured = {
+        "max_base_x_step_m": float(np.max(x_steps, initial=0.0)),
+        "max_base_y_step_m": float(np.max(y_steps, initial=0.0)),
+        "max_base_yaw_step_rad": float(np.max(yaw_steps, initial=0.0)),
+        "max_articulation_step_rad": float(
+            np.max(articulation_steps, initial=0.0)
+        ),
+        "max_locked_joint_drift": float(np.max(locked_delta, initial=0.0)),
+        "max_eef_cartesian_step_m": float(np.max(eef_steps, initial=0.0)),
+        "max_eef_orientation_step_rad": float(
+            np.max(orientation_steps, initial=0.0)
+        ),
+    }
+    checks = {
+        "base_x_step": (
+            measured["max_base_x_step_m"]
+            <= WHOLE_BODY_EXECUTION_BASE_XY_STEP_M + 1e-9
+        ),
+        "base_y_step": (
+            measured["max_base_y_step_m"]
+            <= WHOLE_BODY_EXECUTION_BASE_XY_STEP_M + 1e-9
+        ),
+        "base_yaw_step": (
+            measured["max_base_yaw_step_rad"]
+            <= WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD + 1e-9
+        ),
+        "articulation_step": (
+            measured["max_articulation_step_rad"]
+            <= WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD + 1e-9
+        ),
+        "locked_joint_stability": (
+            measured["max_locked_joint_drift"] <= 1e-7
+        ),
+        "eef_cartesian_step": (
+            measured["max_eef_cartesian_step_m"] <= eef_step_limit + 1e-9
+        ),
+        "eef_orientation_step": (
+            measured["max_eef_orientation_step_rad"]
+            <= WHOLE_BODY_EEF_WRIST_MAX_ORIENTATION_STEP_RAD + 1e-9
+        ),
+    }
+    return {
+        "admitted": all(checks.values()),
+        "checks": checks,
+        **measured,
+        "base_xy_step_limit_m": WHOLE_BODY_EXECUTION_BASE_XY_STEP_M,
+        "base_yaw_step_limit_rad": WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD,
+        "articulation_step_limit_rad": (
+            WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD
+        ),
+        "eef_cartesian_step_limit_m": eef_step_limit,
+        "eef_orientation_step_limit_rad": (
+            WHOLE_BODY_EEF_WRIST_MAX_ORIENTATION_STEP_RAD
+        ),
+    }
+
+
+def _whole_body_execution_subset_indices(
+    dense_trajectory: Any,
+    positions: Any,
+    quaternions_xyzw: Any,
+    *,
+    joint_names: tuple[str, ...] | list[str],
+    short_target: bool,
+) -> np.ndarray:
+    """Choose the fewest ordered dense anchors satisfying every execution edge cap."""
+
+    q = np.asarray(_jsonable(dense_trajectory), dtype=np.float32)
+    xyz = np.asarray(_jsonable(positions), dtype=np.float64)
+    quaternions = np.asarray(_jsonable(quaternions_xyzw), dtype=np.float64)
+    names = tuple(str(name) for name in joint_names)
+    if len(q) < 2:
+        raise RuntimeError("whole-body execution subset requires a moving dense path")
+    _whole_body_execution_step_report(
+        q,
+        xyz,
+        quaternions,
+        joint_names=names,
+        short_target=short_target,
+    )
+
+    name_to_index = {name: index for index, name in enumerate(names)}
+    q64 = q.astype(np.float64)
+    articulation_indices = [
+        name_to_index[name]
+        for name in WHOLE_BODY_ACTIVE_JOINT_NAMES
+        if name
+        not in {
+            "base_footprint_x_joint",
+            "base_footprint_y_joint",
+            "base_footprint_rz_joint",
+        }
+    ]
+    locked_indices = [
+        name_to_index[name] for name in WHOLE_BODY_LOCKED_JOINT_NAMES
+    ]
+    quaternion_norms = np.linalg.norm(quaternions, axis=1)
+    normalized_quaternions = quaternions / quaternion_norms[:, None]
+    eef_step_limit = (
+        WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M
+        if bool(short_target)
+        else WHOLE_BODY_EEF_MAX_CARTESIAN_STEP_M
+    )
+    edge_count = np.full((len(q),), -1, dtype=np.int64)
+    predecessor = np.full((len(q),), -1, dtype=np.int64)
+    edge_count[0] = 0
+    for end in range(1, len(q)):
+        deltas = q64[:end] - q64[end]
+        yaw_deltas = deltas[
+            :,
+            name_to_index["base_footprint_rz_joint"],
+        ]
+        yaw_steps = np.fromiter(
+            (
+                abs(_wrap_angle(float(value)))
+                for value in yaw_deltas
+            ),
+            dtype=np.float64,
+            count=end,
+        )
+        quaternion_dots = np.clip(
+            np.abs(
+                np.sum(
+                    normalized_quaternions[:end]
+                    * normalized_quaternions[end],
+                    axis=1,
+                )
+            ),
+            0.0,
+            1.0,
+        )
+        admitted = (
+            (edge_count[:end] >= 0)
+            & (
+                np.abs(
+                    deltas[
+                        :,
+                        name_to_index["base_footprint_x_joint"],
+                    ]
+                )
+                <= WHOLE_BODY_EXECUTION_BASE_XY_STEP_M + 1e-9
+            )
+            & (
+                np.abs(
+                    deltas[
+                        :,
+                        name_to_index["base_footprint_y_joint"],
+                    ]
+                )
+                <= WHOLE_BODY_EXECUTION_BASE_XY_STEP_M + 1e-9
+            )
+            & (
+                yaw_steps
+                <= WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD + 1e-9
+            )
+            & (
+                np.max(
+                    np.abs(deltas[:, articulation_indices]),
+                    axis=1,
+                )
+                <= WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD + 1e-9
+            )
+            & (
+                np.max(
+                    np.abs(deltas[:, locked_indices]),
+                    axis=1,
+                )
+                <= 1e-7
+            )
+            & (
+                np.linalg.norm(xyz[:end] - xyz[end], axis=1)
+                <= eef_step_limit + 1e-9
+            )
+            & (
+                2.0 * np.arccos(quaternion_dots)
+                <= WHOLE_BODY_EEF_WRIST_MAX_ORIENTATION_STEP_RAD + 1e-9
+            )
+        )
+        admitted_starts = np.flatnonzero(admitted)
+        if admitted_starts.size:
+            admitted_edge_counts = edge_count[admitted_starts]
+            minimum_edge_count = int(np.min(admitted_edge_counts))
+            best_start = int(
+                admitted_starts[
+                    np.flatnonzero(
+                        admitted_edge_counts == minimum_edge_count
+                    )[-1]
+                ]
+            )
+            edge_count[end] = minimum_edge_count + 1
+            predecessor[end] = best_start
+    if predecessor[-1] < 0:
+        raise RuntimeError(
+            "whole-body dense path has no execution subset satisfying step limits"
+        )
+
+    reverse_indices = [len(q) - 1]
+    cursor = len(q) - 1
+    while cursor > 0:
+        cursor = int(predecessor[cursor])
+        if cursor < 0:
+            raise RuntimeError("whole-body execution subset predecessor is invalid")
+        reverse_indices.append(cursor)
+    indices = np.asarray(list(reversed(reverse_indices)), dtype=np.int64)
+    if (
+        indices[0] != 0
+        or indices[-1] != len(q) - 1
+        or bool(np.any(np.diff(indices) <= 0))
+    ):
+        raise RuntimeError("whole-body execution subset is not a terminal ordered path")
+    return indices
 
 
 def _interpolate_whole_body_execution_trajectory(

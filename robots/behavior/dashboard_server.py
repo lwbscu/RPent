@@ -72,13 +72,17 @@ class DashboardServer(OfficialDashboardServer):
     def _install_control_routes(self) -> None:
         """Attach BEHAVIOR-only routes without changing the official server."""
 
-        def state_for_run(run_id: Any) -> Any:
+        def lookup_state(run_id: Any) -> Any:
             run = str(run_id or "").strip()
             if not run:
                 raise ControlRequestError(422, "invalid_run", "run is required")
             state = self._runs.get(run)
             if state is None:
                 raise ControlRequestError(404, "unknown_run", "unknown run")
+            return state
+
+        def state_for_run(run_id: Any) -> Any:
+            state = lookup_state(run_id)
             lifecycle_callback = getattr(state, "control_admission_snapshot", None)
             lifecycle = (
                 lifecycle_callback() if callable(lifecycle_callback) else {}
@@ -130,13 +134,24 @@ class DashboardServer(OfficialDashboardServer):
                 )
             return payload
 
-        def error_response(exc: ControlRequestError) -> JSONResponse:
-            return JSONResponse(exc.payload(), status_code=exc.status_code)
+        def error_response(
+            exc: ControlRequestError,
+            controller: Any = None,
+        ) -> JSONResponse:
+            payload: dict[str, Any] = {}
+            snapshot = getattr(controller, "snapshot", None)
+            if callable(snapshot):
+                candidate = snapshot()
+                if isinstance(candidate, dict):
+                    payload.update(candidate)
+            payload.update(exc.payload())
+            return JSONResponse(payload, status_code=exc.status_code)
 
         @self._app.post("/api/run/control/command")
         def api_control_command(
             payload: dict[str, Any] = Body(default={}),
         ) -> JSONResponse:
+            controller = None
             try:
                 body = validate_payload(
                     payload,
@@ -158,27 +173,39 @@ class DashboardServer(OfficialDashboardServer):
                     action=body["action"],
                     camera=body["camera"],
                 )
-                return JSONResponse(
+                response = dict(
+                    command.acceptance_snapshot
+                    if not deduplicated
+                    and isinstance(command.acceptance_snapshot, dict)
+                    else controller.snapshot()
+                )
+                response.update(
                     {
                         "accepted": True,
                         "deduplicated": deduplicated,
+                        "accepted_command_id": command.command_id,
                         "command_id": command.command_id,
                         "lease_id": command.lease_id,
                         "sequence": command.sequence,
                         "target": command.target,
                         "action": command.action,
                         "camera": command.camera,
-                        "phase": command.phase,
-                    },
-                    status_code=202,
+                        "phase": (
+                            "accepted"
+                            if not deduplicated
+                            else command.phase
+                        ),
+                    }
                 )
+                return JSONResponse(response, status_code=202)
             except ControlRequestError as exc:
-                return error_response(exc)
+                return error_response(exc, controller)
 
         @self._app.post("/api/run/control/heartbeat")
         def api_control_heartbeat(
             payload: dict[str, Any] = Body(default={}),
         ) -> JSONResponse:
+            controller = None
             try:
                 body = validate_payload(
                     payload, required={"run", "lease_id"}
@@ -189,17 +216,18 @@ class DashboardServer(OfficialDashboardServer):
                     controller.heartbeat(lease_id=body["lease_id"])
                 )
             except ControlRequestError as exc:
-                return error_response(exc)
+                return error_response(exc, controller)
 
         @self._app.post("/api/run/control/stop")
         def api_control_stop(
             payload: dict[str, Any] = Body(default={}),
         ) -> JSONResponse:
+            controller = None
             try:
                 body = validate_payload(
                     payload,
                     required={"run", "lease_id"},
-                    optional={"reason"},
+                    optional={"reason", "stop_mode"},
                 )
                 state = state_for_run(body["run"])
                 controller = controller_for_state(state)
@@ -207,28 +235,63 @@ class DashboardServer(OfficialDashboardServer):
                     controller.stop(
                         lease_id=body["lease_id"],
                         reason=str(body.get("reason") or "client_stop"),
+                        stop_mode=str(
+                            body.get("stop_mode") or "clear_pending"
+                        ),
                     )
                 )
             except ControlRequestError as exc:
-                return error_response(exc)
+                return error_response(exc, controller)
 
         @self._app.post("/api/run/control/camera")
         def api_control_camera(
             payload: dict[str, Any] = Body(default={}),
         ) -> JSONResponse:
+            controller = None
             try:
                 body = validate_payload(payload, required={"run", "camera"})
                 state = state_for_run(body["run"])
                 controller = controller_for_state(state)
                 control = controller.select_camera(body["camera"])
-                return JSONResponse({"ok": True, "control": control})
+                return JSONResponse({**control, "ok": True})
             except ControlRequestError as exc:
-                return error_response(exc)
+                return error_response(exc, controller)
 
         @self._app.get("/api/run/control/state")
         def api_control_state(run: str) -> JSONResponse:
             try:
-                state = state_for_run(run)
+                state = lookup_state(run)
+                lifecycle_callback = getattr(
+                    state, "control_admission_snapshot", None
+                )
+                lifecycle = (
+                    lifecycle_callback() if callable(lifecycle_callback) else {}
+                )
+                if lifecycle.get("official_task_success") is True:
+                    state_snapshot = getattr(state, "snapshot", None)
+                    public_state = (
+                        state_snapshot() if callable(state_snapshot) else {}
+                    )
+                    terminal = (
+                        public_state.get("control")
+                        if isinstance(public_state, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(terminal, dict)
+                        and terminal.get("success_latched") is True
+                        and terminal.get("command_id")
+                        and terminal.get("phase")
+                        in {"completed", "failed", "cancelled"}
+                    ):
+                        return JSONResponse(terminal)
+                    raise ControlRequestError(
+                        410, "run_finished", "run is already finished"
+                    )
+                if lifecycle.get("state") != "running":
+                    raise ControlRequestError(
+                        410, "run_finished", "run is already finished"
+                    )
                 controller = controller_for_state(state)
                 return JSONResponse(controller.state())
             except ControlRequestError as exc:

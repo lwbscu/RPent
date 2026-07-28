@@ -41,6 +41,21 @@ _CHASSIS_ACTIONS = frozenset(
     {"forward", "backward", "turn_left", "turn_right", "up", "down", "observe"}
 )
 _ONE_SHOT_ACTIONS = frozenset({"open", "close", "observe"})
+_QUEUE_CAPACITY = 5
+_CAPTURE_IDLE_DELAY_S = 0.34
+_PLANNING_METADATA_FIELDS = (
+    "planning_elapsed_s",
+    "planning_profile",
+    "fast_solver_deadline_s",
+    "fast_solver_deadline",
+    "latency_metrics",
+    "obstacle_refresh",
+    "selected_solver_stage",
+    "solver_stages",
+)
+_PLANNING_TRAJECTORY_FIELD_FRAGMENT = "trajectory"
+_PLANNING_METADATA_MAX_DEPTH = 4
+_PLANNING_METADATA_MAX_ITEMS = 32
 
 
 class ControlRequestError(RuntimeError):
@@ -344,6 +359,41 @@ class BehaviorCommandArbiter:
                 self._command_id = None
                 self._condition.notify_all()
 
+    def handoff_manual(self, command_id: str, next_command_id: str) -> None:
+        """Retain one manual reservation while changing its exact permit."""
+
+        command_id = str(command_id or "").strip()
+        next_command_id = str(next_command_id or "").strip()
+        with self._condition:
+            if (
+                not command_id
+                or not next_command_id
+                or self._owner != "manual"
+                or self._command_id != command_id
+            ):
+                raise RuntimeError("manual reservation handoff does not match owner")
+            self._command_id = next_command_id
+
+    def require_manual_permit(self, command_id: str) -> None:
+        """Require the exact command-scoped manual permit.
+
+        Checking only ``owner == "manual"`` would let an unrelated internal
+        caller borrow another command's permit while its Env RPC is in flight.
+        The opaque command id therefore remains part of the permit until the
+        controller publishes the terminal receipt and releases it.
+        """
+
+        command_id = str(command_id or "").strip()
+        with self._condition:
+            if (
+                not command_id
+                or self._owner != "manual"
+                or self._command_id != command_id
+            ):
+                raise RuntimeError(
+                    "Dashboard manual primitive requires its exact command permit"
+                )
+
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
             return {
@@ -381,7 +431,6 @@ class _Lease:
     lease_id: str
     deadline: float
     last_sequence: int = 0
-    in_flight_command_id: str | None = None
     stopped: bool = False
     expired: bool = False
     stop_reason: str | None = None
@@ -400,6 +449,11 @@ class _Command:
     phase: str = "accepted"
     accepted_at: float = field(default_factory=time.monotonic)
     result: dict[str, Any] | None = None
+    plan_id: str | None = None
+    planning_metadata: dict[str, Any] = field(default_factory=dict)
+    predecessor_plan_id: str | None = None
+    timeline_started: bool = False
+    acceptance_snapshot: dict[str, Any] | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -411,11 +465,66 @@ class _Command:
             "camera": self.camera,
             "phase": self.phase,
             "result": self.result,
+            "plan_id": self.plan_id,
+            "planning_metadata": dict(self.planning_metadata),
         }
 
 
+def _planning_metadata(
+    prepared: Mapping[str, Any], *, plan_id: str
+) -> dict[str, Any]:
+    """Keep only bounded, JSON-safe planning receipt fields.
+
+    Prepared plans may carry simulator-private trajectory arrays.  The control
+    receipt needs planning provenance, not those large execution payloads.
+    """
+
+    metadata: dict[str, Any] = {"plan_id": plan_id}
+    for field_name in _PLANNING_METADATA_FIELDS:
+        value = _bounded_planning_value(prepared.get(field_name))
+        if value is not None:
+            metadata[field_name] = value
+    return metadata
+
+
+def _bounded_planning_value(value: Any, *, depth: int = 0) -> Any:
+    """Return a small JSON-safe metadata value, dropping trajectory payloads."""
+
+    if depth > _PLANNING_METADATA_MAX_DEPTH:
+        return None
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        try:
+            json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+        return value
+    if isinstance(value, Mapping):
+        bounded: dict[str, Any] = {}
+        for key, item in list(value.items())[:_PLANNING_METADATA_MAX_ITEMS]:
+            name = str(key)
+            if (
+                name.startswith("_")
+                or _PLANNING_TRAJECTORY_FIELD_FRAGMENT in name.lower()
+            ):
+                continue
+            safe_item = _bounded_planning_value(item, depth=depth + 1)
+            if safe_item is not None:
+                bounded[name] = safe_item
+        return bounded
+    if isinstance(value, (list, tuple)):
+        bounded_items = []
+        for item in value[:_PLANNING_METADATA_MAX_ITEMS]:
+            safe_item = _bounded_planning_value(item, depth=depth + 1)
+            if safe_item is not None:
+                bounded_items.append(safe_item)
+        return bounded_items
+    return None
+
+
 class BehaviorDashboardController:
-    """Own leases and dispatch one manual command at a time."""
+    """Pipeline manual commands through one planner and one Env executor."""
 
     def __init__(
         self,
@@ -433,12 +542,20 @@ class BehaviorDashboardController:
         self.success_latch = success_latch or arbiter.success_latch
         self._toolkit: Any = None
         self._lock = threading.RLock()
-        self._drained = threading.Condition(self._lock)
+        self._submit_lock = threading.Lock()
+        self._work = threading.Condition(self._lock)
         self._commands: dict[tuple[str, int], _Command] = {}
         self._lease: _Lease | None = None
+        self._head: _Command | None = None
+        self._pending: list[_Command] = []
+        self._planning_command: _Command | None = None
+        self._plans_to_discard: list[str] = []
+        self._last_terminal: dict[str, Any] | None = None
+        self._pending_cleared_count = 0
         self._active = False
         self._quiescing = False
         self._closed = False
+        self._workers_stop = False
         self._policy_motion_available = bool(motion_available)
         self._policy_observe_available = bool(observe_available)
         self._motion_available = False
@@ -446,61 +563,70 @@ class BehaviorDashboardController:
         self._unavailable_reason = str(unavailable_reason or "controller_unavailable")
         self._capabilities: dict[str, Any] = {}
         self._lease_timeout_s = max(0.1, float(lease_timeout_s))
-        self._control: dict[str, Any] = {
-            "available": False,
-            "motion_available": False,
-            "observe_available": False,
-            "busy": False,
-            "owner": None,
-            "command_id": None,
-            "lease_id": None,
-            "target": None,
-            "action": None,
+        self._selected_camera = "head"
+        self._control_revision = 0
+        self._capture: dict[str, Any] = {
             "phase": "idle",
+            "revision": 0,
             "error": None,
-            "stop_reason": None,
-            "selected_camera": "head",
-            "success_latched": False,
-            "unavailable_reason": self._unavailable_reason,
         }
+        self._capture_ready_at = 0.0
+        self._capture_command_id: str | None = None
         self._watchdog_stop = threading.Event()
+        run_id = getattr(state, "run_id", "run")
+        self._planner_worker = threading.Thread(
+            target=self._planner_loop,
+            name=f"behavior-dashboard-planner-{run_id}",
+            daemon=True,
+        )
+        self._executor_worker = threading.Thread(
+            target=self._executor_loop,
+            name=f"behavior-dashboard-executor-{run_id}",
+            daemon=True,
+        )
         self._watchdog = threading.Thread(
             target=self._watchdog_loop,
-            name=f"behavior-dashboard-control-{getattr(state, 'run_id', 'run')}",
+            name=f"behavior-dashboard-control-{run_id}",
             daemon=True,
         )
         self.arbiter.add_listener(self._on_arbiter_change)
+        self._planner_worker.start()
+        self._executor_worker.start()
         self._watchdog.start()
 
     def bind_toolkit(self, toolkit: Any) -> None:
-        command = getattr(toolkit, "dashboard_manual_command", None)
-        if not callable(command):
-            raise TypeError("toolkit must provide dashboard_manual_command")
+        required = (
+            "dashboard_manual_command",
+            "dashboard_prepare_manual_command",
+            "dashboard_execute_prepared_command",
+            "dashboard_discard_prepared_command",
+            "dashboard_capture_views",
+        )
+        missing = [name for name in required if not callable(getattr(toolkit, name, None))]
+        if missing:
+            raise TypeError(
+                "toolkit must provide Dashboard pipeline methods: "
+                + ", ".join(missing)
+            )
         capabilities_callback = getattr(toolkit, "dashboard_control_capabilities", None)
         capabilities: dict[str, Any] = {}
         if callable(capabilities_callback):
             reported = capabilities_callback()
             if isinstance(reported, Mapping):
                 capabilities = dict(reported)
-        with self._lock:
+        with self._work:
             if self._closed:
                 raise RuntimeError("dashboard controller is closed")
             self._toolkit = toolkit
             self._capabilities = capabilities
-            dynamic_motion = capabilities.get("motion_available", True)
-            dynamic_observe = capabilities.get("observe_available", True)
-            self._motion_available = bool(
-                self._policy_motion_available and dynamic_motion is True
-            )
-            self._observe_available = bool(
-                self._policy_observe_available and dynamic_observe is True
-            )
+            self._recompute_capabilities_locked()
             reported_reason = capabilities.get("unavailable_reason")
             if reported_reason:
                 self._unavailable_reason = str(reported_reason)
             elif self._motion_available or self._observe_available:
                 self._unavailable_reason = ""
-            self._refresh_control_locked()
+            self._touch_locked()
+            self._work.notify_all()
         self._publish_snapshot()
 
     def configure_capabilities(
@@ -510,26 +636,20 @@ class BehaviorDashboardController:
         observe_available: bool,
         unavailable_reason: str = "",
     ) -> None:
-        with self._lock:
+        with self._work:
             self._policy_motion_available = bool(motion_available)
             self._policy_observe_available = bool(observe_available)
-            self._motion_available = bool(
-                self._policy_motion_available
-                and self._capabilities.get("motion_available", True) is True
-            )
-            self._observe_available = bool(
-                self._policy_observe_available
-                and self._capabilities.get("observe_available", True) is True
-            )
+            self._recompute_capabilities_locked()
             if unavailable_reason:
                 self._unavailable_reason = str(unavailable_reason)
             elif self._motion_available or self._observe_available:
                 self._unavailable_reason = ""
-            self._refresh_control_locked()
+            self._touch_locked()
+            self._work.notify_all()
         self._publish_snapshot()
 
     def activate(self) -> None:
-        with self._lock:
+        with self._work:
             if self._closed:
                 raise RuntimeError("dashboard controller is closed")
             if self._toolkit is None:
@@ -540,10 +660,29 @@ class BehaviorDashboardController:
                 )
             self._active = True
             self._quiescing = False
-            self._refresh_control_locked()
+            self._touch_locked()
+            self._work.notify_all()
         self._publish_snapshot()
 
     def submit(
+        self,
+        *,
+        lease_id: str,
+        sequence: int,
+        target: str,
+        action: str,
+        camera: str,
+    ) -> tuple[_Command, bool]:
+        with self._submit_lock:
+            return self._submit_serialized(
+                lease_id=lease_id,
+                sequence=sequence,
+                target=target,
+                action=action,
+                camera=camera,
+            )
+
+    def _submit_serialized(
         self,
         *,
         lease_id: str,
@@ -561,35 +700,23 @@ class BehaviorDashboardController:
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
             raise ControlRequestError(422, "invalid_sequence", "sequence must be positive")
         self._validate_target_action(target, action, camera)
-
         key = (lease_id, sequence)
         fingerprint = (target, action, camera)
+
         with self._lock:
             existing = self._commands.get(key)
             if existing is not None:
-                if existing.payload_fingerprint != fingerprint:
-                    raise ControlRequestError(
-                        409,
-                        "idempotency_conflict",
-                        "lease_id and sequence were used with a different command",
-                    )
+                self._require_matching_fingerprint(existing, fingerprint)
                 return existing, True
-
         lifecycle = self._state.control_admission_snapshot()
         if lifecycle["state"] != "running" or lifecycle["official_task_success"]:
             raise ControlRequestError(410, "run_finished", "run is already finished")
 
-        with self._lock:
-            # Another request may have reserved the idempotency key while the
-            # State lifecycle was read without holding either component lock.
+        command_id = uuid.uuid4().hex
+        with self._work:
             existing = self._commands.get(key)
             if existing is not None:
-                if existing.payload_fingerprint != fingerprint:
-                    raise ControlRequestError(
-                        409,
-                        "idempotency_conflict",
-                        "lease_id and sequence were used with a different command",
-                    )
+                self._require_matching_fingerprint(existing, fingerprint)
                 return existing, True
             self._expire_lease_locked(time.monotonic())
             if self.success_latch.is_latched():
@@ -598,26 +725,36 @@ class BehaviorDashboardController:
                 raise ControlRequestError(
                     409, "controller_unavailable", "manual controller unavailable"
                 )
-            if action == "observe":
-                if not self._observe_available:
-                    raise ControlRequestError(
-                        409,
-                        "observe_unavailable",
-                        self._unavailable_reason or "camera refresh unavailable",
-                    )
-            elif not self._motion_available:
+            if action == "observe" and not self._observe_available:
+                raise ControlRequestError(
+                    409,
+                    "observe_unavailable",
+                    self._unavailable_reason or "camera refresh unavailable",
+                )
+            if action != "observe" and not self._motion_available:
                 raise ControlRequestError(
                     409,
                     "motion_unavailable",
                     self._unavailable_reason or "motion control unavailable",
                 )
-            if self._lease is None or self._lease.stopped or self._lease.expired:
+
+            new_lease = (
+                self._lease is None
+                or self._lease.stopped
+                or self._lease.expired
+            )
+            if new_lease:
+                if self._head is not None or self._pending:
+                    raise ControlRequestError(
+                        409, "controller_busy", "another manual queue is active"
+                    )
                 if sequence != 1:
                     raise ControlRequestError(
                         409,
                         "invalid_sequence",
                         "a new control lease must start at sequence 1",
                     )
+                self._reserve_for_new_head_locked(command_id)
                 self._lease = _Lease(
                     lease_id=lease_id,
                     deadline=time.monotonic() + self._lease_timeout_s,
@@ -627,22 +764,20 @@ class BehaviorDashboardController:
                 raise ControlRequestError(
                     409, "controller_busy", "another manual control lease is active"
                 )
+
             lease = self._lease
+            assert lease is not None
             if lease.payload_fingerprint != fingerprint:
                 raise ControlRequestError(
                     409,
                     "lease_command_conflict",
                     "a repeat lease cannot change target, action, or camera",
                 )
-            if lease.in_flight_command_id is not None:
-                raise ControlRequestError(
-                    409, "controller_busy", "a manual command is still in flight"
-                )
             if sequence != lease.last_sequence + 1:
                 raise ControlRequestError(
                     409,
                     "invalid_sequence",
-                    "sequence must follow the previous completed command",
+                    "sequence must follow the previous accepted command",
                 )
             if action in _ONE_SHOT_ACTIONS and sequence != 1:
                 raise ControlRequestError(
@@ -650,20 +785,13 @@ class BehaviorDashboardController:
                     "non_repeatable_action",
                     f"{action} does not support lease repetition",
                 )
-
-            command_id = uuid.uuid4().hex
-            acquired, reason = self.arbiter.try_acquire_manual(command_id)
-            if not acquired:
-                if reason == "official_success_latched":
-                    raise ControlRequestError(
-                        410, "run_finished", "official success latched"
-                    )
-                message = (
-                    "agent command is waiting"
-                    if reason == "agent_waiting"
-                    else "robot controller is busy"
+            if self._head is not None and len(self._pending) >= _QUEUE_CAPACITY:
+                raise ControlRequestError(
+                    409, "queue_full", "manual command queue is full"
                 )
-                raise ControlRequestError(409, reason or "controller_busy", message)
+            if not new_lease and self._head is None:
+                self._reserve_for_new_head_locked(command_id)
+
             command = _Command(
                 command_id=command_id,
                 lease_id=lease_id,
@@ -675,47 +803,32 @@ class BehaviorDashboardController:
             )
             self._commands[key] = command
             lease.last_sequence = sequence
-            lease.in_flight_command_id = command_id
             lease.deadline = time.monotonic() + self._lease_timeout_s
-            self._control.update(
-                {
-                    "command_id": command_id,
-                    "lease_id": lease_id,
-                    "target": target,
-                    "action": action,
-                    "phase": "accepted",
-                    "error": None,
-                    "stop_reason": None,
-                    "selected_camera": camera,
-                }
-            )
-            self._refresh_control_locked()
+            if self._head is None:
+                self._head = command
+            else:
+                self._pending.append(command)
+            if self._capture["phase"] == "pending":
+                self._capture.update({"phase": "discarded", "error": None})
+                self._capture_ready_at = 0.0
+            self._selected_camera = camera
+            self._touch_locked()
+            command.acceptance_snapshot = self._snapshot_locked()
 
         try:
             self._state.on_manual_command_start(command.public())
-            self._publish_snapshot()
-            worker = threading.Thread(
-                target=self._run_command,
-                args=(command,),
-                name=f"behavior-dashboard-command-{command_id[:8]}",
-                daemon=True,
-            )
-            worker.start()
-        except Exception:
-            with self._lock:
-                if self._lease is not None:
-                    self._lease.in_flight_command_id = None
-                command.phase = "failed"
-                command.result = {"error": "failed to start manual command"}
-                self._refresh_control_locked()
-            self.arbiter.release_manual(command_id)
-            self._publish_snapshot()
+        except BaseException as exc:
+            self._fail_admission(command, exc)
             raise
+        with self._work:
+            command.timeline_started = True
+            self._work.notify_all()
+        self._publish_snapshot()
         return command, False
 
     def heartbeat(self, *, lease_id: str) -> dict[str, Any]:
         lease_id = str(lease_id).strip()
-        with self._lock:
+        with self._work:
             self._expire_lease_locked(time.monotonic())
             lease = self._lease
             if (
@@ -728,25 +841,35 @@ class BehaviorDashboardController:
                     409, "lease_expired", "control lease is not active"
                 )
             lease.deadline = time.monotonic() + self._lease_timeout_s
+            self._touch_locked()
             result = self._snapshot_locked()
+            self._work.notify_all()
         self._publish_snapshot()
         return result
 
-    def stop(self, *, lease_id: str, reason: str = "client_stop") -> dict[str, Any]:
+    def stop(
+        self,
+        *,
+        lease_id: str,
+        reason: str = "client_stop",
+        stop_mode: str = "clear_pending",
+    ) -> dict[str, Any]:
         lease_id = str(lease_id).strip()
-        with self._lock:
+        if str(stop_mode or "") != "clear_pending":
+            raise ControlRequestError(
+                422, "invalid_stop_mode", "stop_mode must be clear_pending"
+            )
+        with self._work:
             lease = self._lease
             if lease is None or lease.lease_id != lease_id:
                 raise ControlRequestError(409, "unknown_lease", "control lease not found")
-            if not lease.stopped:
-                lease.stopped = True
-                lease.stop_reason = str(reason or "client_stop")
-            if lease.in_flight_command_id is not None:
-                self._control["phase"] = "stopping"
-            self._control["stop_reason"] = lease.stop_reason
-            self._control["lease_status"] = "stopped"
-            self._refresh_control_locked()
+            lease.stopped = True
+            lease.stop_reason = str(reason or "client_stop")
+            cleared = self._clear_pending_locked(lease.stop_reason)
+            self._touch_locked()
             result = self._snapshot_locked()
+            self._work.notify_all()
+        self._publish_cleared(cleared)
         self._publish_snapshot()
         return result
 
@@ -755,8 +878,9 @@ class BehaviorDashboardController:
         if camera not in _CAMERAS:
             raise ControlRequestError(422, "invalid_camera", "invalid camera")
         self._state.set_selected_camera(camera)
-        with self._lock:
-            self._control["selected_camera"] = camera
+        with self._work:
+            self._selected_camera = camera
+            self._touch_locked()
             result = self._snapshot_locked()
         self._publish_snapshot()
         return result
@@ -765,33 +889,43 @@ class BehaviorDashboardController:
         return self.snapshot()
 
     def snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            self._expire_lease_locked(time.monotonic())
-            self._refresh_control_locked()
+        with self._work:
+            changed = self._expire_lease_locked(time.monotonic())
+            if changed:
+                self._work.notify_all()
             return self._snapshot_locked()
 
     def quiesce(self) -> None:
-        with self._lock:
+        with self._work:
             self._quiescing = True
             self._active = False
             if self._lease is not None:
                 self._lease.stopped = True
                 self._lease.stop_reason = "controller_quiescing"
-            self._refresh_control_locked()
+            cleared = self._clear_pending_locked("controller_quiescing")
+            if self._capture["phase"] == "pending":
+                self._capture.update({"phase": "discarded", "error": None})
+                self._capture_ready_at = 0.0
+            self._touch_locked()
+            self._work.notify_all()
+        self._publish_cleared(cleared)
         self.arbiter.quiesce()
         self._publish_snapshot()
 
     def drain(self, timeout_s: float = 10.0) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_s))
-        with self._drained:
+        with self._work:
             while (
-                self._lease is not None
-                and self._lease.in_flight_command_id is not None
+                self._head is not None
+                or self._pending
+                or self._planning_command is not None
+                or self._capture["phase"] in {"pending", "started"}
+                or self._plans_to_discard
             ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
-                self._drained.wait(remaining)
+                self._work.wait(remaining)
         return self.arbiter.drain(max(0.0, deadline - time.monotonic()))
 
     def close(self, timeout_s: float = 10.0) -> bool:
@@ -800,215 +934,571 @@ class BehaviorDashboardController:
         if not drained:
             self._publish_snapshot()
             return False
-        with self._lock:
+        with self._work:
             self._closed = True
+            self._workers_stop = True
             self._toolkit = None
-            self._refresh_control_locked()
+            self._touch_locked()
+            self._work.notify_all()
         self._watchdog_stop.set()
-        self._watchdog.join(timeout=min(1.0, max(0.0, float(timeout_s))))
+        join_s = min(1.0, max(0.0, float(timeout_s)))
+        self._watchdog.join(timeout=join_s)
+        self._planner_worker.join(timeout=join_s)
+        self._executor_worker.join(timeout=join_s)
         self.arbiter.remove_listener(self._on_arbiter_change)
         self._publish_snapshot()
-        return drained
+        return True
 
-    def _run_command(self, command: _Command) -> None:
-        try:
-            self._run_command_impl(command)
-        except BaseException as exc:
-            self._finalize_worker_failure(command, exc)
-
-    def _run_command_impl(self, command: _Command) -> None:
-        started = time.monotonic()
-        result: dict[str, Any]
-        with self._lock:
-            lease = self._lease
-            lifecycle = self._state.control_admission_snapshot()
-            cancelled_reason = (
-                "official_success_latched"
-                if self.success_latch.is_latched()
-                or lifecycle["official_task_success"]
-                else "run_finished"
-                if lifecycle["state"] != "running"
-                else "controller_quiescing"
-                if self._quiescing or self._closed or not self._active
-                else lease.stop_reason
-                if lease is not None and lease.stopped
-                else "lease_expired"
-                if lease is None
-                or lease.lease_id != command.lease_id
-                or lease.expired
-                else None
-            )
-            command.phase = "cancelled" if cancelled_reason else "planning"
-            self._control["phase"] = command.phase
-            self._control["stop_reason"] = cancelled_reason
-            self._refresh_control_locked()
-        self._publish_snapshot()
-        if cancelled_reason:
-            result = {
-                "primitive_success": False,
-                "stop_reason": cancelled_reason,
-                "cancelled_before_execution": True,
-            }
-        else:
-            with self._lock:
-                command.phase = "moving"
-                self._control["phase"] = "moving"
-                self._refresh_control_locked()
+    def _planner_loop(self) -> None:
+        while True:
+            discard_plan: str | None = None
+            command: _Command | None = None
+            with self._work:
+                while True:
+                    if self._workers_stop:
+                        return
+                    if self._plans_to_discard:
+                        discard_plan = self._plans_to_discard.pop(0)
+                        break
+                    command = self._next_unplanned_locked()
+                    if command is not None:
+                        self._planning_command = command
+                        command.phase = "planning"
+                        self._touch_locked()
+                        break
+                    self._work.wait()
+            if discard_plan is not None:
+                self._discard_plan(discard_plan)
+                with self._work:
+                    self._work.notify_all()
+                continue
+            assert command is not None
             self._publish_snapshot()
             try:
-                toolkit = self._toolkit
-                if toolkit is None:
-                    raise RuntimeError("dashboard controller toolkit is not bound")
+                toolkit = self._require_toolkit()
+                prepared = toolkit.dashboard_prepare_manual_command(
+                    target=command.target,
+                    action=command.action,
+                    predecessor_plan_id=command.predecessor_plan_id,
+                    # Controller admission only plans the current FIFO head.
+                    # Never re-enable the Env RPC background escape hatch here.
+                    background=False,
+                )
+                if not isinstance(prepared, Mapping):
+                    raise RuntimeError("manual planner returned a non-object result")
+                plan_id = str(prepared.get("plan_id") or "").strip()
+                if not plan_id:
+                    raise RuntimeError("manual planner did not return plan_id")
+            except BaseException as exc:
+                self._finish_planning_failure(command, exc)
+                continue
+            discard_after_prepare = False
+            with self._work:
+                if self._planning_command is command:
+                    self._planning_command = None
+                if not self._command_is_active_locked(command):
+                    discard_after_prepare = True
+                else:
+                    command.plan_id = plan_id
+                    command.planning_metadata = _planning_metadata(
+                        prepared, plan_id=plan_id
+                    )
+                    command.phase = "prepared"
+                self._touch_locked()
+                self._work.notify_all()
+            if discard_after_prepare:
+                self._discard_plan(plan_id)
+            self._publish_snapshot()
+
+    def _executor_loop(self) -> None:
+        while True:
+            command: _Command | None = None
+            capture: tuple[int, str] | None = None
+            with self._work:
+                while True:
+                    if self._workers_stop:
+                        return
+                    head = self._head
+                    if head is not None and (
+                        head.timeline_started
+                        and (
+                            head.action in _ONE_SHOT_ACTIONS
+                            or head.plan_id
+                        )
+                    ):
+                        command = head
+                        command.phase = "moving"
+                        self._touch_locked()
+                        break
+                    capture = self._start_capture_if_ready_locked()
+                    if capture is not None:
+                        break
+                    timeout = None
+                    if self._capture["phase"] == "pending":
+                        timeout = max(
+                            0.05, self._capture_ready_at - time.monotonic()
+                        )
+                    self._work.wait(timeout)
+            self._publish_snapshot()
+            if command is not None:
+                self._execute_command(command)
+            elif capture is not None:
+                self._execute_capture(*capture)
+
+    def _execute_command(self, command: _Command) -> None:
+        started = time.monotonic()
+        try:
+            toolkit = self._require_toolkit()
+            if command.action in _ONE_SHOT_ACTIONS:
                 payload = toolkit.dashboard_manual_command(
                     target=command.target,
                     action=command.action,
                     camera=command.camera,
+                    permit_command_id=command.command_id,
                 )
-                result = dict(payload) if isinstance(payload, Mapping) else {
-                    "primitive_success": False,
-                    "error": "manual primitive returned a non-object result",
-                }
-            except Exception as exc:
-                result = {
-                    "primitive_success": False,
-                    "stop_reason": "tool_error",
-                    "error": str(exc),
-                }
+            else:
+                payload = toolkit.dashboard_execute_prepared_command(
+                    plan_id=str(command.plan_id or ""),
+                    command_id=command.command_id,
+                )
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("manual executor returned a non-object result")
+            result = dict(payload)
+        except BaseException as exc:
+            result = {
+                "primitive_success": False,
+                "stop_reason": "tool_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        self._attach_planning_metadata(command, result)
         result.setdefault("elapsed_s", max(0.0, time.monotonic() - started))
-        command.result = result
-        success_latched = self.success_latch.observe(result)
-        failed = (
-            result.get("primitive_success") is False
-            or result.get("success") is False
-            or result.get("error") not in (None, "", False)
-            or result.get("capture_error") not in (None, "", False)
-        )
-        command.phase = (
-            "cancelled"
-            if result.get("cancelled_before_execution") is True
-            else "failed"
-            if failed
-            else "completed"
-        )
-        self._state.on_manual_command_result(
-            command.public(),
-            result,
-            official_success_latched=success_latched,
-        )
-        with self._drained:
-            lease = self._lease
-            if (
-                lease is not None
-                and lease.in_flight_command_id == command.command_id
-            ):
-                lease.in_flight_command_id = None
-                if command.action in _ONE_SHOT_ACTIONS:
-                    lease.stopped = True
-                    lease.stop_reason = "command_complete"
-                    self._control["lease_status"] = "completed"
-            self._control.update(
+        capture_result = self._detach_capture_payload(result)
+        try:
+            success_latched = self.success_latch.observe(result)
+        except BaseException as exc:
+            result.update(
                 {
-                    "phase": command.phase,
-                    "error": result.get("error") or result.get("capture_error"),
-                    "capture_error": result.get("capture_error"),
-                    "stop_reason": (
-                        lease.stop_reason
-                        if lease is not None and lease.stopped
-                        else result.get("stop_reason")
-                        or (
-                            "camera_refresh_failed"
-                            if result.get("capture_error")
-                            not in (None, "", False)
-                            else None
-                        )
-                    ),
-                    "success_latched": success_latched,
+                    "primitive_success": False,
+                    "stop_reason": "dashboard_control_worker_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "worker_exception_type": type(exc).__name__,
                 }
             )
-            capabilities = result.get("control_capabilities")
-            if isinstance(capabilities, Mapping):
-                self._capabilities.update(dict(capabilities))
-                self._recompute_capabilities_locked()
-            if success_latched:
-                self._active = False
-                if lease is not None:
-                    lease.stopped = True
-                    lease.stop_reason = "official_task_success"
-            self._refresh_control_locked()
-            self._drained.notify_all()
-        self._publish_snapshot()
-        self.arbiter.release_manual(command.command_id)
-        self._publish_snapshot()
-
-    def _finalize_worker_failure(
-        self,
-        command: _Command,
-        exc: BaseException,
-    ) -> None:
-        """Fail closed and release the permit after any worker-side exception."""
-
-        original_error = f"{type(exc).__name__}: {exc}"
-        result = dict(command.result or {})
-        prior_error = result.get("error")
-        if prior_error not in (None, "", False) and str(prior_error) != original_error:
-            result["prior_error"] = str(prior_error)
-        result.update(
-            {
-                "primitive_success": False,
-                "stop_reason": "dashboard_control_worker_error",
-                "error": original_error,
-                "worker_exception_type": type(exc).__name__,
-            }
-        )
-        command.phase = "failed"
+            success_latched = self.success_latch.is_latched()
+        failed = self._action_failed(result)
         command.result = result
-        success_latched = self.success_latch.is_latched()
+        command.phase = "failed" if failed else "completed"
+        if success_latched:
+            command.phase = "completed" if not failed else "failed"
 
-        # Retry a terminal State publication once.  Complete frame groups and
-        # command IDs are idempotent, so a callback that raised after a partial
-        # commit cannot duplicate robot work or frame revisions.
         try:
             self._state.on_manual_command_result(
                 command.public(),
                 result,
                 official_success_latched=success_latched,
             )
-        except BaseException as state_exc:
-            result["state_publish_error"] = (
-                f"{type(state_exc).__name__}: {state_exc}"
+        except BaseException as exc:
+            result["state_publish_error"] = f"{type(exc).__name__}: {exc}"
+        if capture_result is not None and not success_latched:
+            revision = self._new_capture_revision()
+            publish_error = self._publish_capture_result(
+                revision, capture_result
             )
-
-        try:
-            with self._drained:
-                lease = self._lease
-                if (
-                    lease is not None
-                    and lease.in_flight_command_id == command.command_id
-                ):
-                    lease.in_flight_command_id = None
-                    lease.stopped = True
-                    lease.stop_reason = "dashboard_control_worker_error"
-                self._control.update(
+            with self._work:
+                capture_error = (
+                    publish_error
+                    or capture_result.get("capture_error")
+                    or capture_result.get("error")
+                )
+                self._capture.update(
                     {
-                        "phase": "failed",
-                        "error": original_error,
-                        "stop_reason": "dashboard_control_worker_error",
-                        "success_latched": success_latched,
-                        "worker_exception_type": type(exc).__name__,
+                        "phase": "failed" if capture_error else "completed",
+                        "revision": revision,
+                        "error": (
+                            str(capture_error) if capture_error else None
+                        ),
                     }
                 )
-                self._refresh_control_locked()
-                self._drained.notify_all()
+                self._touch_locked()
+
+        with self._work:
+            if self._head is not command:
+                return
+            cleared: list[_Command] = []
+            self._last_terminal = self._terminal_public(command)
+            self._head = None
+            lease = self._lease
+            if success_latched:
+                self._active = False
+                if lease is not None:
+                    lease.stopped = True
+                    lease.stop_reason = "official_task_success"
+                cleared = self._clear_pending_locked("official_task_success")
+                if self._capture["phase"] == "pending":
+                    self._capture.update({"phase": "discarded", "error": None})
+                    self._capture_ready_at = 0.0
+            elif failed:
+                if lease is not None:
+                    lease.stopped = True
+                    lease.stop_reason = str(
+                        result.get("stop_reason") or "command_error"
+                    )
+                cleared = self._clear_pending_locked(
+                    str(result.get("stop_reason") or "command_error")
+                )
+            elif self._pending:
+                self._head = self._pending.pop(0)
+            elif lease is not None and command.action in _ONE_SHOT_ACTIONS:
+                lease.stopped = True
+                lease.stop_reason = "command_complete"
+
+            next_head = self._head
+            self._touch_locked()
+            # Publish the immutable action terminal while the exact manual
+            # permit is still visible.  The reservation is handed off/released
+            # only after State and control readers can observe that terminal.
+            self._publish_snapshot()
+            if next_head is not None:
+                self.arbiter.handoff_manual(
+                    command.command_id, next_head.command_id
+                )
+            else:
+                self.arbiter.release_manual(command.command_id)
+                if (
+                    not success_latched
+                    and command.action != "observe"
+                    and result.get("cancelled_before_execution") is not True
+                    and not self._quiescing
+                    and not self._closed
+                ):
+                    self._schedule_capture_locked()
+            self._touch_locked()
+            self._work.notify_all()
+        self._publish_cleared(cleared)
+        self._publish_snapshot()
+
+    def _execute_capture(self, revision: int, command_id: str) -> None:
+        try:
+            payload = self._require_toolkit().dashboard_capture_views(
+                command_id=command_id
+            )
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("Dashboard capture returned a non-object result")
+            result = dict(payload)
+        except BaseException as exc:
+            result = {"capture_error": f"{type(exc).__name__}: {exc}"}
+        publish_error = self._publish_capture_result(revision, result)
+        with self._work:
+            error = (
+                publish_error
+                or result.get("capture_error")
+                or result.get("error")
+            )
+            self._capture.update(
+                {
+                    "phase": "failed" if error else "completed",
+                    "revision": revision,
+                    "error": str(error) if error else None,
+                }
+            )
+            next_head = self._head
+            if next_head is not None:
+                self.arbiter.handoff_manual(command_id, next_head.command_id)
+            else:
+                self.arbiter.release_manual(command_id)
+            self._capture_command_id = None
+            self._touch_locked()
+            self._work.notify_all()
+        self._publish_snapshot()
+
+    def _publish_capture_result(
+        self, revision: int, result: Mapping[str, Any]
+    ) -> str | None:
+        callback = getattr(self._state, "on_dashboard_capture_result", None)
+        if not callable(callback):
+            return "Dashboard capture State callback is unavailable"
+        try:
+            accepted = callback(
+                result,
+                controller=self,
+                generation=revision,
+            )
+            if accepted is not True:
+                return "Dashboard capture result was rejected"
+        except BaseException as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            with self._work:
+                if self._capture.get("revision") == revision:
+                    self._capture.update(
+                        {
+                            "phase": "failed",
+                            "error": error,
+                        }
+                    )
+                    self._touch_locked()
+            return error
+        return None
+
+    def _finish_planning_failure(
+        self, command: _Command, exc: BaseException
+    ) -> None:
+        result = {
+            "primitive_success": False,
+            "stop_reason": "planning_error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        with self._work:
+            if self._planning_command is command:
+                self._planning_command = None
+            if not self._command_is_active_locked(command):
+                self._work.notify_all()
+                return
+            command.phase = "failed"
+            command.result = result
+            cleared: list[_Command] = []
+            if self._head is command:
+                self._head = None
+                self._last_terminal = self._terminal_public(command)
+                cleared = self._clear_pending_locked("planning_error")
+                if self._lease is not None:
+                    self._lease.stopped = True
+                    self._lease.stop_reason = "planning_error"
+                self.arbiter.release_manual(command.command_id)
+            else:
+                index = self._pending.index(command)
+                cleared = self._pending[index + 1 :]
+                del self._pending[index:]
+                self._pending_cleared_count += 1
+                self._mark_cleared_locked(cleared, "planning_error")
+                if self._lease is not None:
+                    self._lease.stopped = True
+                    self._lease.stop_reason = "planning_error"
+            self._touch_locked()
+            self._work.notify_all()
+        try:
+            self._state.on_manual_command_result(
+                command.public(),
+                result,
+                official_success_latched=False,
+            )
+        except BaseException:
+            pass
+        self._publish_cleared(
+            [item for item in cleared if item is not command]
+        )
+        self._publish_snapshot()
+
+    def _fail_admission(self, command: _Command, exc: BaseException) -> None:
+        result = {
+            "primitive_success": False,
+            "stop_reason": "dashboard_state_error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        with self._work:
+            command.phase = "failed"
+            command.result = result
+            if self._head is command:
+                self._head = None
+                self.arbiter.release_manual(command.command_id)
+            elif command in self._pending:
+                self._pending.remove(command)
+            if self._lease is not None:
+                self._lease.stopped = True
+                self._lease.stop_reason = "dashboard_state_error"
+            self._last_terminal = self._terminal_public(command)
+            self._touch_locked()
+            self._work.notify_all()
+        self._publish_snapshot()
+
+    def _reserve_for_new_head_locked(self, command_id: str) -> None:
+        arbiter = self.arbiter.snapshot()
+        if (
+            self._capture["phase"] == "started"
+            and self._capture_command_id
+            and arbiter.get("owner") == "manual"
+            and arbiter.get("command_id") == self._capture_command_id
+        ):
+            return
+        acquired, reason = self.arbiter.try_acquire_manual(command_id)
+        if acquired:
+            return
+        if reason == "official_success_latched":
+            raise ControlRequestError(410, "run_finished", "official success latched")
+        message = (
+            "agent command is waiting"
+            if reason == "agent_waiting"
+            else "robot controller is busy"
+        )
+        raise ControlRequestError(409, reason or "controller_busy", message)
+
+    def _next_unplanned_locked(self) -> _Command | None:
+        # Planning and physical execution both enter the simulator backend.
+        # A pending background prepare must therefore not overlap the current
+        # head's physics steps.  Keep accepting the bounded tail, but promote
+        # each item to head before planning it from the then-live state.
+        command = self._head
+        if (
+            command is None
+            or not command.timeline_started
+            or command.action in _ONE_SHOT_ACTIONS
+            or command.plan_id
+        ):
+            return None
+        command.predecessor_plan_id = None
+        return command
+
+    def _start_capture_if_ready_locked(self) -> tuple[int, str] | None:
+        if (
+            self._capture["phase"] != "pending"
+            or self._head is not None
+            or time.monotonic() < self._capture_ready_at
+            or self.success_latch.is_latched()
+            or self._quiescing
+            or self._closed
+        ):
+            return None
+        command_id = f"capture-{uuid.uuid4().hex}"
+        acquired, _ = self.arbiter.try_acquire_manual(command_id)
+        if not acquired:
+            return None
+        revision = int(self._capture["revision"])
+        self._capture_command_id = command_id
+        self._capture.update({"phase": "started", "error": None})
+        self._touch_locked()
+        return revision, command_id
+
+    def _schedule_capture_locked(self) -> None:
+        revision = int(self._capture["revision"]) + 1
+        self._capture = {
+            "phase": "pending",
+            "revision": revision,
+            "error": None,
+        }
+        self._capture_ready_at = time.monotonic() + _CAPTURE_IDLE_DELAY_S
+
+    def _new_capture_revision(self) -> int:
+        with self._work:
+            revision = int(self._capture["revision"]) + 1
+            self._capture.update(
+                {"phase": "started", "revision": revision, "error": None}
+            )
+            self._touch_locked()
+            return revision
+
+    def _detach_capture_payload(
+        self, result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        capture_keys = {
+            "_frames_bytes",
+            "capture_group_id",
+            "simulator_step",
+            "capture_error",
+        }
+        if not any(key in result for key in capture_keys):
+            return None
+        capture = {
+            key: result.pop(key)
+            for key in tuple(capture_keys)
+            if key in result
+        }
+        return capture
+
+    def _clear_pending_locked(self, reason: str) -> list[_Command]:
+        cleared = list(self._pending)
+        self._pending.clear()
+        self._mark_cleared_locked(cleared, reason)
+        return cleared
+
+    def _mark_cleared_locked(
+        self, commands: list[_Command], reason: str
+    ) -> None:
+        for command in commands:
+            if command.plan_id:
+                self._plans_to_discard.append(command.plan_id)
+            command.phase = "cancelled"
+            command.result = {
+                "primitive_success": False,
+                "stop_reason": reason,
+                "cancelled_before_execution": True,
+            }
+        self._pending_cleared_count += len(commands)
+
+    def _publish_cleared(self, commands: list[_Command]) -> None:
+        for command in commands:
+            if not command.timeline_started:
+                continue
             try:
-                self._publish_snapshot()
+                self._state.on_manual_command_result(
+                    command.public(),
+                    dict(command.result or {}),
+                    official_success_latched=False,
+                )
             except BaseException:
-                pass
-        finally:
-            self.arbiter.release_manual(command.command_id)
-            try:
-                self._publish_snapshot()
-            except BaseException:
-                pass
+                continue
+
+    def _discard_plan(self, plan_id: str) -> None:
+        try:
+            toolkit = self._require_toolkit()
+            toolkit.dashboard_discard_prepared_command(plan_id=plan_id)
+        except BaseException:
+            pass
+
+    def _command_is_active_locked(self, command: _Command) -> bool:
+        return self._head is command or command in self._pending
+
+    @staticmethod
+    def _action_failed(result: Mapping[str, Any]) -> bool:
+        return bool(
+            result.get("primitive_success") is False
+            or result.get("success") is False
+            or result.get("error") not in (None, "", False)
+        )
+
+    @staticmethod
+    def _attach_planning_metadata(
+        command: _Command, result: dict[str, Any]
+    ) -> None:
+        """Publish bounded planning receipt metadata with the action terminal."""
+
+        if not command.planning_metadata:
+            return
+        existing = result.get("metrics")
+        metrics = dict(existing) if isinstance(existing, Mapping) else {}
+        metrics.update(command.planning_metadata)
+        result["metrics"] = metrics
+
+    @staticmethod
+    def _terminal_public(command: _Command) -> dict[str, Any]:
+        terminal = command.public()
+        result = command.result
+        if isinstance(result, Mapping):
+            terminal.update(
+                {
+                    "error": result.get("error"),
+                    "stop_reason": result.get("stop_reason"),
+                    "primitive_success": result.get("primitive_success"),
+                    "task_success": result.get("task_success"),
+                }
+            )
+        return terminal
+
+    @staticmethod
+    def _require_matching_fingerprint(
+        command: _Command, fingerprint: tuple[str, str, str]
+    ) -> None:
+        if command.payload_fingerprint != fingerprint:
+            raise ControlRequestError(
+                409,
+                "idempotency_conflict",
+                "lease_id and sequence were used with a different command",
+            )
+
+    def _require_toolkit(self) -> Any:
+        with self._lock:
+            toolkit = self._toolkit
+        if toolkit is None:
+            raise RuntimeError("dashboard controller toolkit is not bound")
+        return toolkit
 
     def _validate_target_action(self, target: str, action: str, camera: str) -> None:
         if target not in _TARGETS:
@@ -1036,24 +1526,30 @@ class BehaviorDashboardController:
         lease.expired = True
         lease.stopped = True
         lease.stop_reason = "lease_expired"
-        self._control["phase"] = (
-            "stopping" if lease.in_flight_command_id is not None else "cancelled"
-        )
-        self._control["stop_reason"] = "lease_expired"
-        self._control["lease_status"] = "expired"
-        self._refresh_control_locked()
+        cleared = self._clear_pending_locked("lease_expired")
+        self._touch_locked()
+        if cleared:
+            threading.Thread(
+                target=self._publish_cleared,
+                args=(cleared,),
+                name="behavior-dashboard-expiry-publication",
+                daemon=True,
+            ).start()
         return True
 
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.wait(_WATCHDOG_PERIOD_S):
-            with self._lock:
+            with self._work:
                 changed = self._expire_lease_locked(time.monotonic())
+                if changed:
+                    self._work.notify_all()
             if changed:
                 self._publish_snapshot()
 
     def _on_arbiter_change(self) -> None:
-        with self._lock:
-            self._refresh_control_locked()
+        with self._work:
+            self._touch_locked()
+            self._work.notify_all()
         self._publish_snapshot()
 
     def _recompute_capabilities_locked(self) -> None:
@@ -1066,49 +1562,98 @@ class BehaviorDashboardController:
             and self._capabilities.get("observe_available", True) is True
         )
 
-    def _refresh_control_locked(self) -> None:
-        arbiter = self.arbiter.snapshot()
-        self._control.update(
-            {
-                "available": bool(
-                    self._active
-                    and not self._quiescing
-                    and not self._closed
-                    and (self._motion_available or self._observe_available)
-                    and not self.success_latch.is_latched()
-                ),
-                "motion_available": bool(
-                    self._active
-                    and not self._quiescing
-                    and self._motion_available
-                    and not self.success_latch.is_latched()
-                ),
-                "observe_available": bool(
-                    self._active
-                    and not self._quiescing
-                    and self._observe_available
-                    and not self.success_latch.is_latched()
-                ),
-                "busy": bool(arbiter["busy"]),
-                "owner": arbiter["owner"],
-                "success_latched": self.success_latch.is_latched(),
-                "unavailable_reason": (
-                    self._unavailable_reason
-                    if not (self._motion_available or self._observe_available)
-                    else None
-                ),
-                "capabilities": dict(self._capabilities),
-            }
-        )
+    def _touch_locked(self) -> None:
+        self._control_revision += 1
 
     def _snapshot_locked(self) -> dict[str, Any]:
-        return dict(self._control)
+        arbiter = self.arbiter.snapshot()
+        head = self._head.public() if self._head is not None else None
+        planning = (
+            self._planning_command.public()
+            if self._planning_command is not None
+            else None
+        )
+        queue = [command.public() for command in self._pending]
+        terminal = (
+            dict(self._last_terminal)
+            if self._last_terminal is not None
+            else None
+        )
+        display = head or terminal or {}
+        lease = self._lease
+        lease_status = (
+            "expired"
+            if lease is not None and lease.expired
+            else "succeeded"
+            if self.success_latch.is_latched()
+            else "stopped"
+            if lease is not None and lease.stopped
+            else "active"
+            if lease is not None
+            else "idle"
+        )
+        result = display.get("result")
+        error = result.get("error") if isinstance(result, Mapping) else None
+        stop_reason = (
+            "official_task_success"
+            if self.success_latch.is_latched()
+            else lease.stop_reason
+            if lease is not None and lease.stop_reason
+            else result.get("stop_reason")
+            if isinstance(result, Mapping)
+            else None
+        )
+        available = bool(
+            self._active
+            and not self._quiescing
+            and not self._closed
+            and (self._motion_available or self._observe_available)
+            and not self.success_latch.is_latched()
+        )
+        return {
+            "control_revision": self._control_revision,
+            "available": available,
+            "motion_available": bool(available and self._motion_available),
+            "observe_available": bool(available and self._observe_available),
+            "lease_status": lease_status,
+            "current_command": head,
+            "planning_command": planning,
+            "queue": queue,
+            "queue_depth": len(queue),
+            "queue_capacity": _QUEUE_CAPACITY,
+            "last_terminal": terminal,
+            "pending_cleared_count": self._pending_cleared_count,
+            "owner": arbiter.get("owner"),
+            "busy": bool(arbiter.get("busy")),
+            "agent_waiters": int(arbiter.get("agent_waiters") or 0),
+            "capture": dict(self._capture),
+            "command_id": display.get("command_id"),
+            "lease_id": display.get("lease_id") or (
+                lease.lease_id if lease is not None else None
+            ),
+            "sequence": display.get("sequence"),
+            "target": display.get("target"),
+            "action": display.get("action"),
+            "phase": display.get("phase", "idle"),
+            "error": error,
+            "capture_error": self._capture.get("error"),
+            "stop_reason": stop_reason,
+            "selected_camera": self._selected_camera,
+            "success_latched": self.success_latch.is_latched(),
+            "unavailable_reason": (
+                self._unavailable_reason
+                if not (self._motion_available or self._observe_available)
+                else None
+            ),
+            "capabilities": dict(self._capabilities),
+        }
 
     def _publish_snapshot(self) -> None:
-        snapshot = self.snapshot()
+        with self._lock:
+            snapshot = self._snapshot_locked()
         callback = getattr(self._state, "update_control_snapshot", None)
         if callable(callback):
-            callback(snapshot)
+            callback(snapshot, controller=self)
 
 
 __all__ = [

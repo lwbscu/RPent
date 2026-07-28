@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run one BEHAVIOR env for operator-driven hybrid primitive debugging.
+"""Operator-driven BEHAVIOR/R1Pro debug host.
 
-This is deliberately not an Eval/Explore runner and does not start an LLM. It
-owns one env process, one checkpoint-bound VLA sidecar, one live Dashboard, and
-a JSON-lines command loop so the surrounding Codex conversation can plan.
+This is intentionally not an Eval/Explore runner and it does not start an LLM.
+It owns one simulator env, an optional VLA sidecar, and one Dashboard. JSONL
+commands on stdin are executed through the same public ``BehaviorToolkit``
+instance that is bound to Dashboard manual control.
 """
 
 from __future__ import annotations
@@ -24,23 +25,25 @@ _RPENT_ROOT = Path(__file__).resolve().parents[1]
 if str(_RPENT_ROOT) not in sys.path:
     sys.path.insert(0, str(_RPENT_ROOT))
 
+from robots.behavior import get_toolkit  # noqa: E402
+from robots.behavior.dashboard_control import (  # noqa: E402
+    BehaviorCommandArbiter,
+    BehaviorRawSuccessLatch,
+)
 from robots.behavior.dashboard_server import DashboardServer  # noqa: E402
 from robots.behavior.dashboard_state import State  # noqa: E402
 from robots.behavior.env_client import BehaviorEnvClient  # noqa: E402
 from robots.behavior.runtime import (  # noqa: E402
     DEFAULT_ACTION_CHUNK,
     DEFAULT_MAX_EPISODE_STEPS,
+    BehaviorRuntimeResources,
     _expected_shared_policy_checkpoint_binding,
     _managed_env_rpc_client,
-    _owned_process_group_alive,
-    _terminate_process,
     prepare_campaign_runtime_isolation,
     start_env_server,
     start_vla_server,
-    stop_env_server,
 )
 from robots.behavior.task_specs import PICKING_UP_TRASH_TASK_SPEC  # noqa: E402
-from robots.behavior.toolkit import BehaviorToolkit  # noqa: E402
 from robots.behavior.vla_client import BehaviorVLAClient  # noqa: E402
 
 _RLINF_ROOT = Path("/home/ubuntu/lwb/Projects/RLinf_agentic_push")
@@ -48,11 +51,12 @@ _BEHAVIOR_PYTHON = _RLINF_ROOT / ".venv-behavior" / "bin" / "python"
 _POLICY_CHECKPOINT = Path(
     "/home/ubuntu/lwb/Models/openpi_comet_pytorch/pi05-b1kpt50-cs32"
 )
+_DISABLED_TOOLS = frozenset({"pi0_nav_pick"})
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manual hybrid BEHAVIOR debug host with an owned VLA sidecar",
+        description="Single-env manual BEHAVIOR whole-body planning host",
     )
     parser.add_argument(
         "--output-root",
@@ -69,6 +73,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--env-ready-timeout-s", type=int, default=1800)
     parser.add_argument("--vla-ready-timeout-s", type=int, default=1800)
+    parser.add_argument(
+        "--planner-only",
+        action="store_true",
+        help="Do not start VLA; disable only pi0_nav_pick.",
+    )
     parser.add_argument("--max-tool-calls", type=int, default=350)
     parser.add_argument("--max-wall-clock-s", type=float, default=43200.0)
     return parser
@@ -153,56 +162,163 @@ def _runtime_args(
     )
 
 
+def _expected_env_meta(args: SimpleNamespace) -> dict[str, Any]:
+    return {
+        "suite": args.suite,
+        "task": args.task,
+        "task_name": args.task_name,
+        "public_seed": args.public_seed,
+        "max_episode_steps": args.max_episode_steps,
+    }
+
+
+def _make_state(
+    *,
+    output_dir: Path,
+    run_id: str,
+    args: SimpleNamespace,
+    cli: argparse.Namespace,
+) -> State:
+    return State(
+        run_id=run_id,
+        name=f"picking_up_trash_s{args.public_seed}_manual",
+        suite=args.suite,
+        task=args.task,
+        seed=args.public_seed,
+        environment="behavior",
+        output_dir=str(output_dir),
+        video_path=str(output_dir / "episode.mp4"),
+        identity={
+            "suite": args.suite,
+            "task": args.task,
+            "task_name": args.task_name,
+            "public_seed": args.public_seed,
+            "activity_definition_id": args.activity_definition_id,
+            "activity_instance_id": args.activity_instance_id,
+        },
+        metadata={
+            "planner": "current-codex-conversation",
+            "model": "none",
+            "task-name": args.task_name,
+            "task-index": args.task,
+            "activity-definition-id": args.activity_definition_id,
+            "activity-instance-id": args.activity_instance_id,
+            "public-seed": args.public_seed,
+            "scene-model": args.scene_model,
+            "behavior-phase": "manual-debug",
+            "controller": "hybrid",
+            "llm-enabled": False,
+            "cuda-device": cli.cuda_device,
+            "health-status": "starting",
+        },
+    )
+
+
+def _build_toolkit(
+    *,
+    cli: argparse.Namespace,
+    args: SimpleNamespace,
+    output_dir: Path,
+    env: BehaviorEnvClient,
+    model: Any,
+    initial_observation: dict[str, Any],
+    initial_info: Any,
+    state: State,
+    resource: BehaviorRuntimeResources,
+    arbiter: BehaviorCommandArbiter,
+    success_latch: BehaviorRawSuccessLatch,
+) -> Any:
+    """Build and automatically activate the one shared Dashboard toolkit."""
+
+    return get_toolkit(
+        primitives_kwargs={
+            "env": env,
+            "model": model,
+            "task_name": args.task_name,
+            "behavior_phase": "eval",
+            "public_seed": args.public_seed,
+            "initial_attempt_index": 1,
+            "job_id": None,
+            "max_episode_steps": args.max_episode_steps,
+            "max_tool_calls": cli.max_tool_calls,
+            "max_wall_clock_s": cli.max_wall_clock_s,
+            "pure_vla_baseline": False,
+            "action_horizon": DEFAULT_ACTION_CHUNK,
+            "output_dir": output_dir,
+            "video_path": output_dir / "episode.mp4",
+            "initial_observation": initial_observation,
+            "initial_info": initial_info,
+            "_dashboard_runtime_resource": resource,
+            "_dashboard_command_arbiter": arbiter,
+            "_dashboard_success_latch": success_latch,
+            "_dashboard_motion_allowed": True,
+            "_dashboard_observe_allowed": True,
+            "_dashboard_control_unavailable_reason": None,
+        },
+        video_path=str(output_dir / "episode.mp4"),
+        dashboard=state,
+    )
+
+
 def _start_bound_vla(
-    runtime_args: SimpleNamespace,
+    args: SimpleNamespace,
     *,
     output_dir: Path,
     binding_id: str,
 ) -> tuple[str, Any, BehaviorVLAClient, dict[str, Any]]:
-    """Start one owned VLA sidecar and bind its disabled action gate."""
+    """Start an owned sidecar with a fresh, initially disabled action gate."""
 
-    endpoint, process = start_vla_server(runtime_args, output_dir=output_dir)
-    model = None
+    endpoint, process = start_vla_server(args, output_dir=output_dir)
+    model = BehaviorVLAClient(endpoint)
     try:
-        model = BehaviorVLAClient(endpoint)
         health = model.healthz(
             timeout_ms=5000,
-            expected_checkpoint_binding=(
-                runtime_args._behavior_policy_checkpoint_binding
-            ),
+            expected_checkpoint_binding=args._behavior_policy_checkpoint_binding,
         )
         if health.get("config_name") != "pi05_behavior":
             raise RuntimeError(f"unexpected VLA metadata: {health!r}")
         model.disable_actions()
         bound = model.bind_actions(binding_id)
-        expected_binding_digest = hashlib.sha256(
-            binding_id.encode("utf-8")
-        ).hexdigest()
+        expected_digest = hashlib.sha256(binding_id.encode("utf-8")).hexdigest()
         if (
             bound.get("actions_enabled") is not False
-            or bound.get("binding_digest") != expected_binding_digest
+            or bound.get("binding_digest") != expected_digest
         ):
-            raise RuntimeError("VLA fresh binding did not remain disabled")
+            raise RuntimeError("VLA binding did not remain disabled")
         health = model.healthz(
             timeout_ms=5000,
-            expected_checkpoint_binding=(
-                runtime_args._behavior_policy_checkpoint_binding
-            ),
+            expected_checkpoint_binding=args._behavior_policy_checkpoint_binding,
         )
         if (
             health.get("actions_enabled") is not False
-            or health.get("binding_digest") != expected_binding_digest
+            or health.get("binding_digest") != expected_digest
         ):
-            raise RuntimeError("VLA fresh binding did not preserve the idle gate")
+            raise RuntimeError("VLA binding health check failed")
         return endpoint, process, model, health
     except BaseException:
-        try:
-            close = getattr(model, "close", None)
-            if callable(close):
-                close()
-        finally:
-            _terminate_process(process)
+        model.close()
+        from robots.behavior.runtime import _terminate_process
+
+        _terminate_process(process)
         raise
+
+
+def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _final_manifest_status(
+    primary_status: str,
+    cleanup_errors: list[str],
+) -> str:
+    if primary_status == "startup_failed":
+        return "startup_failed_cleanup_failed" if cleanup_errors else "startup_failed"
+    return "cleanup_failed" if cleanup_errors else "stopped"
 
 
 def _persist_bytes(
@@ -222,10 +338,7 @@ def _persist_bytes(
         suffix = ".png" if "image" in safe_path or "depth" in safe_path else ".bin"
         target = image_dir / f"call_{call_index:04d}_{safe_path}{suffix}"
         target.write_bytes(bytes(value))
-        return {
-            "bytes": len(value),
-            "saved_path": str(target.resolve()),
-        }
+        return {"bytes": len(value), "saved_path": str(target.resolve())}
     if isinstance(value, dict):
         return {
             str(key): _persist_bytes(
@@ -251,72 +364,64 @@ def _persist_bytes(
     return str(value)
 
 
-def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=True, sort_keys=True),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+def _cleanup_owned(
+    *,
+    toolkit: Any,
+    resource: BehaviorRuntimeResources,
+    dashboard: Any,
+    dashboard_started: bool,
+    orphan_model: Any = None,
+) -> list[str]:
+    """Quiesce toolkit control before env transport/process and Dashboard."""
+
+    errors: list[str] = []
+    if toolkit is not None:
+        try:
+            toolkit.close()
+        except BaseException as exc:
+            errors.append(f"toolkit: {type(exc).__name__}: {exc}")
+    elif orphan_model is not None:
+        try:
+            orphan_model.close()
+        except BaseException as exc:
+            errors.append(f"vla_client: {type(exc).__name__}: {exc}")
+    try:
+        resource.close()
+    except BaseException as exc:
+        errors.append(f"runtime: {type(exc).__name__}: {exc}")
+    if dashboard_started:
+        try:
+            dashboard.stop()
+        except BaseException as exc:
+            errors.append(f"dashboard: {type(exc).__name__}: {exc}")
+    return errors
 
 
-def _final_manifest_status(
-    primary_status: str,
-    cleanup_errors: list[str],
-) -> str:
-    if primary_status == "startup_failed":
-        return (
-            "startup_failed_cleanup_failed"
-            if cleanup_errors
-            else "startup_failed"
-        )
-    return "cleanup_failed" if cleanup_errors else "stopped"
-
-
-def _tool_process_rejection_reason(
+def _tool_rejection(
     name: str,
     *,
+    terminal: bool,
     env_proc: Any,
-    vla_proc: Any,
+    planner_only: bool,
+    vla_proc: Any = None,
 ) -> str | None:
-    """Return a zero-action process-liveness rejection for one public tool."""
-
+    if name in _DISABLED_TOOLS and planner_only:
+        return "pi0_nav_pick is disabled by --planner-only"
+    if name in _DISABLED_TOOLS and (vla_proc is None or vla_proc.poll() is not None):
+        return "owned VLA process exited; pi0_nav_pick is unavailable"
+    if terminal:
+        return "official success or terminal state is latched; no further action is allowed"
     if env_proc is None or env_proc.poll() is not None:
         return "owned env process exited; no further tool is allowed"
-    if (
-        name == "pi0_nav_pick"
-        and (vla_proc is None or vla_proc.poll() is not None)
-    ):
-        return "owned VLA process exited; pi0_nav_pick is unavailable"
     return None
 
 
-def _latch_dashboard_terminal(state: Any, toolkit: Any, result: Any) -> bool:
+def _terminal_latched(toolkit: Any, result: Any = None) -> bool:
     continuation = toolkit.runner_continuation_state()
-    verified_success = (
+    return bool(
         continuation.get("raw_official_success_verified") is True
+        or getattr(result, "is_finish", False)
     )
-    terminal = bool(getattr(result, "is_finish", False) or verified_success)
-    if not terminal:
-        return False
-    attempt_index = int(continuation.get("attempt_index", 1))
-    if verified_success:
-        state.on_event(
-            {
-                "type": "official_success",
-                "attempt_index": attempt_index,
-                "task_success": True,
-                "workflow_complete": False,
-                "artifact_seal_complete": False,
-                "publication_complete": False,
-            }
-        )
-        outcome = "official_task_success"
-    else:
-        outcome = "terminal_without_official_success"
-    state.end_attempt(attempt_index=attempt_index, outcome=outcome)
-    state.mark_done(terminated=verified_success)
-    return True
 
 
 def main() -> int:
@@ -325,81 +430,60 @@ def main() -> int:
         raise ValueError("env and VLA ready timeouts must be positive")
     if cli.max_tool_calls <= 0 or cli.max_wall_clock_s <= 0:
         raise ValueError("manual debug budgets must be positive")
+
     output_dir = _new_output_dir(Path(cli.output_root).expanduser(), cli.public_seed)
     instance_id = PICKING_UP_TRASH_TASK_SPEC.instance_for_public_seed(
         cli.public_seed,
         phase="eval",
     )
-    runtime_args = _runtime_args(
-        cli,
-        output_dir=output_dir,
-        instance_id=instance_id,
-    )
+    args = _runtime_args(cli, output_dir=output_dir, instance_id=instance_id)
     run_id = f"behavior-manual/{output_dir.name}"
+    state = _make_state(output_dir=output_dir, run_id=run_id, args=args, cli=cli)
     dashboard = DashboardServer(
         host=cli.dashboard_host,
         port=cli.dashboard_port,
         language=cli.dashboard_language,
     )
-    state = State(
-        run_id=run_id,
-        name=f"picking_up_trash_s{cli.public_seed}_manual",
-        suite=runtime_args.suite,
-        task=runtime_args.task,
-        seed=cli.public_seed,
-        output_dir=str(output_dir),
-        video_path=str(output_dir / "episode.mp4"),
+    success_latch = BehaviorRawSuccessLatch()
+    arbiter = BehaviorCommandArbiter(success_latch=success_latch)
+    resource = BehaviorRuntimeResources(
+        output_dir=output_dir,
+        command_arbiter=arbiter,
+        success_latch=success_latch,
+        dashboard_state=state,
     )
-    state.set_metadata(
-        {
-            "planner": "current-codex-conversation",
-            "model": "pi0.5-manual-planner",
-            "task-name": runtime_args.task_name,
-            "task-index": runtime_args.task,
-            "activity-definition-id": runtime_args.activity_definition_id,
-            "activity-instance-id": instance_id,
-            "public-seed": cli.public_seed,
-            "scene-model": runtime_args.scene_model,
-            "controller": "hybrid",
-            "llm-enabled": False,
-            "cuda-device": cli.cuda_device,
-            "health-status": "starting",
-        }
-    )
+
+    toolkit = None
+    model = None
+    env_proc = None
+    vla_proc = None
+    vla_endpoint = None
+    vla_health = None
+    dashboard_started = False
+    call_index = 0
+    terminal = False
+    exit_code = 0
+    primary_status = "starting"
     manifest_path = output_dir / "manual_debug_manifest.json"
     manifest: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "behavior_manual_debug",
         "formal_eval": False,
-        "analytic_only": False,
-        "hybrid_vla_debug": True,
+        "planner_only": bool(cli.planner_only),
+        "controller_bound": False,
         "vla_started": False,
         "status": "starting",
         "run_id": run_id,
         "output_dir": str(output_dir),
-        "task_name": runtime_args.task_name,
-        "task": runtime_args.task,
-        "activity_definition_id": runtime_args.activity_definition_id,
-        "activity_instance_id": instance_id,
-        "public_seed": cli.public_seed,
-        "native_seed": runtime_args.seed,
-        "scene_model": runtime_args.scene_model,
-        "cuda_device": cli.cuda_device,
+        "task_name": args.task_name,
+        "task": args.task,
+        "public_seed": args.public_seed,
+        "activity_definition_id": args.activity_definition_id,
+        "activity_instance_id": args.activity_instance_id,
+        "cuda_device": args.cuda_device,
         "started_at_unix_s": time.time(),
     }
     _write_manifest(manifest_path, manifest)
-
-    env_proc = None
-    vla_proc = None
-    env_rpc_client = None
-    model = None
-    vla_endpoint = None
-    vla_health: dict[str, Any] | None = None
-    toolkit = None
-    dashboard_started = False
-    terminal_latched = False
-    call_index = 0
-    primary_status = "starting"
 
     def interrupt(_signum: int, _frame: Any) -> None:
         raise KeyboardInterrupt
@@ -407,7 +491,7 @@ def main() -> int:
     previous_sigterm = signal.signal(signal.SIGTERM, interrupt)
     previous_sigint = signal.signal(signal.SIGINT, interrupt)
     try:
-        dashboard_url = dashboard.start()
+        dashboard.start()
         dashboard_started = True
         dashboard.register(state)
         state.begin_attempt(
@@ -415,101 +499,65 @@ def main() -> int:
             output_dir=output_dir,
             video_path=output_dir / "episode.mp4",
         )
-        env_proc = start_env_server(runtime_args, output_dir=output_dir)
-        vla_binding_id = f"manual:{output_dir.name}"
-        vla_endpoint, vla_proc, model, vla_health = _start_bound_vla(
-            runtime_args,
-            output_dir=output_dir,
-            binding_id=vla_binding_id,
-        )
-        env_rpc_client = _managed_env_rpc_client(env_proc)
-        env = BehaviorEnvClient(
-            env_rpc_client,
-            expected_meta={
-                "suite": runtime_args.suite,
-                "task": runtime_args.task,
-                "task_name": runtime_args.task_name,
-                "public_seed": runtime_args.public_seed,
-                "max_episode_steps": runtime_args.max_episode_steps,
-            },
-        )
+
+        env_proc = start_env_server(args, output_dir=output_dir)
+        resource.env_proc = env_proc
+        if not cli.planner_only:
+            binding_id = f"manual:{output_dir.name}"
+            vla_endpoint, vla_proc, model, vla_health = _start_bound_vla(
+                args,
+                output_dir=output_dir,
+                binding_id=binding_id,
+            )
+            resource.vla_proc = vla_proc
+        rpc = _managed_env_rpc_client(env_proc)
+        resource.env_rpc_client = rpc
+        env = BehaviorEnvClient(rpc, expected_meta=_expected_env_meta(args))
         env.vla_endpoint = vla_endpoint
         initial_observation, initial_info = env.reset()
-        toolkit = BehaviorToolkit(
-            primitives_kwargs={
-                "env": env,
-                "model": model,
-                "task_name": runtime_args.task_name,
-                "behavior_phase": "eval",
-                "public_seed": runtime_args.public_seed,
-                "initial_attempt_index": 1,
-                "job_id": None,
-                "max_episode_steps": runtime_args.max_episode_steps,
-                "max_tool_calls": cli.max_tool_calls,
-                "max_wall_clock_s": cli.max_wall_clock_s,
-                "pure_vla_baseline": False,
-                "action_horizon": DEFAULT_ACTION_CHUNK,
-                "output_dir": output_dir,
-                "video_path": output_dir / "episode.mp4",
-                "initial_observation": initial_observation,
-                "initial_info": initial_info,
-            },
-            video_path=output_dir / "episode.mp4",
-            dashboard=state,
+        toolkit = _build_toolkit(
+            cli=cli,
+            args=args,
+            output_dir=output_dir,
+            env=env,
+            model=model,
+            initial_observation=initial_observation,
+            initial_info=initial_info,
+            state=state,
+            resource=resource,
+            arbiter=arbiter,
+            success_latch=success_latch,
         )
+        if resource.toolkit is not toolkit or resource.dashboard_controller is None:
+            raise RuntimeError("Dashboard controller did not bind to the shared toolkit")
+        primary_status = "ready"
+        manifest.update(
+            {
+                "status": "ready",
+                "controller_bound": True,
+                "env_pid": env_proc.pid,
+                "env_transport_host": getattr(
+                    env_proc, "_rpent_transport_host", None
+                ),
+                "env_transport_port": getattr(
+                    env_proc, "_rpent_transport_port", None
+                ),
+                "vla_started": vla_proc is not None,
+                "vla_pid": getattr(vla_proc, "pid", None),
+                "vla_endpoint": vla_endpoint,
+                "vla_health": vla_health,
+                "ready_at_unix_s": time.time(),
+            }
+        )
+        _write_manifest(manifest_path, manifest)
+
         state.set_metadata(
             {
                 "health-status": "ready",
                 "health-checked-at": time.time(),
                 "task-language": PICKING_UP_TRASH_TASK_SPEC.task_language,
-                "vla-endpoint": vla_endpoint,
-                "vla-pid": vla_proc.pid,
-                "vla-actions-enabled": vla_health.get("actions_enabled"),
             }
         )
-        manifest.update(
-            {
-                "status": "ready",
-                "dashboard_url": dashboard_url,
-                "dashboard_local_url": (
-                    f"http://127.0.0.1:{cli.dashboard_port}"
-                    if cli.dashboard_port
-                    else dashboard_url
-                ),
-                "env_pid": env_proc.pid,
-                "env_transport_host": getattr(
-                    env_proc,
-                    "_rpent_transport_host",
-                    None,
-                ),
-                "env_transport_port": getattr(
-                    env_proc,
-                    "_rpent_transport_port",
-                    None,
-                ),
-                "vla_started": True,
-                "vla_available": True,
-                "vla_endpoint": vla_endpoint,
-                "vla_pid": vla_proc.pid,
-                "vla_binding_id": vla_binding_id,
-                "vla_checkpoint_binding_sha256": (
-                    runtime_args._behavior_policy_checkpoint_binding[
-                        "binding_sha256"
-                    ]
-                ),
-                "vla_health": {
-                    "status": vla_health.get("status"),
-                    "config_name": vla_health.get("config_name"),
-                    "action_horizon": vla_health.get("action_horizon"),
-                    "action_dim": vla_health.get("action_dim"),
-                    "actions_enabled": vla_health.get("actions_enabled"),
-                },
-                "ready_at_unix_s": time.time(),
-            }
-        )
-        primary_status = "ready"
-        _write_manifest(manifest_path, manifest)
-
         call_index += 1
         initial_result = toolkit.execute_tool("observe", {"camera": "head"})
         initial_public = _persist_bytes(
@@ -517,25 +565,26 @@ def main() -> int:
             image_dir=output_dir / "manual_images",
             call_index=call_index,
         )
-        terminal_latched = _latch_dashboard_terminal(
-            state,
-            toolkit,
-            initial_result,
-        )
+        terminal = _terminal_latched(toolkit, initial_result)
+        local_url = f"http://127.0.0.1:{dashboard.port}"
         _emit(
             "manual_debug_ready",
-            dashboard_url=dashboard_url,
-            dashboard_local_url=manifest["dashboard_local_url"],
+            dashboard_url=local_url,
+            dashboard_bind=f"http://{cli.dashboard_host}:{dashboard.port}",
             run_id=run_id,
             output_dir=str(output_dir),
             env_pid=env_proc.pid,
-            env_transport_port=manifest["env_transport_port"],
+            env_transport_port=getattr(env_proc, "_rpent_transport_port", None),
+            available_tools=[
+                spec["name"]
+                for spec in toolkit.get_tools_spec()
+                if not (cli.planner_only and spec["name"] in _DISABLED_TOOLS)
+            ],
             initial_observe=initial_public,
-            terminal_latched=terminal_latched,
-            vla_available=True,
+            terminal_latched=terminal,
+            planner_only=cli.planner_only,
+            vla_pid=getattr(vla_proc, "pid", None),
             vla_endpoint=vla_endpoint,
-            vla_pid=vla_proc.pid,
-            vla_actions_enabled=vla_health.get("actions_enabled"),
         )
 
         for raw_line in sys.stdin:
@@ -551,46 +600,39 @@ def main() -> int:
                     _emit("shutdown_acknowledged")
                     break
                 if operation == "status":
+                    terminal = terminal or success_latch.is_latched()
                     _emit(
                         "status",
                         run_id=run_id,
                         output_dir=str(output_dir),
                         env_pid=env_proc.pid,
                         env_returncode=env_proc.poll(),
-                        vla_pid=vla_proc.pid,
-                        vla_returncode=vla_proc.poll(),
-                        vla_endpoint=vla_endpoint,
+                        vla_pid=getattr(vla_proc, "pid", None),
+                        vla_returncode=(
+                            vla_proc.poll() if vla_proc is not None else None
+                        ),
                         env_steps=env.total_env_steps,
-                        terminal_latched=terminal_latched,
+                        terminal_latched=terminal,
                         continuation=toolkit.runner_continuation_state(),
+                        dashboard_control=toolkit.dashboard_control_capabilities(),
                     )
                     continue
                 if operation != "tool":
-                    raise ValueError(
-                        "command must be one of: tool, status, shutdown"
-                    )
+                    raise ValueError("command must be one of: tool, status, shutdown")
                 name = command.get("name")
                 input_dict = command.get("input", {})
                 if not isinstance(name, str) or not isinstance(input_dict, dict):
                     raise ValueError("tool command requires string name and object input")
-                if terminal_latched:
-                    _emit(
-                        "tool_rejected",
-                        name=name,
-                        reason="terminal result is latched; no further tool is allowed",
-                    )
-                    continue
-                process_rejection = _tool_process_rejection_reason(
+                terminal = terminal or success_latch.is_latched()
+                rejection = _tool_rejection(
                     name,
+                    terminal=terminal,
                     env_proc=env_proc,
+                    planner_only=cli.planner_only,
                     vla_proc=vla_proc,
                 )
-                if process_rejection is not None:
-                    _emit(
-                        "tool_rejected",
-                        name=name,
-                        reason=process_rejection,
-                    )
+                if rejection is not None:
+                    _emit("tool_rejected", name=name, reason=rejection)
                     continue
                 call_index += 1
                 result = toolkit.execute_tool(name, input_dict)
@@ -599,18 +641,14 @@ def main() -> int:
                     image_dir=output_dir / "manual_images",
                     call_index=call_index,
                 )
-                terminal_latched = _latch_dashboard_terminal(
-                    state,
-                    toolkit,
-                    result,
-                )
+                terminal = _terminal_latched(toolkit, result)
                 _emit(
                     "tool_result",
                     call_index=call_index,
                     name=name,
                     result=public,
                     is_finish=result.is_finish,
-                    terminal_latched=terminal_latched,
+                    terminal_latched=terminal,
                 )
             except Exception as exc:
                 _emit(
@@ -621,56 +659,35 @@ def main() -> int:
     except KeyboardInterrupt:
         _emit("manual_debug_interrupted")
     except BaseException as exc:
+        exit_code = 1
         primary_status = "startup_failed"
-        manifest["status"] = "startup_failed"
+        manifest["status"] = primary_status
         manifest["error"] = f"{type(exc).__name__}: {exc}"
         _write_manifest(manifest_path, manifest)
         _emit(
             "manual_debug_error",
-            error=manifest["error"],
+            error=f"{type(exc).__name__}: {exc}",
             traceback=traceback.format_exc(),
             output_dir=str(output_dir),
         )
-        return 1
     finally:
-        cleanup_errors: list[str] = []
-        try:
-            stop_env_server(env_proc, output_dir=output_dir)
-        except BaseException as exc:
-            cleanup_errors.append(f"env: {type(exc).__name__}: {exc}")
-        if toolkit is not None:
-            try:
-                toolkit.close()
-            except BaseException as exc:
-                cleanup_errors.append(f"toolkit: {type(exc).__name__}: {exc}")
-            finally:
-                model = None
-        if model is not None:
-            try:
-                model.close()
-            except BaseException as exc:
-                cleanup_errors.append(f"vla_client: {type(exc).__name__}: {exc}")
-        if vla_proc is not None:
-            try:
-                _terminate_process(vla_proc)
-                if _owned_process_group_alive(vla_proc):
-                    raise RuntimeError("owned VLA process group is still alive")
-            except BaseException as exc:
-                cleanup_errors.append(f"vla: {type(exc).__name__}: {exc}")
-        if dashboard_started:
-            try:
-                dashboard.stop()
-            except BaseException as exc:
-                cleanup_errors.append(f"dashboard: {type(exc).__name__}: {exc}")
+        cleanup_errors = _cleanup_owned(
+            toolkit=toolkit,
+            resource=resource,
+            dashboard=dashboard,
+            dashboard_started=dashboard_started,
+            orphan_model=model,
+        )
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGINT, previous_sigint)
+        if cleanup_errors:
+            exit_code = 1
         manifest.update(
             {
-                "status": _final_manifest_status(
-                    primary_status,
-                    cleanup_errors,
-                ),
+                "status": _final_manifest_status(primary_status, cleanup_errors),
                 "cleanup_errors": cleanup_errors,
+                "exit_code": exit_code,
+                "controller_bound": False,
                 "env_returncode": (
                     env_proc.poll() if env_proc is not None else None
                 ),
@@ -686,7 +703,7 @@ def main() -> int:
             cleanup_errors=cleanup_errors,
             output_dir=str(output_dir),
         )
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

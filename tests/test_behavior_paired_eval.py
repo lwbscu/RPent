@@ -349,6 +349,7 @@ def test_runtime_base_rejects_symlink_and_protected_overlap(
         )
 
     original_stat = paired_eval.os.stat
+    real_base_resolved = real_base.resolve()
 
     def cross_device_stat(
         path: object,
@@ -356,7 +357,7 @@ def test_runtime_base_rejects_symlink_and_protected_overlap(
         **kwargs: object,
     ) -> os.stat_result:
         result = original_stat(path, *args, **kwargs)
-        if Path(path) == real_base.resolve():
+        if Path(path) == real_base_resolved:
             values = list(result)
             values[2] = result.st_dev + 1
             return os.stat_result(values)

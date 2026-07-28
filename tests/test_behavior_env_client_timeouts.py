@@ -154,6 +154,34 @@ def test_pi0_raw_success_marks_episode_done_and_rejects_second_chunk_before_rpc(
     ) == 1
 
 
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda client: client.dashboard_prepare_manual_command(
+            target="chassis",
+            action="forward",
+        ),
+        lambda client: client.dashboard_execute_prepared_command(
+            plan_id="plan-1",
+            command_id="command-1",
+        ),
+        lambda client: client.dashboard_capture_views(
+            command_id="capture-1",
+        ),
+    ],
+)
+def test_raw_success_rejects_dashboard_pipeline_before_transport(invoke):
+    rpc = _Rpc()
+    client = BehaviorEnvClient(rpc, expected_meta={"seed": 211})
+    client._official_success_latched = True
+    client.episode_done = True
+
+    with pytest.raises(RuntimeError, match="terminal"):
+        invoke(client)
+
+    assert [method for method, *_rest in rpc.calls] == ["env.get_env_meta"]
+
+
 def test_neutral_rpc_timeout_tracks_deadline_with_bounded_grace():
     rpc = _Rpc()
     client = BehaviorEnvClient(rpc, expected_meta={"seed": 211})

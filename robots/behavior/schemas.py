@@ -105,6 +105,62 @@ def validate_dashboard_manual_command(
     return {"target": target, "action": action, "camera": camera}
 
 
+def _dashboard_identifier(value: Any, *, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
+def validate_dashboard_prepare_request(
+    *,
+    target: Any,
+    action: Any,
+    predecessor_plan_id: Any = None,
+    background: Any = False,
+) -> dict[str, Any]:
+    """Validate one internal, motion-only Dashboard planning request."""
+
+    command = validate_dashboard_manual_command(
+        target=target,
+        action=action,
+        camera="head",
+    )
+    if command["action"] == "observe":
+        raise ValueError("observe must use dashboard_capture_views")
+    if type(background) is not bool:
+        raise TypeError("background must be boolean")
+    predecessor = (
+        None
+        if predecessor_plan_id is None
+        else _dashboard_identifier(
+            predecessor_plan_id,
+            name="predecessor_plan_id",
+        )
+    )
+    if background and predecessor is None:
+        raise ValueError(
+            "background planning requires a predecessor_plan_id"
+        )
+    return {
+        "target": command["target"],
+        "action": command["action"],
+        "predecessor_plan_id": predecessor,
+        "background": background,
+    }
+
+
+def validate_dashboard_plan_id(value: Any) -> str:
+    """Validate one opaque internal Dashboard plan identifier."""
+
+    return _dashboard_identifier(value, name="plan_id")
+
+
+def validate_dashboard_command_id(value: Any) -> str:
+    """Validate one opaque command id used for permit and exactly-once replay."""
+
+    return _dashboard_identifier(value, name="command_id")
+
+
 # Pi0.5 compacts raw R1Pro proprio in this order. In particular, both arms
 # precede both grippers.
 POLICY_STATE_SEGMENTS: dict[str, slice] = {
@@ -1105,7 +1161,10 @@ __all__ = [
     "extract_policy_state",
     "segment_ranges",
     "validate_action_chunk",
+    "validate_dashboard_command_id",
     "validate_dashboard_manual_command",
+    "validate_dashboard_plan_id",
+    "validate_dashboard_prepare_request",
     "validate_policy_state",
     "validate_relative_navigation_motion",
 ]

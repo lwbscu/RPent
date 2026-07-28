@@ -3,11 +3,13 @@ import importlib.util
 import inspect
 import json
 import math
+import pickle
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,17 +17,64 @@ import pytest
 from robots.behavior.camera_geometry import CameraIntrinsics, FrameCache
 from robots.behavior.planner_executor import (
     BASE_ACTIVE_JOINT_NAMES,
+    BASE_EXECUTION_XY_STEP_M,
+    BASE_EXECUTION_YAW_STEP_RAD,
+    BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD,
+    BASE_TERMINAL_POSITION_TOLERANCE_M,
+    DASHBOARD_BASE_EXECUTION_XY_STEP_M,
+    DASHBOARD_BASE_EXECUTION_YAW_STEP_RAD,
+    DASHBOARD_PREPARED_BASE_PLANNING_PROFILE,
+    EEF_TERMINAL_ORIENTATION_TOLERANCE_RAD,
+    EEF_TERMINAL_POSITION_TOLERANCE_M,
     LOCAL_GUARDED_IK_SEEDS,
+    PREPARED_DASHBOARD_BASE_EXECUTION_POLICY,
+    PREPARED_DASHBOARD_EEF_EXECUTION_POLICY,
+    RESET_IDENTITY_WARMUP_PROFILE,
+    RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S,
+    TERMINAL_COMMAND_LIMIT,
+    TRACKING_HARD_ARTICULATION_ERROR_RAD,
+    TRACKING_HARD_BASE_XY_ERROR_M,
+    TRACKING_HARD_BASE_YAW_ERROR_RAD,
+    WHOLE_BODY_ACTIVE_JOINT_NAMES,
+    WHOLE_BODY_DASHBOARD_JOG_FAST_TRAJOPT_DEADLINE_S,
+    WHOLE_BODY_DASHBOARD_JOG_LOCAL_IK_DEADLINE_S,
+    WHOLE_BODY_DASHBOARD_JOG_PLANNING_DEADLINE_S,
+    WHOLE_BODY_DASHBOARD_JOG_REPLAN_POSITION_IMPROVEMENT_M,
+    WHOLE_BODY_DENSE_COLLISION_STEP,
+    WHOLE_BODY_EEF_CONTROLLER_RESPONSE_MARGIN_M,
+    WHOLE_BODY_EEF_FIRST_SAMPLE_REVERSE_TRANSIENT_MAX_M,
+    WHOLE_BODY_EEF_NUMERICAL_MARGIN_M,
+    WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M,
+    WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M,
+    WHOLE_BODY_EEF_SHORT_MAX_CARTESIAN_STEP_M,
+    WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD,
+    WHOLE_BODY_EXECUTION_BASE_XY_STEP_M,
+    WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD,
+    WHOLE_BODY_LOCKED_JOINT_NAMES,
+    WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M,
+    WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG,
+    WHOLE_BODY_SEARCH_PROFILE_DEFAULT,
     PlannerExecutor,
     RealCuroboBackend,
     _apply_single_arm_isolation_mask,
     _attachment_identity_status,
+    _canonical_base_xyyaw,
+    _canonicalize_whole_body_base_yaw_trajectory,
+    _eef_pose_path_admission_report,
     _guarded_waypoint_distances,
     _interpolate_joint_trajectory,
+    _interpolate_whole_body_execution_trajectory,
+    _minimum_jerk_base_execution_trajectory,
     _quat_to_intrinsic_rpy,
     _retime_joint_trajectory,
     _terminally_smoothed_joint_trajectory,
+    _tracking_hard_deviation_report,
     _wall_clock_deadline,
+    _whole_body_execution_step_report,
+    _whole_body_execution_subset_indices,
+    _whole_body_search_profile,
+    _whole_body_target_sha256,
+    _wrap_angle,
 )
 from robots.behavior.schemas import ENV_ACTION_SEGMENTS, PI0_NAV_PICK_SPEC
 from robots.behavior.toolkit import BehaviorToolResult
@@ -74,6 +123,807 @@ _REMOVED_RUNTIME_REPORTER_CASES = (
     ),
     ("dynamics_report", RuntimeError("dynamics reporter unavailable")),
 )
+
+
+@pytest.mark.parametrize(
+    ("field", "limit"),
+    [
+        ("max_base_xy_error_m", TRACKING_HARD_BASE_XY_ERROR_M),
+        ("base_yaw_error_rad", TRACKING_HARD_BASE_YAW_ERROR_RAD),
+        (
+            "max_articulation_error_rad",
+            TRACKING_HARD_ARTICULATION_ERROR_RAD,
+        ),
+    ],
+)
+def test_wide_tracking_hard_limits_are_inclusive_and_stop_above(
+    field,
+    limit,
+):
+    report = {
+        "available": True,
+        "max_base_xy_error_m": 0.0,
+        "base_yaw_error_rad": 0.0,
+        "max_articulation_error_rad": 0.0,
+    }
+    report[field] = limit
+    boundary, available = _tracking_hard_deviation_report(report)
+    assert available is True
+    assert boundary["hard_deviation"] is False
+
+    report[field] = np.nextafter(limit, math.inf)
+    exceeded, available = _tracking_hard_deviation_report(report)
+    assert available is True
+    assert exceeded["hard_deviation"] is True
+    assert exceeded["checks"][{
+        "max_base_xy_error_m": "base_xy",
+        "base_yaw_error_rad": "base_yaw",
+        "max_articulation_error_rad": "articulation",
+    }[field]] is False
+
+
+def test_whole_body_execution_caps_are_sparse_safe_and_inclusive():
+    names = tuple(_FakeBackend().joint_names)
+    by_name = {name: index for index, name in enumerate(names)}
+    q = np.zeros((2, len(names)), dtype=np.float32)
+    q[1, by_name["base_footprint_x_joint"]] = (
+        WHOLE_BODY_EXECUTION_BASE_XY_STEP_M
+    )
+    q[1, by_name["torso_joint1"]] = (
+        WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD
+    )
+    positions = np.asarray(
+        [
+            [0.5, 0.0, 0.0],
+            [0.5 + WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M, 0.0, 0.0],
+        ]
+    )
+    quaternions = np.asarray(
+        [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]
+    )
+
+    report = _whole_body_execution_step_report(
+        q,
+        positions,
+        quaternions,
+        joint_names=names,
+        short_target=True,
+    )
+
+    assert WHOLE_BODY_EXECUTION_BASE_XY_STEP_M == pytest.approx(
+        WHOLE_BODY_DENSE_COLLISION_STEP
+    )
+    assert WHOLE_BODY_DENSE_COLLISION_STEP == pytest.approx(0.0075)
+    assert WHOLE_BODY_EEF_SHORT_MAX_CARTESIAN_STEP_M == pytest.approx(0.0022)
+    assert WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M == pytest.approx(0.006)
+    assert WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD == pytest.approx(0.03)
+    assert WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD < (
+        TRACKING_HARD_ARTICULATION_ERROR_RAD
+    )
+    assert report["admitted"] is True
+    assert report["base_xy_step_limit_m"] == pytest.approx(0.0075)
+    assert report["articulation_step_limit_rad"] == pytest.approx(0.03)
+    assert report["eef_cartesian_step_limit_m"] == pytest.approx(0.006)
+
+    eef_over_limit = positions.copy()
+    eef_over_limit[1, 0] += 2e-6
+    eef_rejected = _whole_body_execution_step_report(
+        q,
+        eef_over_limit,
+        quaternions,
+        joint_names=names,
+        short_target=True,
+    )
+    assert eef_rejected["admitted"] is False
+    assert eef_rejected["checks"]["eef_cartesian_step"] is False
+
+    articulation_over_limit = q.copy()
+    articulation_over_limit[1, by_name["torso_joint1"]] += np.float32(2e-6)
+    articulation_rejected = _whole_body_execution_step_report(
+        articulation_over_limit,
+        positions,
+        quaternions,
+        joint_names=names,
+        short_target=True,
+    )
+    assert articulation_rejected["admitted"] is False
+    assert articulation_rejected["checks"]["articulation_step"] is False
+
+    q[1, by_name["base_footprint_x_joint"]] += np.float32(2e-6)
+    rejected = _whole_body_execution_step_report(
+        q,
+        positions,
+        quaternions,
+        joint_names=names,
+        short_target=True,
+    )
+    assert rejected["admitted"] is False
+    assert rejected["checks"]["base_x_step"] is False
+
+
+def test_short_eef_execution_subset_uses_five_certified_commands_for_3cm():
+    names = tuple(_FakeBackend().joint_names)
+    by_name = {name: index for index, name in enumerate(names)}
+    sample_count = 31
+    q = np.zeros((sample_count, len(names)), dtype=np.float32)
+    q[:, by_name["left_arm_joint1"]] = np.linspace(
+        0.0,
+        0.12,
+        sample_count,
+        dtype=np.float32,
+    )
+    positions = np.zeros((sample_count, 3), dtype=np.float64)
+    positions[:, 0] = np.linspace(0.0, 0.03, sample_count)
+    quaternions = np.repeat(
+        np.asarray([[0.0, 0.0, 0.0, 1.0]]),
+        sample_count,
+        axis=0,
+    )
+
+    indices = _whole_body_execution_subset_indices(
+        q,
+        positions,
+        quaternions,
+        joint_names=names,
+        short_target=True,
+    )
+    execution_report = _whole_body_execution_step_report(
+        q[indices],
+        positions[indices],
+        quaternions[indices],
+        joint_names=names,
+        short_target=True,
+    )
+
+    np.testing.assert_array_equal(indices, [0, 6, 12, 18, 24, 30])
+    assert len(indices) - 1 == 5
+    assert execution_report["admitted"] is True
+    assert execution_report["max_eef_cartesian_step_m"] == pytest.approx(0.006)
+    assert execution_report["max_articulation_step_rad"] == pytest.approx(
+        0.024
+    )
+
+
+def _reference_whole_body_execution_subset_indices(
+    q,
+    positions,
+    quaternions,
+    *,
+    joint_names,
+    short_target,
+):
+    q = np.asarray(q, dtype=np.float32)
+    positions = np.asarray(positions, dtype=np.float64)
+    quaternions = np.asarray(quaternions, dtype=np.float64)
+    _whole_body_execution_step_report(
+        q,
+        positions,
+        quaternions,
+        joint_names=joint_names,
+        short_target=short_target,
+    )
+    edge_count = [None] * len(q)
+    predecessor = np.full((len(q),), -1, dtype=np.int64)
+    edge_count[0] = 0
+    for end in range(1, len(q)):
+        best_key = None
+        best_start = -1
+        for start in range(end):
+            if edge_count[start] is None:
+                continue
+            report = _whole_body_execution_step_report(
+                q[[start, end]],
+                positions[[start, end]],
+                quaternions[[start, end]],
+                joint_names=joint_names,
+                short_target=short_target,
+            )
+            if report["admitted"] is not True:
+                continue
+            key = (int(edge_count[start]) + 1, -start)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_start = start
+        if best_key is not None:
+            edge_count[end] = best_key[0]
+            predecessor[end] = best_start
+    if predecessor[-1] < 0:
+        raise RuntimeError(
+            "whole-body dense path has no execution subset satisfying step limits"
+        )
+    reverse_indices = [len(q) - 1]
+    cursor = len(q) - 1
+    while cursor > 0:
+        cursor = int(predecessor[cursor])
+        reverse_indices.append(cursor)
+    return np.asarray(list(reversed(reverse_indices)), dtype=np.int64)
+
+
+@pytest.mark.parametrize("short_target", [False, True])
+def test_execution_subset_matches_frozen_reference_randomized(short_target):
+    rng = np.random.default_rng(20260728 + int(short_target))
+    canonical_names = np.asarray(_FakeBackend().joint_names, dtype=object)
+    canonical_index = {
+        str(name): index for index, name in enumerate(canonical_names)
+    }
+    active_indices = [
+        canonical_index[name] for name in WHOLE_BODY_ACTIVE_JOINT_NAMES
+    ]
+    locked_indices = [
+        canonical_index[name] for name in WHOLE_BODY_LOCKED_JOINT_NAMES
+    ]
+    for _case in range(40):
+        waypoint_count = int(rng.integers(2, 56))
+        q = np.zeros(
+            (waypoint_count, len(canonical_names)),
+            dtype=np.float32,
+        )
+        q[:, locked_indices] = rng.uniform(
+            -0.5,
+            0.5,
+            size=(1, len(locked_indices)),
+        ).astype(np.float32)
+        q[:, active_indices] = np.cumsum(
+            rng.uniform(
+                -0.003,
+                0.003,
+                size=(waypoint_count, len(active_indices)),
+            ),
+            axis=0,
+            dtype=np.float64,
+        ).astype(np.float32)
+        yaw_index = canonical_index["base_footprint_rz_joint"]
+        q[:, yaw_index] = np.asarray(
+            [
+                _wrap_angle(value)
+                for value in q[:, yaw_index]
+            ],
+            dtype=np.float32,
+        )
+        positions = np.cumsum(
+            rng.uniform(-0.0007, 0.0007, size=(waypoint_count, 3)),
+            axis=0,
+        )
+        angles = np.cumsum(
+            rng.uniform(-0.006, 0.006, size=waypoint_count)
+        )
+        quaternions = np.column_stack(
+            [
+                np.zeros(waypoint_count),
+                np.zeros(waypoint_count),
+                np.sin(angles * 0.5),
+                np.cos(angles * 0.5),
+            ]
+        )
+        quaternions[::3] *= -1.0
+        permutation = rng.permutation(len(canonical_names))
+        names = tuple(str(name) for name in canonical_names[permutation])
+        q = q[:, permutation]
+
+        expected = _reference_whole_body_execution_subset_indices(
+            q,
+            positions,
+            quaternions,
+            joint_names=names,
+            short_target=short_target,
+        )
+        actual = _whole_body_execution_subset_indices(
+            q,
+            positions,
+            quaternions,
+            joint_names=names,
+            short_target=short_target,
+        )
+
+        np.testing.assert_array_equal(actual, expected)
+        assert _whole_body_execution_step_report(
+            q[actual],
+            positions[actual],
+            quaternions[actual],
+            joint_names=names,
+            short_target=short_target,
+        )["admitted"] is True
+
+
+@pytest.mark.parametrize(
+    ("gate", "short_target"),
+    [
+        ("base_x", True),
+        ("base_y", True),
+        ("base_yaw", True),
+        ("articulation", True),
+        ("eef", True),
+        ("eef", False),
+        ("orientation", True),
+    ],
+)
+def test_execution_subset_matches_reference_at_gate_boundaries(
+    gate,
+    short_target,
+):
+    names = tuple(_FakeBackend().joint_names)
+    by_name = {name: index for index, name in enumerate(names)}
+    q = np.zeros((3, len(names)), dtype=np.float32)
+    positions = np.zeros((3, 3), dtype=np.float64)
+    quaternions = np.repeat(
+        np.asarray([[0.0, 0.0, 0.0, 1.0]], dtype=np.float64),
+        3,
+        axis=0,
+    )
+    if gate == "base_x":
+        q[:, by_name["base_footprint_x_joint"]] = [0.0, 0.003, 0.007502]
+    elif gate == "base_y":
+        q[:, by_name["base_footprint_y_joint"]] = [0.0, 0.003, 0.007502]
+    elif gate == "base_yaw":
+        q[:, by_name["base_footprint_rz_joint"]] = [
+            0.0,
+            math.radians(0.5),
+            math.radians(1.0) + 2e-6,
+        ]
+    elif gate == "articulation":
+        q[:, by_name["left_arm_joint1"]] = [0.0, 0.015, 0.030002]
+    elif gate == "eef":
+        limit = (
+            WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M
+            if short_target
+            else 0.0029
+        )
+        positions[:, 0] = [0.0, limit * 0.5, limit + 2e-6]
+    else:
+        limit = math.radians(1.25)
+        angles = np.asarray([0.0, limit * 0.5, limit + 2e-6])
+        quaternions[:, 2] = np.sin(angles * 0.5)
+        quaternions[:, 3] = np.cos(angles * 0.5)
+
+    expected = _reference_whole_body_execution_subset_indices(
+        q,
+        positions,
+        quaternions,
+        joint_names=names,
+        short_target=short_target,
+    )
+    actual = _whole_body_execution_subset_indices(
+        q,
+        positions,
+        quaternions,
+        joint_names=names,
+        short_target=short_target,
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(actual, [0, 1, 2])
+
+
+def test_execution_subset_reference_preserves_wrap_and_locked_joint_semantics():
+    names = tuple(_FakeBackend().joint_names)
+    by_name = {name: index for index, name in enumerate(names)}
+    q = np.zeros((3, len(names)), dtype=np.float32)
+    q[:, by_name["base_footprint_rz_joint"]] = [
+        math.pi - 0.005,
+        -math.pi,
+        -math.pi + 0.005,
+    ]
+    q[1, by_name["left_gripper_finger_joint1"]] = np.float32(1e-4)
+    positions = np.zeros((3, 3), dtype=np.float64)
+    quaternions = np.asarray(
+        [
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, -1.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    expected = _reference_whole_body_execution_subset_indices(
+        q,
+        positions,
+        quaternions,
+        joint_names=names,
+        short_target=True,
+    )
+    actual = _whole_body_execution_subset_indices(
+        q,
+        positions,
+        quaternions,
+        joint_names=names,
+        short_target=True,
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(actual, [0, 2])
+
+    q[-1, by_name["left_gripper_finger_joint1"]] = np.float32(2e-7)
+    with pytest.raises(RuntimeError, match="no execution subset"):
+        _reference_whole_body_execution_subset_indices(
+            q,
+            positions,
+            quaternions,
+            joint_names=names,
+            short_target=True,
+        )
+    with pytest.raises(RuntimeError, match="no execution subset"):
+        _whole_body_execution_subset_indices(
+            q,
+            positions,
+            quaternions,
+            joint_names=names,
+            short_target=True,
+        )
+
+
+def test_sparse_short_eef_admission_uses_6mm_but_dense_stays_2_2mm():
+    quaternions = np.repeat(
+        np.asarray([[0.0, 0.0, 0.0, 1.0]]),
+        2,
+        axis=0,
+    )
+    positions = np.asarray([[0.0, 0.0, 0.0], [0.006, 0.0, 0.0]])
+
+    dense = _eef_pose_path_admission_report(
+        positions,
+        quaternions,
+        call_start_xyz=positions[0],
+        target_xyz=positions[-1],
+        target_quat_xyzw=quaternions[-1],
+    )
+    sparse = _eef_pose_path_admission_report(
+        positions,
+        quaternions,
+        call_start_xyz=positions[0],
+        target_xyz=positions[-1],
+        target_quat_xyzw=quaternions[-1],
+        short_cartesian_step_limit_m=(
+            WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M
+        ),
+    )
+    over_limit_positions = positions.copy()
+    over_limit_positions[-1, 0] += 2e-6
+    sparse_over_limit = _eef_pose_path_admission_report(
+        over_limit_positions,
+        quaternions,
+        call_start_xyz=over_limit_positions[0],
+        target_xyz=over_limit_positions[-1],
+        target_quat_xyzw=quaternions[-1],
+        short_cartesian_step_limit_m=(
+            WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M
+        ),
+    )
+
+    assert dense["admitted"] is False
+    assert dense["short_target_cartesian_step_limit_m"] == pytest.approx(
+        0.0022
+    )
+    assert sparse["admitted"] is True
+    assert sparse["all_target_cartesian_step_limit_m"] == pytest.approx(0.006)
+    assert sparse["short_target_cartesian_step_limit_m"] == pytest.approx(
+        0.006
+    )
+    assert sparse_over_limit["admitted"] is False
+    assert sparse_over_limit["checks"]["all_target_cartesian_step"] is False
+    assert sparse_over_limit["checks"]["short_target_cartesian_step"] is False
+
+    long_positions = np.asarray([[0.0, 0.0, 0.0], [0.04, 0.0, 0.0]])
+    long_sparse = _eef_pose_path_admission_report(
+        long_positions,
+        quaternions,
+        call_start_xyz=long_positions[0],
+        target_xyz=long_positions[-1],
+        target_quat_xyzw=quaternions[-1],
+        short_cartesian_step_limit_m=(
+            WHOLE_BODY_EEF_SHORT_EXECUTION_STEP_M
+        ),
+    )
+    assert long_sparse["short_target"] is False
+    assert long_sparse["all_target_cartesian_step_limit_m"] == pytest.approx(
+        0.0029
+    )
+    assert long_sparse["checks"]["all_target_cartesian_step"] is False
+
+
+@pytest.mark.parametrize(
+    ("goal_index", "goal_delta"),
+    [
+        (0, 0.05),
+        (5, math.radians(5.0)),
+    ],
+)
+def test_minimum_jerk_base_jog_uses_six_commands(goal_index, goal_delta):
+    start = np.zeros(28, dtype=np.float64)
+    goal = start.copy()
+    goal[goal_index] = goal_delta
+
+    result, metrics = _minimum_jerk_base_execution_trajectory(
+        np.stack([start, goal]),
+        base_indices=list(range(6)),
+    )
+
+    assert BASE_EXECUTION_XY_STEP_M == pytest.approx(0.015)
+    assert BASE_EXECUTION_YAW_STEP_RAD == pytest.approx(math.radians(1.5))
+    assert BASE_EXECUTION_XY_STEP_M < TRACKING_HARD_BASE_XY_ERROR_M
+    assert BASE_EXECUTION_YAW_STEP_RAD < TRACKING_HARD_BASE_YAW_ERROR_RAD
+    assert len(result) - 1 == 6
+    assert metrics["execution_waypoints"] == 6
+
+
+def test_minimum_jerk_base_resampler_bounds_steps_and_eases_endpoints():
+    base_indices = list(range(6))
+    start = np.linspace(-0.4, 0.4, 28, dtype=np.float64)
+    goal = start.copy()
+    goal[0] += 0.05
+    goal[1] -= 0.02
+    goal[5] += math.radians(5.0)
+
+    result, metrics = _minimum_jerk_base_execution_trajectory(
+        np.stack([start, goal]),
+        base_indices=base_indices,
+    )
+
+    np.testing.assert_allclose(result[0], start)
+    np.testing.assert_allclose(result[-1], goal)
+    xy_steps = np.linalg.norm(np.diff(result[:, :2], axis=0), axis=1)
+    yaw_steps = np.abs(np.diff(result[:, 5]))
+    assert np.max(xy_steps) <= BASE_EXECUTION_XY_STEP_M + 1e-7
+    assert np.max(yaw_steps) <= BASE_EXECUTION_YAW_STEP_RAD + 1e-7
+    assert xy_steps[0] < 0.1 * np.max(xy_steps)
+    assert xy_steps[-1] < 0.1 * np.max(xy_steps)
+    assert yaw_steps[0] < 0.1 * np.max(yaw_steps)
+    assert yaw_steps[-1] < 0.1 * np.max(yaw_steps)
+    locked = [index for index in range(28) if index not in {0, 1, 5}]
+    np.testing.assert_array_equal(
+        result[:, locked],
+        np.repeat(result[:1, locked], len(result), axis=0),
+    )
+    assert metrics["method"] == "quintic_minimum_jerk"
+    assert metrics["profile"] == "10u^3-15u^4+6u^5"
+    assert metrics["analytic_endpoint_velocity_zero"] is True
+    assert metrics["analytic_endpoint_acceleration_zero"] is True
+    assert metrics["measured_max_xy_step_m"] == pytest.approx(
+        np.max(xy_steps), abs=1e-8
+    )
+    assert metrics["measured_max_yaw_step_rad"] == pytest.approx(
+        np.max(yaw_steps), abs=1e-8
+    )
+
+
+def test_minimum_jerk_base_resampler_uses_shortest_yaw_arc():
+    start = np.zeros(28, dtype=np.float64)
+    start[5] = math.pi - math.radians(0.25)
+    goal = start.copy()
+    goal[5] = -math.pi + math.radians(0.25)
+
+    result, metrics = _minimum_jerk_base_execution_trajectory(
+        np.stack([start, goal]),
+        base_indices=list(range(6)),
+    )
+
+    wrapped_steps = np.asarray(
+        [
+            abs((float(delta) + math.pi) % (2.0 * math.pi) - math.pi)
+            for delta in np.diff(result[:, 5])
+        ]
+    )
+    wrapped_endpoint_error = (
+        float(result[-1, 5] - goal[5]) + math.pi
+    ) % (2.0 * math.pi) - math.pi
+    assert abs(wrapped_endpoint_error) <= 1e-6
+    assert np.max(wrapped_steps) <= BASE_EXECUTION_YAW_STEP_RAD + 1e-7
+    assert metrics["measured_max_yaw_step_rad"] <= (
+        BASE_EXECUTION_YAW_STEP_RAD + 1e-9
+    )
+
+
+def test_minimum_jerk_base_resampler_rejects_locked_joint_motion():
+    start = np.zeros(28, dtype=np.float64)
+    goal = start.copy()
+    goal[6] = 0.001
+
+    with pytest.raises(ValueError, match="changed locked joint"):
+        _minimum_jerk_base_execution_trajectory(
+            np.stack([start, goal]),
+            base_indices=list(range(6)),
+        )
+
+
+def test_minimum_jerk_base_resampler_softens_direction_reversal():
+    start = np.zeros(28, dtype=np.float64)
+    forward_goal = start.copy()
+    forward_goal[0] = 0.05
+    forward, _ = _minimum_jerk_base_execution_trajectory(
+        np.stack([start, forward_goal]),
+        base_indices=list(range(6)),
+    )
+    backward_goal = forward_goal.copy()
+    backward_goal[0] = 0.0
+    backward, _ = _minimum_jerk_base_execution_trajectory(
+        np.stack([forward_goal, backward_goal]),
+        base_indices=list(range(6)),
+    )
+
+    last_forward_delta = float(forward[-1, 0] - forward[-2, 0])
+    first_backward_delta = float(backward[1, 0] - backward[0, 0])
+    reversal_jump = abs(first_backward_delta - last_forward_delta)
+
+    assert reversal_jump < 0.25 * BASE_EXECUTION_XY_STEP_M
+
+
+def test_navigation_isolation_keeps_one_degree_roll_pitch_fail_closed():
+    class Robot:
+        base_idx = list(range(6))
+        trunk_control_idx = [6, 7, 8, 9]
+        arm_control_idx = {
+            "left": list(range(10, 17)),
+            "right": list(range(17, 24)),
+        }
+
+        def __init__(self):
+            self.q = np.zeros(28, dtype=np.float64)
+
+        def get_joint_positions(self):
+            return self.q.copy()
+
+    robot = Robot()
+    backend = RealCuroboBackend(None)
+    backend._robot = robot
+    backend.env_facade = SimpleNamespace(
+        _gripper_latch={"left": 0.0, "right": 0.0}
+    )
+    backend.get_attached_object = lambda _hand: None
+    reference = backend.capture_navigation_isolation_reference()
+    robot.q[3] = math.radians(1.0) + 1e-6
+
+    report = backend.navigation_isolation_report(
+        action=np.zeros(23, dtype=np.float32),
+        reference=reference,
+    )
+
+    assert report["available"] is True
+    assert report["ok"] is False
+    assert report["checks"]["base_roll_pitch_locked"] is False
+    assert report["thresholds"]["base_roll_pitch_rad"] == pytest.approx(
+        math.radians(1.0)
+    )
+
+
+def test_whole_body_path_canonicalizes_two_pi_yaw_before_execution_digest():
+    full_names = (
+        "base_footprint_x_joint",
+        "base_footprint_y_joint",
+        "base_footprint_z_joint",
+        "base_footprint_rx_joint",
+        "base_footprint_ry_joint",
+        "base_footprint_rz_joint",
+        *tuple(f"torso_joint{i}" for i in range(1, 5)),
+        *tuple(f"left_arm_joint{i}" for i in range(1, 8)),
+        "left_gripper_finger_joint1",
+        "left_gripper_finger_joint2",
+        *tuple(f"right_arm_joint{i}" for i in range(1, 8)),
+        "right_gripper_finger_joint1",
+        "right_gripper_finger_joint2",
+    )
+    full_index = {name: index for index, name in enumerate(full_names)}
+    active_names = tuple(WHOLE_BODY_ACTIVE_JOINT_NAMES)
+    active_index = {name: index for index, name in enumerate(active_names)}
+    start_q = np.linspace(-0.2, 0.2, len(full_names), dtype=np.float32)
+    start_yaw = math.pi - 0.05
+    start_q[full_index["base_footprint_rz_joint"]] = start_yaw
+    values = np.stack(
+        [
+            np.asarray([start_q[full_index[name]] for name in active_names])
+            for _ in range(3)
+        ]
+    )
+    yaw_column = active_index["base_footprint_rz_joint"]
+    raw_yaw = np.asarray(
+        [
+            start_yaw - 2.0 * math.pi,
+            start_yaw + 0.04 + 2.0 * math.pi,
+            start_yaw + 0.08 - 2.0 * math.pi,
+        ],
+        dtype=np.float32,
+    )
+    values[:, yaw_column] = raw_yaw
+    values[:, active_index["right_arm_joint1"]] += np.asarray(
+        [0.0, 0.01, 0.02], dtype=np.float32
+    )
+    path = SimpleNamespace(joint_names=list(active_names), position=values)
+    generator = SimpleNamespace(
+        robot_joint_names=list(full_names),
+        mg={
+            "default": SimpleNamespace(
+                kinematics=SimpleNamespace(joint_names=list(active_names))
+            )
+        },
+    )
+    robot = SimpleNamespace(joints=dict.fromkeys(full_names))
+    backend = RealCuroboBackend(None)
+    backend._embodiment_cls = SimpleNamespace(DEFAULT="default")
+
+    merged, report = backend._whole_body_path_to_full_joint_trajectory(
+        generator,
+        robot,
+        path,
+        start_q=start_q,
+    )
+    merged, continuity = _canonicalize_whole_body_base_yaw_trajectory(
+        merged,
+        joint_names=full_names,
+        call_start_q=start_q,
+    )
+    report["base_yaw_continuity"] = continuity
+
+    yaw_index = full_index["base_footprint_rz_joint"]
+    canonical_yaw = merged[:, yaw_index].astype(np.float64)
+    np.testing.assert_allclose(
+        canonical_yaw,
+        start_yaw + np.asarray([0.0, 0.04, 0.08]),
+        atol=1e-6,
+    )
+    continuity = report["base_yaw_continuity"]
+    assert continuity["branch_correction_count"] == 3
+    assert continuity["raw_max_step_rad"] > 2.0 * math.pi
+    assert continuity["canonical_max_step_rad"] == pytest.approx(0.04, abs=1e-6)
+    for raw, canonical in zip(raw_yaw, canonical_yaw, strict=True):
+        assert abs((float(raw - canonical) + math.pi) % (2.0 * math.pi) - math.pi) < (
+            1e-6
+        )
+    for name in WHOLE_BODY_LOCKED_JOINT_NAMES:
+        np.testing.assert_array_equal(
+            merged[:, full_index[name]],
+            np.repeat(start_q[full_index[name]], len(merged)),
+        )
+
+    with_start = np.vstack([start_q, merged])
+    dense = _interpolate_joint_trajectory(
+        with_start,
+        max_inter_dist=0.0075,
+    )
+    execution = _interpolate_whole_body_execution_trajectory(
+        with_start,
+        joint_names=full_names,
+    )[1:]
+    assert np.max(np.abs(np.diff(dense[:, yaw_index]))) <= 0.0075 + 1e-6
+    assert np.max(np.abs(np.diff(execution[:, yaw_index]))) <= (
+        math.radians(1.0) + 1e-6
+    )
+    assert np.sum(np.abs(np.diff(execution[:, yaw_index]))) < 0.1
+    execution_digest = hashlib.sha256(
+        np.ascontiguousarray(execution, dtype=np.float32).tobytes()
+    ).hexdigest()
+    branched_execution = execution.copy()
+    branched_execution[:, yaw_index] += np.float32(2.0 * math.pi)
+    assert execution_digest != hashlib.sha256(
+        np.ascontiguousarray(branched_execution, dtype=np.float32).tobytes()
+    ).hexdigest()
+
+
+def test_whole_body_eef_path_rejects_short_target_with_large_detour():
+    backend = RealCuroboBackend(None)
+    positions = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.7, 0.0, 0.0],
+            [0.03, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    backend._curobo_eef_poses = lambda _generator, _q: (
+        positions,
+        np.repeat([[0.0, 0.0, 0.0, 1.0]], len(positions), axis=0),
+    )
+
+    report = backend._whole_body_eef_path_report(
+        object(),
+        np.zeros((3, 28), dtype=np.float32),
+        call_start_xyz=np.zeros(3),
+        target_xyz=np.asarray([0.03, 0.0, 0.0]),
+    )
+
+    assert report["available"] is True
+    assert report["admitted"] is False
+    assert report["short_target"] is True
+    assert report["max_start_excursion_m"] == pytest.approx(0.7)
+    assert report["checks"]["short_target_start_excursion"] is False
+    assert report["terminal_error_m"] == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(
@@ -153,6 +1003,67 @@ class _FakeEnv:
         )
 
 
+def _grouped_dynamics_report(
+    *,
+    base_translation=0.0,
+    base_yaw=0.0,
+    articulation=0.0,
+    ok=True,
+):
+    values = {
+        "base_translation": (
+            float(base_translation),
+            "m/s",
+            ("base_footprint_x_joint", "base_footprint_y_joint"),
+        ),
+        "base_yaw": (
+            float(base_yaw),
+            "rad/s",
+            ("base_footprint_rz_joint",),
+        ),
+        "articulation": (
+            float(articulation),
+            "rad/s",
+            (
+                *tuple(f"torso_joint{index}" for index in range(1, 5)),
+                *tuple(f"left_arm_joint{index}" for index in range(1, 8)),
+                *tuple(f"right_arm_joint{index}" for index in range(1, 8)),
+            ),
+        ),
+    }
+    indices = {
+        "base_translation": [0, 1],
+        "base_yaw": [5],
+        "articulation": list(range(6, 24)),
+    }
+    groups = {}
+    for name, (maximum, unit, joint_names) in values.items():
+        groups[name] = {
+            "available": True,
+            "unit": unit,
+            "dof_count": len(joint_names),
+            "dof_indices": indices[name],
+            "joint_names": list(joint_names),
+            "max_actual_velocity": maximum,
+            "max_actual_velocity_joint": joint_names[0],
+            "max_velocity_limit": 1.0,
+            "max_velocity_ratio": maximum,
+            "within_control_limit": bool(ok),
+        }
+    maximum_name = max(values, key=lambda name: values[name][0])
+    return {
+        "available": True,
+        "ok": bool(ok),
+        "max_actual_velocity": values[maximum_name][0],
+        "max_actual_velocity_joint": groups[maximum_name][
+            "max_actual_velocity_joint"
+        ],
+        "max_velocity_limit": 1.0,
+        "max_velocity_ratio": values[maximum_name][0],
+        "velocity_groups": groups,
+    }
+
+
 class _FakeBackend:
     def __init__(
         self,
@@ -185,9 +1096,31 @@ class _FakeBackend:
         self.attached_used = []
         self.hold = (np.arange(23, dtype=np.float32) + 1.0) * 0.01
         self.joint_positions = np.zeros(28, dtype=np.float32)
+        self.joint_names = (
+            "base_footprint_x_joint",
+            "base_footprint_y_joint",
+            "base_footprint_z_joint",
+            "base_footprint_rx_joint",
+            "base_footprint_ry_joint",
+            "base_footprint_rz_joint",
+            *tuple(f"torso_joint{index}" for index in range(1, 5)),
+            *tuple(f"left_arm_joint{index}" for index in range(1, 8)),
+            "left_gripper_finger_joint1",
+            "left_gripper_finger_joint2",
+            *tuple(f"right_arm_joint{index}" for index in range(1, 8)),
+            "right_gripper_finger_joint1",
+            "right_gripper_finger_joint2",
+        )
         self.whole_body_plan_calls = []
         self.whole_body_hold_calls = []
         self.whole_body_tracking_calls = []
+        self.execution_eef_positions = np.empty((0, 3), dtype=np.float32)
+        self.execution_eef_quaternions = np.empty((0, 4), dtype=np.float32)
+        self.dense_eef_positions = np.empty((0, 3), dtype=np.float32)
+        self.dense_eef_quaternions = np.empty((0, 4), dtype=np.float32)
+        self.execution_eef_index = 0
+        self.next_execution_eef_pose = None
+        self.next_execution_eef_quat = None
         self.isolation_capture_calls = []
         self.isolation_report_calls = []
 
@@ -238,6 +1171,7 @@ class _FakeBackend:
         target_quat_xyzw,
         timeout_s,
         attached_obj=None,
+        search_profile=WHOLE_BODY_SEARCH_PROFILE_DEFAULT,
     ):
         self.target = np.asarray(target_xyz, dtype=np.float64)
         self.target_quat = (
@@ -258,11 +1192,16 @@ class _FakeBackend:
                     None if self.target_quat is None else self.target_quat.copy()
                 ),
                 "timeout_s": float(timeout_s),
+                "search_profile": str(search_profile),
                 "selected_attachment": attached_obj,
                 "attachments_by_hand": attachments_by_hand,
             }
         )
-        waypoint_count = 3
+        nominal_max_target_error = float(np.linalg.norm(self.pose - self.target))
+        waypoint_count = max(
+            20,
+            int(math.ceil(nominal_max_target_error / 0.0028)),
+        )
         q_dimension = 27 if self.bad_actions else 28
         trajectory = np.repeat(
             self.joint_positions[:q_dimension].reshape(1, -1),
@@ -273,16 +1212,155 @@ class _FakeBackend:
             trajectory[1, 6:10] = 6.1
             trajectory[1, 10:17] = 6.1
             trajectory[1, 19:26] = 6.1
+        self.execution_eef_positions = np.ascontiguousarray(
+            np.linspace(
+                self.pose,
+                self.target,
+                waypoint_count + 1,
+                dtype=np.float64,
+            )[1:],
+            dtype=np.float32,
+        )
+        self.execution_eef_index = 0
+        self.next_execution_eef_pose = None
+        self.next_execution_eef_quat = None
+        execution_quat = self.quat if self.target_quat is None else self.target_quat
+        start_quat = np.asarray(self.quat, dtype=np.float64)
+        end_quat = np.asarray(execution_quat, dtype=np.float64)
+        if float(np.dot(start_quat, end_quat)) < 0.0:
+            end_quat = -end_quat
+        interpolated_quats = []
+        for fraction in np.linspace(
+            1.0 / waypoint_count,
+            1.0,
+            waypoint_count,
+        ):
+            quat = (1.0 - fraction) * start_quat + fraction * end_quat
+            interpolated_quats.append(quat / np.linalg.norm(quat))
+        self.execution_eef_quaternions = np.ascontiguousarray(
+            interpolated_quats,
+            dtype=np.float32,
+        )
+        execution_with_start = np.vstack(
+            [self.joint_positions.reshape(1, -1), trajectory]
+        ).astype(np.float32)
+        dense_collision_trajectory = _interpolate_joint_trajectory(
+            execution_with_start,
+            max_inter_dist=WHOLE_BODY_DENSE_COLLISION_STEP,
+        )
+        collision_dense_indices = []
+        search_start = 0
+        for anchor in execution_with_start:
+            matches = np.flatnonzero(
+                np.all(
+                    dense_collision_trajectory[search_start:] == anchor,
+                    axis=1,
+                )
+            )
+            assert len(matches)
+            match = search_start + int(matches[0])
+            collision_dense_indices.append(match)
+            search_start = match + 1
+        collision_dense_indices = np.asarray(
+            collision_dense_indices,
+            dtype=np.int64,
+        )
+        # The source collision path intentionally has additional ordered rows
+        # so the default fake exercises a genuine execution subset instead of
+        # the old dense == [start; execution] shortcut.
+        source_dense_rows = [execution_with_start[0]]
+        source_dense_indices = [0]
+        for row in execution_with_start[1:]:
+            source_dense_rows.extend([row.copy(), row.copy()])
+            source_dense_indices.append(len(source_dense_rows) - 1)
+        source_dense_trajectory = np.asarray(
+            source_dense_rows,
+            dtype=np.float32,
+        )
+        source_dense_indices = np.asarray(source_dense_indices, dtype=np.int64)
+        eef_position_anchors = np.vstack(
+            [
+                self.pose.reshape(1, 3),
+                self.execution_eef_positions,
+            ]
+        )
+        eef_quaternion_anchors = np.vstack(
+            [
+                start_quat.reshape(1, 4),
+                self.execution_eef_quaternions,
+            ]
+        )
+        dense_eef_positions = []
+        dense_eef_quaternions = []
+        for q_start, q_end, xyz_start, xyz_end, quat_start, quat_end in zip(
+            execution_with_start[:-1],
+            execution_with_start[1:],
+            eef_position_anchors[:-1],
+            eef_position_anchors[1:],
+            eef_quaternion_anchors[:-1],
+            eef_quaternion_anchors[1:],
+            strict=True,
+        ):
+            intervals = max(
+                1,
+                int(
+                    math.ceil(
+                        float(np.max(np.abs(q_end - q_start)))
+                        / WHOLE_BODY_DENSE_COLLISION_STEP
+                    )
+                ),
+            )
+            for interval_index in range(intervals):
+                alpha = interval_index / intervals
+                dense_eef_positions.append(
+                    xyz_start + alpha * (xyz_end - xyz_start)
+                )
+                quat = quat_start + alpha * (quat_end - quat_start)
+                dense_eef_quaternions.append(quat / np.linalg.norm(quat))
+        dense_eef_positions.append(eef_position_anchors[-1])
+        dense_eef_quaternions.append(eef_quaternion_anchors[-1])
+        self.dense_eef_positions = np.ascontiguousarray(
+            dense_eef_positions,
+            dtype=np.float32,
+        )
+        self.dense_eef_quaternions = np.ascontiguousarray(
+            dense_eef_quaternions,
+            dtype=np.float32,
+        )
+        assert len(self.dense_eef_positions) == len(dense_collision_trajectory)
+
+        def digest_float32(values):
+            return hashlib.sha256(
+                np.ascontiguousarray(values, dtype=np.float32).tobytes()
+            ).hexdigest()
+
+        def digest_indices(values):
+            return hashlib.sha256(
+                np.ascontiguousarray(values, dtype="<i8").tobytes()
+            ).hexdigest()
+
         certificate = {
-            "schema_version": 1,
-            "trajectory_sha256": hashlib.sha256(
-                np.ascontiguousarray(trajectory, dtype=np.float32).tobytes()
-            ).hexdigest(),
+            "schema_version": 3,
+            "collision_lineage_mode": (
+                "source_dense_execution_subset_recertified_v1"
+            ),
+            "q_encoding": "float32-c-order",
+            "trajectory_sha256": digest_float32(trajectory),
+            "execution_trajectory_sha256": digest_float32(trajectory),
             "start_q_sha256": hashlib.sha256(
                 np.ascontiguousarray(self.joint_positions, dtype=np.float32).tobytes()
             ).hexdigest(),
             "waypoint_count": waypoint_count,
+            "execution_waypoint_count": waypoint_count,
+            "execution_includes_start": False,
             "q_dimension": q_dimension,
+            "joint_name_layout_sha256": hashlib.sha256(
+                json.dumps(
+                    list(self.joint_names[:q_dimension]),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
             "active_dof_count": 21,
             "selected_eef_goal_count": 1,
             "inactive_eef_goal_count": 0,
@@ -290,7 +1368,114 @@ class _FakeBackend:
             "world_collision_check": True,
             "self_collision_check": True,
             "post_interpolation_check": True,
-            "collision_free_waypoints": waypoint_count,
+            "collision_free_waypoints": len(dense_collision_trajectory),
+            "dense_collision_waypoint_count": len(dense_collision_trajectory),
+            "dense_collision_checked_waypoint_count": len(
+                dense_collision_trajectory
+            ),
+            "dense_collision_includes_start": True,
+            "dense_collision_trajectory_sha256": digest_float32(
+                dense_collision_trajectory
+            ),
+            "dense_collision_trajectory": dense_collision_trajectory.tolist(),
+            "collision_densification_method": "joint_linear_max_inter_dist",
+            "collision_densification_joint_step_rad": (
+                WHOLE_BODY_DENSE_COLLISION_STEP
+            ),
+            "source_dense_waypoint_count": len(source_dense_trajectory),
+            "source_dense_includes_start": True,
+            "source_dense_trajectory_sha256": digest_float32(
+                source_dense_trajectory
+            ),
+            "source_dense_trajectory": source_dense_trajectory.tolist(),
+            "execution_source_dense_indices": source_dense_indices.tolist(),
+            "execution_source_dense_indices_sha256": digest_indices(
+                source_dense_indices
+            ),
+            "execution_source_terminal_index": int(source_dense_indices[-1]),
+            "execution_collision_dense_indices": (
+                collision_dense_indices.tolist()
+            ),
+            "execution_collision_dense_indices_sha256": digest_indices(
+                collision_dense_indices
+            ),
+            "execution_collision_terminal_index": int(
+                collision_dense_indices[-1]
+            ),
+            "selected_hand": hand,
+            "selected_target_xyz_sha256": hashlib.sha256(
+                np.ascontiguousarray(self.target, dtype=np.float32).tobytes()
+            ).hexdigest(),
+            "selected_target_quat_xyzw_sha256": (
+                None
+                if target_quat_xyzw is None
+                else hashlib.sha256(
+                    np.ascontiguousarray(
+                        execution_quat, dtype=np.float32
+                    ).tobytes()
+                ).hexdigest()
+            ),
+            "selected_eef_path_admitted": True,
+            "selected_eef_short_target": (
+                nominal_max_target_error <= 0.036 + 1e-9
+            ),
+            "selected_eef_positions_sha256": digest_float32(
+                self.dense_eef_positions
+            ),
+            "selected_eef_dense_positions_sha256": digest_float32(
+                self.dense_eef_positions
+            ),
+            "selected_eef_dense_quaternions_sha256": digest_float32(
+                self.dense_eef_quaternions
+            ),
+            "selected_eef_dense_positions": self.dense_eef_positions.tolist(),
+            "selected_eef_dense_quaternions_xyzw": (
+                self.dense_eef_quaternions.tolist()
+            ),
+            "selected_eef_nominal_max_target_error_m": (
+                nominal_max_target_error
+            ),
+            "selected_eef_execution_positions_sha256": digest_float32(
+                self.execution_eef_positions
+            ),
+            "selected_eef_execution_quaternions_sha256": digest_float32(
+                self.execution_eef_quaternions
+            ),
+            "selected_eef_execution_positions": (
+                self.execution_eef_positions.tolist()
+            ),
+            "selected_eef_execution_quaternions_xyzw": (
+                self.execution_eef_quaternions.tolist()
+            ),
+            "selected_eef_live_waypoint_position_tolerance_m": 0.005,
+            "selected_eef_live_waypoint_orientation_tolerance_rad": (
+                math.radians(1.0)
+            ),
+            "selected_eef_controller_response_margin_m": (
+                WHOLE_BODY_EEF_CONTROLLER_RESPONSE_MARGIN_M
+            ),
+            "selected_eef_numerical_margin_m": (
+                WHOLE_BODY_EEF_NUMERICAL_MARGIN_M
+            ),
+            "selected_eef_prospective_guard_margin_m": (
+                WHOLE_BODY_EEF_PROSPECTIVE_GUARD_MARGIN_M
+            ),
+            "execution_base_xy_step_limit_m": (
+                WHOLE_BODY_EXECUTION_BASE_XY_STEP_M
+            ),
+            "execution_base_yaw_step_limit_rad": (
+                WHOLE_BODY_EXECUTION_BASE_YAW_STEP_RAD
+            ),
+            "execution_articulation_step_limit_rad": (
+                WHOLE_BODY_EXECUTION_ARTICULATION_STEP_RAD
+            ),
+            "terminal_command_limit": TERMINAL_COMMAND_LIMIT,
+            "terminal_eef_position_tolerance_m": (
+                EEF_TERMINAL_POSITION_TOLERANCE_M
+            ),
+            "terminal_eef_orientation_tolerance_rad": (
+                EEF_TERMINAL_ORIENTATION_TOLERANCE_RAD
+            ),
         }
         collision_admission = {
             "available": True,
@@ -302,7 +1487,7 @@ class _FakeBackend:
             "post_interpolation_check": True,
             "colliding_waypoint_count": 0,
         }
-        return {
+        result = {
             "ok": True,
             "joint_trajectory": trajectory,
             "whole_body_certificate": certificate,
@@ -320,12 +1505,194 @@ class _FakeBackend:
                 "whole_body_certificate": certificate,
             },
         }
+        return self._refresh_whole_body_certificate(result)
+
+    def _refresh_whole_body_certificate(self, result):
+        trajectory = np.ascontiguousarray(
+            result["joint_trajectory"],
+            dtype=np.float32,
+        )
+        execution_with_start = np.vstack(
+            [self.joint_positions.reshape(1, -1), trajectory]
+        ).astype(np.float32)
+        dense = _interpolate_joint_trajectory(
+            execution_with_start,
+            max_inter_dist=WHOLE_BODY_DENSE_COLLISION_STEP,
+        )
+
+        def ordered_indices(rows, anchors):
+            indices = [0]
+            cursor = 1
+            for anchor_index, anchor in enumerate(anchors[1:], start=1):
+                if anchor_index == len(anchors) - 1:
+                    match = len(rows) - 1
+                else:
+                    matches = np.flatnonzero(
+                        np.all(rows[cursor:-1] == anchor, axis=1)
+                    )
+                    assert len(matches)
+                    match = cursor + int(matches[0])
+                assert np.array_equal(rows[match], anchor)
+                indices.append(match)
+                cursor = match + 1
+            return np.asarray(indices, dtype=np.int64)
+
+        collision_indices = ordered_indices(dense, execution_with_start)
+        source_rows = [execution_with_start[0]]
+        source_indices = [0]
+        for row in execution_with_start[1:]:
+            source_rows.extend([row.copy(), row.copy()])
+            source_indices.append(len(source_rows) - 1)
+        source_dense = np.asarray(source_rows, dtype=np.float32)
+        source_indices = np.asarray(source_indices, dtype=np.int64)
+
+        execution_position_anchors = np.vstack(
+            [self.pose.reshape(1, 3), self.execution_eef_positions]
+        )
+        execution_quaternion_anchors = np.vstack(
+            [self.quat.reshape(1, 4), self.execution_eef_quaternions]
+        )
+        dense_positions = []
+        dense_quaternions = []
+        for q_start, q_end, xyz_start, xyz_end, quat_start, quat_end in zip(
+            execution_with_start[:-1],
+            execution_with_start[1:],
+            execution_position_anchors[:-1],
+            execution_position_anchors[1:],
+            execution_quaternion_anchors[:-1],
+            execution_quaternion_anchors[1:],
+            strict=True,
+        ):
+            intervals = max(
+                1,
+                int(
+                    math.ceil(
+                        float(np.max(np.abs(q_end - q_start)))
+                        / WHOLE_BODY_DENSE_COLLISION_STEP
+                    )
+                ),
+            )
+            for interval_index in range(intervals):
+                alpha = interval_index / intervals
+                dense_positions.append(
+                    xyz_start + alpha * (xyz_end - xyz_start)
+                )
+                quat = quat_start + alpha * (quat_end - quat_start)
+                dense_quaternions.append(quat / np.linalg.norm(quat))
+        dense_positions.append(execution_position_anchors[-1])
+        dense_quaternions.append(execution_quaternion_anchors[-1])
+        self.dense_eef_positions = np.ascontiguousarray(
+            dense_positions,
+            dtype=np.float32,
+        )
+        self.dense_eef_quaternions = np.ascontiguousarray(
+            dense_quaternions,
+            dtype=np.float32,
+        )
+        assert len(self.dense_eef_positions) == len(dense)
+
+        def digest_float32(values):
+            return hashlib.sha256(
+                np.ascontiguousarray(values, dtype=np.float32).tobytes()
+            ).hexdigest()
+
+        def digest_indices(values):
+            return hashlib.sha256(
+                np.ascontiguousarray(values, dtype="<i8").tobytes()
+            ).hexdigest()
+
+        certificate = result["whole_body_certificate"]
+        certificate.update(
+            {
+                "trajectory_sha256": digest_float32(trajectory),
+                "execution_trajectory_sha256": digest_float32(trajectory),
+                "waypoint_count": len(trajectory),
+                "execution_waypoint_count": len(trajectory),
+                "collision_free_waypoints": len(dense),
+                "dense_collision_waypoint_count": len(dense),
+                "dense_collision_checked_waypoint_count": len(dense),
+                "dense_collision_trajectory_sha256": digest_float32(dense),
+                "dense_collision_trajectory": dense.tolist(),
+                "source_dense_waypoint_count": len(source_dense),
+                "source_dense_trajectory_sha256": digest_float32(source_dense),
+                "source_dense_trajectory": source_dense.tolist(),
+                "execution_source_dense_indices": source_indices.tolist(),
+                "execution_source_dense_indices_sha256": digest_indices(
+                    source_indices
+                ),
+                "execution_source_terminal_index": int(source_indices[-1]),
+                "execution_collision_dense_indices": (
+                    collision_indices.tolist()
+                ),
+                "execution_collision_dense_indices_sha256": digest_indices(
+                    collision_indices
+                ),
+                "execution_collision_terminal_index": int(
+                    collision_indices[-1]
+                ),
+                "selected_eef_positions_sha256": digest_float32(
+                    self.dense_eef_positions
+                ),
+                "selected_eef_dense_positions_sha256": digest_float32(
+                    self.dense_eef_positions
+                ),
+                "selected_eef_dense_quaternions_sha256": digest_float32(
+                    self.dense_eef_quaternions
+                ),
+                "selected_eef_dense_positions": (
+                    self.dense_eef_positions.tolist()
+                ),
+                "selected_eef_dense_quaternions_xyzw": (
+                    self.dense_eef_quaternions.tolist()
+                ),
+                "selected_eef_execution_positions_sha256": digest_float32(
+                    self.execution_eef_positions
+                ),
+                "selected_eef_execution_quaternions_sha256": digest_float32(
+                    self.execution_eef_quaternions
+                ),
+                "selected_eef_execution_positions": (
+                    self.execution_eef_positions.tolist()
+                ),
+                "selected_eef_execution_quaternions_xyzw": (
+                    self.execution_eef_quaternions.tolist()
+                ),
+            }
+        )
+        result["metrics"]["whole_body_certificate"] = certificate
+        return result
 
     def get_eef_pose(self, hand):
         return self.pose.copy(), self.quat.copy()
 
+    def whole_body_eef_poses(self, *, hand, q_trajectory):
+        del hand
+        waypoint_count = np.asarray(q_trajectory).shape[0]
+        if waypoint_count == len(self.execution_eef_positions):
+            return (
+                self.execution_eef_positions.copy(),
+                self.execution_eef_quaternions.copy(),
+            )
+        if waypoint_count == len(self.execution_eef_positions) + 1:
+            return (
+                self.dense_eef_positions.copy(),
+                self.dense_eef_quaternions.copy(),
+            )
+        if waypoint_count == len(self.dense_eef_positions):
+            return (
+                self.dense_eef_positions.copy(),
+                self.dense_eef_quaternions.copy(),
+            )
+        raise AssertionError(
+            f"unexpected whole-body FK path length {waypoint_count}"
+        )
+
     def get_joint_positions(self):
         return self.joint_positions.copy()
+
+    def whole_body_joint_names(self, hand):
+        del hand
+        return self.joint_names
 
     def get_base_pose(self):
         return self.base_pose.copy()
@@ -344,7 +1711,10 @@ class _FakeBackend:
                             self.attached_obj = None
                 elif self.attach_on_close and self.attached_obj is None:
                     self.attached_obj = {eef_link: self.target_root}
-        if self.progress and self.target is not None:
+        if self.progress and self.next_execution_eef_pose is not None:
+            self.pose = self.next_execution_eef_pose.copy()
+            self.quat = self.next_execution_eef_quat.copy()
+        elif self.progress and self.target is not None:
             self.pose = self.pose + 0.5 * (self.target - self.pose)
             if self.target_quat is not None:
                 self.quat = self.target_quat.copy()
@@ -425,9 +1795,13 @@ class _FakeBackend:
         return {"available": True, "pairs": [], "pair_count": 0}
 
     def whole_body_contact_report(
-        self, *, baseline, expected_attachments_by_hand
+        self,
+        *,
+        baseline,
+        expected_attachments_by_hand,
+        allowed_expected_contact=None,
     ):
-        del baseline, expected_attachments_by_hand
+        del baseline, expected_attachments_by_hand, allowed_expected_contact
         if self.contact_mode == "unavailable":
             return {
                 "available": False,
@@ -488,6 +1862,10 @@ class _FakeBackend:
             "base_yaw_error_rad": 0.0,
         }
 
+    @staticmethod
+    def dynamics_report():
+        return _grouped_dynamics_report()
+
     def capture_trajectory_hold_reference(
         self,
         *,
@@ -524,6 +1902,17 @@ class _FakeBackend:
                 "motion_scope": "whole_body",
                 "token": "whole_body_fixed_at_trajectory_start",
             }
+            index = min(
+                self.execution_eef_index,
+                len(self.execution_eef_positions) - 1,
+            )
+            self.next_execution_eef_pose = self.execution_eef_positions[
+                index
+            ].astype(np.float64)
+            self.next_execution_eef_quat = self.execution_eef_quaternions[
+                index
+            ].astype(np.float64)
+            self.execution_eef_index += 1
         action = self.hold.copy()
         action[ENV_ACTION_SEGMENTS["trunk"]] = target[6:10]
         action[ENV_ACTION_SEGMENTS["left_arm"]] = target[10:17]
@@ -673,6 +2062,83 @@ def _executor(backend, *, output_dir=None):
         ),
         env,
     )
+
+
+def _move_to_without_replan_checkpoint(
+    executor,
+    *,
+    hand,
+    target_xyz,
+    **kwargs,
+):
+    parameters = {
+        "frame": "world",
+        "target_quat_xyzw": None,
+        "plan_only": False,
+        "position_tolerance_m": 0.02,
+        "orientation_tolerance_rad": math.radians(5.0),
+        "timeout_s": 240.0,
+        "allow_replan_checkpoint": False,
+    }
+    parameters.update(kwargs)
+    return executor._move_to_whole_body_impl(
+        hand=hand,
+        target_xyz=target_xyz,
+        **parameters,
+    )
+
+
+def _scripted_whole_body_replan_checkpoint(
+    execution_kwargs,
+    *,
+    final_position_error_m,
+    call_start_position_error_m=None,
+    checkpoint_overrides=None,
+):
+    trajectory = np.ascontiguousarray(
+        execution_kwargs["joint_trajectory"], dtype=np.float32
+    )
+    assert trajectory.ndim == 2 and len(trajectory) >= 2
+    certificate = execution_kwargs["whole_body_certificate"]
+    call_start_error = (
+        float(final_position_error_m) + 0.003
+        if call_start_position_error_m is None
+        else float(call_start_position_error_m)
+    )
+    checkpoint = {
+        "commanded_index": 0,
+        "post_step_index": 1,
+        "q_sha256": hashlib.sha256(trajectory[0].tobytes()).hexdigest(),
+        "trajectory_sha256": certificate["trajectory_sha256"],
+        "call_start_position_error_m": call_start_error,
+        "final_position_error_m": float(final_position_error_m),
+        "position_improvement_m": (
+            call_start_error - float(final_position_error_m)
+        ),
+        "minimum_position_improvement_m": 0.002,
+        "trigger_position_improvement_m": (
+            WHOLE_BODY_REPLAN_POSITION_IMPROVEMENT_M
+        ),
+        "eef_pose_settled": True,
+        "dynamics_stationary": True,
+        "joint_waypoint_reached": True,
+    }
+    checkpoint.update(checkpoint_overrides or {})
+    return {
+        "primitive_success": False,
+        "task_success": False,
+        "stop_reason": "whole_body_replan_checkpoint",
+        "recoverable": True,
+        "suggested_next_tool": None,
+        "metrics": {
+            "final_position_error_m": float(final_position_error_m),
+            "trajectory_complete": False,
+            "env_actions_sent": 1,
+            "post_stop_env_actions": 0,
+            "whole_body_replan_checkpoint": checkpoint,
+        },
+        "diagnostics": {"trace": []},
+    }
 
 
 def _install_counted_reporter(backend, name, outcome):
@@ -852,88 +2318,20 @@ def test_move_to_stops_bounded_when_target_tolerance_is_not_met():
     result = executor.move_to(hand="left", target_xyz=[0.0, 0.0, 0.0], timeout_s=10)
 
     assert result["primitive_success"] is False
-    assert result["stop_reason"] == "replan_no_progress"
-    assert result["recoverable"] is True
-    assert 20 <= len(env.calls) <= 30
-    assert len(result["metrics"]["replan_rounds"]) == 2
+    assert result["stop_reason"] == "eef_path_divergence"
+    assert result["recoverable"] is False
+    assert len(env.calls) == 18
+    assert result["metrics"]["post_stop_env_actions"] == 0
 
 
-@pytest.mark.parametrize(
-    ("second_position_error", "second_tracking_error"),
-    [
-        (0.008, 0.99),
-        (0.01, 0.95),
-    ],
-)
-def test_move_to_replans_after_exact_position_or_tracking_progress_threshold(
-    second_position_error,
-    second_tracking_error,
-):
-    backend = _FakeBackend(progress=False)
-    executor, _env = _executor(backend)
-    scripted = iter(
-        [
-            (False, "stalled_tracking", 0.01, 1.0),
-            (
-                False,
-                "stalled_tracking",
-                second_position_error,
-                second_tracking_error,
-            ),
-            (True, "reached", 0.0, 0.0),
-        ]
-    )
-
-    def execute(*_args, **_kwargs):
-        success, stop_reason, position_error, tracking_error = next(scripted)
-        return {
-            "primitive_success": success,
-            "task_success": False,
-            "stop_reason": stop_reason,
-            "recoverable": True,
-            "suggested_next_tool": None,
-            "metrics": {
-                "final_position_error_m": position_error,
-                "final_joint_tracking": {
-                    "normalized_21d_tracking_error": tracking_error,
-                },
-                "trajectory_complete": success,
-            },
-            "diagnostics": {"trace": []},
-        }
-
-    executor._execute_actions = execute
-    result = executor.move_to(hand="left", target_xyz=[0.0, 0.0, 0.0])
-
-    assert result["primitive_success"] is True
-    assert len(backend.whole_body_plan_calls) == 3
-    assert len(result["metrics"]["replan_rounds"]) == 3
-
-
-@pytest.mark.parametrize(
-    ("second_position_error", "second_tracking_error"),
-    [
-        (0.008001, 0.99),
-        (0.01, 0.950001),
-        (float("nan"), 0.99),
-        (0.01, float("nan")),
-    ],
-)
-def test_move_to_replan_progress_must_be_finite_and_reach_the_exact_threshold(
-    second_position_error,
-    second_tracking_error,
-):
+def test_move_to_noncheckpoint_execution_failure_never_replans():
     backend = _FakeBackend(progress=False)
     executor, env = _executor(backend)
-    scripted = iter(
-        [
-            (0.01, 1.0),
-            (second_position_error, second_tracking_error),
-        ]
-    )
+    execute_calls = 0
 
     def execute(*_args, **_kwargs):
-        position_error, tracking_error = next(scripted)
+        nonlocal execute_calls
+        execute_calls += 1
         return {
             "primitive_success": False,
             "task_success": False,
@@ -941,11 +2339,9 @@ def test_move_to_replan_progress_must_be_finite_and_reach_the_exact_threshold(
             "recoverable": True,
             "suggested_next_tool": None,
             "metrics": {
-                "final_position_error_m": position_error,
-                "final_joint_tracking": {
-                    "normalized_21d_tracking_error": tracking_error,
-                },
+                "final_position_error_m": 0.01,
                 "trajectory_complete": False,
+                "env_actions_sent": 1,
             },
             "diagnostics": {"trace": []},
         }
@@ -954,8 +2350,145 @@ def test_move_to_replan_progress_must_be_finite_and_reach_the_exact_threshold(
     result = executor.move_to(hand="left", target_xyz=[0.0, 0.0, 0.0])
 
     assert result["primitive_success"] is False
+    assert result["stop_reason"] == "stalled_tracking"
+    assert execute_calls == 1
+    assert len(backend.whole_body_plan_calls) == 1
+    assert env.calls == []
+
+
+def test_move_to_checkpoint_replans_until_eventual_success():
+    backend = _FakeBackend(progress=False)
+    executor, _env = _executor(backend)
+    scripted_position_errors = iter([0.020, 0.018, 0.016])
+    execute_calls = 0
+
+    def execute(*_args, **kwargs):
+        nonlocal execute_calls
+        execute_calls += 1
+        if execute_calls == 4:
+            return {
+                "primitive_success": True,
+                "task_success": False,
+                "stop_reason": "reached",
+                "recoverable": True,
+                "suggested_next_tool": None,
+                "metrics": {
+                    "final_position_error_m": 0.0,
+                    "trajectory_complete": True,
+                    "env_actions_sent": 1,
+                },
+                "diagnostics": {"trace": []},
+            }
+        return _scripted_whole_body_replan_checkpoint(
+            kwargs,
+            final_position_error_m=next(scripted_position_errors),
+        )
+
+    executor._execute_actions = execute
+    result = executor.move_to(hand="left", target_xyz=[0.0, 0.0, 0.0])
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert execute_calls == 4
+    assert len(backend.whole_body_plan_calls) == 4
+    assert len(result["metrics"]["replan_rounds"]) == 4
+    assert result["metrics"]["replan_rounds"][0][
+        "eligible_replan_failure"
+    ]["first_checkpoint"] is True
+    assert result["metrics"]["replan_rounds"][1]["replan_progress"][
+        "position_improved_at_least_2mm"
+    ] is True
+    assert result["metrics"]["replan_rounds"][2]["replan_progress"][
+        "position_improved_at_least_2mm"
+    ] is True
+    assert result["metrics"]["replan_rounds"][2]["replan_progress"][
+        "fresh_plan_tracking_comparison_used"
+    ] is False
+
+
+def test_move_to_checkpoint_stops_when_later_world_error_progress_is_below_2mm():
+    backend = _FakeBackend(progress=False)
+    executor, env = _executor(backend)
+    scripted_position_errors = iter([0.020, 0.018, 0.016002])
+    execute_calls = 0
+
+    def execute(*_args, **kwargs):
+        nonlocal execute_calls
+        execute_calls += 1
+        position_error = next(scripted_position_errors)
+        return _scripted_whole_body_replan_checkpoint(
+            kwargs,
+            final_position_error_m=position_error,
+        )
+
+    executor._execute_actions = execute
+    result = executor.move_to(hand="left", target_xyz=[0.0, 0.0, 0.0])
+
+    assert result["primitive_success"] is False
     assert result["stop_reason"] == "replan_no_progress"
-    assert len(backend.whole_body_plan_calls) == 2
+    assert execute_calls == 3
+    assert len(backend.whole_body_plan_calls) == 3
+    assert env.calls == []
+    assert result["metrics"]["post_stop_env_actions"] == 0
+    assert result["metrics"]["replan_rounds"][-1]["replan_progress"][
+        "position_improved_at_least_2mm"
+    ] is False
+
+
+@pytest.mark.parametrize(
+    "checkpoint_overrides",
+    [
+        {"commanded_index": 999, "post_step_index": 1000},
+        {"q_sha256": "0" * 64},
+        {"position_improvement_m": float("nan")},
+        {"post_step_index": 2},
+    ],
+)
+def test_move_to_rejects_forged_replan_checkpoint_without_second_plan(
+    checkpoint_overrides,
+):
+    backend = _FakeBackend(progress=False)
+    executor, env = _executor(backend)
+    execute_calls = 0
+
+    def execute(*_args, **kwargs):
+        nonlocal execute_calls
+        execute_calls += 1
+        return _scripted_whole_body_replan_checkpoint(
+            kwargs,
+            final_position_error_m=0.02,
+            checkpoint_overrides=checkpoint_overrides,
+        )
+
+    executor._execute_actions = execute
+    result = executor.move_to(hand="left", target_xyz=[0.0, 0.0, 0.0])
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "whole_body_replan_checkpoint_invalid"
+    assert execute_calls == 1
+    assert len(backend.whole_body_plan_calls) == 1
+    assert env.calls == []
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+def test_move_to_replan_checkpoint_requires_zero_post_stop_actions():
+    backend = _FakeBackend(progress=False)
+    executor, env = _executor(backend)
+
+    def execute(*_args, **kwargs):
+        result = _scripted_whole_body_replan_checkpoint(
+            kwargs,
+            final_position_error_m=0.02,
+        )
+        result["metrics"]["post_stop_env_actions"] = 1
+        return result
+
+    executor._execute_actions = execute
+    result = executor.move_to(hand="left", target_xyz=[0.0, 0.0, 0.0])
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "whole_body_replan_checkpoint_invalid"
+    assert len(backend.whole_body_plan_calls) == 1
     assert env.calls == []
 
 
@@ -1043,6 +2576,12 @@ def test_held_move_validates_exact_attachment_identity_after_every_step():
     result = executor.move_to(hand="left", target_xyz=[0.45, 0.0, 0.0])
 
     assert result["primitive_success"] is True
+    assert len(backend.whole_body_plan_calls) == 1
+    assert all(
+        round_report.get("execution_stop_reason")
+        != "whole_body_replan_checkpoint"
+        for round_report in result["metrics"]["replan_rounds"]
+    )
     assert backend.attachment_reads >= len(env.calls) + 2
     assert (
         result["metrics"]["whole_body_execution"][
@@ -1147,7 +2686,7 @@ def test_press_uses_guarded_two_millimeter_waypoints():
             name,
             RuntimeError(f"{name} must not participate in press execution"),
         )
-        for name in ("collision_report", "joint_margin_report", "dynamics_report")
+        for name in ("collision_report", "joint_margin_report")
     }
     executor, _ = _executor(backend)
     executor._gripper_command = lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -1298,24 +2837,25 @@ def test_move_to_returns_after_first_stable_endpoint_without_extra_hold():
     assert len(env.calls) >= 1
 
 
-def test_move_to_does_not_reject_command_delta_dynamics_heuristic():
+def test_move_to_rejects_execution_step_over_limit_before_first_action():
     executor, env = _executor(_FakeBackend(bad_velocity=True))
 
     result = executor.move_to(hand="left", target_xyz=[0.0, 0.0, 0.0])
 
-    assert result["primitive_success"] is True
-    assert env.calls
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "error"
+    assert "execution_step_admitted" in result["diagnostics"]["error"]
+    assert env.calls == []
 
 
 @pytest.mark.parametrize(
     ("reporter_name", "outcome"),
-    _REMOVED_RUNTIME_REPORTER_CASES,
+    _REMOVED_RUNTIME_REPORTER_CASES[:-1],
     ids=(
         "collision_true",
         "collision_unavailable",
         "joint_margin_false",
         "joint_margin_unavailable",
-        "dynamics_exception",
     ),
 )
 def test_move_to_execution_does_not_query_removed_runtime_safety_reporters(
@@ -1348,9 +2888,6 @@ def test_rotate_wrist_does_not_query_removed_runtime_safety_reporters():
             raise AssertionError("rotate_wrist must not query joint-margin telemetry")
 
     backend = Backend()
-    backend.dynamics_report = lambda: (_ for _ in ()).throw(
-        AssertionError("rotate_wrist must not query dynamics telemetry")
-    )
     executor, env = _executor(backend)
 
     result = executor.rotate_wrist(
@@ -1367,7 +2904,7 @@ def test_public_planner_timeout_remains_a_runtime_gate():
     chunk_step = env.chunk_step
 
     def slow_chunk_step(actions):
-        time.sleep(0.02)
+        time.sleep(0.08)
         return chunk_step(actions)
 
     env.chunk_step = slow_chunk_step
@@ -1375,12 +2912,16 @@ def test_public_planner_timeout_remains_a_runtime_gate():
     result = executor.move_to(
         hand="left",
         target_xyz=[0.0, 0.0, 0.0],
-        timeout_s=0.01,
+        timeout_s=0.05,
     )
 
     assert result["primitive_success"] is False
     assert result["stop_reason"] == "execution_budget_exhausted"
-    assert time.monotonic() - started < 0.1
+    assert result["metrics"]["env_actions_sent"] == 1
+    assert result["metrics"]["env_actions_confirmed"] == 0
+    assert result["metrics"]["env_actions_sent_exact"] is False
+    assert result["metrics"]["partial_motion"] is True
+    assert time.monotonic() - started < 0.4
 
 
 def test_move_to_clamps_public_planning_and_execution_wall_clock_budgets(
@@ -1735,6 +3276,565 @@ def test_generator_construction_does_not_probe_null_lock_resolution(tmp_path):
     assert isinstance(backend._generator(kind="arm", hand="right"), Generator)
 
 
+@pytest.mark.parametrize("kind", ["base", "whole_body"])
+def test_fast_obstacle_refresh_is_installed_on_collision_generators(
+    tmp_path,
+    kind,
+):
+    class Generator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    robot = SimpleNamespace(
+        curobo_path={"default": "default.yaml"},
+        base_joint_names=[],
+    )
+    backend = RealCuroboBackend(None, output_dir=tmp_path)
+    backend._lazy_imports = lambda: None
+    backend._curobo_cls = Generator
+    backend._embodiment_cls = SimpleNamespace(DEFAULT="default", BASE="base")
+    backend._find_robot = lambda: robot
+    backend._base_config_path = lambda: tmp_path / "base.yaml"
+    backend._whole_body_config_path = lambda _hand: tmp_path / "whole.yaml"
+    backend._base_prismatic_workspace_limit = lambda _robot: 10.0
+    installed = []
+    backend._install_fast_obstacle_refresh = installed.append
+
+    generator = backend._generator(kind=kind, hand="left")
+
+    assert installed == [generator]
+
+
+def test_fast_obstacle_refresh_full_pose_topology_ignore_and_error_fallback(
+    tmp_path,
+):
+    class Checker:
+        def __init__(self):
+            self.tensor_args = object()
+            self._env_mesh_names = [["/mesh/a", "/mesh/b"]]
+            self._env_n_mesh = [2]
+            self.pose_updates = []
+            self.fail_name = None
+            self.clear_calls = 0
+
+        def update_obstacle_pose(self, **kwargs):
+            self.pose_updates.append(dict(kwargs))
+            if kwargs["name"] == self.fail_name:
+                self.fail_name = None
+                raise RuntimeError("injected pose update failure")
+
+    class GraphPlanner:
+        def __init__(self):
+            self.reset_calls = 0
+
+        def reset_buffer(self):
+            self.reset_calls += 1
+
+    class MotionGenerator:
+        def __init__(self, checker):
+            self.world_coll_checker = checker
+            self.graph_planner = GraphPlanner()
+
+        def clear_world_cache(self):
+            self.world_coll_checker.clear_calls += 1
+
+    class Generator:
+        def __init__(self):
+            self.checker = Checker()
+            self.mg = {
+                "default": MotionGenerator(self.checker),
+                "base": MotionGenerator(self.checker),
+            }
+            self.full_updates = 0
+            self.collision_calls = 0
+            self.ignored = []
+
+        def update_obstacles(self, ignore_objects=None):
+            self.full_updates += 1
+            self.ignored.append(ignore_objects)
+
+        def check_collisions(self):
+            self.collision_calls += 1
+            self.update_obstacles()
+            return np.asarray([False])
+
+    snapshot_state = {
+        "topology": ("topology-a",),
+        "poses": (
+            ("/mesh/a", [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+            ("/mesh/b", [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+        ),
+    }
+
+    def snapshot_provider(_generator, _ignore_objects):
+        return {
+            "topology": snapshot_state["topology"],
+            "poses": snapshot_state["poses"],
+            "mesh_count": len(snapshot_state["poses"]),
+        }
+
+    generator = Generator()
+    backend = RealCuroboBackend(None, output_dir=tmp_path)
+    backend._install_fast_obstacle_refresh(
+        generator,
+        snapshot_provider=snapshot_provider,
+        world_collision_type=Checker,
+        pose_factory=lambda pose, _tensor_args: tuple(pose),
+    )
+
+    generator.update_obstacles()
+    first = backend._obstacle_refresh_metrics(generator)
+    assert generator.full_updates == 1
+    assert first["mode"] == "full"
+    assert first["reason"] == "first_refresh"
+    assert first["count"] == 1
+    assert first["fallback"] is False
+
+    snapshot_state["poses"] = (
+        ("/mesh/a", [0.2, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+        ("/mesh/b", [1.2, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+    )
+    assert generator.check_collisions().tolist() == [False]
+    second = backend._obstacle_refresh_metrics(generator)
+    assert generator.collision_calls == 1
+    assert generator.full_updates == 1
+    assert [item["name"] for item in generator.checker.pose_updates] == [
+        "/mesh/a",
+        "/mesh/b",
+    ]
+    assert all(
+        item["update_cpu_reference"] is True
+        for item in generator.checker.pose_updates
+    )
+    assert second["mode"] == "pose_only"
+    assert second["count"] == 2
+    assert second["topology_verified"] is True
+    assert second["collision_checks_skipped"] is False
+    assert second["stale_pose_ttl_s"] is None
+    assert second["graph_buffer_reset_count"] == 2
+
+    snapshot_state["topology"] = ("topology-b",)
+    generator.update_obstacles()
+    topology = backend._obstacle_refresh_metrics(generator)
+    assert generator.full_updates == 2
+    assert generator.checker.clear_calls == 1
+    assert topology["mode"] == "full"
+    assert topology["reason"] == "topology_change"
+    assert topology["count"] == 3
+
+    generator.update_obstacles(ignore_objects=[object()])
+    ignored = backend._obstacle_refresh_metrics(generator)
+    assert generator.full_updates == 3
+    assert generator.ignored[-1] is not None
+    assert ignored["reason"] == "ignore_objects"
+    assert ignored["count"] == 4
+
+    generator.checker.fail_name = "/mesh/b"
+    generator.update_obstacles()
+    fallback = backend._obstacle_refresh_metrics(generator)
+    assert generator.full_updates == 4
+    assert generator.checker.clear_calls == 2
+    assert fallback["mode"] == "full"
+    assert fallback["reason"] == "fallback_full"
+    assert fallback["fallback"] is True
+    assert "injected pose update failure" in fallback["fallback_reason"]
+    assert fallback["count"] == 5
+    assert all(
+        motion_gen.graph_planner.reset_calls >= 5
+        for motion_gen in generator.mg.values()
+    )
+
+    backend._generators["base:left"] = generator
+    backend.on_runtime_state_changed()
+    generator.update_obstacles()
+    retained = backend._obstacle_refresh_metrics(generator)
+    assert generator.full_updates == 4
+    assert retained["reason"] == "unchanged_rigid_mesh_topology"
+    assert retained["count"] == 6
+
+
+@_REQUIRES_TORCH
+def test_fast_obstacle_refresh_batches_gpu_and_cpu_pose_updates(tmp_path):
+    class Checker:
+        def __init__(self):
+            self.tensor_args = SimpleNamespace(device="cpu")
+            self._env_mesh_names = [["/mesh/a", "/mesh/b"]]
+            self._env_n_mesh = [2]
+            self.world_model = SimpleNamespace(
+                objects=[
+                    SimpleNamespace(name="/mesh/a", pose=None),
+                    SimpleNamespace(name="/mesh/b", pose=None),
+                ]
+            )
+            self.batch_updates = []
+
+        def update_mesh_pose(self, **kwargs):
+            self.batch_updates.append(dict(kwargs))
+
+        def update_obstacle_pose(self, **_kwargs):
+            raise AssertionError("batch-capable checker used the scalar pose API")
+
+    class MotionGenerator:
+        def __init__(self, checker):
+            self.world_coll_checker = checker
+            self.graph_planner = SimpleNamespace(reset_buffer=lambda: None)
+
+        def clear_world_cache(self):
+            pass
+
+    class Generator:
+        def __init__(self):
+            self.checker = Checker()
+            self.mg = {"default": MotionGenerator(self.checker)}
+            self.full_updates = 0
+
+        def update_obstacles(self, ignore_objects=None):
+            assert ignore_objects is None
+            self.full_updates += 1
+
+    snapshot = {
+        "topology": ("same-topology",),
+        "poses": (
+            ("/mesh/a", [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+            ("/mesh/b", [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+        ),
+        "mesh_count": 2,
+    }
+    points_a, faces_a, points_b, faces_b = (object() for _ in range(4))
+    snapshot["storage_refs"] = (
+        ("/mesh/a", points_a, faces_a),
+        ("/mesh/b", points_b, faces_b),
+    )
+    kinematic_cache_receipts = []
+
+    def snapshot_provider(
+        _generator,
+        _ignored,
+        *,
+        kinematic_cache=None,
+    ):
+        kinematic_cache_receipts.append(kinematic_cache)
+        snapshot["kinematic_cache"] = {
+            "generation": len(kinematic_cache_receipts)
+        }
+        return snapshot
+
+    generator = Generator()
+    backend = RealCuroboBackend(None, output_dir=tmp_path)
+    backend._install_fast_obstacle_refresh(
+        generator,
+        snapshot_provider=snapshot_provider,
+        world_collision_type=Checker,
+        pose_factory=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("scalar pose factory used")
+        ),
+        pose_batch_factory=lambda rows, _tensor_args: ("batch", rows),
+    )
+
+    generator.update_obstacles()
+    snapshot["poses"] = (
+        ("/mesh/a", [0.2, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+        ("/mesh/b", [1.2, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+    )
+    generator.update_obstacles()
+
+    assert generator.full_updates == 1
+    assert len(generator.checker.batch_updates) == 1
+    update = generator.checker.batch_updates[0]
+    assert update["w_obj_pose"][0] == "batch"
+    assert update["env_obj_idx"].tolist() == [0, 1]
+    assert [
+        obstacle.pose for obstacle in generator.checker.world_model.objects
+    ] == [list(pose) for _name, pose in snapshot["poses"]]
+    metrics = backend._obstacle_refresh_metrics(generator)
+    assert metrics["mode"] == "pose_only"
+    assert metrics["pose_update_mode"] == "batch_tensor_and_linear_cpu"
+    assert kinematic_cache_receipts == [
+        None,
+        None,
+        {"generation": 2},
+    ]
+
+    # Replacement is detected by object identity while the baseline retains
+    # strong references, so CPython id reuse cannot create an ABA match.
+    snapshot["storage_refs"] = (
+        ("/mesh/a", object(), faces_a),
+        ("/mesh/b", points_b, faces_b),
+    )
+    generator.update_obstacles()
+    assert generator.full_updates == 2
+    assert len(generator.checker.batch_updates) == 1
+    metrics = backend._obstacle_refresh_metrics(generator)
+    assert metrics["mode"] == "full"
+    assert metrics["reason"] == "mesh_storage_replaced"
+    assert kinematic_cache_receipts[-1] == {"generation": 3}
+
+
+@_REQUIRES_TORCH
+def test_mesh_topology_key_is_identical_for_full_and_pose_only_snapshots():
+    import torch
+
+    vertices = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=torch.float32,
+    )
+
+    full_key = RealCuroboBackend._mesh_topology_component(
+        vertices,
+        full_digest=True,
+        exact_values=True,
+    )
+    pose_only_key = RealCuroboBackend._mesh_topology_component(
+        vertices,
+        full_digest=True,
+        exact_values=True,
+    )
+    assert full_key == pose_only_key
+    assert RealCuroboBackend._mesh_topology_component(
+        vertices.clone(),
+        full_digest=True,
+        exact_values=True,
+    ) == pose_only_key
+    assert RealCuroboBackend._mesh_topology_component(
+        torch.ones_like(vertices),
+        full_digest=True,
+        exact_values=True,
+    ) != pose_only_key
+
+    vertices.add_(1.0)
+    mutated_key = RealCuroboBackend._mesh_topology_component(
+        vertices,
+        full_digest=True,
+        exact_values=True,
+    )
+    assert mutated_key != pose_only_key
+
+
+@_REQUIRES_TORCH
+def test_cached_torch_mesh_topology_key_uses_identity_and_mutation_version():
+    import torch
+
+    vertices = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=torch.float32,
+    )
+    initial = RealCuroboBackend._mesh_topology_component(
+        vertices,
+        full_digest=True,
+        exact_values=False,
+    )
+    assert (
+        RealCuroboBackend._mesh_topology_component(
+            vertices,
+            full_digest=False,
+            exact_values=False,
+        )
+        == initial
+    )
+    assert (
+        RealCuroboBackend._mesh_topology_component(
+            vertices.clone(),
+            full_digest=False,
+            exact_values=False,
+        )
+        != initial
+    )
+
+    vertices.add_(1.0)
+    assert (
+        RealCuroboBackend._mesh_topology_component(
+            vertices,
+            full_digest=False,
+            exact_values=False,
+        )
+        != initial
+    )
+
+
+@_REQUIRES_TORCH
+def test_collision_snapshot_reads_each_parent_link_once_and_reuses_local_pose(
+    monkeypatch,
+):
+    import torch
+
+    def pose2mat(pose):
+        position, quaternion = pose
+        position = torch.as_tensor(position, dtype=torch.float32)
+        x, y, z, w = torch.as_tensor(quaternion, dtype=torch.float32)
+        rotation = torch.tensor(
+            [
+                [
+                    1 - 2 * (y * y + z * z),
+                    2 * (x * y - z * w),
+                    2 * (x * z + y * w),
+                ],
+                [
+                    2 * (x * y + z * w),
+                    1 - 2 * (x * x + z * z),
+                    2 * (y * z - x * w),
+                ],
+                [
+                    2 * (x * z - y * w),
+                    2 * (y * z + x * w),
+                    1 - 2 * (x * x + y * y),
+                ],
+            ],
+            dtype=torch.float32,
+        )
+        result = torch.eye(4, dtype=torch.float32)
+        result[:3, :3] = rotation
+        result[:3, 3] = position
+        return result
+
+    def mat2pose(matrix):
+        matrix = torch.as_tensor(matrix, dtype=torch.float32)
+        yaw = torch.atan2(matrix[1, 0], matrix[0, 0])
+        quaternion = torch.stack(
+            [
+                torch.tensor(0.0),
+                torch.tensor(0.0),
+                torch.sin(yaw / 2),
+                torch.cos(yaw / 2),
+            ]
+        )
+        return matrix[:3, 3].clone(), quaternion
+
+    transform_module = ModuleType("omnigibson.utils.transform_utils")
+    transform_module.pose2mat = pose2mat
+    transform_module.pose_inv = torch.linalg.inv
+    transform_module.mat2pose = mat2pose
+    utils_module = ModuleType("omnigibson.utils")
+    utils_module.__path__ = []
+    utils_module.transform_utils = transform_module
+    lazy_module = ModuleType("omnigibson.lazy")
+    og_module = ModuleType("omnigibson")
+    og_module.__path__ = []
+    og_module.sim = SimpleNamespace(floor_plane=None)
+    og_module.lazy = lazy_module
+    monkeypatch.setitem(sys.modules, "omnigibson", og_module)
+    monkeypatch.setitem(sys.modules, "omnigibson.lazy", lazy_module)
+    monkeypatch.setitem(sys.modules, "omnigibson.utils", utils_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "omnigibson.utils.transform_utils",
+        transform_module,
+    )
+
+    class Link:
+        def __init__(self, position, yaw):
+            self.position = torch.tensor(position, dtype=torch.float32)
+            self.yaw = float(yaw)
+            self.pose_reads = 0
+            self.collision_meshes = {}
+
+        def get_position_orientation(self):
+            self.pose_reads += 1
+            return (
+                self.position,
+                torch.tensor(
+                    [
+                        0.0,
+                        0.0,
+                        math.sin(self.yaw / 2),
+                        math.cos(self.yaw / 2),
+                    ],
+                    dtype=torch.float32,
+                ),
+            )
+
+    class Mesh:
+        geom_type = "Mesh"
+
+        def __init__(self, name, link, local_position):
+            self.prim_path = name
+            self.link = link
+            self.local = pose2mat(
+                (
+                    torch.tensor(local_position, dtype=torch.float32),
+                    torch.tensor([0.0, 0.0, 0.0, 1.0]),
+                )
+            )
+            self.points = torch.tensor(
+                [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]],
+                dtype=torch.float32,
+            )
+            self.faces = torch.tensor([[0, 1, 2]], dtype=torch.int64)
+            self.pose_reads = 0
+
+        def get_position_orientation(self):
+            self.pose_reads += 1
+            return mat2pose(pose2mat(self.link.get_position_orientation()) @ self.local)
+
+        @staticmethod
+        def get_world_scale():
+            return torch.ones(3, dtype=torch.float32)
+
+    link_a = Link([1.0, 2.0, 0.0], math.radians(90.0))
+    link_b = Link([-1.0, 0.5, 0.0], 0.0)
+    meshes = [
+        Mesh("/mesh/a0", link_a, [0.1, 0.0, 0.0]),
+        Mesh("/mesh/a1", link_a, [0.0, 0.2, 0.0]),
+        Mesh("/mesh/b0", link_b, [0.3, 0.0, 0.0]),
+        Mesh("/mesh/b1", link_b, [0.0, -0.4, 0.0]),
+    ]
+    link_a.collision_meshes = {
+        mesh.prim_path: mesh for mesh in meshes if mesh.link is link_a
+    }
+    link_b.collision_meshes = {
+        mesh.prim_path: mesh for mesh in meshes if mesh.link is link_b
+    }
+    class SceneObject:
+        visual_only = False
+        links = {"a": link_a, "b": link_b}
+
+    obj = SceneObject()
+    root = SimpleNamespace(
+        get_position_orientation=lambda: (
+            torch.zeros(3),
+            torch.tensor([0.0, 0.0, 0.0, 1.0]),
+        )
+    )
+    robot = SimpleNamespace(root_link=root)
+    robot.scene = SimpleNamespace(objects=[robot, obj])
+    generator = SimpleNamespace(robot=robot)
+
+    first = RealCuroboBackend._current_collision_mesh_snapshot(
+        generator,
+        full_digest=True,
+    )
+    # One parent-link read is for the grouped cache and one per mesh comes
+    # from the fake mesh's initial authoritative world-pose read.
+    assert link_a.pose_reads == 3
+    assert link_b.pose_reads == 3
+    assert all(mesh.pose_reads == 1 for mesh in meshes)
+    assert first["snapshot_timings"]["unique_link_count"] == 2
+
+    link_a.position = torch.tensor([2.0, -1.0, 0.0])
+    link_a.yaw = math.radians(-90.0)
+    link_b.position = torch.tensor([0.5, 1.5, 0.0])
+    second = RealCuroboBackend._current_collision_mesh_snapshot(
+        generator,
+        full_digest=False,
+        kinematic_cache=first["kinematic_cache"],
+    )
+
+    assert link_a.pose_reads == 4
+    assert link_b.pose_reads == 4
+    assert all(mesh.pose_reads == 1 for mesh in meshes)
+    assert second["snapshot_timings"]["unique_link_count"] == 2
+    poses = dict(second["poses"])
+    for mesh in meshes:
+        expected_position, expected_xyzw = mat2pose(
+            pose2mat(mesh.link.get_position_orientation()) @ mesh.local
+        )
+        expected = [
+            *expected_position.tolist(),
+            float(expected_xyzw[3]),
+            *expected_xyzw[:3].tolist(),
+        ]
+        np.testing.assert_allclose(poses[mesh.prim_path], expected, atol=1e-6)
+
+
 @_REQUIRES_TORCH
 def test_fresh_attached_generator_refreshes_world_registry_without_collision_admission(
     tmp_path,
@@ -1796,7 +3896,9 @@ def test_fresh_attached_generator_refreshes_world_registry_without_collision_adm
     assert result["metrics"]["collision_admission_enabled"] is False
 
 
-def test_real_warmup_uses_only_whole_body_planners_without_env_actions(tmp_path):
+def test_real_warmup_includes_base_and_whole_body_identity_plans_without_actions(
+    tmp_path,
+):
     class Robot:
         @staticmethod
         def get_joint_positions():
@@ -1818,9 +3920,19 @@ def test_real_warmup_uses_only_whole_body_planners_without_env_actions(tmp_path)
     backend.get_eef_pose = lambda hand: eef_poses[hand]
     assert not hasattr(backend, "_candidate_base_collision_reports")
     assert not hasattr(backend, "_check_q_trajectory_collisions")
-    backend._compute_base_plan = lambda **_kwargs: pytest.fail(
-        "whole-body analytic warmup must not compile the unrelated BASE planner"
-    )
+    base_calls = []
+
+    def base_plan(**kwargs):
+        base_calls.append(kwargs)
+        return {
+            "ok": True,
+            "metrics": {
+                "trajectory_waypoints": 1,
+                "collision_admission": {"admitted": True},
+            },
+        }
+
+    backend._compute_base_plan = base_plan
     arm_calls = []
 
     def arm_plan(**kwargs):
@@ -1835,6 +3947,14 @@ def test_real_warmup_uses_only_whole_body_planners_without_env_actions(tmp_path)
     result = backend.warmup()
 
     assert result["status"] == "complete"
+    assert len(base_calls) == 1
+    np.testing.assert_allclose(base_calls[0]["target_xyyaw"], [0.0, 0.0, 0.0])
+    assert base_calls[0]["timeout_s"] == pytest.approx(120.0)
+    assert base_calls[0]["skip_obstacle_update"] is False
+    assert base_calls[0]["attempt_timeout_cap_s"] == pytest.approx(8.0)
+    assert base_calls[0]["solver_timeout_cap_s"] == pytest.approx(6.0)
+    assert base_calls[0]["planning_profile"] == RESET_IDENTITY_WARMUP_PROFILE
+    assert base_calls[0]["wall_clock_timeout_s"] == pytest.approx(120.0)
     assert arm_calls == []
     assert [call["hand"] for call in whole_body_calls] == ["left", "right"]
     for call in whole_body_calls:
@@ -1844,13 +3964,166 @@ def test_real_warmup_uses_only_whole_body_planners_without_env_actions(tmp_path)
             call["target_quat_xyzw"],
             expected_quaternion,
         )
-        assert call["timeout_s"] == pytest.approx(60.0)
+        assert call["timeout_s"] == pytest.approx(12.0)
+        assert call["search_profile"] == RESET_IDENTITY_WARMUP_PROFILE
+        assert call["search_profile"] != WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG
+        assert call["wall_clock_timeout_s"] == pytest.approx(120.0)
     assert result["identity_warmup"]["env_actions_sent"] == 0
     assert result["identity_warmup"]["simulator_advanced"] is False
+    assert result["identity_warmup"]["base"] == {
+        "query": "current_pose_identity_trajectory",
+        "ok": True,
+        "stop_reason": None,
+        "trajectory_waypoints": 1,
+        "collision_admitted": True,
+    }
     assert [sample["query"] for sample in result["identity_warmup"]["hands"]] == [
         "identity_trajectory",
         "identity_trajectory",
     ]
+    artifact = Path(result["artifact"])
+    assert artifact.exists()
+    assert json.loads(artifact.read_text(encoding="utf-8"))["status"] == "complete"
+
+
+def test_background_whole_body_planning_does_not_enter_signal_deadline(
+    monkeypatch,
+):
+    backend = RealCuroboBackend(None)
+    backend._compute_whole_body_plan = lambda **_kwargs: {
+        "ok": True,
+        "metrics": {},
+    }
+
+    def forbidden_deadline(*_args, **_kwargs):
+        raise AssertionError("background planning must not install SIGALRM")
+
+    monkeypatch.setattr(
+        "robots.behavior.planner_executor._wall_clock_deadline",
+        forbidden_deadline,
+    )
+    result = backend.plan_whole_body_trajectory(
+        hand="left",
+        target_xyz=np.zeros(3),
+        target_quat_xyzw=None,
+        timeout_s=12.0,
+        search_profile=WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG,
+        background=True,
+    )
+
+    assert result["ok"] is True
+    assert result["metrics"]["deadline_enforcement"] == {
+        "solver_timeout_enforced": True,
+        "hard_wall_clock_enforced": False,
+        "hard_wall_clock_deadline_s": None,
+        "soft_deadline_s": 12.0,
+        "solver_planning_budget_s": 12.0,
+    }
+
+
+def test_reset_warmup_wall_override_preserves_dashboard_solver_budget(
+    monkeypatch,
+):
+    deadlines = []
+    compute_calls = []
+
+    @contextmanager
+    def recording_deadline(timeout_s, operation):
+        deadlines.append((str(operation), float(timeout_s)))
+        yield
+
+    backend = RealCuroboBackend(None)
+    backend._compute_whole_body_plan = lambda **kwargs: (
+        compute_calls.append(kwargs) or {"ok": True, "metrics": {}}
+    )
+    monkeypatch.setattr(
+        "robots.behavior.planner_executor._wall_clock_deadline",
+        recording_deadline,
+    )
+    dashboard = {
+        "hand": "left",
+        "target_xyz": np.zeros(3),
+        "target_quat_xyzw": np.asarray([0.0, 0.0, 0.0, 1.0]),
+        "timeout_s": 12.0,
+        "search_profile": WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG,
+    }
+    warmup = {
+        **dashboard,
+        "search_profile": RESET_IDENTITY_WARMUP_PROFILE,
+    }
+
+    runtime = backend.plan_whole_body_trajectory(**dashboard)
+    reset_warmup = backend.plan_whole_body_trajectory(
+        **warmup,
+        wall_clock_timeout_s=RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S,
+    )
+
+    assert runtime["ok"] is True
+    assert reset_warmup["ok"] is True
+    assert [call["timeout_s"] for call in compute_calls] == pytest.approx(
+        [12.0, 12.0]
+    )
+    assert [call["search_profile"] for call in compute_calls] == [
+        WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG,
+        RESET_IDENTITY_WARMUP_PROFILE,
+    ]
+    assert deadlines == [
+        ("left whole-body planning transaction", pytest.approx(12.0)),
+        (
+            "left whole-body planning transaction",
+            pytest.approx(RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S),
+        ),
+    ]
+    assert runtime["metrics"]["deadline_enforcement"][
+        "solver_planning_budget_s"
+    ] == pytest.approx(12.0)
+    assert reset_warmup["metrics"]["deadline_enforcement"][
+        "solver_planning_budget_s"
+    ] == pytest.approx(12.0)
+
+
+def test_reset_identity_warmup_profile_excludes_dashboard_local_ik():
+    profile = _whole_body_search_profile(RESET_IDENTITY_WARMUP_PROFILE)
+
+    assert profile["name"] == RESET_IDENTITY_WARMUP_PROFILE
+    assert profile["name"] != WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG
+    assert "local_ik_deadline_s" not in profile
+    assert profile["planning_deadline_s"] == pytest.approx(12.0)
+    assert profile["fast_trajopt_deadline_s"] == pytest.approx(4.0)
+
+
+def test_real_warmup_base_identity_failure_is_fail_closed_and_artifacted(
+    tmp_path,
+):
+    class Robot:
+        @staticmethod
+        def get_joint_positions():
+            return np.zeros(28, dtype=np.float32)
+
+    backend = RealCuroboBackend(None, output_dir=tmp_path)
+    backend._find_robot = lambda: Robot()
+    backend._base_xy_yaw = lambda _robot: np.zeros(4)
+    backend._compute_base_plan = lambda **_kwargs: {
+        "ok": False,
+        "stop_reason": "collision",
+        "metrics": {"env_actions_sent": 0},
+    }
+    backend.plan_whole_body_trajectory = lambda **_kwargs: pytest.fail(
+        "hand warmup must not run after BASE identity failure"
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="BASE current-pose cuRobo warmup failed closed",
+    ):
+        backend.warmup()
+
+    artifact = tmp_path / "planner_curobo_warmup.json"
+    report = json.loads(artifact.read_text(encoding="utf-8"))
+    assert report["status"] == "error"
+    assert report["artifact"] == str(artifact)
+    assert report["identity_warmup"]["env_actions_sent"] == 0
+    assert report["identity_warmup"]["simulator_advanced"] is False
 
 
 def test_guarded_ik_uses_current_state_as_public_solver_seed_and_retract(tmp_path):
@@ -2361,7 +4634,18 @@ def test_base_reachability_uses_precontact_point_toward_candidate():
 
 
 @_REQUIRES_TORCH
-def test_base_plan_requires_dense_collision_admission(tmp_path):
+def test_base_plan_requires_dense_collision_admission(tmp_path, monkeypatch):
+    wall_clock_calls = []
+
+    @contextmanager
+    def recording_deadline(timeout_s, operation):
+        wall_clock_calls.append((str(operation), float(timeout_s)))
+        yield
+
+    monkeypatch.setattr(
+        "robots.behavior.planner_executor._wall_clock_deadline",
+        recording_deadline,
+    )
     full_names = [
         "base_footprint_x_joint",
         "base_footprint_y_joint",
@@ -2408,8 +4692,12 @@ def test_base_plan_requires_dense_collision_admission(tmp_path):
 
         def __init__(self):
             self.compute_kwargs = None
+            self.compute_calls = 0
+            self.collision_q = None
+            self.collision_kwargs = []
 
         def compute_trajectories(self, _positions, _quaternions, **kwargs):
+            self.compute_calls += 1
             self.compute_kwargs = kwargs
             return np.array([True, False]), [path, None]
 
@@ -2417,10 +4705,10 @@ def test_base_plan_requires_dense_collision_admission(tmp_path):
         def path_to_joint_trajectory(_path, **_kwargs):
             raise AssertionError("BASE full-js augmentation must not be called")
 
-        @staticmethod
-        def check_collisions(q, **kwargs):
+        def check_collisions(self, q, **kwargs):
             assert kwargs["self_collision_check"] is True
-            assert kwargs["skip_obstacle_update"] is True
+            self.collision_q = np.asarray(q).copy()
+            self.collision_kwargs.append(dict(kwargs))
             return np.zeros(len(q), dtype=bool)
 
     class Robot:
@@ -2444,20 +4732,126 @@ def test_base_plan_requires_dense_collision_admission(tmp_path):
 
     result = backend._compute_base_plan(
         target_xyyaw=np.array([0.2, 0.1, 0.2]),
-        timeout_s=1.0,
+        timeout_s=12.0,
     )
 
     assert result["ok"] is True
+    assert generator.compute_calls == 1
+    assert generator.collision_kwargs[-1]["skip_obstacle_update"] is True
     assert generator.compute_kwargs["ik_only"] is True
     assert generator.compute_kwargs["ik_world_collision_check"] is True
     assert generator.compute_kwargs["skip_obstacle_update"] is False
+    assert generator.compute_kwargs["timeout"] == pytest.approx(6.0)
+    assert result["metrics"]["attempt_timeout_budget_s"] == pytest.approx(8.0)
+    assert result["metrics"]["attempt_timeout_s"] == pytest.approx(6.0)
+    assert result["metrics"]["solver_timeout_s"] == pytest.approx(6.0)
+    assert result["metrics"]["attempt_timeout_cap_s"] == pytest.approx(8.0)
+    assert result["metrics"]["solver_timeout_cap_s"] == pytest.approx(6.0)
+    assert result["metrics"]["planning_profile"] == "default"
     assert result["metrics"]["collision_admission_enabled"] is True
     assert result["metrics"]["obstacle_update"] is True
     assert result["metrics"]["collision_admission"]["admitted"] is True
     assert result["metrics"]["base_trajectory_certificate"][
         "post_interpolation_check"
     ] is True
-    assert len(result["joint_trajectory"]) >= 1
+    trajectory = np.asarray(result["joint_trajectory"], dtype=np.float32)
+    certificate = result["metrics"]["base_trajectory_certificate"]
+    assert len(trajectory) >= 1
+    assert certificate["waypoint_count"] == len(trajectory)
+    assert certificate["trajectory_sha256"] == hashlib.sha256(
+        np.ascontiguousarray(trajectory).tobytes()
+    ).hexdigest()
+    assert generator.collision_q is not None
+    assert len(generator.collision_q) > len(trajectory)
+    resampling = result["metrics"]["execution_resampling"]
+    assert resampling["source"] == "base_ik_minimum_jerk_execution_resampling"
+    assert resampling["method"] == "quintic_minimum_jerk"
+    assert resampling["measured_max_xy_step_m"] <= (
+        BASE_EXECUTION_XY_STEP_M + 1e-9
+    )
+    assert resampling["measured_max_yaw_step_rad"] <= (
+        BASE_EXECUTION_YAW_STEP_RAD + 1e-9
+    )
+
+    prepared_result = backend._compute_base_plan(
+        target_xyyaw=np.array([0.2, 0.1, 0.2]),
+        timeout_s=12.0,
+        attempt_timeout_cap_s=4.0,
+        solver_timeout_cap_s=4.0,
+        planning_profile=DASHBOARD_PREPARED_BASE_PLANNING_PROFILE,
+    )
+
+    assert prepared_result["ok"] is True
+    assert generator.compute_calls == 1
+    assert generator.collision_kwargs[-1]["skip_obstacle_update"] is False
+    assert prepared_result["metrics"]["solver_invoked"] is False
+    assert prepared_result["metrics"]["base_goal_construction"] == {
+        "method": "analytic_full_q_base_assignment",
+        "active_base_indices": [0, 1, 5],
+        "nonbase_locked_to_call_start": True,
+        "continuous_shortest_yaw_arc": True,
+    }
+    assert prepared_result["metrics"][
+        "attempt_timeout_budget_s"
+    ] == pytest.approx(
+        4.0
+    )
+    assert prepared_result["metrics"]["attempt_timeout_s"] == pytest.approx(4.0)
+    assert prepared_result["metrics"]["solver_timeout_s"] == pytest.approx(4.0)
+    assert prepared_result["metrics"]["attempt_timeout_cap_s"] == pytest.approx(
+        4.0
+    )
+    assert prepared_result["metrics"]["solver_timeout_cap_s"] == pytest.approx(
+        4.0
+    )
+    assert prepared_result["metrics"]["planning_profile"] == (
+        DASHBOARD_PREPARED_BASE_PLANNING_PROFILE
+    )
+    assert prepared_result["metrics"]["execution_resampling"]["source"] == (
+        "analytic_full_q_minimum_jerk_execution_resampling"
+    )
+    assert prepared_result["metrics"]["execution_resampling"][
+        "xy_step_limit_m"
+    ] == pytest.approx(DASHBOARD_BASE_EXECUTION_XY_STEP_M)
+    assert prepared_result["metrics"]["execution_resampling"][
+        "yaw_step_limit_rad"
+    ] == pytest.approx(DASHBOARD_BASE_EXECUTION_YAW_STEP_RAD)
+    prepared_trajectory = np.asarray(
+        prepared_result["joint_trajectory"], dtype=np.float32
+    )
+    np.testing.assert_array_equal(prepared_trajectory[:, 2:5], 0.0)
+    np.testing.assert_array_equal(prepared_trajectory[:, 6:], 0.0)
+
+    warmup_result = backend._compute_base_plan(
+        target_xyyaw=np.array([0.2, 0.1, 0.2]),
+        timeout_s=RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S,
+        attempt_timeout_cap_s=8.0,
+        solver_timeout_cap_s=6.0,
+        planning_profile=RESET_IDENTITY_WARMUP_PROFILE,
+        wall_clock_timeout_s=RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S,
+    )
+
+    assert warmup_result["ok"] is True
+    assert generator.compute_calls == 2
+    assert generator.compute_kwargs["timeout"] == pytest.approx(6.0)
+    assert warmup_result["metrics"]["attempt_timeout_budget_s"] == pytest.approx(
+        8.0
+    )
+    assert warmup_result["metrics"]["solver_timeout_s"] == pytest.approx(6.0)
+    assert warmup_result["metrics"]["planning_profile"] == (
+        RESET_IDENTITY_WARMUP_PROFILE
+    )
+    assert warmup_result["metrics"]["deadline_enforcement"][
+        "hard_wall_clock_deadline_s"
+    ] == pytest.approx(RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S)
+    assert wall_clock_calls == [
+        ("BASE cuRobo candidate", pytest.approx(8.0)),
+        ("BASE cuRobo candidate", pytest.approx(4.0)),
+        (
+            "BASE cuRobo candidate",
+            pytest.approx(RESET_IDENTITY_WARMUP_STAGE_DEADLINE_S),
+        ),
+    ]
 
 
 @_REQUIRES_TORCH
@@ -2812,6 +5206,36 @@ def test_base_waypoint_tracking_is_tighter_than_final_arrival_tolerance():
     assert backend.joint_tracking_report(target, hand=None)["reached"] is False
 
 
+def test_whole_body_tracking_l2_wraps_equivalent_two_pi_base_yaw():
+    class Robot:
+        base_control_idx = [0, 1, 5]
+        trunk_control_idx = [6, 7, 8, 9]
+        arm_control_idx = {
+            "left": list(range(10, 17)),
+            "right": list(range(17, 24)),
+        }
+
+        @staticmethod
+        def get_joint_positions():
+            current = np.zeros(28, dtype=np.float32)
+            current[5] = math.pi - 0.01
+            return current
+
+    backend = RealCuroboBackend(None)
+    backend._robot = Robot()
+    target = Robot.get_joint_positions()
+    target[5] -= np.float32(2.0 * math.pi)
+    target[6] = 0.003
+
+    report = backend.joint_tracking_report(target, hand=None)
+
+    assert report["available"] is True
+    assert report["reached"] is True
+    assert report["base_yaw_error_rad"] <= 1e-6
+    assert report["normalized_21d_tracking_error"] == pytest.approx(0.15)
+    assert report["active_joint_l2_error"] == pytest.approx(0.003, abs=1e-6)
+
+
 def test_arm_waypoint_tracking_tolerates_small_controller_settling_error():
     class Robot:
         base_control_idx = [0, 1, 5]
@@ -3131,15 +5555,19 @@ def test_move_to_plans_directly_with_collision_certified_whole_body(hand):
     backend = Backend()
     executor, env = _executor(backend)
 
-    result = executor.move_to(
+    result = _move_to_without_replan_checkpoint(
+        executor,
         hand=hand,
-        target_xyz=[0.45, 0.0, -0.05],
+        target_xyz=[0.55, 0.0, 0.0],
     )
 
     assert result["primitive_success"] is True
     assert result["metrics"]["motion_scope"] == "whole_body"
     assert result["metrics"]["generator_kind"] == "whole_body"
     assert result["metrics"]["active_dof_count"] == 21
+    assert result["metrics"]["whole_body_eef_path_guard"][
+        "waypoint_settle_position_tolerance_m"
+    ] == pytest.approx(0.002)
     assert result["metrics"]["collision_admission"] == {
         "available": True,
         "admitted": True,
@@ -3173,9 +5601,1545 @@ def test_move_to_plans_directly_with_collision_certified_whole_body(hand):
             )
 
 
+def test_whole_body_live_eef_divergence_stops_before_next_action():
+    class Backend(_FakeBackend):
+        def advance(self):
+            assert self.target is not None
+            self.pose = self.target + np.asarray([0.2, 0.0, 0.0])
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    result = executor.move_to(
+        hand="right",
+        target_xyz=[0.45, 0.0, -0.05],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "eef_path_divergence"
+    assert result["metrics"]["executed_waypoints"] == 1
+    assert result["metrics"]["partial_motion"] is True
+    assert result["metrics"]["post_stop_env_actions"] == 0
+    assert len(env.calls) == 1
+    guard = result["metrics"]["whole_body_eef_path_guard"]
+    assert guard["live_waypoint_position_tolerance_m"] == pytest.approx(0.005)
+    assert guard["live_waypoint_orientation_tolerance_rad"] == pytest.approx(
+        math.radians(1.0)
+    )
+    assert guard["last_waypoint"]["violations"]["waypoint_position"] is True
+    assert guard["max_observed_live_waypoint_position_error_m"] > 0.005
+
+
+def test_whole_body_streams_each_intermediate_waypoint_exactly_once():
+    class Backend(_FakeBackend):
+        marker_step = 0.0001
+        delayed_waypoint = 3
+
+        def __init__(self):
+            super().__init__()
+            self.commanded_waypoint_indices = []
+            self.waypoint_command_counts = {}
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            result = super().plan_whole_body_trajectory(**kwargs)
+            trajectory = np.asarray(
+                result["joint_trajectory"], dtype=np.float32
+            ).copy()
+            trajectory[:, 6] = (
+                np.arange(len(trajectory), dtype=np.float32) * self.marker_step
+            )
+            result["joint_trajectory"] = trajectory
+            return self._refresh_whole_body_certificate(result)
+
+        def joint_target_to_action(
+            self,
+            target_q,
+            *,
+            hand,
+            fixed_reference=None,
+        ):
+            action = super().joint_target_to_action(
+                target_q,
+                hand=hand,
+                fixed_reference=fixed_reference,
+            )
+            target = np.asarray(target_q, dtype=np.float32).reshape(-1)
+            waypoint_index = int(round(float(target[6]) / self.marker_step))
+            self.commanded_waypoint_indices.append(waypoint_index)
+            count = self.waypoint_command_counts.get(waypoint_index, 0) + 1
+            self.waypoint_command_counts[waypoint_index] = count
+            nominal = self.execution_eef_positions[waypoint_index].astype(
+                np.float64
+            )
+            if waypoint_index == self.delayed_waypoint and count == 1:
+                nominal = nominal - np.asarray([0.0, 0.0044, 0.0])
+            self.next_execution_eef_pose = nominal
+            self.next_execution_eef_quat = self.execution_eef_quaternions[
+                waypoint_index
+            ].astype(np.float64)
+            return action
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    result = _move_to_without_replan_checkpoint(
+        executor,
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is True, result.get("stop_reason")
+    assert backend.commanded_waypoint_indices[3:5] == [3, 4]
+    assert all(
+        count == 1
+        for waypoint, count in backend.waypoint_command_counts.items()
+        if waypoint < max(backend.commanded_waypoint_indices)
+    )
+    assert len(env.calls) == 20
+    delayed = [
+        row["whole_body_eef_waypoint_tracking"]
+        for row in result["trace"]
+        if row.get("whole_body_eef_waypoint_tracking", {}).get(
+            "commanded_index"
+        )
+        == 3
+    ]
+    assert len(delayed) == 1
+    assert delayed[0]["waypoint_settled"] is False
+    assert delayed[0]["post_step_index"] == 4
+    assert delayed[0]["joint_waypoint_reached"] is True
+    assert delayed[0]["position_error_m"] == pytest.approx(0.0044, abs=1e-6)
+    assert delayed[0][
+        "configured_position_settle_tolerance_m"
+    ] == pytest.approx(0.004)
+    assert delayed[0][
+        "effective_position_settle_tolerance_m"
+    ] < 0.004
+    assert delayed[0]["prospective_position_bound_m"] > 0.005
+    assert delayed[0]["violations"]["waypoint_position"] is False
+    guard = result["metrics"]["whole_body_eef_path_guard"]
+    assert guard["waypoint_settle_position_tolerance_m"] == pytest.approx(
+        0.004
+    )
+    certificate = result["metrics"]["whole_body_certificate"]
+    assert certificate["active_dof_count"] == 21
+    assert certificate["inactive_eef_goal_count"] == 0
+    assert certificate["attachment_hand_count"] == 2
+
+
+@pytest.mark.parametrize("success_on_terminal_command", [6, None])
+def test_whole_body_terminal_has_six_command_total_cap_without_seventh(
+    success_on_terminal_command,
+):
+    class Backend(_FakeBackend):
+        marker_step = 0.0001
+
+        def __init__(self):
+            super().__init__()
+            self.commanded_waypoint_indices = []
+            self.terminal_commands = 0
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            result = super().plan_whole_body_trajectory(**kwargs)
+            trajectory = np.asarray(
+                result["joint_trajectory"], dtype=np.float32
+            ).copy()
+            trajectory[:, 6] = (
+                np.arange(len(trajectory), dtype=np.float32) * self.marker_step
+            )
+            result["joint_trajectory"] = trajectory
+            return self._refresh_whole_body_certificate(result)
+
+        def joint_target_to_action(
+            self,
+            target_q,
+            *,
+            hand,
+            fixed_reference=None,
+        ):
+            action = super().joint_target_to_action(
+                target_q,
+                hand=hand,
+                fixed_reference=fixed_reference,
+            )
+            target = np.asarray(target_q, dtype=np.float32).reshape(-1)
+            waypoint_index = int(round(float(target[6]) / self.marker_step))
+            self.commanded_waypoint_indices.append(waypoint_index)
+            terminal_index = len(self.execution_eef_positions) - 1
+            if waypoint_index == terminal_index:
+                self.terminal_commands += 1
+                if (
+                    success_on_terminal_command is None
+                    or self.terminal_commands < success_on_terminal_command
+                ):
+                    self.next_execution_eef_pose = (
+                        self.execution_eef_positions[-1].astype(np.float64)
+                        - np.asarray([0.002, 0.0, 0.0])
+                    )
+            return action
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    target = np.asarray([0.53, 0.0, 0.0], dtype=np.float64)
+    plan = backend.plan_whole_body_trajectory(
+        hand="left",
+        target_xyz=target,
+        target_quat_xyzw=None,
+        timeout_s=12.0,
+        attached_obj=None,
+    )
+
+    result = executor._execute_actions(
+        None,
+        hand="left",
+        target_xyz=target,
+        target_quat_xyzw=None,
+        position_tolerance_m=0.001,
+        orientation_tolerance_rad=EEF_TERMINAL_ORIENTATION_TOLERANCE_RAD,
+        timeout_s=12.0,
+        require_pose=True,
+        hold_steps_required=0,
+        joint_trajectory=plan["joint_trajectory"],
+        expected_attachments_by_hand=plan["expected_attachments_by_hand"],
+        motion_scope="whole_body",
+        whole_body_certificate=plan["whole_body_certificate"],
+    )
+
+    terminal_index = len(backend.execution_eef_positions) - 1
+    assert backend.terminal_commands == TERMINAL_COMMAND_LIMIT
+    assert backend.commanded_waypoint_indices.count(terminal_index) == (
+        TERMINAL_COMMAND_LIMIT
+    )
+    assert len(env.calls) == terminal_index + TERMINAL_COMMAND_LIMIT
+    guard = result["metrics"]["whole_body_eef_path_guard"]
+    assert guard["terminal_commands_sent"] == TERMINAL_COMMAND_LIMIT
+    if success_on_terminal_command is None:
+        assert result["primitive_success"] is False
+        assert result["stop_reason"] == "target_tolerance_not_met"
+    else:
+        assert result["primitive_success"] is True
+        assert result["stop_reason"] == "reached"
+
+
+def test_whole_body_runtime_never_reads_dynamics_reporter():
+    class Backend(_FakeBackend):
+        @staticmethod
+        def dynamics_report():
+            raise AssertionError("whole-body runtime must not read dynamics")
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    result = _move_to_without_replan_checkpoint(
+        executor,
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is True, result.get("stop_reason")
+    assert env.calls
+
+
+def test_whole_body_unreached_intermediate_is_not_repeated_below_hard_threshold():
+    class Backend(_FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.tracking_calls = 0
+            self.runtime_q_targets = []
+
+        def dynamics_report(self):
+            raise AssertionError("whole-body runtime must not read dynamics")
+
+        def joint_tracking_report(self, target_q, *, hand):
+            self.tracking_calls += 1
+            report = super().joint_tracking_report(target_q, hand=hand)
+            if self.tracking_calls == 1:
+                report["reached"] = False
+                report["max_articulation_error_rad"] = 0.1
+            return report
+
+        def joint_target_to_action(
+            self,
+            target_q,
+            *,
+            hand,
+            fixed_reference=None,
+        ):
+            self.runtime_q_targets.append(
+                np.asarray(target_q, dtype=np.float32).copy()
+            )
+            return super().joint_target_to_action(
+                target_q,
+                hand=hand,
+                fixed_reference=fixed_reference,
+            )
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    result = _move_to_without_replan_checkpoint(
+        executor,
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is True
+    assert len(env.calls) == 20
+    assert backend.tracking_calls == len(env.calls)
+    commanded_indices = [
+        row["whole_body_eef_waypoint_tracking"]["commanded_index"]
+        for row in result["trace"]
+        if row.get("whole_body_eef_waypoint_tracking") is not None
+    ]
+    assert commanded_indices[:2] == [0, 1]
+
+
+class _InitialAxisReverseBackend(_FakeBackend):
+    marker_step = 0.0001
+
+    def __init__(
+        self,
+        first_waypoint_feedback=None,
+        *,
+        waypoint_feedback=None,
+        moving_dynamics_calls=(2,),
+    ):
+        super().__init__()
+        self.waypoint_feedback = dict(waypoint_feedback or {})
+        for attempt, feedback in enumerate(
+            first_waypoint_feedback or (),
+            start=1,
+        ):
+            self.waypoint_feedback[(0, attempt)] = feedback
+        self.moving_dynamics_calls = set(moving_dynamics_calls)
+        self.call_start_pose = self.pose.copy()
+        self.commanded_waypoint_indices = []
+        self.commanded_q = []
+        self.waypoint_command_counts = {}
+        self.dynamics_calls = 0
+
+    def plan_whole_body_trajectory(self, **kwargs):
+        result = super().plan_whole_body_trajectory(**kwargs)
+        trajectory = np.asarray(
+            result["joint_trajectory"], dtype=np.float32
+        ).copy()
+        trajectory[:, 6] = (
+            np.arange(len(trajectory), dtype=np.float32) * self.marker_step
+        )
+        result["joint_trajectory"] = trajectory
+        return self._refresh_whole_body_certificate(result)
+
+    def dynamics_report(self):
+        self.dynamics_calls += 1
+        return _grouped_dynamics_report(
+            base_translation=(
+                0.01 if self.dynamics_calls in self.moving_dynamics_calls else 0.0
+            )
+        )
+
+    def joint_target_to_action(
+        self,
+        target_q,
+        *,
+        hand,
+        fixed_reference=None,
+    ):
+        action = super().joint_target_to_action(
+            target_q,
+            hand=hand,
+            fixed_reference=fixed_reference,
+        )
+        target = np.asarray(target_q, dtype=np.float32).reshape(-1)
+        waypoint_index = int(round(float(target[6]) / self.marker_step))
+        self.commanded_waypoint_indices.append(waypoint_index)
+        self.commanded_q.append(target.copy())
+        count = self.waypoint_command_counts.get(waypoint_index, 0) + 1
+        self.waypoint_command_counts[waypoint_index] = count
+        feedback = self.waypoint_feedback.get((waypoint_index, count))
+        if feedback is not None:
+            along_m, lateral_m = feedback
+            self.next_execution_eef_pose = self.call_start_pose + np.asarray(
+                [along_m, lateral_m, 0.0],
+                dtype=np.float64,
+            )
+        else:
+            self.next_execution_eef_pose = self.execution_eef_positions[
+                waypoint_index
+            ].astype(np.float64)
+        self.next_execution_eef_quat = self.execution_eef_quaternions[
+            waypoint_index
+        ].astype(np.float64)
+        return action
+
+
+def test_initial_axis_reverse_with_other_violation_hard_fails():
+    backend = _InitialAxisReverseBackend([(-0.0016345, 0.0051)])
+    executor, env = _executor(backend)
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "eef_path_divergence"
+    assert len(env.calls) == 1
+    waypoint = result["metrics"]["whole_body_eef_path_guard"]["last_waypoint"]
+    assert waypoint["violations"]["axis_monotonic"] is True
+    assert waypoint["violations"]["lateral"] is True
+    assert waypoint["fatal_violations"]["lateral"] is True
+    assert waypoint["initial_axis_reverse_deferred"] is False
+    assert waypoint["deferred_violations"] == {}
+    assert len(
+        result["metrics"]["whole_body_eef_path_guard"][
+            "axis_reverse_defer_ledger"
+        ]
+    ) == 0
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+def test_first_axis_reverse_hard_fails_without_repeating_waypoint():
+    backend = _InitialAxisReverseBackend(
+        [(-0.0015, 0.0), (-0.0026, 0.0)]
+    )
+    executor, env = _executor(backend)
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "eef_path_divergence"
+    assert len(env.calls) == 1
+    assert backend.commanded_waypoint_indices == [0]
+    waypoint = result["metrics"]["whole_body_eef_path_guard"]["last_waypoint"]
+    assert waypoint["reverse_step_m"] == pytest.approx(0.0015)
+    assert waypoint["violations"]["axis_monotonic"] is True
+    assert waypoint["fatal_violations"]["axis_monotonic"] is True
+    assert waypoint["initial_axis_reverse_deferred"] is False
+    assert waypoint["deferred_violations"] == {}
+    assert result["metrics"]["whole_body_eef_path_guard"][
+        "axis_reverse_defer_ledger"
+    ] == {}
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+def test_initial_axis_reverse_above_transient_cap_hard_fails():
+    reverse_m = WHOLE_BODY_EEF_FIRST_SAMPLE_REVERSE_TRANSIENT_MAX_M + 1e-6
+    backend = _InitialAxisReverseBackend([(-reverse_m, 0.0)])
+    executor, env = _executor(backend)
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "eef_path_divergence"
+    assert len(env.calls) == 1
+    waypoint = result["metrics"]["whole_body_eef_path_guard"]["last_waypoint"]
+    assert waypoint["reverse_step_m"] == pytest.approx(reverse_m)
+    assert waypoint["violations"]["axis_monotonic"] is True
+    assert waypoint["fatal_violations"]["axis_monotonic"] is True
+    assert waypoint["initial_axis_reverse_deferred"] is False
+    assert waypoint["deferred_violations"] == {}
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+def test_initial_axis_reverse_contact_path_never_defers():
+    backend = _InitialAxisReverseBackend([(-0.0016345, 0.0)])
+    executor, env = _executor(backend)
+
+    result = executor._move_to_composite_stage(
+        hand="left",
+        target_xyz=np.asarray([0.53, 0.0, 0.0]),
+        target_quat_xyzw=None,
+        position_tolerance_m=0.002,
+        orientation_tolerance_rad=math.radians(5.0),
+        timeout_s=10.0,
+        hold_steps_required=1,
+        contact_target_xyz=np.asarray([0.53, 0.0, 0.0]),
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "eef_path_divergence"
+    assert len(env.calls) == 1
+    waypoint = result["metrics"]["whole_body_eef_path_guard"]["last_waypoint"]
+    assert waypoint["violations"]["axis_monotonic"] is True
+    assert waypoint["fatal_violations"]["axis_monotonic"] is True
+    assert waypoint["initial_axis_reverse_deferred"] is False
+    assert waypoint["deferred_violations"] == {}
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+def test_initial_axis_reverse_attached_object_path_never_defers():
+    backend = _InitialAxisReverseBackend([(-0.0016345, 0.0)])
+    backend.attached_obj = {"left_eef_link": backend.target_root}
+    executor, env = _executor(backend)
+    env._gripper_latch["left"] = -1.0
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "eef_path_divergence"
+    assert len(env.calls) == 1
+    guard = result["metrics"]["whole_body_eef_path_guard"]
+    waypoint = guard["last_waypoint"]
+    assert waypoint["violations"]["axis_monotonic"] is True
+    assert waypoint["fatal_violations"]["axis_monotonic"] is True
+    assert waypoint["axis_reverse_deferred"] is False
+    assert guard["axis_reverse_defer_ledger"] == {}
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+def test_prepared_dashboard_eef_defers_retry10_1191um_first_sample_once():
+    class Backend(_InitialAxisReverseBackend):
+        def plan_whole_body_trajectory(
+            self,
+            *,
+            start_q=None,
+            start_eef_pose=None,
+            background=False,
+            **kwargs,
+        ):
+            del start_q, start_eef_pose, background
+            return super().plan_whole_body_trajectory(**kwargs)
+
+    backend = Backend([(-0.001191, 0.0)])
+    executor, env = _executor(backend)
+    prepared = executor.prepare_dashboard_motion("left_arm", "forward")
+
+    assert prepared["execution_policy"] == (
+        PREPARED_DASHBOARD_EEF_EXECUTION_POLICY
+    )
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "retry10-left-arm-forward",
+    )
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert backend.commanded_waypoint_indices[:3] == [0, 0, 1]
+    assert np.array_equal(backend.commanded_q[0], backend.commanded_q[1])
+    guard = result["metrics"]["whole_body_eef_path_guard"]
+    assert guard["execution_policy"] == (
+        PREPARED_DASHBOARD_EEF_EXECUTION_POLICY
+    )
+    assert guard["first_sample_axis_reverse_transient_enabled"] is True
+    assert len(guard["axis_reverse_defer_ledger"]) == 1
+    deferred = next(iter(guard["axis_reverse_defer_ledger"].values()))
+    assert deferred["reverse_step_m"] == pytest.approx(0.001191)
+    assert deferred["maximum_reverse_step_m"] == pytest.approx(
+        WHOLE_BODY_EEF_FIRST_SAMPLE_REVERSE_TRANSIENT_MAX_M
+    )
+    assert deferred["exact_same_q_repeat_required"] is True
+    assert guard["pending_axis_reverse_settle_repeat"] is None
+    first_sample = next(
+        row["whole_body_eef_waypoint_tracking"]
+        for row in result["trace"]
+        if (
+            isinstance(row.get("whole_body_eef_waypoint_tracking"), dict)
+            and row["whole_body_eef_waypoint_tracking"].get(
+                "initial_axis_reverse_deferred"
+            )
+            is True
+        )
+    )
+    assert first_sample["violations"]["axis_monotonic"] is True
+    assert first_sample["fatal_violations"]["axis_monotonic"] is False
+    assert first_sample["deferred_violations"] == {
+        "axis_monotonic": (
+            "prepared_dashboard_first_sample_controller_transient"
+        )
+    }
+    assert len(env.calls) == len(backend.execution_eef_positions) + 1
+
+
+def test_prepared_dashboard_eef_repeat_axis_reverse_is_fatal_without_third_action():
+    class Backend(_InitialAxisReverseBackend):
+        def plan_whole_body_trajectory(
+            self,
+            *,
+            start_q=None,
+            start_eef_pose=None,
+            background=False,
+            **kwargs,
+        ):
+            del start_q, start_eef_pose, background
+            return super().plan_whole_body_trajectory(**kwargs)
+
+    backend = Backend(
+        waypoint_feedback={
+            (0, 1): (-0.001191, 0.0),
+            (0, 2): (-0.0025, 0.0),
+        }
+    )
+    executor, env = _executor(backend)
+    prepared = executor.prepare_dashboard_motion("left_arm", "forward")
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "retry10-repeat-reverse",
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "eef_path_divergence"
+    assert backend.commanded_waypoint_indices == [0, 0]
+    assert len(env.calls) == 2
+    waypoint = result["metrics"]["whole_body_eef_path_guard"]["last_waypoint"]
+    assert waypoint["axis_reverse_settle_repeat_command"] is True
+    assert waypoint["fatal_violations"]["axis_monotonic"] is True
+    assert waypoint["axis_reverse_deferred"] is False
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+@pytest.mark.parametrize(
+    ("position_error_m", "expected_stop_reason"),
+    [
+        (0.002498, None),
+        (0.002500, None),
+        (0.005001, "eef_path_divergence"),
+    ],
+)
+def test_short_jog_streams_once_and_keeps_hard_corridor_boundary(
+    position_error_m,
+    expected_stop_reason,
+):
+    class Backend(_FakeBackend):
+        marker_step = 0.0001
+
+        def __init__(self):
+            super().__init__()
+            self.waypoint_command_counts = {}
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            result = super().plan_whole_body_trajectory(**kwargs)
+            trajectory = np.asarray(
+                result["joint_trajectory"], dtype=np.float32
+            ).copy()
+            trajectory[:, 6] = (
+                np.arange(len(trajectory), dtype=np.float32) * self.marker_step
+            )
+            result["joint_trajectory"] = trajectory
+            return self._refresh_whole_body_certificate(result)
+
+        def joint_target_to_action(
+            self,
+            target_q,
+            *,
+            hand,
+            fixed_reference=None,
+        ):
+            action = super().joint_target_to_action(
+                target_q,
+                hand=hand,
+                fixed_reference=fixed_reference,
+            )
+            target = np.asarray(target_q, dtype=np.float32).reshape(-1)
+            waypoint_index = int(round(float(target[6]) / self.marker_step))
+            count = self.waypoint_command_counts.get(waypoint_index, 0) + 1
+            self.waypoint_command_counts[waypoint_index] = count
+            nominal = self.execution_eef_positions[waypoint_index].astype(
+                np.float64
+            )
+            if waypoint_index == 0 and count == 1:
+                nominal = nominal - np.asarray(
+                    [0.0, position_error_m, 0.0]
+                )
+            self.next_execution_eef_pose = nominal
+            self.next_execution_eef_quat = self.execution_eef_quaternions[
+                waypoint_index
+            ].astype(np.float64)
+            return action
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    result = _move_to_without_replan_checkpoint(
+        executor,
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert backend.waypoint_command_counts[0] == 1
+    guard = result["metrics"]["whole_body_eef_path_guard"]
+    assert guard["waypoint_settle_position_tolerance_m"] == pytest.approx(
+        0.004
+    )
+    first_waypoint = (
+        next(
+            row["whole_body_eef_waypoint_tracking"]
+            for row in result["diagnostics"]["trace"]
+            if row.get("whole_body_eef_waypoint_tracking", {}).get(
+                "commanded_index"
+            )
+            == 0
+        )
+        if expected_stop_reason is None
+        else guard["last_waypoint"]
+    )
+    assert first_waypoint[
+        "configured_position_settle_tolerance_m"
+    ] == pytest.approx(0.004)
+    assert first_waypoint[
+        "prospective_next_waypoint_step_m"
+    ] == pytest.approx(0.0015, abs=1e-6)
+    assert first_waypoint[
+        "effective_position_settle_tolerance_m"
+    ] == pytest.approx(0.002499, abs=1e-6)
+    if expected_stop_reason is None:
+        assert result["primitive_success"] is True, result.get("stop_reason")
+        assert len(env.calls) == 20
+    else:
+        assert result["primitive_success"] is False
+        assert result["stop_reason"] == expected_stop_reason
+        assert len(env.calls) == 1
+        assert guard["last_waypoint"]["violations"]["lateral"] is True
+
+
+def test_whole_body_streams_once_with_subthreshold_orientation_lag():
+    class Backend(_FakeBackend):
+        marker_step = 0.0001
+        delayed_waypoint = 3
+
+        def __init__(self):
+            super().__init__()
+            self.commanded_waypoint_indices = []
+            self.waypoint_command_counts = {}
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            result = super().plan_whole_body_trajectory(**kwargs)
+            trajectory = np.asarray(
+                result["joint_trajectory"], dtype=np.float32
+            ).copy()
+            trajectory[:, 6] = (
+                np.arange(len(trajectory), dtype=np.float32) * self.marker_step
+            )
+            result["joint_trajectory"] = trajectory
+            angles = np.deg2rad(
+                np.minimum(np.arange(1, len(trajectory) + 1), 6)
+            )
+            quaternions = np.column_stack(
+                [
+                    np.zeros(len(angles)),
+                    np.zeros(len(angles)),
+                    np.sin(angles * 0.5),
+                    np.cos(angles * 0.5),
+                ]
+            ).astype(np.float32)
+            self.execution_eef_quaternions = quaternions
+            return self._refresh_whole_body_certificate(result)
+
+        def joint_target_to_action(
+            self,
+            target_q,
+            *,
+            hand,
+            fixed_reference=None,
+        ):
+            action = super().joint_target_to_action(
+                target_q,
+                hand=hand,
+                fixed_reference=fixed_reference,
+            )
+            target = np.asarray(target_q, dtype=np.float32).reshape(-1)
+            waypoint_index = int(round(float(target[6]) / self.marker_step))
+            self.commanded_waypoint_indices.append(waypoint_index)
+            count = self.waypoint_command_counts.get(waypoint_index, 0) + 1
+            self.waypoint_command_counts[waypoint_index] = count
+            self.next_execution_eef_pose = self.execution_eef_positions[
+                waypoint_index
+            ].astype(np.float64)
+            quat = self.execution_eef_quaternions[waypoint_index].astype(
+                np.float64
+            )
+            if waypoint_index >= self.delayed_waypoint and count == 1:
+                angle = math.radians(
+                    min(waypoint_index + 1, 6) - 0.6
+                )
+                quat = np.asarray(
+                    [0.0, 0.0, math.sin(angle * 0.5), math.cos(angle * 0.5)]
+                )
+            self.next_execution_eef_quat = quat
+            return action
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    target_angle = math.radians(6.0)
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=backend.pose.copy(),
+        target_quat_xyzw=[
+            0.0,
+            0.0,
+            math.sin(target_angle * 0.5),
+            math.cos(target_angle * 0.5),
+        ],
+    )
+
+    assert result["primitive_success"] is True, result.get("stop_reason")
+    assert backend.commanded_waypoint_indices[3:5] == [3, 4]
+    assert len(env.calls) == 20
+    delayed = [
+        row["whole_body_eef_waypoint_tracking"]
+        for row in result["trace"]
+        if row.get("whole_body_eef_waypoint_tracking", {}).get(
+            "commanded_index"
+        )
+        == 3
+    ]
+    assert len(delayed) == 1
+    assert delayed[0]["waypoint_settled"] is True
+    assert delayed[0]["orientation_error_rad"] == pytest.approx(
+        math.radians(0.6), abs=1e-6
+    )
+    assert delayed[0]["violations"]["waypoint_orientation"] is False
+
+
+def test_whole_body_subthreshold_lag_does_not_repeat_or_replan():
+    class Backend(_FakeBackend):
+        marker_step = 0.0001
+        delayed_waypoint = 3
+
+        def __init__(self):
+            super().__init__()
+            self.commanded_waypoint_indices = []
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            result = super().plan_whole_body_trajectory(**kwargs)
+            trajectory = np.asarray(
+                result["joint_trajectory"], dtype=np.float32
+            ).copy()
+            trajectory[:, 6] = (
+                np.arange(len(trajectory), dtype=np.float32) * self.marker_step
+            )
+            result["joint_trajectory"] = trajectory
+            return self._refresh_whole_body_certificate(result)
+
+        def joint_target_to_action(
+            self,
+            target_q,
+            *,
+            hand,
+            fixed_reference=None,
+        ):
+            action = super().joint_target_to_action(
+                target_q,
+                hand=hand,
+                fixed_reference=fixed_reference,
+            )
+            target = np.asarray(target_q, dtype=np.float32).reshape(-1)
+            waypoint_index = int(round(float(target[6]) / self.marker_step))
+            self.commanded_waypoint_indices.append(waypoint_index)
+            nominal = self.execution_eef_positions[waypoint_index].astype(
+                np.float64
+            )
+            if waypoint_index == self.delayed_waypoint:
+                nominal = nominal - np.asarray([0.0, 0.0044, 0.0])
+            self.next_execution_eef_pose = nominal
+            self.next_execution_eef_quat = self.execution_eef_quaternions[
+                waypoint_index
+            ].astype(np.float64)
+            return action
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    result = _move_to_without_replan_checkpoint(
+        executor,
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert backend.commanded_waypoint_indices[:5] == [0, 1, 2, 3, 4]
+    assert len(backend.whole_body_plan_calls) == 1
+    assert len(env.calls) == 20
+    repeated = [
+        row["whole_body_eef_waypoint_tracking"]
+        for row in result["diagnostics"]["trace"]
+        if row.get("whole_body_eef_waypoint_tracking", {}).get(
+            "commanded_index"
+        )
+        == 3
+    ]
+    assert len(repeated) == 1
+    assert repeated[0]["settle_repeat"] is False
+    assert repeated[0]["prospective_position_bound_m"] > 0.005
+
+
+def test_whole_body_raw_success_preempts_all_post_step_checks():
+    class Backend(_FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.feedback_reads = {
+                "pose": 0,
+                "attachment": 0,
+                "whole_contact": 0,
+                "dynamics": 0,
+            }
+            self.feedback_reads_at_success = None
+
+        def joint_target_to_action(
+            self,
+            target_q,
+            *,
+            hand,
+            fixed_reference=None,
+        ):
+            action = super().joint_target_to_action(
+                target_q,
+                hand=hand,
+                fixed_reference=fixed_reference,
+            )
+            nominal = self.execution_eef_positions[0].astype(np.float64)
+            if self.env is not None and len(self.env.calls) == 0:
+                nominal = nominal - np.asarray([0.0, 0.0044, 0.0])
+            self.next_execution_eef_pose = nominal
+            self.next_execution_eef_quat = self.execution_eef_quaternions[
+                0
+            ].astype(np.float64)
+            return action
+
+        def get_eef_pose(self, hand):
+            self.feedback_reads["pose"] += 1
+            return super().get_eef_pose(hand)
+
+        def get_attached_object(self, hand):
+            self.feedback_reads["attachment"] += 1
+            return super().get_attached_object(hand)
+
+        def whole_body_contact_report(
+            self,
+            *,
+            baseline,
+            expected_attachments_by_hand,
+            allowed_expected_contact=None,
+        ):
+            self.feedback_reads["whole_contact"] += 1
+            return super().whole_body_contact_report(
+                baseline=baseline,
+                expected_attachments_by_hand=expected_attachments_by_hand,
+                allowed_expected_contact=allowed_expected_contact,
+            )
+
+        def dynamics_report(self):
+            raise AssertionError("whole-body runtime must not read dynamics")
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    def chunk_step(actions):
+        env.calls.append(np.asarray(actions).copy())
+        backend.advance()
+        success = len(env.calls) == 2
+        if success:
+            backend.feedback_reads_at_success = dict(backend.feedback_reads)
+        return (
+            None,
+            0.0,
+            False,
+            False,
+            {
+                "done": {"success": success},
+                "_rpent": {"executed_steps": 1},
+            },
+        )
+
+    env.chunk_step = chunk_step
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert result["task_success"] is True
+    assert len(env.calls) == 2
+    terminal = result["diagnostics"]["trace"][-1]
+    assert terminal["whole_body_waypoint_command"]["settle_repeat"] is False
+    assert backend.feedback_reads == backend.feedback_reads_at_success
+    assert backend.feedback_reads["dynamics"] == 0
+
+
+def test_whole_body_next_waypoint_still_checks_unexpected_contact():
+    class Backend(_FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.whole_contact_calls = 0
+
+        def joint_target_to_action(
+            self,
+            target_q,
+            *,
+            hand,
+            fixed_reference=None,
+        ):
+            action = super().joint_target_to_action(
+                target_q,
+                hand=hand,
+                fixed_reference=fixed_reference,
+            )
+            nominal = self.execution_eef_positions[0].astype(np.float64)
+            nominal = nominal - np.asarray([0.0, 0.0044, 0.0])
+            self.next_execution_eef_pose = nominal
+            self.next_execution_eef_quat = self.execution_eef_quaternions[
+                0
+            ].astype(np.float64)
+            return action
+
+        def whole_body_contact_report(
+            self,
+            *,
+            baseline,
+            expected_attachments_by_hand,
+            allowed_expected_contact=None,
+        ):
+            del baseline, expected_attachments_by_hand, allowed_expected_contact
+            self.whole_contact_calls += 1
+            return {
+                "available": True,
+                "unexpected_contact": self.whole_contact_calls == 2,
+                "unexpected_pairs": (
+                    [["/World/robot/base", "/World/cabinet"]]
+                    if self.whole_contact_calls == 2
+                    else []
+                ),
+            }
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "unexpected_contact"
+    assert len(env.calls) == 2
+    command = result["diagnostics"]["trace"][-1][
+        "whole_body_waypoint_command"
+    ]
+    assert command["settle_repeat"] is False
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+def test_expected_contact_stops_on_current_certified_waypoint():
+    backend = _FakeBackend(contact_mode="expected")
+    executor, env = _executor(backend)
+    target = np.asarray([0.53, 0.0, 0.0])
+    plan = backend.plan_whole_body_trajectory(
+        hand="left",
+        target_xyz=target,
+        target_quat_xyzw=None,
+        timeout_s=1.0,
+        attached_obj=None,
+    )
+
+    result = executor._execute_actions(
+        None,
+        hand="left",
+        target_xyz=target,
+        target_quat_xyzw=None,
+        position_tolerance_m=0.005,
+        orientation_tolerance_rad=math.radians(1.0),
+        timeout_s=2.0,
+        require_pose=True,
+        hold_steps_required=5,
+        contact_target_xyz=target,
+        stop_on_expected_contact=True,
+        joint_trajectory=plan["joint_trajectory"],
+        expected_attachments_by_hand=plan["expected_attachments_by_hand"],
+        motion_scope="whole_body",
+        whole_body_certificate=plan["whole_body_certificate"],
+        allow_replan_checkpoint=True,
+    )
+
+    assert result["primitive_success"] is True
+    assert "whole_body_replan_checkpoint" not in result["metrics"]
+    assert result["metrics"]["expected_contact_seen"] is True
+    assert len(env.calls) == 1
+    assert result["trace"][-1]["expected_contact_stop"] is True
+    assert result["trace"][-1]["whole_body_waypoint_command"]["index"] == 0
+
+
+def test_expected_contact_cannot_hide_other_whole_body_collision():
+    class Backend(_FakeBackend):
+        def __init__(self):
+            super().__init__(contact_mode="expected")
+            self.allowed_expected_contacts = []
+
+        def whole_body_contact_report(
+            self,
+            *,
+            baseline,
+            expected_attachments_by_hand,
+            allowed_expected_contact=None,
+        ):
+            del baseline, expected_attachments_by_hand
+            self.allowed_expected_contacts.append(allowed_expected_contact)
+            return {
+                "available": True,
+                "unexpected_contact": True,
+                "unexpected_pairs": [
+                    ["/World/robot/base", "/World/cabinet"],
+                ],
+            }
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    target = np.asarray([0.53, 0.0, 0.0])
+    plan = backend.plan_whole_body_trajectory(
+        hand="left",
+        target_xyz=target,
+        target_quat_xyzw=None,
+        timeout_s=1.0,
+        attached_obj=None,
+    )
+
+    result = executor._execute_actions(
+        None,
+        hand="left",
+        target_xyz=target,
+        target_quat_xyzw=None,
+        position_tolerance_m=0.005,
+        orientation_tolerance_rad=math.radians(1.0),
+        timeout_s=2.0,
+        require_pose=True,
+        hold_steps_required=5,
+        contact_target_xyz=target,
+        stop_on_expected_contact=True,
+        joint_trajectory=plan["joint_trajectory"],
+        expected_attachments_by_hand=plan["expected_attachments_by_hand"],
+        motion_scope="whole_body",
+        whole_body_certificate=plan["whole_body_certificate"],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "unexpected_contact"
+    assert len(env.calls) == 1
+    assert backend.allowed_expected_contacts[0]["expected_contact"] is True
+    command = result["trace"][-1]["whole_body_waypoint_command"]
+    assert command["index"] == 0
+    assert command["q_sha256"]
+    assert command["trajectory_sha256"]
+
+
+@pytest.mark.parametrize(
+    "contact_mode",
+    ["expected_contact", "attachment_contact"],
+)
+def test_post_action_contact_unavailable_trace_binds_certified_waypoint(
+    contact_mode,
+):
+    class Backend(_FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.attached_obj = {"left_eef_link": self.target_root}
+
+        @staticmethod
+        def capture_whole_body_contact_baseline(
+            *,
+            expected_attachments_by_hand,
+        ):
+            del expected_attachments_by_hand
+            return {"available": True, "pairs": [], "continuous_pairs": []}
+
+        @staticmethod
+        def contact_report(
+            *,
+            hand,
+            target_xyz=None,
+            allowed_contact_distance_m=0.025,
+        ):
+            del hand, target_xyz, allowed_contact_distance_m
+            return {
+                "available": False,
+                "reason": "injected post-action contact failure",
+                "unexpected_contact": False,
+                "expected_contact": False,
+            }
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    env._gripper_latch["left"] = 0.0
+    target = np.asarray([0.53, 0.0, 0.0])
+    selected_attachment = backend.get_attached_object("left")
+    plan = backend.plan_whole_body_trajectory(
+        hand="left",
+        target_xyz=target,
+        target_quat_xyzw=None,
+        timeout_s=1.0,
+        attached_obj=selected_attachment,
+    )
+    contact_kwargs = (
+        {"stop_on_expected_contact": True}
+        if contact_mode == "expected_contact"
+        else {
+            "stop_on_attachment": True,
+            "expected_attachment": plan["expected_attachments_by_hand"]["left"],
+        }
+    )
+
+    result = executor._execute_actions(
+        None,
+        hand="left",
+        target_xyz=target,
+        target_quat_xyzw=None,
+        position_tolerance_m=0.005,
+        orientation_tolerance_rad=math.radians(1.0),
+        timeout_s=2.0,
+        require_pose=True,
+        hold_steps_required=5,
+        contact_target_xyz=target,
+        joint_trajectory=plan["joint_trajectory"],
+        expected_attachments_by_hand=plan["expected_attachments_by_hand"],
+        motion_scope="whole_body",
+        whole_body_certificate=plan["whole_body_certificate"],
+        **contact_kwargs,
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "contact_feedback_unavailable"
+    assert len(env.calls) == 1
+    command = result["trace"][-1]["whole_body_waypoint_command"]
+    assert command["index"] == 0
+    expected_q_sha256 = hashlib.sha256(
+        np.ascontiguousarray(
+            plan["joint_trajectory"][0],
+            dtype=np.float32,
+        ).tobytes()
+    ).hexdigest()
+    assert command["q_sha256"] == expected_q_sha256
+    assert (
+        command["trajectory_sha256"]
+        == plan["whole_body_certificate"]["trajectory_sha256"]
+    )
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+def test_whole_body_contact_report_exempts_only_proven_target_finger_pair():
+    backend = RealCuroboBackend(None)
+    expected_pair = tuple(
+        sorted(("/World/robot/left_finger", "/World/button/collision"))
+    )
+    unrelated_pair = tuple(
+        sorted(("/World/robot/base", "/World/cabinet/collision"))
+    )
+    baseline = {
+        "available": True,
+        "pairs": [],
+        "continuous_pairs": [],
+    }
+    backend._whole_body_contact_pairs = lambda _attachments: {
+        expected_pair,
+        unrelated_pair,
+    }
+
+    report = backend.whole_body_contact_report(
+        baseline=baseline,
+        expected_attachments_by_hand={"left": None, "right": None},
+        allowed_expected_contact={
+            "expected_contact": True,
+            "target_root": "/World/button",
+            "target_finger_paths": ["/World/robot/left_finger"],
+        },
+    )
+
+    assert report["available"] is True
+    assert report["unexpected_contact"] is True
+    assert report["allowed_expected_contact_pairs"] == [list(expected_pair)]
+    assert report["unexpected_pairs"] == [list(unrelated_pair)]
+
+    backend._whole_body_contact_pairs = lambda _attachments: {expected_pair}
+    allowed_only = backend.whole_body_contact_report(
+        baseline={
+            "available": True,
+            "pairs": [],
+            "continuous_pairs": [],
+        },
+        expected_attachments_by_hand={"left": None, "right": None},
+        allowed_expected_contact={
+            "expected_contact": True,
+            "target_root": "/World/button",
+            "target_finger_paths": ["/World/robot/left_finger"],
+        },
+    )
+    assert allowed_only["unexpected_contact"] is False
+
+
+@pytest.mark.parametrize("invalid_value", [float("nan"), float("inf")])
+def test_whole_body_nonfinite_live_eef_feedback_stops_after_current_action(
+    invalid_value,
+):
+    class Backend(_FakeBackend):
+        def advance(self):
+            self.pose = np.asarray(
+                [invalid_value, 0.0, 0.0],
+                dtype=np.float64,
+            )
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    result = executor.move_to(
+        hand="right",
+        target_xyz=[0.45, 0.0, -0.05],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "pose_feedback_unavailable"
+    assert result["metrics"]["executed_waypoints"] == 1
+    assert result["metrics"]["partial_motion"] is True
+    assert result["metrics"]["post_stop_env_actions"] == 0
+    assert len(env.calls) == 1
+
+
+def test_whole_body_live_wrist_backtracking_stops_before_next_action():
+    class Backend(_FakeBackend):
+        def advance(self):
+            super().advance()
+            assert self.env is not None
+            executed = len(self.env.calls)
+            if executed in {1, 2}:
+                angle = math.radians(1.0 if executed == 1 else 0.0)
+                self.quat = np.asarray(
+                    [0.0, 0.0, math.sin(angle * 0.5), math.cos(angle * 0.5)],
+                    dtype=np.float64,
+                )
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    target_angle = math.radians(5.0)
+
+    result = executor.move_to(
+        hand="right",
+        target_xyz=backend.pose.copy(),
+        target_quat_xyzw=[
+            0.0,
+            0.0,
+            math.sin(target_angle * 0.5),
+            math.cos(target_angle * 0.5),
+        ],
+        orientation_tolerance_rad=math.radians(1.0),
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "eef_path_divergence"
+    assert result["metrics"]["executed_waypoints"] == 2
+    assert result["metrics"]["partial_motion"] is True
+    assert result["metrics"]["post_stop_env_actions"] == 0
+    assert len(env.calls) == 2
+    guard = result["metrics"]["whole_body_eef_path_guard"]
+    assert guard["last_waypoint"]["violations"]["orientation_monotonic"] is True
+    assert (
+        guard["max_observed_live_orientation_reverse_progress_rad"]
+        > math.radians(0.25)
+    )
+
+
+def test_whole_body_eef_path_admission_failure_executes_zero_actions():
+    class Backend(_FakeBackend):
+        def plan_whole_body_trajectory(self, **kwargs):
+            self.whole_body_plan_calls.append(dict(kwargs))
+            return {
+                "ok": False,
+                "stop_reason": "eef_path_admission_failed",
+                "metrics": {
+                    "candidate_audit": [
+                        {
+                            "certified": False,
+                            "rejection_reason": "selected_eef_path_rejected",
+                            "selected_eef_path": {
+                                "available": True,
+                                "admitted": False,
+                                "max_start_excursion_m": 0.7,
+                                "max_start_excursion_limit_m": 0.035,
+                            },
+                        }
+                    ]
+                },
+            }
+
+    executor, env = _executor(Backend())
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.47, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "replan_no_progress"
+    assert result["metrics"]["last_plan_stop_reason"] == (
+        "eef_path_admission_failed"
+    )
+    assert len(result["metrics"]["replan_rounds"]) == 2
+    assert len(result["diagnostics"]["metrics"]["candidate_audit"]) == 1
+    assert result["metrics"]["candidate_audit"][0]["selected_eef_path"][
+        "max_start_excursion_m"
+    ] == pytest.approx(0.7)
+    assert len(executor.backend.whole_body_plan_calls) == 2
+    assert env.calls == []
+
+
+def test_whole_body_first_eef_admission_failure_replans_then_executes():
+    class Backend(_FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.plan_attempt = 0
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            self.plan_attempt += 1
+            if self.plan_attempt == 1:
+                self.whole_body_plan_calls.append(dict(kwargs))
+                return {
+                    "ok": False,
+                    "stop_reason": "eef_path_admission_failed",
+                    "metrics": {
+                        "env_actions_sent": 0,
+                        "collision_admission": {
+                            "available": False,
+                            "admitted": False,
+                        },
+                    },
+                }
+            return super().plan_whole_body_trajectory(**kwargs)
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    result = _move_to_without_replan_checkpoint(
+        executor,
+        hand="left",
+        target_xyz=[0.47, 0.0, 0.0],
+        target_quat_xyzw=[0.0, 0.0, 0.0, 1.0],
+    )
+
+    assert result["primitive_success"] is True
+    assert len(backend.whole_body_plan_calls) == 2
+    assert len(result["metrics"]["replan_rounds"]) == 2
+    assert result["metrics"]["replan_rounds"][0][
+        "eligible_plan_failure"
+    ]["unconditional_replan"] is True
+    assert env.calls
+
+
+def test_move_to_planning_retry_does_not_authorize_execution_failure_replan():
+    class Backend(_FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.plan_attempt = 0
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            self.plan_attempt += 1
+            if self.plan_attempt == 1:
+                self.whole_body_plan_calls.append(dict(kwargs))
+                return {
+                    "ok": False,
+                    "stop_reason": "eef_path_admission_failed",
+                    "metrics": {"env_actions_sent": 0},
+                }
+            return super().plan_whole_body_trajectory(**kwargs)
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    executor._execute_actions = lambda *_args, **_kwargs: {
+        "primitive_success": False,
+        "task_success": False,
+        "stop_reason": "stalled_tracking",
+        "recoverable": True,
+        "metrics": {
+            "env_actions_sent": 1,
+            "executed_waypoints": 1,
+            "partial_motion": True,
+            "final_position_error_m": 0.02,
+            "final_joint_tracking": {
+                "normalized_21d_tracking_error": 1.0,
+            },
+        },
+        "diagnostics": {"trace": []},
+    }
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.45, 0.0, -0.05],
+    )
+
+    assert result["stop_reason"] == "stalled_tracking"
+    assert len(backend.whole_body_plan_calls) == 2
+    assert result["metrics"]["env_actions_sent"] == 1
+    assert result["metrics"]["partial_motion"] is True
+    assert env.calls == []
+
+
+def test_move_to_checkpoint_then_planning_retry_preserves_action_accounting():
+    class Backend(_FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.plan_attempt = 0
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            self.plan_attempt += 1
+            if self.plan_attempt in {2, 3}:
+                self.whole_body_plan_calls.append(dict(kwargs))
+                return {
+                    "ok": False,
+                    "stop_reason": "eef_path_admission_failed",
+                    "metrics": {"env_actions_sent": 0},
+                }
+            return super().plan_whole_body_trajectory(**kwargs)
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    execute_calls = 0
+
+    def execute(*_args, **kwargs):
+        nonlocal execute_calls
+        execute_calls += 1
+        return _scripted_whole_body_replan_checkpoint(
+            kwargs,
+            final_position_error_m=0.02,
+        )
+
+    executor._execute_actions = execute
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.45, 0.0, -0.05],
+    )
+
+    assert result["stop_reason"] == "replan_no_progress"
+    assert execute_calls == 1
+    assert len(backend.whole_body_plan_calls) == 3
+    assert result["metrics"]["env_actions_sent"] == 1
+    assert result["metrics"]["partial_motion"] is True
+    assert result["metrics"]["post_stop_env_actions"] == 0
+    assert env.calls == []
+
+
 @pytest.mark.parametrize(
     "certificate_fault",
-    ["collision_admission", "missing_certificate", "trajectory_digest"],
+    [
+        "collision_admission",
+        "missing_certificate",
+        "trajectory_digest",
+        "eef_target_hash",
+        "eef_positions_digest",
+        "eef_short_target_flag",
+        "dense_trajectory_digest",
+        "dense_waypoint_count",
+        "joint_layout_digest",
+        "execution_base_xy_step_limit",
+        "execution_base_yaw_step_limit",
+        "execution_articulation_step_limit",
+        "terminal_command_limit",
+        "terminal_position_tolerance",
+        "terminal_orientation_tolerance",
+    ],
 )
 def test_move_to_requires_whole_body_collision_certificate_before_first_action(
     certificate_fault,
@@ -3187,10 +7151,139 @@ def test_move_to_requires_whole_body_collision_certificate_before_first_action(
                 result["metrics"]["collision_admission"]["admitted"] = False
             elif certificate_fault == "missing_certificate":
                 result["whole_body_certificate"] = None
-            else:
+            elif certificate_fault == "trajectory_digest":
                 result["whole_body_certificate"] = {
                     **result["whole_body_certificate"],
                     "trajectory_sha256": "tampered",
+                }
+            elif certificate_fault == "eef_target_hash":
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    "selected_target_xyz_sha256": "0" * 64,
+                }
+            elif certificate_fault == "eef_positions_digest":
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    "selected_eef_execution_positions_sha256": "tampered",
+                }
+            elif certificate_fault == "eef_short_target_flag":
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    "selected_eef_short_target": False,
+                }
+            elif certificate_fault == "dense_trajectory_digest":
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    "dense_collision_trajectory_sha256": "tampered",
+                }
+            elif certificate_fault == "dense_waypoint_count":
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    "collision_free_waypoints": 999,
+                }
+            elif certificate_fault.startswith("execution_"):
+                key = {
+                    "execution_base_xy_step_limit": (
+                        "execution_base_xy_step_limit_m"
+                    ),
+                    "execution_base_yaw_step_limit": (
+                        "execution_base_yaw_step_limit_rad"
+                    ),
+                    "execution_articulation_step_limit": (
+                        "execution_articulation_step_limit_rad"
+                    ),
+                }[certificate_fault]
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    key: -1.0,
+                }
+            elif certificate_fault.startswith("terminal_"):
+                key = {
+                    "terminal_command_limit": "terminal_command_limit",
+                    "terminal_position_tolerance": (
+                        "terminal_eef_position_tolerance_m"
+                    ),
+                    "terminal_orientation_tolerance": (
+                        "terminal_eef_orientation_tolerance_rad"
+                    ),
+                }[certificate_fault]
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    key: -1,
+                }
+            elif certificate_fault.startswith("stationary_"):
+                key = {
+                    "stationary_base_translation_threshold": (
+                        "waypoint_stationary_base_translation_"
+                        "max_actual_velocity_m_s"
+                    ),
+                    "stationary_base_yaw_threshold": (
+                        "waypoint_stationary_base_yaw_"
+                        "max_actual_velocity_rad_s"
+                    ),
+                    "stationary_articulation_threshold": (
+                        "waypoint_stationary_articulation_"
+                        "max_actual_velocity_rad_s"
+                    ),
+                    "stationary_articulation_step": (
+                        "waypoint_stationary_articulation_max_step_rad"
+                    ),
+                    "stationary_sample_rate": (
+                        "waypoint_stationary_sample_rate_hz"
+                    ),
+                    "stationary_policy": "waypoint_stationary_policy",
+                }[certificate_fault]
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    key: (
+                        "tampered"
+                        if certificate_fault == "stationary_policy"
+                        else -1.0
+                    ),
+                }
+            else:
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    "joint_name_layout_sha256": "tampered",
+                }
+            return result
+
+    executor, env = _executor(Backend())
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.47, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == (
+        "error"
+        if certificate_fault
+        not in {"collision_admission", "missing_certificate"}
+        else "collision_admission_unavailable"
+    )
+    assert env.calls == []
+
+
+@pytest.mark.parametrize(
+    "certificate_fault",
+    ["dense_trajectory_digest", "dense_waypoint_count"],
+)
+def test_long_move_to_binds_exact_execution_to_dense_collision_lineage(
+    certificate_fault,
+):
+    class Backend(_FakeBackend):
+        def plan_whole_body_trajectory(self, **kwargs):
+            result = super().plan_whole_body_trajectory(**kwargs)
+            if certificate_fault == "dense_trajectory_digest":
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    "dense_collision_trajectory_sha256": "tampered",
+                }
+            else:
+                result["whole_body_certificate"] = {
+                    **result["whole_body_certificate"],
+                    "collision_free_waypoints": 999,
                 }
             return result
 
@@ -3202,11 +7295,257 @@ def test_move_to_requires_whole_body_collision_certificate_before_first_action(
     )
 
     assert result["primitive_success"] is False
-    assert result["stop_reason"] == (
-        "error"
-        if certificate_fault == "trajectory_digest"
-        else "collision_admission_unavailable"
+    assert result["stop_reason"] == "error"
+    assert "does not match its collision certificate" in result["diagnostics"]["error"]
+    assert env.calls == []
+
+
+def test_whole_body_ordered_execution_subset_sends_only_certified_rows():
+    class Backend(_FakeBackend):
+        marker_step = 0.005
+
+        def __init__(self):
+            super().__init__()
+            self.last_plan = None
+            self.runtime_q_targets = []
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            result = super().plan_whole_body_trajectory(**kwargs)
+            trajectory = np.asarray(
+                result["joint_trajectory"], dtype=np.float32
+            ).copy()
+            trajectory[:, 6] = (
+                np.arange(1, len(trajectory) + 1, dtype=np.float32)
+                * self.marker_step
+            )
+            result["joint_trajectory"] = trajectory
+            self.last_plan = self._refresh_whole_body_certificate(result)
+            return self.last_plan
+
+        def joint_target_to_action(
+            self,
+            target_q,
+            *,
+            hand,
+            fixed_reference=None,
+        ):
+            self.runtime_q_targets.append(
+                np.asarray(target_q, dtype=np.float32).copy()
+            )
+            return super().joint_target_to_action(
+                target_q,
+                hand=hand,
+                fixed_reference=fixed_reference,
+            )
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    result = _move_to_without_replan_checkpoint(
+        executor,
+        hand="left",
+        target_xyz=[0.53, 0.0, 0.0],
     )
+
+    assert result["primitive_success"] is True
+    assert backend.last_plan is not None
+    execution = np.asarray(
+        backend.last_plan["joint_trajectory"], dtype=np.float32
+    )
+    certificate = backend.last_plan["whole_body_certificate"]
+    source_dense = np.asarray(
+        certificate["source_dense_trajectory"], dtype=np.float32
+    )
+    collision_dense = np.asarray(
+        certificate["dense_collision_trajectory"], dtype=np.float32
+    )
+    source_indices = np.asarray(
+        certificate["execution_source_dense_indices"], dtype=np.int64
+    )
+    collision_indices = np.asarray(
+        certificate["execution_collision_dense_indices"], dtype=np.int64
+    )
+    assert len(source_dense) > len(execution) + 1
+    assert len(collision_dense) >= len(execution) + 1
+    assert certificate["dense_collision_checked_waypoint_count"] == len(
+        collision_dense
+    )
+    assert certificate["world_collision_check"] is True
+    assert certificate["self_collision_check"] is True
+    np.testing.assert_array_equal(
+        source_dense[source_indices[1:]],
+        execution,
+    )
+    np.testing.assert_array_equal(
+        collision_dense[collision_indices[1:]],
+        execution,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(backend.runtime_q_targets),
+        execution,
+    )
+    assert len(env.calls) == len(execution)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "source_indices",
+        "collision_indices",
+        "dense_payload",
+        "dense_digest",
+        "execution_row",
+        "start_q",
+    ],
+)
+def test_whole_body_subset_lineage_tamper_fails_before_first_action(fault):
+    class Backend(_FakeBackend):
+        marker_step = 0.005
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            result = super().plan_whole_body_trajectory(**kwargs)
+            trajectory = np.asarray(
+                result["joint_trajectory"], dtype=np.float32
+            ).copy()
+            trajectory[:, 6] = (
+                np.arange(1, len(trajectory) + 1, dtype=np.float32)
+                * self.marker_step
+            )
+            result["joint_trajectory"] = trajectory
+            result = self._refresh_whole_body_certificate(result)
+            certificate = result["whole_body_certificate"]
+
+            def indices_digest(values):
+                return hashlib.sha256(
+                    np.ascontiguousarray(values, dtype="<i8").tobytes()
+                ).hexdigest()
+
+            if fault == "source_indices":
+                indices = np.asarray(
+                    certificate["execution_source_dense_indices"],
+                    dtype=np.int64,
+                )
+                indices[1] += 1
+                certificate["execution_source_dense_indices"] = indices.tolist()
+                certificate["execution_source_dense_indices_sha256"] = (
+                    indices_digest(indices)
+                )
+            elif fault == "collision_indices":
+                indices = np.asarray(
+                    certificate["execution_collision_dense_indices"],
+                    dtype=np.int64,
+                )
+                indices[1] -= 1
+                certificate["execution_collision_dense_indices"] = (
+                    indices.tolist()
+                )
+                certificate["execution_collision_dense_indices_sha256"] = (
+                    indices_digest(indices)
+                )
+            elif fault == "dense_payload":
+                dense = np.asarray(
+                    certificate["dense_collision_trajectory"],
+                    dtype=np.float32,
+                )
+                dense[1, 6] += np.float32(0.0001)
+                certificate["dense_collision_trajectory"] = dense.tolist()
+            elif fault == "dense_digest":
+                certificate["dense_collision_trajectory_sha256"] = "tampered"
+            elif fault == "execution_row":
+                execution = np.asarray(
+                    result["joint_trajectory"], dtype=np.float32
+                ).copy()
+                execution[0, 6] += np.float32(0.0001)
+                result["joint_trajectory"] = execution
+                execution_digest = hashlib.sha256(
+                    np.ascontiguousarray(execution, dtype=np.float32).tobytes()
+                ).hexdigest()
+                certificate["trajectory_sha256"] = execution_digest
+                certificate["execution_trajectory_sha256"] = execution_digest
+            else:
+                self.joint_positions[6] += np.float32(0.0001)
+            return result
+
+    executor, env = _executor(Backend())
+
+    result = executor.move_to(hand="left", target_xyz=[0.53, 0.0, 0.0])
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "error"
+    assert "does not match its collision certificate" in (
+        result["diagnostics"]["error"]
+    )
+    assert env.calls == []
+
+
+def test_whole_body_full_dense_eef_payload_is_verified_before_first_action():
+    class Backend(_FakeBackend):
+        marker_step = 0.01
+
+        def plan_whole_body_trajectory(self, **kwargs):
+            result = super().plan_whole_body_trajectory(**kwargs)
+            trajectory = np.asarray(
+                result["joint_trajectory"], dtype=np.float32
+            ).copy()
+            trajectory[:, 6] = (
+                np.arange(1, len(trajectory) + 1, dtype=np.float32)
+                * self.marker_step
+            )
+            result["joint_trajectory"] = trajectory
+            result = self._refresh_whole_body_certificate(result)
+            certificate = result["whole_body_certificate"]
+            dense_positions = np.asarray(
+                certificate["selected_eef_dense_positions"],
+                dtype=np.float32,
+            )
+            collision_indices = set(
+                certificate["execution_collision_dense_indices"]
+            )
+            tamper_index = next(
+                index
+                for index in range(1, len(dense_positions) - 1)
+                if index not in collision_indices
+            )
+            dense_positions[tamper_index, 1] += np.float32(0.0001)
+            digest = hashlib.sha256(
+                np.ascontiguousarray(
+                    dense_positions, dtype=np.float32
+                ).tobytes()
+            ).hexdigest()
+            certificate["selected_eef_dense_positions"] = (
+                dense_positions.tolist()
+            )
+            certificate["selected_eef_dense_positions_sha256"] = digest
+            certificate["selected_eef_positions_sha256"] = digest
+            return result
+
+    executor, env = _executor(Backend())
+
+    result = executor.move_to(hand="left", target_xyz=[0.53, 0.0, 0.0])
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "error"
+    assert "recomputed_dense_position_digest" in result["diagnostics"]["error"]
+    assert env.calls == []
+
+
+def test_move_to_rejects_runtime_joint_layout_reordering_before_first_action():
+    class Backend(_FakeBackend):
+        def plan_whole_body_trajectory(self, **kwargs):
+            result = super().plan_whole_body_trajectory(**kwargs)
+            self.joint_names = tuple(reversed(self.joint_names))
+            return result
+
+    executor, env = _executor(Backend())
+
+    result = executor.move_to(
+        hand="right",
+        target_xyz=[0.47, 0.0, 0.0],
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "error"
+    assert "collision certificate" in result["diagnostics"]["error"]
     assert env.calls == []
 
 
@@ -3434,7 +7773,11 @@ class _RelativeTraversabilityMap:
 
     def _erode_trav_map(self, floor_map, *, robot):
         del robot
-        result = floor_map.clone()
+        result = (
+            floor_map.clone()
+            if hasattr(floor_map, "clone")
+            else np.asarray(floor_map).copy()
+        )
         if self.blocked_cell is not None:
             result[self.blocked_cell] = 0
         return result
@@ -3523,7 +7866,14 @@ def test_relative_navigation_plans_body_axis_motion_and_locks_nonbase_q(
             q_path[:, :2],
             np.broadcast_to(q_reference[:2], q_path[:, :2].shape),
         )
-        yaw_steps = np.diff(np.concatenate([[q_reference[5]], q_path[:, 5]]))
+        yaw_steps = np.asarray(
+            [
+                _wrap_angle(float(delta))
+                for delta in np.diff(
+                    np.concatenate([[q_reference[5]], q_path[:, 5]])
+                )
+            ]
+        )
         expected_sign = 1.0 if relative_motion["direction"] == "left" else -1.0
         assert np.all(yaw_steps * expected_sign > 0.0)
     path_metrics = result["metrics"]["navigation_path"]
@@ -3567,6 +7917,7 @@ class _NavigationBackend(_FakeBackend):
         super().__init__()
         self.isolation_reports = list(isolation_reports or [])
         self.navigation_actions: list[np.ndarray] = []
+        self.navigation_targets: list[np.ndarray] = []
         self.relative_navigation_calls: list[dict] = []
         self.navigation_reference = {
             "mode": "base_only",
@@ -3579,6 +7930,7 @@ class _NavigationBackend(_FakeBackend):
         self.q_path[:, 0] = [0.1, 0.2, 0.3]
         self.q_path[:, 1] = [0.0, 0.1, 0.2]
         self.q_path[:, 5] = [0.0, 0.1, 0.2]
+        self.base_goal = np.array([0.3, 0.2, 0.2], dtype=np.float32)
 
     def _navigation_plan(self):
         certificate = {
@@ -3597,13 +7949,42 @@ class _NavigationBackend(_FakeBackend):
             "post_interpolation_check": True,
             "attachment_hand_count": 2,
             "colliding_waypoint_count": 0,
+            "base_goal_xyyaw_sha256": hashlib.sha256(
+                np.ascontiguousarray(self.base_goal).tobytes()
+            ).hexdigest(),
+            "terminal_q_sha256": hashlib.sha256(
+                np.ascontiguousarray(
+                    self.q_path[-1], dtype=np.float32
+                ).tobytes()
+            ).hexdigest(),
+            "terminal_command_limit": TERMINAL_COMMAND_LIMIT,
+            "terminal_position_tolerance_m": (
+                BASE_TERMINAL_POSITION_TOLERANCE_M
+            ),
+            "terminal_orientation_tolerance_rad": (
+                BASE_TERMINAL_ORIENTATION_TOLERANCE_RAD
+            ),
         }
         return {
             "ok": True,
             "joint_trajectory": self.q_path.copy(),
-            "base_goal": [0.3, 0.2, 0.2],
+            "base_goal": self.base_goal.tolist(),
             "expected_attachments_by_hand": {"left": None, "right": None},
             "metrics": {
+                "obstacle_refresh": {
+                    "mode": "pose_only",
+                    "count": 7,
+                    "elapsed_s": 0.002,
+                    "fallback": False,
+                },
+                "solver_stages": [
+                    {
+                        "name": "base_ik",
+                        "elapsed_s": 0.01,
+                        "timing_s": {"certificate_s": 0.009},
+                    }
+                ],
+                "selected_solver_stage": "base_ik",
                 "base_trajectory_certificate": certificate,
                 "collision_admission": {
                     "available": True,
@@ -3624,7 +8005,46 @@ class _NavigationBackend(_FakeBackend):
 
     def plan_relative_navigation_trajectory(self, **kwargs):
         self.relative_navigation_calls.append(kwargs)
-        return self._navigation_plan()
+        plan = self._navigation_plan()
+        attempt_cap = kwargs.get("base_attempt_timeout_cap_s")
+        solver_cap = kwargs.get("base_solver_timeout_cap_s")
+        if attempt_cap is not None and solver_cap is not None:
+            hard_attempt = min(float(kwargs["timeout_s"]), float(attempt_cap))
+            plan["metrics"].update(
+                {
+                    "attempt_timeout_cap_s": float(attempt_cap),
+                    "solver_timeout_cap_s": float(solver_cap),
+                    "attempt_timeout_budget_s": hard_attempt,
+                    "attempt_timeout_s": min(
+                        hard_attempt,
+                        float(solver_cap),
+                    ),
+                    "solver_timeout_s": min(
+                        hard_attempt,
+                        float(solver_cap),
+                    ),
+                    "planning_profile": kwargs.get(
+                        "base_planning_profile"
+                    ),
+                    "base_solver_deadline_enforcement": {
+                        "solver_timeout_enforced": True,
+                        "hard_wall_clock_enforced": not bool(
+                            kwargs.get("background", False)
+                        ),
+                        "hard_wall_clock_deadline_s": (
+                            None
+                            if kwargs.get("background", False)
+                            else hard_attempt
+                        ),
+                        "soft_deadline_s": (
+                            hard_attempt
+                            if kwargs.get("background", False)
+                            else None
+                        ),
+                    },
+                }
+            )
+        return plan
 
     @staticmethod
     def capture_trajectory_hold_reference(*, hand):
@@ -3638,6 +8058,7 @@ class _NavigationBackend(_FakeBackend):
         assert hand is None
         assert fixed_reference == {"mode": "base_only", "token": "fixed"}
         target_q = np.asarray(target_q)
+        self.navigation_targets.append(target_q.copy())
         action = self.hold.copy()
         action[ENV_ACTION_SEGMENTS["base"]] = target_q[[0, 1, 5]]
         self.base_pose = target_q[[0, 1, 5]].astype(np.float64)
@@ -3676,7 +8097,467 @@ class _NavigationBackend(_FakeBackend):
             "reached": True,
             "max_base_xy_error_m": 0.0,
             "base_yaw_error_rad": 0.0,
+            "max_articulation_error_rad": 0.0,
         }
+
+
+class _NavigationDynamicsBackend(_NavigationBackend):
+    def __init__(self, dynamics_reports, isolation_reports=None):
+        super().__init__(isolation_reports=isolation_reports)
+        self.dynamics_reports = list(dynamics_reports)
+        self.dynamics_calls = 0
+        self.advance_calls = 0
+
+    def advance(self):
+        super().advance()
+        self.advance_calls += 1
+
+    def dynamics_report(self):
+        self.dynamics_calls += 1
+        assert self.dynamics_reports, "unexpected navigation dynamics read"
+        return self.dynamics_reports.pop(0)
+
+
+class _NavigationSettleGateBackend(_NavigationDynamicsBackend):
+    def __init__(self, dynamics_reports, *, settle_fault):
+        super().__init__(dynamics_reports)
+        self.settle_fault = settle_fault
+        self.settle_events: list[str] = []
+
+    def _is_first_terminal_settle_hold(self):
+        return self.advance_calls == len(self.q_path) + 1
+
+    def dynamics_report(self):
+        if self._is_first_terminal_settle_hold():
+            self.settle_events.append("dynamics")
+        return super().dynamics_report()
+
+    def joint_tracking_report(self, target_q, *, hand):
+        if self._is_first_terminal_settle_hold():
+            self.settle_events.append("tracking")
+            if self.settle_fault == "tracking_not_reached":
+                return {
+                    "available": True,
+                    "reached": False,
+                    "max_base_xy_error_m": 0.02,
+                    "base_yaw_error_rad": 0.0,
+                }
+        return super().joint_tracking_report(target_q, hand=hand)
+
+    def get_base_pose(self):
+        if self._is_first_terminal_settle_hold():
+            self.settle_events.append("pose")
+            if self.settle_fault == "pose_outside_tolerance":
+                return self.base_goal.astype(np.float64) + [0.02, 0.0, 0.0]
+        return super().get_base_pose()
+
+
+def _navigation_isolation_sample(
+    *,
+    roll_pitch_drift_rad=0.0,
+    trunk_drift_rad=0.0,
+    failed_checks=(),
+):
+    checks = {
+        "base_z_locked": True,
+        "base_roll_pitch_locked": True,
+        "trunk_locked": True,
+        "left_arm_locked": True,
+        "right_arm_locked": True,
+        "left_gripper_command_locked": True,
+        "right_gripper_command_locked": True,
+        "left_attachment_identity_unchanged": True,
+        "right_attachment_identity_unchanged": True,
+    }
+    for name in failed_checks:
+        checks[name] = False
+    return {
+        "available": True,
+        "ok": all(checks.values()),
+        "mode": "base_only",
+        "checks": checks,
+        "max_observed": {
+            "base_roll_pitch_drift_rad": float(roll_pitch_drift_rad),
+            "trunk_drift_rad": float(trunk_drift_rad),
+        },
+        "thresholds": {
+            "base_roll_pitch_rad": math.radians(1.0),
+            "articulation_rad": 0.01,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("initial_drift", "settled_drift"),
+    [
+        (math.radians(1.0) + 2e-9, math.radians(0.75)),
+        (math.radians(1.5), math.radians(1.0)),
+    ],
+)
+def test_dashboard_base_terminal_roll_pitch_transient_settles_once(
+    initial_drift,
+    settled_drift,
+):
+    reports = [
+        _navigation_isolation_sample(),
+        _navigation_isolation_sample(),
+        _navigation_isolation_sample(
+            roll_pitch_drift_rad=initial_drift,
+            failed_checks=("base_roll_pitch_locked",),
+        ),
+        _navigation_isolation_sample(
+            roll_pitch_drift_rad=settled_drift,
+        ),
+    ]
+    backend = _NavigationBackend(reports)
+    executor, env = _executor(backend)
+    prepared = executor.prepare_dashboard_motion("chassis", "backward")
+    assert prepared["execution_policy"] == (
+        PREPARED_DASHBOARD_BASE_EXECUTION_POLICY
+    )
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "base-terminal-tilt",
+    )
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert len(env.calls) == len(backend.q_path) + 1
+    np.testing.assert_array_equal(
+        backend.navigation_targets[-2],
+        backend.navigation_targets[-1],
+    )
+    settle = result["metrics"]["dashboard_base_terminal_tilt_settle"]
+    assert settle["eligible"] is True
+    assert settle["hold_sent"] is True
+    assert settle["maximum_holds"] == 1
+    assert settle["initial_base_roll_pitch_drift_rad"] == pytest.approx(
+        initial_drift
+    )
+    assert settle["settled_base_roll_pitch_drift_rad"] == pytest.approx(
+        settled_drift
+    )
+    assert settle["settled"] is True
+
+
+def test_dashboard_base_terminal_roll_pitch_must_settle_within_one_hold():
+    drift = math.radians(1.25)
+    reports = [
+        _navigation_isolation_sample(),
+        _navigation_isolation_sample(),
+        _navigation_isolation_sample(
+            roll_pitch_drift_rad=drift,
+            failed_checks=("base_roll_pitch_locked",),
+        ),
+        _navigation_isolation_sample(
+            roll_pitch_drift_rad=drift,
+            failed_checks=("base_roll_pitch_locked",),
+        ),
+    ]
+    backend = _NavigationBackend(reports)
+    executor, env = _executor(backend)
+    prepared = executor.prepare_dashboard_motion("chassis", "backward")
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "base-terminal-tilt-not-settled",
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "navigation_isolation_violation"
+    assert len(env.calls) == len(backend.q_path) + 1
+    assert len(backend.isolation_reports) == 0
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        math.radians(1.0) + 2e-9,
+        math.radians(1.5),
+    ],
+)
+def test_dashboard_base_intermediate_roll_pitch_transient_continues(
+    drift,
+):
+    backend = _NavigationBackend(
+        [
+            _navigation_isolation_sample(
+                roll_pitch_drift_rad=drift,
+                failed_checks=("base_roll_pitch_locked",),
+            ),
+            _navigation_isolation_sample(),
+            _navigation_isolation_sample(),
+        ]
+    )
+    executor, env = _executor(backend)
+    prepared = executor.prepare_dashboard_motion("chassis", "backward")
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "base-intermediate-tilt",
+    )
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert len(env.calls) == len(backend.q_path)
+    transient = result["metrics"]["dashboard_base_terminal_tilt_settle"]
+    assert transient["intermediate_transient_count"] == 1
+    assert transient[
+        "maximum_intermediate_base_roll_pitch_drift_rad"
+    ] == pytest.approx(drift)
+    assert result["trace"][0]["navigation_isolation_deferred"] == (
+        "dashboard_base_intermediate_roll_pitch_transient"
+    )
+
+
+@pytest.mark.parametrize("drift", [0.010000002, 0.015])
+def test_dashboard_base_intermediate_trunk_transient_continues(drift):
+    backend = _NavigationBackend(
+        [
+            _navigation_isolation_sample(
+                trunk_drift_rad=drift,
+                failed_checks=("trunk_locked",),
+            ),
+            _navigation_isolation_sample(),
+            _navigation_isolation_sample(),
+        ]
+    )
+    executor, env = _executor(backend)
+    prepared = executor.prepare_dashboard_motion("chassis", "forward")
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "base-intermediate-trunk",
+    )
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert len(env.calls) == len(backend.q_path)
+    transient = result["metrics"]["dashboard_base_terminal_tilt_settle"]
+    assert transient["normal_articulation_limit_rad"] == pytest.approx(0.01)
+    assert transient["transient_trunk_limit_rad"] == pytest.approx(0.015)
+    assert transient["intermediate_trunk_transient_count"] == 1
+    assert transient["maximum_intermediate_trunk_drift_rad"] == pytest.approx(
+        drift
+    )
+    isolation = result["metrics"]["navigation_isolation"]
+    assert isolation["ok"] is True
+    assert isolation["all_steps_strict_ok"] is False
+    assert isolation["failed_checks_observed"] == ["trunk_locked"]
+    assert isolation["checks_performed"] == len(backend.q_path)
+    assert isolation["max_observed"]["trunk_drift_rad"] == pytest.approx(drift)
+    assert result["trace"][0]["navigation_isolation_deferred"] == (
+        "dashboard_base_intermediate_trunk_transient"
+    )
+
+
+@pytest.mark.parametrize(
+    ("drift", "prepared"),
+    [
+        (0.015000002, True),
+        (0.012, False),
+    ],
+)
+def test_dashboard_base_intermediate_trunk_transient_is_narrow(
+    drift,
+    prepared,
+):
+    backend = _NavigationBackend(
+        [
+            _navigation_isolation_sample(
+                trunk_drift_rad=drift,
+                failed_checks=("trunk_locked",),
+            ),
+            _navigation_isolation_sample(),
+            _navigation_isolation_sample(),
+        ]
+    )
+    executor, env = _executor(backend)
+    if prepared:
+        plan = executor.prepare_dashboard_motion("chassis", "forward")
+        result = executor.execute_dashboard_motion(
+            plan["plan_id"],
+            "base-intermediate-trunk-rejected",
+        )
+    else:
+        result = executor.navigate_to(
+            target_xyz=[1.0, 0.0, 0.0],
+            standoff_m=0.85,
+            max_travel_m=1.0,
+            timeout_s=5.0,
+        )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "navigation_isolation_violation"
+    assert len(env.calls) == 1
+    assert result["metrics"]["post_stop_env_actions"] == 0
+    isolation = result["metrics"]["navigation_isolation"]
+    assert isolation["available"] is True
+    assert isolation["ok"] is False
+    assert isolation["all_steps_strict_ok"] is False
+    assert isolation["failed_checks_observed"] == ["trunk_locked"]
+    assert isolation["checks_performed"] == 1
+    assert isolation["max_observed"]["trunk_drift_rad"] == pytest.approx(drift)
+
+
+def test_dashboard_base_terminal_trunk_drift_remains_strict():
+    drift = 0.01131296157836914
+    backend = _NavigationBackend(
+        [
+            _navigation_isolation_sample(),
+            _navigation_isolation_sample(),
+            _navigation_isolation_sample(
+                trunk_drift_rad=drift,
+                failed_checks=("trunk_locked",),
+            ),
+        ]
+    )
+    executor, env = _executor(backend)
+    prepared = executor.prepare_dashboard_motion("chassis", "forward")
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "base-terminal-trunk-rejected",
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "navigation_isolation_violation"
+    assert len(env.calls) == len(backend.q_path)
+    settle = result["metrics"]["dashboard_base_terminal_tilt_settle"]
+    assert settle["hold_sent"] is False
+    isolation = result["metrics"]["navigation_isolation"]
+    assert isolation["ok"] is False
+    assert isolation["all_steps_strict_ok"] is False
+    assert isolation["failed_checks_observed"] == ["trunk_locked"]
+    assert isolation["checks_performed"] == len(backend.q_path)
+    assert isolation["max_observed"]["trunk_drift_rad"] == pytest.approx(drift)
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+@pytest.mark.parametrize(
+    ("report", "prepared"),
+    [
+        (
+            _navigation_isolation_sample(
+                roll_pitch_drift_rad=math.radians(1.5) + 2e-9,
+                failed_checks=("base_roll_pitch_locked",),
+            ),
+            True,
+        ),
+        (
+            _navigation_isolation_sample(
+                roll_pitch_drift_rad=math.radians(1.25),
+                failed_checks=("base_roll_pitch_locked", "trunk_locked"),
+            ),
+            True,
+        ),
+        (
+            _navigation_isolation_sample(
+                roll_pitch_drift_rad=math.radians(1.25),
+                failed_checks=("base_roll_pitch_locked",),
+            ),
+            False,
+        ),
+    ],
+)
+def test_dashboard_base_intermediate_roll_pitch_transient_is_narrow(
+    report,
+    prepared,
+):
+    backend = _NavigationBackend(
+        [
+            report,
+            _navigation_isolation_sample(),
+            _navigation_isolation_sample(),
+        ]
+    )
+    executor, env = _executor(backend)
+    if prepared:
+        plan = executor.prepare_dashboard_motion("chassis", "backward")
+        result = executor.execute_dashboard_motion(
+            plan["plan_id"],
+            "base-intermediate-tilt-rejected",
+        )
+    else:
+        result = executor.navigate_to(
+            target_xyz=[1.0, 0.0, 0.0],
+            standoff_m=0.85,
+            max_travel_m=1.0,
+            timeout_s=5.0,
+        )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "navigation_isolation_violation"
+    assert len(env.calls) == 1
+    assert result["metrics"]["post_stop_env_actions"] == 0
+
+
+@pytest.mark.parametrize(
+    ("terminal_report", "prepared", "expected_actions"),
+    [
+        (
+            _navigation_isolation_sample(
+                roll_pitch_drift_rad=math.radians(1.5) + 2e-9,
+                failed_checks=("base_roll_pitch_locked",),
+            ),
+            True,
+            3,
+        ),
+        (
+            _navigation_isolation_sample(
+                roll_pitch_drift_rad=math.radians(1.25),
+                failed_checks=(
+                    "base_roll_pitch_locked",
+                    "trunk_locked",
+                ),
+            ),
+            True,
+            3,
+        ),
+        (
+            _navigation_isolation_sample(
+                roll_pitch_drift_rad=math.radians(1.25),
+                failed_checks=("base_roll_pitch_locked",),
+            ),
+            False,
+            3,
+        ),
+    ],
+)
+def test_dashboard_base_terminal_roll_pitch_policy_does_not_broaden_other_paths(
+    terminal_report,
+    prepared,
+    expected_actions,
+):
+    backend = _NavigationBackend(
+        [
+            _navigation_isolation_sample(),
+            _navigation_isolation_sample(),
+            terminal_report,
+        ]
+    )
+    executor, env = _executor(backend)
+    if prepared:
+        plan = executor.prepare_dashboard_motion("chassis", "backward")
+        result = executor.execute_dashboard_motion(
+            plan["plan_id"],
+            "base-terminal-tilt-rejected",
+        )
+    else:
+        result = executor.navigate_to(
+            target_xyz=[1.0, 0.0, 0.0],
+            standoff_m=0.85,
+            max_travel_m=1.0,
+            timeout_s=5.0,
+        )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "navigation_isolation_violation"
+    assert len(env.calls) == expected_actions
+    assert len(backend.isolation_reports) == 0
+    assert result["metrics"]["post_stop_env_actions"] == 0
 
 
 @pytest.mark.parametrize(
@@ -3711,6 +8592,549 @@ def test_jog_base_uses_only_fixed_server_steps(action, expected_motion):
         {"relative_motion": expected_motion, "timeout_s": 5.0}
     ]
     assert result["metrics"]["fixed_server_step"] is True
+
+
+def test_prepared_dashboard_queue_is_picklable_predicted_and_exactly_once():
+    backend = _NavigationBackend()
+    executor, env = _executor(backend)
+
+    first = executor.prepare_dashboard_motion(
+        "chassis",
+        "forward",
+        background=True,
+    )
+    assert pickle.loads(pickle.dumps(first)) == first
+    assert first["status"] == "prepared"
+    assert first["planning_profile"] == (
+        DASHBOARD_PREPARED_BASE_PLANNING_PROFILE
+    )
+    assert first["planning_deadline_s"] == pytest.approx(12.0)
+    assert first["fast_solver_deadline_s"] == pytest.approx(4.0)
+    assert first["plan_metrics"] == {
+        "obstacle_refresh": {
+            "mode": "pose_only",
+            "count": 7,
+            "elapsed_s": 0.002,
+            "fallback": False,
+        },
+        "solver_stages": [{"name": "base_ik", "elapsed_s": 0.01}],
+        "selected_solver_stage": "base_ik",
+    }
+    assert first["deadline_enforcement"] == {
+        "solver_timeout_enforced": True,
+        "hard_wall_clock_enforced": False,
+        "hard_wall_clock_deadline_s": None,
+        "soft_deadline_s": 12.0,
+        "soft_deadline_exceeded": False,
+        "base_attempt_timeout_budget_s": 4.0,
+        "base_solver_timeout_s": 4.0,
+        "base_attempt_timeout_cap_s": 4.0,
+        "base_solver_timeout_cap_s": 4.0,
+        "base_solver_deadline_enforcement": {
+            "solver_timeout_enforced": True,
+            "hard_wall_clock_enforced": False,
+            "hard_wall_clock_deadline_s": None,
+            "soft_deadline_s": 4.0,
+        },
+    }
+    assert "joint_trajectory" not in first
+
+    second = executor.prepare_dashboard_motion(
+        "chassis",
+        "turn_left",
+        predecessor_plan_id=first["plan_id"],
+        background=True,
+    )
+    np.testing.assert_allclose(
+        backend.relative_navigation_calls[1]["start_q"],
+        first["predicted_terminal"]["joint_positions"],
+    )
+    np.testing.assert_allclose(
+        backend.relative_navigation_calls[1]["start_base_xyyaw"],
+        first["predicted_terminal"]["base_xyyaw"],
+    )
+    assert second["predecessor_plan_id"] == first["plan_id"]
+
+    executed = executor.execute_dashboard_motion(first["plan_id"], "command-1")
+    assert executed["primitive_success"] is True
+    assert executed["metrics"]["prepared_plan_reused"] is True
+    assert executed["metrics"]["live_start_checked"] is True
+    assert executed["metrics"]["collision_revalidated"] is False
+    assert executed["metrics"]["live_start_equality_skipped"] is False
+    assert executed["metrics"]["prepared_start_strict_float32_equal"] is True
+    assert executed["metrics"]["replan_required"] is False
+    assert executed["metrics"]["collision_revalidation_skipped"] is True
+    action_count = len(env.calls)
+
+    replay = executor.execute_dashboard_motion(first["plan_id"], "command-1")
+    assert replay == executed
+    assert len(env.calls) == action_count
+    with pytest.raises(RuntimeError, match="different command"):
+        executor.execute_dashboard_motion(first["plan_id"], "command-2")
+    consumed = executor.discard_dashboard_motion(first["plan_id"])
+    assert consumed["discarded"] is False
+    assert consumed["status"] == "completed"
+
+    discarded = executor.discard_dashboard_motion(second["plan_id"])
+    assert discarded["discarded"] is True
+    with pytest.raises(RuntimeError, match="not executable"):
+        executor.execute_dashboard_motion(second["plan_id"], "command-3")
+
+
+def test_prepared_base_live_start_drift_requires_replan_without_actions():
+    backend = _NavigationBackend()
+    executor, env = _executor(backend)
+    prepared = executor.prepare_dashboard_motion("chassis", "forward")
+    backend.joint_positions[6] = np.nextafter(
+        np.float32(0.0),
+        np.float32(np.inf),
+    )
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "base-start-drift",
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "prepared_start_drift"
+    assert result["recoverable"] is True
+    assert result["metrics"]["replan_required"] is True
+    assert result["metrics"]["live_start_checked"] is True
+    assert result["metrics"]["live_start_equality_skipped"] is False
+    assert result["metrics"]["prepared_start_strict_float32_equal"] is False
+    assert result["metrics"]["env_actions_sent"] == 0
+    assert result["metrics"]["post_stop_env_actions"] == 0
+    assert result["metrics"]["planned_start_q_sha256"] != (
+        result["metrics"]["live_start_q_sha256"]
+    )
+    assert env.calls == []
+    assert backend.navigation_targets == []
+    assert executor._prepared_motions[prepared["plan_id"]]["status"] == "failed"
+
+    replay = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "base-start-drift",
+    )
+    assert replay == result
+    assert env.calls == []
+    with pytest.raises(RuntimeError, match="different command"):
+        executor.execute_dashboard_motion(
+            prepared["plan_id"],
+            "base-start-drift-other",
+        )
+
+
+def test_prepared_eef_live_start_drift_requires_replan_without_actions():
+    class Backend(_FakeBackend):
+        def plan_whole_body_trajectory(
+            self,
+            *,
+            start_q=None,
+            start_eef_pose=None,
+            background=False,
+            **kwargs,
+        ):
+            del start_q, start_eef_pose, background
+            return super().plan_whole_body_trajectory(**kwargs)
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    prepared = executor.prepare_dashboard_motion("left_arm", "forward")
+    backend.joint_positions[6] = np.nextafter(
+        np.float32(0.0),
+        np.float32(np.inf),
+    )
+
+    result = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "eef-start-drift",
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "prepared_start_drift"
+    assert result["recoverable"] is True
+    assert result["metrics"]["replan_required"] is True
+    assert result["metrics"]["live_start_checked"] is True
+    assert result["metrics"]["prepared_start_strict_float32_equal"] is False
+    assert result["metrics"]["env_actions_sent"] == 0
+    assert result["metrics"]["post_stop_env_actions"] == 0
+    assert env.calls == []
+    assert backend.whole_body_hold_calls == []
+
+
+def test_successful_predecessor_actual_terminal_drift_rejects_successor():
+    class Backend(_NavigationBackend):
+        def plan_relative_navigation_trajectory(self, **kwargs):
+            plan = super().plan_relative_navigation_trajectory(**kwargs)
+            start_q = np.ascontiguousarray(
+                np.asarray(kwargs["start_q"], dtype=np.float32)
+            )
+            plan["metrics"]["base_trajectory_certificate"][
+                "start_q_sha256"
+            ] = hashlib.sha256(start_q.tobytes()).hexdigest()
+            return plan
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    first = executor.prepare_dashboard_motion("chassis", "forward")
+    successor = executor.prepare_dashboard_motion(
+        "chassis",
+        "turn_left",
+        predecessor_plan_id=first["plan_id"],
+    )
+
+    first_result = executor.execute_dashboard_motion(
+        first["plan_id"],
+        "predecessor",
+    )
+    assert first_result["primitive_success"] is True
+    actions_after_predecessor = len(env.calls)
+    targets_after_predecessor = len(backend.navigation_targets)
+    assert actions_after_predecessor > 0
+    assert not np.array_equal(
+        backend.joint_positions,
+        np.asarray(
+            first["predicted_terminal"]["joint_positions"],
+            dtype=np.float32,
+        ),
+    )
+
+    result = executor.execute_dashboard_motion(
+        successor["plan_id"],
+        "successor",
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "prepared_start_drift"
+    assert result["metrics"]["replan_required"] is True
+    assert result["metrics"]["env_actions_sent"] == 0
+    assert result["metrics"]["predecessor_plan_id"] == first["plan_id"]
+    assert len(env.calls) == actions_after_predecessor
+    assert len(backend.navigation_targets) == targets_after_predecessor
+
+
+def test_prepared_base_foreground_wraps_relative_plan_and_certification_in_12s(
+    monkeypatch,
+):
+    deadline_calls = []
+    deadline_active = False
+
+    @contextmanager
+    def recording_deadline(timeout_s, operation):
+        nonlocal deadline_active
+        deadline_calls.append((str(operation), float(timeout_s)))
+        deadline_active = True
+        try:
+            yield
+        finally:
+            deadline_active = False
+
+    class Backend(_NavigationBackend):
+        def plan_relative_navigation_trajectory(self, **kwargs):
+            assert deadline_active is True
+            return super().plan_relative_navigation_trajectory(**kwargs)
+
+    monkeypatch.setattr(
+        "robots.behavior.planner_executor._wall_clock_deadline",
+        recording_deadline,
+    )
+    backend = Backend()
+    executor, _env = _executor(backend)
+
+    prepared = executor.prepare_dashboard_motion(
+        "chassis",
+        "forward",
+        background=False,
+    )
+
+    assert deadline_calls == [
+        (
+            "prepared Dashboard BASE planning transaction",
+            pytest.approx(12.0),
+        )
+    ]
+    call = backend.relative_navigation_calls[0]
+    assert call["timeout_s"] == pytest.approx(12.0)
+    assert call["base_attempt_timeout_cap_s"] == pytest.approx(4.0)
+    assert call["base_solver_timeout_cap_s"] == pytest.approx(4.0)
+    assert call["base_planning_profile"] == (
+        DASHBOARD_PREPARED_BASE_PLANNING_PROFILE
+    )
+    assert prepared["deadline_enforcement"]["hard_wall_clock_enforced"] is True
+    assert prepared["deadline_enforcement"][
+        "hard_wall_clock_deadline_s"
+    ] == pytest.approx(12.0)
+    assert prepared["deadline_enforcement"]["soft_deadline_s"] is None
+
+
+def test_prepared_base_background_uses_soft_12s_without_signal_and_reports_overrun(
+    monkeypatch,
+):
+    def forbidden_deadline(*_args, **_kwargs):
+        raise AssertionError("background preparation must not install SIGALRM")
+
+    ticks = iter((100.0, 112.000001))
+    monkeypatch.setattr(
+        "robots.behavior.planner_executor._wall_clock_deadline",
+        forbidden_deadline,
+    )
+    monkeypatch.setattr(
+        "robots.behavior.planner_executor.time",
+        SimpleNamespace(monotonic=lambda: next(ticks)),
+    )
+    executor, _env = _executor(_NavigationBackend())
+
+    prepared = executor.prepare_dashboard_motion(
+        "chassis",
+        "forward",
+        background=True,
+    )
+
+    deadline = prepared["deadline_enforcement"]
+    assert prepared["status"] == "prepared"
+    assert deadline["hard_wall_clock_enforced"] is False
+    assert deadline["hard_wall_clock_deadline_s"] is None
+    assert deadline["soft_deadline_s"] == pytest.approx(12.0)
+    assert deadline["soft_deadline_exceeded"] is True
+
+
+def test_prepared_base_rejects_untruthful_4s_solver_metrics_without_caching():
+    class Backend(_NavigationBackend):
+        def plan_relative_navigation_trajectory(self, **kwargs):
+            plan = super().plan_relative_navigation_trajectory(**kwargs)
+            plan["metrics"]["solver_timeout_s"] = 4.000001
+            return plan
+
+    executor, env = _executor(Backend())
+
+    with pytest.raises(RuntimeError, match="violated its 4s solver"):
+        executor.prepare_dashboard_motion("chassis", "forward")
+
+    assert executor._prepared_motions == {}
+    assert env.calls == []
+
+
+def test_prepared_turn_right_crossing_negative_pi_has_one_canonical_goal_hash():
+    class CollisionGenerator:
+        @staticmethod
+        def check_collisions(q, **kwargs):
+            assert kwargs["self_collision_check"] is True
+            return np.zeros(len(q), dtype=bool)
+
+    class Backend(_NavigationBackend):
+        def __init__(self):
+            super().__init__()
+            self.joint_positions[5] = math.radians(-179.0)
+            self.base_pose = np.asarray(
+                [0.0, 0.0, self.joint_positions[5]],
+                dtype=np.float64,
+            )
+            self.raw_goal = np.asarray(
+                [0.0, 0.0, self.joint_positions[5] - math.radians(5.0)],
+                dtype=np.float64,
+            )
+            with_start, _metrics = _minimum_jerk_base_execution_trajectory(
+                np.stack(
+                    [
+                        self.joint_positions.astype(np.float64),
+                        np.asarray(
+                            [
+                                *self.joint_positions[:5],
+                                self.raw_goal[2],
+                                *self.joint_positions[6:],
+                            ],
+                            dtype=np.float64,
+                        ),
+                    ]
+                ),
+                base_indices=list(range(6)),
+            )
+            self.q_path = with_start[1:]
+            self.base_goal = _canonical_base_xyyaw(self.raw_goal)
+            self._torch = SimpleNamespace(
+                float32=np.float32,
+                as_tensor=lambda value, dtype=None: np.asarray(
+                    value,
+                    dtype=np.float32 if dtype is not None else None,
+                ),
+            )
+            self._collision_generator = CollisionGenerator()
+            self._certifier_robot = SimpleNamespace(base_idx=np.arange(6))
+
+        def _find_robot(self):
+            return self._certifier_robot
+
+        def _generator(self, **_kwargs):
+            return self._collision_generator
+
+        @staticmethod
+        def _all_attached_objects(**_kwargs):
+            return None, {"left": None, "right": None}
+
+        def _navigation_plan(self):
+            q_path, metrics, attachments = (
+                RealCuroboBackend._certify_base_trajectory(
+                    self,
+                    self.q_path,
+                    start_q=self.joint_positions,
+                    base_goal_xyyaw=self.raw_goal,
+                    skip_obstacle_update=False,
+                )
+            )
+            return {
+                "ok": True,
+                "joint_trajectory": q_path,
+                "base_goal": self.base_goal.copy(),
+                "expected_attachments_by_hand": attachments,
+                "metrics": metrics,
+            }
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    prepared = executor.prepare_dashboard_motion(
+        "chassis",
+        "turn_right",
+    )
+    entry = executor._prepared_motions[prepared["plan_id"]]
+    canonical_goal = _canonical_base_xyyaw(backend.raw_goal)
+    certificate = entry["plan"]["metrics"]["base_trajectory_certificate"]
+
+    assert backend.raw_goal[2] < -math.pi
+    assert canonical_goal[2] > 0.0
+    np.testing.assert_allclose(entry["plan"]["base_goal"], canonical_goal)
+    np.testing.assert_allclose(
+        prepared["predicted_terminal"]["base_xyyaw"],
+        canonical_goal,
+    )
+    assert certificate["base_goal_xyyaw_sha256"] == (
+        _whole_body_target_sha256(canonical_goal)
+    )
+
+    executed = executor.execute_dashboard_motion(
+        prepared["plan_id"],
+        "cross-negative-pi",
+    )
+
+    assert executed["primitive_success"] is True
+    assert executed["stop_reason"] == "reached"
+    assert executed["metrics"]["certificate_verified_before_first_action"] is True
+    assert len(env.calls) > 0
+
+
+def test_discard_prepared_motion_invalidates_all_descendants():
+    executor, _env = _executor(_NavigationBackend())
+    first = executor.prepare_dashboard_motion("chassis", "forward")
+    second = executor.prepare_dashboard_motion(
+        "chassis",
+        "turn_left",
+        predecessor_plan_id=first["plan_id"],
+    )
+    third = executor.prepare_dashboard_motion(
+        "chassis",
+        "backward",
+        predecessor_plan_id=second["plan_id"],
+    )
+
+    result = executor.discard_dashboard_motion(first["plan_id"])
+
+    assert result["discarded"] is True
+    assert result["invalidated_descendant_plan_ids"] == [
+        second["plan_id"],
+        third["plan_id"],
+    ]
+    for plan, command in ((second, "second"), (third, "third")):
+        with pytest.raises(RuntimeError, match="not executable"):
+            executor.execute_dashboard_motion(plan["plan_id"], command)
+
+
+def test_prepared_dashboard_queue_rejects_one_shots_and_unsupported_torso():
+    executor, _env = _executor(_NavigationBackend())
+
+    for action in ("observe", "open", "close"):
+        with pytest.raises(ValueError, match="one-shot"):
+            executor.prepare_dashboard_motion("left_arm", action)
+    with pytest.raises(RuntimeError, match="torso_control_unsupported"):
+        executor.prepare_dashboard_motion("chassis", "up")
+
+
+def test_prepared_arm_successor_uses_predicted_eef_and_has_no_extra_hold():
+    class Backend(_FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.prepared_calls = []
+
+        def plan_whole_body_trajectory(
+            self,
+            *,
+            start_q=None,
+            start_eef_pose=None,
+            background=False,
+            **kwargs,
+        ):
+            self.prepared_calls.append(
+                {
+                    **kwargs,
+                    "start_q": np.asarray(start_q).copy(),
+                    "start_eef_pose": (
+                        np.asarray(start_eef_pose[0]).copy(),
+                        np.asarray(start_eef_pose[1]).copy(),
+                    ),
+                    "background": background,
+                }
+            )
+            return super().plan_whole_body_trajectory(**kwargs)
+
+    backend = Backend()
+    executor, env = _executor(backend)
+
+    first = executor.prepare_dashboard_motion("left_arm", "forward")
+    second = executor.prepare_dashboard_motion(
+        "left_arm",
+        "up",
+        predecessor_plan_id=first["plan_id"],
+    )
+    first_call, second_call = backend.prepared_calls
+    np.testing.assert_allclose(first_call["target_xyz"], [0.53, 0.0, 0.0])
+    np.testing.assert_allclose(second_call["start_eef_pose"][0], [0.53, 0.0, 0.0])
+    np.testing.assert_allclose(second_call["target_xyz"], [0.53, 0.0, 0.03])
+    np.testing.assert_allclose(
+        second_call["start_q"],
+        first["predicted_terminal"]["joint_positions"],
+    )
+    assert second["predecessor_plan_id"] == first["plan_id"]
+
+    first_plan = executor._prepared_motions[first["plan_id"]]["plan"]
+    first_certificate = first_plan["whole_body_certificate"]
+    backend.target = np.asarray(first_call["target_xyz"], dtype=np.float64)
+    backend.target_quat = np.asarray(
+        first_call["target_quat_xyzw"], dtype=np.float64
+    )
+    backend.execution_eef_positions = np.asarray(
+        first_certificate["selected_eef_execution_positions"],
+        dtype=np.float32,
+    )
+    backend.execution_eef_quaternions = np.asarray(
+        first_certificate["selected_eef_execution_quaternions_xyzw"],
+        dtype=np.float32,
+    )
+    backend.dense_eef_positions = np.asarray(
+        first_certificate["selected_eef_dense_positions"],
+        dtype=np.float32,
+    )
+    backend.dense_eef_quaternions = np.asarray(
+        first_certificate["selected_eef_dense_quaternions_xyzw"],
+        dtype=np.float32,
+    )
+    executed = executor.execute_dashboard_motion(first["plan_id"], "arm-command")
+    assert executed["primitive_success"] is True
+    assert len(env.calls) == len(backend.execution_eef_positions)
+    guard = executed["metrics"]["whole_body_eef_path_guard"]
+    assert guard["terminal_commands_sent"] == 1
+    assert executed["metrics"]["live_start_checked"] is True
+    assert executed["metrics"]["live_start_equality_skipped"] is False
+    assert executed["metrics"]["prepared_start_strict_float32_equal"] is True
+    assert executed["metrics"]["collision_revalidation_skipped"] is True
 
 
 def test_navigation_missing_collision_certificate_executes_zero_actions():
@@ -3758,6 +9182,269 @@ def test_jog_eef_transforms_base_local_delta_and_preserves_call_start_quat():
         [0.0, 0.03, 0.0],
         atol=1e-8,
     )
+    assert len(backend.whole_body_plan_calls) > 1
+    assert any(
+        round_report.get("execution_stop_reason")
+        == "whole_body_replan_checkpoint"
+        for round_report in result["metrics"]["replan_rounds"]
+    )
+    assert {
+        call["search_profile"] for call in backend.whole_body_plan_calls
+    } == {WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG}
+
+
+@_REQUIRES_TORCH
+@pytest.mark.parametrize("local_ik_success", [True, False])
+def test_dashboard_jog_profile_uses_local_ik_then_falls_back_and_stops_first_safe(
+    tmp_path,
+    local_ik_success,
+):
+    torch = pytest.importorskip("torch")
+    joint_names = tuple(_FakeBackend().joint_names)
+    live_q = np.full(len(joint_names), -0.25, dtype=np.float32)
+    start_q = np.linspace(
+        0.0,
+        0.027,
+        len(joint_names),
+        dtype=np.float32,
+    )
+    start_xyz = np.asarray([0.5, 0.0, 0.0], dtype=np.float64)
+    target_xyz = np.asarray([0.53, 0.0, 0.0], dtype=np.float64)
+
+    class Robot:
+        joints = dict.fromkeys(joint_names)
+        links = {"left_eef_link": object(), "right_eef_link": object()}
+
+        @staticmethod
+        def get_joint_positions():
+            return live_q.copy()
+
+    rollout_retract = torch.zeros(21, dtype=torch.float32)
+    cspace_retract = torch.zeros(21, dtype=torch.float32)
+    rollout = SimpleNamespace(
+        dynamics_model=SimpleNamespace(retract_config=rollout_retract)
+    )
+    kinematics = SimpleNamespace(
+        joint_names=list(WHOLE_BODY_ACTIVE_JOINT_NAMES),
+        kinematics_config=SimpleNamespace(
+            cspace=SimpleNamespace(retract_config=cspace_retract)
+        ),
+    )
+    motion_gen = SimpleNamespace(
+        kinematics=kinematics,
+        get_all_rollout_instances=lambda: [rollout],
+    )
+
+    class Generator:
+        batch_size = 2
+        robot_joint_names = list(joint_names)
+        mg = {"default": motion_gen}
+
+        def __init__(self):
+            self.compute_calls = []
+            self.collision_calls = []
+            self.world_updates = 0
+
+        def update_obstacles(self):
+            self.world_updates += 1
+            self._rpent_obstacle_refresh_metrics = {
+                "clock": "time.monotonic",
+                "completed_monotonic_ns": self.world_updates,
+                "count": self.world_updates,
+                "mode": "pose_only",
+                "elapsed_s": 0.001,
+                "fallback": False,
+            }
+
+        def compute_trajectories(self, _positions, _quaternions, **kwargs):
+            policy = getattr(self, "_rpent_plan_override", None)
+            graph = bool(policy["enable_graph"]) if policy is not None else False
+            self.compute_calls.append(
+                {
+                    "graph": graph,
+                    "policy": None if policy is None else dict(policy),
+                    "kwargs": dict(kwargs),
+                }
+            )
+            if kwargs["ik_only"]:
+                if local_ik_success:
+                    return (
+                        np.asarray([True, False]),
+                        [SimpleNamespace(index=0), None],
+                    )
+                return np.asarray([False, False]), [None, None]
+            if not graph:
+                return np.asarray([False, False]), [None, None]
+            return (
+                np.asarray([True, True]),
+                [SimpleNamespace(index=0), SimpleNamespace(index=1)],
+            )
+
+        def check_collisions(self, q_trajectory, **kwargs):
+            q = np.asarray(q_trajectory, dtype=np.float32)
+            self.collision_calls.append((q.copy(), dict(kwargs)))
+            return np.zeros(len(q), dtype=bool)
+
+    generator = Generator()
+    backend = RealCuroboBackend(None, output_dir=tmp_path)
+    backend._torch = torch
+    backend._embodiment_cls = SimpleNamespace(DEFAULT="default")
+    backend._generator = lambda **_kwargs: generator
+    backend._find_robot = lambda: Robot()
+    backend._eef_link_name = lambda _robot, hand: f"{hand}_eef_link"
+    backend.get_eef_pose = lambda _hand: (
+        start_xyz.copy(),
+        np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+    )
+    backend._all_attached_objects = lambda **_kwargs: (
+        None,
+        {"left": None, "right": None},
+    )
+    config_path = tmp_path / "whole_body.yaml"
+    config_path.write_text("kind: whole_body_test\n", encoding="utf-8")
+    backend._whole_body_config_path = lambda _hand: config_path
+
+    def merge(_generator, _robot, path, *, start_q):
+        goal = np.asarray(start_q, dtype=np.float32).copy()
+        goal[6 + int(path.index)] = 0.03
+        return goal.reshape(1, -1), {
+            "source": "dashboard_profile_test",
+            "candidate": int(path.index),
+        }
+
+    def eef_poses(_generator, q_trajectory):
+        count = len(np.asarray(q_trajectory))
+        return (
+            np.linspace(start_xyz, target_xyz, count, dtype=np.float64),
+            np.repeat(
+                np.asarray([[0.0, 0.0, 0.0, 1.0]], dtype=np.float64),
+                count,
+                axis=0,
+            ),
+        )
+
+    backend._whole_body_path_to_full_joint_trajectory = merge
+    backend._curobo_eef_poses = eef_poses
+
+    result = backend.plan_whole_body_trajectory(
+        hand="left",
+        target_xyz=target_xyz,
+        target_quat_xyzw=np.asarray([0.0, 0.0, 0.0, 1.0]),
+        timeout_s=99.0,
+        search_profile=WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG,
+        start_q=start_q,
+        start_eef_pose=(
+            start_xyz,
+            np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
+        ),
+    )
+
+    assert result["ok"] is True
+    assert generator.compute_calls[0]["policy"] is None
+    assert generator.compute_calls[0]["kwargs"]["ik_only"] is True
+    assert generator.compute_calls[0]["kwargs"]["is_local"] is False
+    assert generator.compute_calls[0]["kwargs"]["max_attempts"] == 1
+    assert generator.compute_calls[0]["kwargs"]["ik_fail_return"] == 1
+    assert generator.compute_calls[0]["kwargs"]["enable_finetune_trajopt"] is False
+    assert generator.compute_calls[0]["kwargs"]["finetune_attempts"] == 0
+    assert generator.compute_calls[0]["kwargs"]["timeout"] <= (
+        WHOLE_BODY_DASHBOARD_JOG_LOCAL_IK_DEADLINE_S
+    )
+    np.testing.assert_allclose(
+        np.asarray(
+            generator.compute_calls[0]["kwargs"]["initial_joint_pos"]
+        ),
+        start_q,
+    )
+    active_expected = np.asarray(
+        [
+            start_q[joint_names.index(name)]
+            for name in WHOLE_BODY_ACTIVE_JOINT_NAMES
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(np.asarray(rollout_retract), active_expected)
+    np.testing.assert_allclose(np.asarray(cspace_retract), active_expected)
+    if local_ik_success:
+        assert len(generator.compute_calls) == 1
+        expected_stage = "local_ik"
+    else:
+        assert [call["graph"] for call in generator.compute_calls] == [
+            False,
+            False,
+            True,
+        ]
+        for call in generator.compute_calls[1:]:
+            assert call["kwargs"]["ik_only"] is False
+            assert call["kwargs"]["max_attempts"] == 3
+            assert call["kwargs"]["ik_fail_return"] == 3
+            assert call["kwargs"]["finetune_attempts"] == 1
+        assert generator.compute_calls[1]["kwargs"]["timeout"] <= (
+            WHOLE_BODY_DASHBOARD_JOG_FAST_TRAJOPT_DEADLINE_S
+        )
+        assert generator.compute_calls[2]["kwargs"]["timeout"] <= (
+            WHOLE_BODY_DASHBOARD_JOG_PLANNING_DEADLINE_S
+        )
+        expected_stage = "graph_trajopt"
+    assert len(generator.collision_calls) == 1
+    assert len(result["metrics"]["candidate_audit"]) == 1
+    assert result["metrics"]["candidate_audit"][0]["certified"] is True
+    assert result["metrics"]["selected_solver_stage"] == expected_stage
+    assert result["whole_body_certificate"]["start_q_sha256"] == hashlib.sha256(
+        np.ascontiguousarray(start_q, dtype=np.float32).tobytes()
+    ).hexdigest()
+    policy = result["metrics"]["planning_policy"]
+    assert policy["search_profile"] == WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG
+    assert policy["graph_fallback"] is True
+    assert policy["candidate_certification"] == "first_fully_certified"
+    assert result["metrics"]["solver_stages"][-1][
+        "certification_short_circuit"
+    ]["remaining_successes_not_certified"] == (0 if local_ik_success else 1)
+
+
+def test_public_move_to_keeps_default_whole_body_search_profile():
+    backend = _FakeBackend()
+    executor, _env = _executor(backend)
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.5, 0.0, 0.0],
+        plan_only=True,
+    )
+
+    assert result["primitive_success"] is True
+    assert len(backend.whole_body_plan_calls) == 1
+    assert backend.whole_body_plan_calls[0]["search_profile"] == (
+        WHOLE_BODY_SEARCH_PROFILE_DEFAULT
+    )
+
+
+def test_public_move_to_replans_only_after_a_certified_progress_checkpoint():
+    backend = _FakeBackend()
+    executor, env = _executor(backend)
+
+    result = executor.move_to(
+        hand="left",
+        target_xyz=[0.506, 0.0, 0.0],
+        position_tolerance_m=0.001,
+    )
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert len(backend.whole_body_plan_calls) == 2
+    assert len(env.calls) == 37
+    assert [
+        round_report.get("execution_stop_reason")
+        for round_report in result["metrics"]["replan_rounds"]
+    ] == [
+        "whole_body_replan_checkpoint",
+        "reached",
+    ]
+    checkpoint = result["metrics"]["replan_rounds"][0][
+        "whole_body_replan_checkpoint"
+    ]
+    assert checkpoint["dynamics_gate_used"] is False
+    assert result["metrics"]["env_actions_sent"] == len(env.calls)
 
 
 def test_jog_eef_fallback_is_plan_only_single_axis_and_bounded():
@@ -3790,7 +9477,96 @@ def test_jog_eef_fallback_is_plan_only_single_axis_and_bounded():
     )
     assert np.count_nonzero(np.abs(attempts[1]["fallback_offset"]) > 0.0) == 1
     assert max(abs(value) for value in attempts[1]["fallback_offset"]) <= 0.005
+    assert len(backend.planned_targets) > 3
+    np.testing.assert_allclose(
+        backend.planned_targets[:2],
+        np.asarray([[0.53, 0.0, 0.0], [0.53, 0.0, 0.0]]),
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        backend.planned_targets[2:],
+        np.tile([0.53, 0.0025, 0.0], (len(backend.planned_targets) - 2, 1)),
+        atol=1e-9,
+    )
     assert len(env.calls) > 0
+
+
+def test_jog_eef_compensation_candidates_share_twelve_second_budget():
+    backend = _FakeBackend()
+    executor, env = _executor(backend)
+    budgets = []
+    calls = []
+
+    def move_with_budget(**kwargs):
+        calls.append(dict(kwargs))
+        budgets.append(float(kwargs["planning_budget_s"]))
+        return {
+            "primitive_success": False,
+            "task_success": False,
+            "stop_reason": "unreachable",
+            "recoverable": True,
+            "metrics": {
+                "planning_spent_s": 12.0,
+                "execution_spent_s": 0.0,
+                "env_actions_sent": 0,
+            },
+            "diagnostics": {},
+        }
+
+    executor._move_to_whole_body_impl = move_with_budget
+
+    result = executor.jog_eef("left", "forward", timeout_s=240.0)
+
+    assert budgets == pytest.approx([12.0])
+    assert calls[0]["search_profile"] == (
+        WHOLE_BODY_SEARCH_PROFILE_DASHBOARD_JOG
+    )
+    assert calls[0]["replan_checkpoint_position_improvement_m"] == pytest.approx(
+        WHOLE_BODY_DASHBOARD_JOG_REPLAN_POSITION_IMPROVEMENT_M
+    )
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "planning_budget_exhausted"
+    assert result["metrics"]["candidate_attempts"][-1][
+        "remaining_planning_budget_s"
+    ] == pytest.approx(0.0)
+    assert env.calls == []
+
+
+def test_jog_eef_candidate_feedback_reads_are_inside_total_wall_deadline(
+    monkeypatch,
+):
+    operations = []
+
+    @contextmanager
+    def deadline(timeout_s, operation):
+        operations.append((str(operation), float(timeout_s)))
+        if operation == "EEF jog candidate transaction":
+            raise TimeoutError("blocked candidate feedback")
+        yield
+
+    monkeypatch.setattr(
+        "robots.behavior.planner_executor._wall_clock_deadline",
+        deadline,
+    )
+    backend = _FakeBackend()
+    executor, env = _executor(backend)
+    private_calls = []
+    executor._move_to_whole_body_impl = lambda **kwargs: private_calls.append(
+        kwargs
+    )
+
+    result = executor.jog_eef("left", "forward", timeout_s=999.0)
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "timeout"
+    assert private_calls == []
+    assert operations[0] == (
+        "EEF jog call-start pose transaction",
+        pytest.approx(12.0),
+    )
+    assert operations[1][0] == "EEF jog candidate transaction"
+    assert 0.0 < operations[1][1] <= 12.0
+    assert env.calls == []
 
 
 def test_jog_eef_non_unreachable_failure_does_not_try_compensation():
@@ -3895,6 +9671,51 @@ def test_jog_wrist_uses_independent_verified_visual_sign_and_holds_position(
     assert len(env.calls) > 0
 
 
+def test_jog_wrist_nonfinite_final_position_cannot_preserve_success():
+    class Backend(_FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.pose_reads = 0
+
+        @staticmethod
+        def wrist_visual_rotation_capability(selected_hand):
+            return {
+                "verified": True,
+                "hand": selected_hand,
+                "clockwise_angle_sign": 1.0,
+                "probe_artifact": "left-visual-probe.json",
+            }
+
+        def get_eef_pose(self, hand):
+            del hand
+            self.pose_reads += 1
+            if self.pose_reads == 1:
+                return self.pose.copy(), self.quat.copy()
+            return (
+                np.asarray([float("nan"), 0.0, 0.0]),
+                self.quat.copy(),
+            )
+
+    backend = Backend()
+    executor, _env = _executor(backend)
+    _add_wrist_frame(executor, "left")
+    executor.move_to = lambda **_kwargs: {
+        "primitive_success": True,
+        "task_success": False,
+        "stop_reason": "reached",
+        "recoverable": True,
+        "metrics": {"env_actions_sent": 1},
+        "diagnostics": {},
+    }
+
+    result = executor.jog_wrist("left", "rotate_left", timeout_s=10.0)
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "pose_feedback_unavailable"
+    assert result["metrics"]["partial_motion"] is True
+    assert result["metrics"]["env_actions_sent"] == 1
+
+
 @pytest.mark.parametrize("hand", ["left", "right"])
 def test_set_gripper_is_formal_latched_primitive_without_retreat(hand):
     backend = _FakeBackend()
@@ -3935,6 +9756,13 @@ def test_navigation_execution_emits_base_only_actions_and_preserves_attachments(
     assert result["primitive_success"] is True
     assert result["stop_reason"] == "reached"
     assert len(env.calls) == len(backend.q_path) == 3
+    np.testing.assert_array_equal(
+        backend.navigation_targets,
+        backend.q_path,
+    )
+    terminal = result["metrics"]["navigation_terminal"]
+    assert terminal["commands_sent"] == 1
+    assert terminal["command_limit"] == TERMINAL_COMMAND_LIMIT
     assert result["metrics"]["navigation_isolation"]["ok"] is True
     checks = result["metrics"]["navigation_isolation"]["checks"]
     assert checks["left_attachment_identity_unchanged"] is True
@@ -3970,6 +9798,104 @@ def test_navigation_executor_dispatches_relative_motion_to_relative_planner():
         }
     ]
     assert len(env.calls) == len(backend.q_path)
+
+
+@pytest.mark.parametrize(
+    ("certificate_field", "tampered_value"),
+    [
+        ("terminal_command_limit", TERMINAL_COMMAND_LIMIT + 1),
+        ("terminal_position_tolerance_m", -1.0),
+        ("terminal_orientation_tolerance_rad", -1.0),
+    ],
+)
+def test_navigation_terminal_policy_certificate_tamper_executes_zero_actions(
+    certificate_field,
+    tampered_value,
+):
+    backend = _NavigationBackend()
+    unsafe_plan = backend._navigation_plan()
+    unsafe_plan["metrics"]["base_trajectory_certificate"][
+        certificate_field
+    ] = tampered_value
+    backend.plan_navigation_trajectory = lambda **_kwargs: unsafe_plan
+    executor, env = _executor(backend)
+
+    result = executor.navigate_to(
+        target_xyz=[1.0, 0.0, 0.0],
+        standoff_m=0.85,
+        max_travel_m=1.0,
+        timeout_s=5.0,
+    )
+
+    assert result["primitive_success"] is False
+    assert result["stop_reason"] == "navigation_collision_certificate_unavailable"
+    assert result["metrics"]["env_actions_sent"] == 0
+    assert env.calls == []
+
+
+def test_navigation_runtime_never_reads_dynamics_reporter():
+    backend = _NavigationDynamicsBackend([])
+    executor, env = _executor(backend)
+
+    result = executor.navigate_to(
+        target_xyz=[1.0, 0.0, 0.0],
+        standoff_m=0.85,
+        max_travel_m=1.0,
+        timeout_s=5.0,
+    )
+
+    assert result["primitive_success"] is True
+    assert result["stop_reason"] == "reached"
+    assert len(env.calls) == len(backend.q_path)
+    assert backend.dynamics_calls == 0
+
+
+@pytest.mark.parametrize("success_on_terminal_command", [6, None])
+def test_navigation_terminal_has_six_command_total_cap_without_seventh(
+    success_on_terminal_command,
+):
+    class Backend(_NavigationBackend):
+        def __init__(self):
+            super().__init__()
+            self.terminal_commands = 0
+
+        def joint_target_to_action(self, target_q, *, hand, fixed_reference):
+            action = super().joint_target_to_action(
+                target_q,
+                hand=hand,
+                fixed_reference=fixed_reference,
+            )
+            if np.array_equal(np.asarray(target_q), self.q_path[-1]):
+                self.terminal_commands += 1
+                if (
+                    success_on_terminal_command is None
+                    or self.terminal_commands < success_on_terminal_command
+                ):
+                    self.base_pose = self.q_path[-2, [0, 1, 5]].astype(
+                        np.float64
+                    )
+            return action
+
+    backend = Backend()
+    executor, env = _executor(backend)
+    result = executor.navigate_to(
+        target_xyz=[1.0, 0.0, 0.0],
+        standoff_m=0.85,
+        max_travel_m=1.0,
+        timeout_s=5.0,
+    )
+
+    assert backend.terminal_commands == TERMINAL_COMMAND_LIMIT
+    assert len(env.calls) == len(backend.q_path) - 1 + TERMINAL_COMMAND_LIMIT
+    assert result["metrics"]["navigation_terminal"]["commands_sent"] == (
+        TERMINAL_COMMAND_LIMIT
+    )
+    if success_on_terminal_command is None:
+        assert result["primitive_success"] is False
+        assert result["stop_reason"] == "target_tolerance_not_met"
+    else:
+        assert result["primitive_success"] is True
+        assert result["stop_reason"] == "reached"
 
 
 @pytest.mark.parametrize(

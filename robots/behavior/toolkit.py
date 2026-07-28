@@ -428,24 +428,166 @@ class BehaviorToolkit(Toolkit):
             public["unavailable_reason"] = public["motion_unavailable_reason"]
         return public
 
+    def _require_dashboard_manual_reservation(self) -> None:
+        """Require a live manual reservation for planning without borrowing it."""
+
+        arbiter = getattr(self, "_command_arbiter", None)
+        snapshot = getattr(arbiter, "snapshot", None)
+        ownership = snapshot() if callable(snapshot) else {}
+        if (
+            not isinstance(ownership, dict)
+            or ownership.get("owner") != "manual"
+            or not isinstance(ownership.get("command_id"), str)
+            or not ownership["command_id"]
+        ):
+            raise RuntimeError(
+                "Dashboard planning requires an active manual reservation"
+            )
+        latch = getattr(self, "_success_latch", None)
+        is_latched = getattr(latch, "is_latched", None)
+        if callable(is_latched) and is_latched():
+            raise RuntimeError(
+                "raw task success is terminal; Dashboard RPC rejected"
+            )
+
+    def _require_dashboard_command_permit(self, command_id: str) -> str:
+        """Return the exact command id after checking the shared arbiter."""
+
+        arbiter = getattr(self, "_command_arbiter", None)
+        require_permit = getattr(arbiter, "require_manual_permit", None)
+        if not callable(require_permit):
+            raise RuntimeError(
+                "Dashboard primitive requires the shared command arbiter"
+            )
+        normalized = str(command_id or "").strip()
+        require_permit(normalized)
+        latch = getattr(self, "_success_latch", None)
+        is_latched = getattr(latch, "is_latched", None)
+        if callable(is_latched) and is_latched():
+            raise RuntimeError(
+                "raw task success is terminal; Dashboard RPC rejected"
+            )
+        return normalized
+
+    def dashboard_prepare_manual_command(
+        self,
+        *,
+        target: str,
+        action: str,
+        predecessor_plan_id: str | None = None,
+        background: bool = False,
+    ) -> dict[str, Any]:
+        """Prepare one reserved manual motion without entering the public tools."""
+
+        if self._closed:
+            raise RuntimeError("BEHAVIOR toolkit is closed")
+        self._require_dashboard_manual_reservation()
+        self._manual_intervention_latch.set()
+        handler = getattr(
+            self._primitives,
+            "dashboard_prepare_manual_command",
+            None,
+        )
+        if not callable(handler):
+            raise RuntimeError("Dashboard motion planning is unavailable")
+        result = handler(
+            target=target,
+            action=action,
+            predecessor_plan_id=predecessor_plan_id,
+            background=background,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Dashboard motion planning returned a non-object")
+        return result
+
+    def dashboard_execute_prepared_command(
+        self,
+        *,
+        plan_id: str,
+        command_id: str,
+    ) -> dict[str, Any]:
+        """Execute one prepared motion with an exact command-scoped permit."""
+
+        if self._closed:
+            raise RuntimeError("BEHAVIOR toolkit is closed")
+        command_id = self._require_dashboard_command_permit(command_id)
+        self._manual_intervention_latch.set()
+        handler = getattr(
+            self._primitives,
+            "dashboard_execute_prepared_command",
+            None,
+        )
+        if not callable(handler):
+            raise RuntimeError("Dashboard prepared execution is unavailable")
+        result = handler(plan_id=plan_id, command_id=command_id)
+        if not isinstance(result, dict):
+            raise RuntimeError("Dashboard prepared execution returned a non-object")
+        receipt_binding = self._receipt_binding_from_result(result)
+        if receipt_binding is not None:
+            latch = self._success_latch
+            if latch is not None and latch.observe(result):
+                self._shared_success_evidence = self._success_evidence(result)
+                self._official_task_success = True
+        return result
+
+    def dashboard_discard_prepared_command(
+        self,
+        *,
+        plan_id: str,
+    ) -> dict[str, Any]:
+        """Discard one speculative prepared motion."""
+
+        if self._closed:
+            raise RuntimeError("BEHAVIOR toolkit is closed")
+        handler = getattr(
+            self._primitives,
+            "dashboard_discard_prepared_command",
+            None,
+        )
+        if not callable(handler):
+            raise RuntimeError("Dashboard prepared-plan discard is unavailable")
+        result = handler(plan_id=plan_id)
+        if not isinstance(result, dict):
+            raise RuntimeError("Dashboard plan discard returned a non-object")
+        return result
+
+    def dashboard_capture_views(
+        self,
+        *,
+        command_id: str,
+    ) -> dict[str, Any]:
+        """Capture one full camera group under an exact manual permit."""
+
+        if self._closed:
+            raise RuntimeError("BEHAVIOR toolkit is closed")
+        command_id = self._require_dashboard_command_permit(command_id)
+        handler = getattr(self._primitives, "dashboard_capture_views", None)
+        if not callable(handler):
+            raise RuntimeError("Dashboard camera capture is unavailable")
+        result = handler(command_id=command_id)
+        if not isinstance(result, dict):
+            raise RuntimeError("Dashboard camera capture returned a non-object")
+        return result
+
     def dashboard_manual_command(
         self,
         *,
         target: str,
         action: str,
         camera: str,
+        permit_command_id: str | None = None,
     ) -> dict[str, Any]:
         """Execute one controller-arbitrated manual primitive."""
 
         if self._closed:
             raise RuntimeError("BEHAVIOR toolkit is closed")
         arbiter = getattr(self, "_command_arbiter", None)
-        snapshot = getattr(arbiter, "snapshot", None)
-        ownership = snapshot() if callable(snapshot) else {}
-        if not isinstance(ownership, dict) or ownership.get("owner") != "manual":
+        require_permit = getattr(arbiter, "require_manual_permit", None)
+        if not callable(require_permit):
             raise RuntimeError(
-                "Dashboard manual primitive requires the shared manual permit"
+                "Dashboard manual primitive requires the shared command arbiter"
             )
+        require_permit(str(permit_command_id or ""))
         if action != "observe":
             latch = getattr(self, "_manual_intervention_latch", None)
             if latch is None:

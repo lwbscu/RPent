@@ -44,7 +44,10 @@
 
   main { flex: 1; display: grid; grid-template-columns: var(--leftw, 1.4fr) 6px 1fr; gap: 0; min-height: 0; }
   .col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-  .col.right { display: grid; grid-template-rows: var(--frameh, 42vh) 6px 1fr; min-height: 0; }
+  .col.right {
+    display: grid; grid-template-rows: var(--frameh, 42vh) 6px 1fr; min-height: 0;
+    container-type: inline-size; container-name: dashboard-right;
+  }
 
   /* draggable splitters */
   .gutter { background: var(--border); position: relative; z-index: 5; }
@@ -115,7 +118,7 @@
     background: #e3dccd; border-bottom: 1px solid var(--border);
     position: relative; min-height: 200px; display: grid;
     grid-template-columns: minmax(168px, .52fr) minmax(260px, 1fr) minmax(168px, .5fr);
-    overflow: hidden;
+    overflow: hidden; container-type: size; container-name: behavior-frame;
   }
   .framewrap:not(.behavior-mode),
   .framewrap.controls-collapsed { grid-template-columns: 1fr; }
@@ -155,24 +158,32 @@
   .control-rail {
     position: relative; z-index: 3; min-width: 0; padding: 8px 9px 7px;
     background:
-      radial-gradient(circle at 45% 20%, rgba(255,255,255,.52), transparent 42%),
-      rgba(246,241,232,.96);
+      radial-gradient(circle at 45% 20%, rgba(255,255,255,.11), transparent 48%),
+      #ebe4d7;
     color: var(--fg); font-size: 12px; line-height: 1.15;
     display: none; flex-direction: column; align-items: center;
   }
   .framewrap.behavior-mode:not(.controls-collapsed) .control-rail { display: flex; }
-  .control-left { grid-column: 1; border-right: 1px solid rgba(216,207,190,.65); }
-  .control-right { grid-column: 3; border-left: 1px solid rgba(216,207,190,.65); }
+  .control-left { grid-column: 1; border-right: 1px solid #d1c6b5; }
+  .control-right { grid-column: 3; border-left: 1px solid #d1c6b5; }
   .controls-toggle {
     width: min(162px, 100%); height: 27px; flex: 0 0 27px; margin: 0 0 12px;
     display: inline-flex; align-items: center; justify-content: space-between;
-    padding: 0 10px; border: 1px solid #c9bfad; border-radius: 5px;
-    background: rgba(255,253,248,.92); color: #766e61; font: inherit;
-    box-shadow: 0 1px 2px rgba(73,61,48,.13); cursor: pointer;
+    padding: 0 10px; border: 1px solid #bdb2a1; border-radius: 5px;
+    background: linear-gradient(#fffefa, #f5f0e8); color: #6f675c; font: inherit;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.9),
+      0 1px 2px rgba(68,54,41,.25);
+    cursor: pointer;
   }
-  .controls-toggle:hover { background: #f1eadf; border-color: #b8ad9a; }
-  .controls-toggle:active { transform: translateY(1px); background: #e6ddd0; }
-  .controls-toggle .chevron { font-size: 13px; line-height: 1; transition: transform .12s ease; }
+  .controls-toggle:hover { background: linear-gradient(#fbf8f2, #ebe3d7); border-color: #a99d8a; }
+  .controls-toggle:active {
+    transform: translateY(1px); background: #e1d7c8;
+    box-shadow: inset 0 1px 2px rgba(68,54,41,.19);
+  }
+  .controls-toggle .chevron {
+    color: #554d42; font-size: 13px; line-height: 1; transition: transform .12s ease;
+  }
   .controls-toggle[aria-expanded="false"] .chevron { transform: rotate(180deg); }
   .collapsed-toggle {
     display: none; position: absolute; top: 8px; left: 9px; z-index: 5;
@@ -182,22 +193,46 @@
   .target-row { display: flex; gap: 8px; justify-content: center; width: 100%; min-height: 26px; }
   .target-button {
     box-sizing: border-box; width: 76px; height: 26px; flex: 0 0 76px;
-    margin: 0; padding: 0 7px; color: #655f55; background: #f7f3eb;
-    border: 1px solid #bdb4a5; border-radius: 5px;
+    margin: 0; padding: 0 7px; color: #5c564d;
+    background: linear-gradient(#fffefa, #eee8de);
+    border: 1px solid #b5aa99; border-radius: 5px;
     font: 12px/24px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    white-space: nowrap; box-shadow: 0 2px 3px rgba(67,56,43,.22);
+    white-space: nowrap;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.88),
+      0 2px 3px rgba(63,50,38,.28);
     cursor: pointer;
   }
-  .target-button:hover { background: #ede6da; border-color: #a99e8c; }
-  .target-button:active, .target-button.pressed {
-    transform: translateY(1px); background: #ddd3c4; box-shadow: 0 1px 1px rgba(67,56,43,.18);
+  .target-button:hover:not([aria-disabled="true"]) {
+    background: linear-gradient(#faf6ef, #e3dacd); border-color: #9e927f;
+  }
+  .target-button:active:not([aria-disabled="true"]), .target-button.pressed {
+    transform: translateY(1px); background: #d9cebe;
+    box-shadow: inset 0 1px 2px rgba(63,50,38,.2);
   }
   .target-button.selected {
-    color: #31567d; border-color: #8ba5bd; background: #e6edf2;
-    box-shadow: 0 2px 3px rgba(67,56,43,.22);
+    color: #315572; border-color: #8ea6b8;
+    background: linear-gradient(#f1f6f9, #dce7ee);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.88),
+      0 2px 3px rgba(63,50,38,.28);
+  }
+  .target-button[aria-disabled="true"] {
+    color: #938a7d; background: linear-gradient(#f8f4ed, #e7dfd3);
+    border-color: #c4b9a8;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.7),
+      0 1px 2px rgba(63,50,38,.18);
+    cursor: not-allowed;
+  }
+  .target-button.selected[aria-disabled="true"] {
+    color: #7d8790; border-color: #b4bdc4;
+    background: linear-gradient(#f1f3f4, #e1e5e7);
   }
   .control-left .target-row { margin-bottom: 25px; }
-  .control-left .controls-toggle { left: -2px; position: relative; }
+  .control-left .controls-toggle {
+    left: -2px; position: relative; margin-bottom: 34px;
+  }
   .control-left .target-row { transform: translateX(-4.5px); }
   .control-right .target-row {
     gap: 9px; margin-top: 61px; margin-bottom: 36px; transform: translateX(5px);
@@ -208,15 +243,22 @@
     position: absolute; left: 21.58px; top: 26px; width: 96px; height: 96px;
   }
   .dpad::before, .dpad::after {
-    content: ""; position: absolute; background: #e9e2d6; border: 1px solid #bdb3a2;
-    box-shadow: 0 2px 3px rgba(67,56,43,.2);
+    content: ""; position: absolute;
+    background: linear-gradient(135deg, #f3eee6, #dfd5c6);
+    border: 1px solid #b7ab99;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.72),
+      0 2px 3px rgba(63,50,38,.26);
   }
   .dpad::before { left: 32px; top: 0; width: 32px; height: 96px; border-radius: 7px; }
   .dpad::after { left: 0; top: 32px; width: 96px; height: 32px; border-radius: 7px; }
   .control-button {
     position: relative; z-index: 2; margin: 0; padding: 0;
-    color: #756d60; background: linear-gradient(#fffdf8, #e9e1d5);
-    border: 1px solid #bcb2a1; box-shadow: 0 2px 3px rgba(67,56,43,.2);
+    color: #61584c; background: linear-gradient(#fffefa, #eee8df);
+    border: 1px solid #b6aa98;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.86),
+      0 2px 3px rgba(63,50,38,.28);
     cursor: pointer; user-select: none; touch-action: none;
     font: 600 19px/1 -apple-system, "Segoe UI Symbol", "Segoe UI", sans-serif;
   }
@@ -229,8 +271,12 @@
     box-shadow: inset 0 1px 2px rgba(67,56,43,.2);
   }
   .control-button[aria-disabled="true"] {
-    color: #b5ac9e; background: #eee9e0; border-color: #d3cabd;
-    box-shadow: none; cursor: not-allowed;
+    color: #938a7d; background: linear-gradient(#f8f4ed, #e7dfd3);
+    border-color: #c4b9a8;
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.7),
+      0 1px 2px rgba(63,50,38,.18);
+    cursor: not-allowed;
   }
   .control-button.error, .target-button.error {
     border-color: var(--red); box-shadow: 0 0 0 1px rgba(200,57,47,.18);
@@ -257,13 +303,26 @@
     position: absolute; width: 32px; height: 32px; border: 0; background: transparent;
     box-shadow: none; border-radius: 5px; font-size: 13px;
   }
+  .control-icon {
+    display: block; width: 22px; height: 22px; margin: auto;
+    overflow: visible; pointer-events: none;
+  }
+  .dpad-icon { width: 13px; height: 13px; }
+  .observe-icon { width: 24px; height: 18px; }
+  .rotate-icon { width: 23px; height: 23px; }
+  .gripper-icon { width: 24px; height: 24px; }
+  .gripper-icon .grip-dark { fill: currentColor; }
+  .gripper-icon .grip-mid { fill: #b5aea4; }
+  .gripper-icon .grip-accent { fill: #eea631; }
+  .control-button[aria-disabled="true"] .gripper-icon .grip-mid { fill: #c5bdb1; }
+  .control-button[aria-disabled="true"] .gripper-icon .grip-accent { fill: #cbb68e; }
   .dpad .control-button:hover:not([aria-disabled="true"]) { background: rgba(184,173,155,.27); }
   .dpad .control-button.pressed { background: rgba(132,119,101,.28); transform: translateY(1px); }
   .dpad-up { left: 32px; top: 0; }
   .dpad-down { left: 32px; bottom: 0; }
   .dpad-left { left: 0; top: 32px; }
   .dpad-right { right: 0; top: 32px; }
-  .dpad-label { position: absolute; color: #4f4a42; font-size: 12px; line-height: 1.05; text-align: center; }
+  .dpad-label { position: absolute; color: #403b35; font-size: 12px; line-height: 1.05; text-align: center; }
   .label-forward { top: 0; left: 47px; width: 58px; }
   .label-backward { bottom: 0; left: 43px; width: 66px; }
   .label-left { left: -12px; top: 61px; width: 25px; }
@@ -276,7 +335,7 @@
     gap: 5px; transform: translateX(-7px);
   }
   .observe-wrap .round-button { font-size: 18px; }
-  .button-caption { color: #4f4a42; font-size: 12px; line-height: 1.1; text-align: center; }
+  .button-caption { color: #403b35; font-size: 12px; line-height: 1.1; text-align: center; }
   .function-grid {
     display: grid; grid-template-columns: 64px 64px; column-gap: 16px; row-gap: 29px;
     align-items: start; justify-content: center; transform: translateX(6px);
@@ -290,6 +349,19 @@
   }
   .control-status.error { color: var(--red); }
   .col.right > .col .panel-title { padding: 7px 14px; }
+  @container behavior-frame (min-height: 430px) {
+    .control-rail { padding-top: 14.6667px; }
+    .behavior-frame-tabs { top: 10.6667px; }
+    .control-left .controls-toggle { margin-bottom: 58.3333px; }
+    .control-left .target-row { margin-bottom: 15px; }
+    .control-right .target-row { margin-top: 85.3333px; margin-bottom: 30px; }
+    .observe-wrap { margin-top: 20px; }
+  }
+  @container dashboard-right (min-width: 830px) and (max-width: 900px) {
+    .framewrap {
+      grid-template-columns: 216.6667px minmax(0, 1fr) 212px;
+    }
+  }
   @media (max-width: 820px) {
     .framewrap {
       grid-template-columns: minmax(150px, .48fr) minmax(230px, 1fr) minmax(150px, .47fr);
@@ -476,9 +548,12 @@
           <span>Interactive Controls</span><span class="chevron" aria-hidden="true">⌃</span>
         </button>
         <div class="frame-tabs behavior-frame-tabs" aria-label="Camera view">
-          <button data-kind="head" data-camera="head" class="active">head</button>
-          <button data-kind="left_wrist" data-camera="left_wrist">left wrist</button>
-          <button data-kind="right_wrist" data-camera="right_wrist">right wrist</button>
+          <button type="button" data-kind="head" data-camera="head" class="active"
+                  aria-pressed="true">head</button>
+          <button type="button" data-kind="left_wrist" data-camera="left_wrist"
+                  aria-pressed="false">left wrist</button>
+          <button type="button" data-kind="right_wrist" data-camera="right_wrist"
+                  aria-pressed="false">right wrist</button>
         </div>
         <section class="control-rail control-left" id="interactiveControls"
                  aria-label="Interactive robot controls">
@@ -498,18 +573,40 @@
               <span class="dpad-label label-backward">Backward</span>
               <div class="dpad" aria-label="Directional controls">
                 <button class="control-button dpad-up" type="button" data-action="forward"
-                        data-repeat="true" aria-label="Forward">▲</button>
+                        data-repeat="true" aria-label="Forward">
+                  <svg class="control-icon dpad-icon" viewBox="0 0 16 16" aria-hidden="true">
+                    <path fill="currentColor" d="M8 3 13 11H3Z"/>
+                  </svg>
+                </button>
                 <button class="control-button dpad-left" type="button" data-action="turn_left"
-                        data-repeat="true" aria-label="Turn left">◀</button>
+                        data-repeat="true" aria-label="Turn left">
+                  <svg class="control-icon dpad-icon" viewBox="0 0 16 16" aria-hidden="true">
+                    <path fill="currentColor" d="m3 8 8-5v10Z"/>
+                  </svg>
+                </button>
                 <button class="control-button dpad-right" type="button" data-action="turn_right"
-                        data-repeat="true" aria-label="Turn right">▶</button>
+                        data-repeat="true" aria-label="Turn right">
+                  <svg class="control-icon dpad-icon" viewBox="0 0 16 16" aria-hidden="true">
+                    <path fill="currentColor" d="m13 8-8 5V3Z"/>
+                  </svg>
+                </button>
                 <button class="control-button dpad-down" type="button" data-action="backward"
-                        data-repeat="true" aria-label="Backward">▼</button>
+                        data-repeat="true" aria-label="Backward">
+                  <svg class="control-icon dpad-icon" viewBox="0 0 16 16" aria-hidden="true">
+                    <path fill="currentColor" d="M8 13 3 5h10Z"/>
+                  </svg>
+                </button>
               </div>
             </div>
             <div class="observe-wrap">
               <button class="control-button round-button" type="button" data-action="observe"
-                      data-repeat="false" aria-label="Observe">◉</button>
+                      data-repeat="false" aria-label="Observe">
+                <svg class="control-icon observe-icon" viewBox="0 0 26 18" aria-hidden="true">
+                  <path d="M1.8 9s4.1-6.1 11.2-6.1S24.2 9 24.2 9 20.1 15.1 13 15.1 1.8 9 1.8 9Z"
+                        fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+                  <circle cx="13" cy="9" r="3.2" fill="currentColor"/>
+                </svg>
+              </button>
               <span class="button-caption">Observe</span>
             </div>
           </div>
@@ -536,32 +633,70 @@
           <div class="function-grid">
             <div class="function-key">
               <button class="control-button round-button" type="button" data-action="up"
-                      data-repeat="true" aria-label="Up">↑</button>
+                      data-repeat="true" aria-label="Up">
+                <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 20V4M5.8 10.2 12 4l6.2 6.2" fill="none"
+                        stroke="currentColor" stroke-width="2.3" stroke-linecap="round"
+                        stroke-linejoin="round"/>
+                </svg>
+              </button>
               <span class="button-caption">Up</span>
             </div>
             <div class="function-key">
               <button class="control-button round-button" type="button" data-action="down"
-                      data-repeat="true" aria-label="Down">↓</button>
+                      data-repeat="true" aria-label="Down">
+                <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 4v16m6.2-6.2L12 20l-6.2-6.2" fill="none"
+                        stroke="currentColor" stroke-width="2.3" stroke-linecap="round"
+                        stroke-linejoin="round"/>
+                </svg>
+              </button>
               <span class="button-caption">Down</span>
             </div>
             <div class="function-key">
               <button class="control-button round-button" type="button" data-action="rotate_left"
-                      data-repeat="true" aria-label="Rotate left">↻</button>
+                      data-repeat="true" aria-label="Rotate left">
+                <svg class="control-icon rotate-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M15.8 5.5A7.7 7.7 0 1 1 10.1 3.9" fill="none"
+                        stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+                  <path d="M10.1 3.9h5.7v5.7" fill="none" stroke="currentColor"
+                        stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
               <span class="button-caption">Rotate left</span>
             </div>
             <div class="function-key">
               <button class="control-button round-button" type="button" data-action="rotate_right"
-                      data-repeat="true" aria-label="Rotate right">↺</button>
+                      data-repeat="true" aria-label="Rotate right">
+                <svg class="control-icon rotate-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M8.2 5.5a7.7 7.7 0 1 0 5.7-1.6" fill="none"
+                        stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+                  <path d="M13.9 3.9H8.2v5.7" fill="none" stroke="currentColor"
+                        stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
               <span class="button-caption">Rotate right</span>
             </div>
             <div class="function-key gripper">
               <button class="control-button round-button" type="button" data-action="open"
-                      data-repeat="false" aria-label="Open">↱</button>
+                      data-repeat="false" aria-label="Open">
+                <svg class="control-icon gripper-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path class="grip-accent" d="M9.2 3.1 5.5 5.5 2.7 11.5l2.8 6.6 3.7 2.6v-5l-1.4-.9-1.5-3.2 1.5-3.1 1.4-.9Z"/>
+                  <path class="grip-dark" d="m14.8 3.1 3.7 2.4 2.8 6-2.8 6.6-3.7 2.6v-5l1.4-.9 1.5-3.2-1.5-3.1-1.4-.9Z"/>
+                  <path class="grip-mid" d="M9.2 9.2h2.1v8.7H9.2Zm3.5 0h2.1v8.7h-2.1Z"/>
+                </svg>
+              </button>
               <span class="button-caption">Open</span>
             </div>
             <div class="function-key gripper">
               <button class="control-button round-button" type="button" data-action="close"
-                      data-repeat="false" aria-label="Close">↲</button>
+                      data-repeat="false" aria-label="Close">
+                <svg class="control-icon gripper-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path class="grip-dark" d="M9.2 3.1 5.5 5.5 2.7 11.5l2.8 6.6 3.7 2.6v-5l-1.4-.9-1.5-3.2 1.5-3.1 1.4-.9Z"/>
+                  <path class="grip-accent" d="m14.8 3.1 3.7 2.4 2.8 6-2.8 6.6-3.7 2.6v-5l1.4-.9 1.5-3.2-1.5-3.1-1.4-.9Z"/>
+                  <path class="grip-mid" d="M9.2 9.2h2.1v8.7H9.2Zm3.5 0h2.1v8.7h-2.1Z"/>
+                </svg>
+              </button>
               <span class="button-caption">Close</span>
             </div>
           </div>
@@ -590,13 +725,28 @@ let autoActionPlayback = null;
 let autoActionReturnTimer = null;
 let stepTransitioning = false;  // suppress realtime frames during step transition
 let controlsExpanded = true;
+let desiredControlsExpanded = true;
+let controlsTransitionGeneration = 0;
 let selectedTarget = "chassis";
+let desiredTarget = "chassis";
+let targetTransitionGeneration = 0;
 let selectedCamera = "head";
+let publishedCamera = "head";
+let cameraSelectionQueue = Promise.resolve();
+let frameTransitionGeneration = 0;
+let runSelectionGeneration = 0;
+let timelineRevision = -1;
+let frameRevisions = {};
 let pressedAction = null;
 let activeLeaseId = null;
 let controlStatus = "idle";
 let behaviorControlsEnabled = false;
-let controlSnapshot = { available: false, busy: false, owner: null, phase: "idle" };
+let controlSnapshot = {
+  control_revision: -1, available: false, busy: false, owner: null,
+  lease_id: null, current_command: null, planning_command: null,
+  queue_depth: 0, queue_capacity: 5, last_terminal: null,
+  capture: { phase: "idle", revision: 0, error: null },
+};
 let controlSequence = 0;
 let activeControlButton = null;
 let activePointerId = null;
@@ -607,13 +757,15 @@ let controlLoopGeneration = 0;
 let lastCommandSubmittedAt = 0;
 let controlErrorTimer = null;
 let controlCommandInFlight = false;
-let controlPollAbort = null;
+let controlLoopPromise = null;
+let activeLeaseToken = null;
+let stopLeasePromise = null;
 const AUTO_ACTION_RETURN_DELAY_MS = 300;
 const CONTROL_HOLD_DELAY_MS = 320;
-const CONTROL_REPEAT_MIN_MS = 220;
+const CONTROL_REPEAT_MIN_MS = 100;
 const CONTROL_HEARTBEAT_MS = 400;
 const CONTROL_POLL_MS = 100;
-const CONTROL_COMMAND_TIMEOUT_MS = 245000;
+const CONTROL_QUIESCE_TIMEOUT_MS = 15000;
 const PHYSICAL_CAMERAS = new Set(["head", "left_wrist", "right_wrist"]);
 const REPEATABLE_ACTIONS = new Set([
   "forward", "backward", "turn_left", "turn_right",
@@ -741,7 +893,7 @@ function _pumpSwap() {
   });
 }
 
-function _runSwap({ kind, url, cap, onReady, holdUntilEnded }, gen, done) {
+function _runSwap({ kind, url, cap, onReady, onError, holdUntilEnded }, gen, done) {
   const target = _pickTarget(kind, url);
   let finished = false;
   let fallbackTimer = null;
@@ -750,11 +902,18 @@ function _runSwap({ kind, url, cap, onReady, holdUntilEnded }, gen, done) {
     if (finished) return;
     finished = true;
     if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+    _clearMediaListeners(target);
     if (gen !== inflightGen) return;   // abandoned — don't paint or advance
     target._loadedSrc = ok ? url : null;
+    if (!ok) {
+      if (onError) onError(target);
+      else $("#frameCap").textContent = "Media unavailable; showing the previous frame.";
+      done();
+      return;
+    }
     _showBuffer(target);
     if (cap != null) $("#frameCap").textContent = cap;
-    if (onReady) onReady(target);
+    let holdRelease = null;
     if (holdUntilEnded && kind === "video") {
       // Realtime frames wait on this video until it ends (natural or errored)
       // — or until a user action releases the hold via `swapMedia`.
@@ -765,10 +924,20 @@ function _runSwap({ kind, url, cap, onReady, holdUntilEnded }, gen, done) {
         target.removeEventListener("error", release);
         done();
       };
+      holdRelease = release;
       releaseHold = release;
       target.addEventListener("ended", release, { once: true });
       target.addEventListener("error", release, { once: true });
-    } else {
+    }
+    try {
+      if (onReady) onReady(target, holdRelease);
+    } catch (error) {
+      if (holdRelease) holdRelease();
+      else done();
+      if (onError) onError(target, error);
+      return;
+    }
+    if (!holdRelease) {
       done();
     }
   };
@@ -812,9 +981,9 @@ function _runSwap({ kind, url, cap, onReady, holdUntilEnded }, gen, done) {
     target.load();
   }
 
-  // Fallback: if load/canplay never fires (network stall, missing keyframe),
-  // swap anyway after 4s so the queue does not wedge on one bad fetch.
-  fallbackTimer = setTimeout(() => finish(true), 4000);
+  // A stalled or malformed asset must not replace the last good buffer. Fail
+  // this swap and release the queue so later user selections remain usable.
+  fallbackTimer = setTimeout(() => finish(false), 4000);
 }
 
 function _clearMediaListeners(el) {
@@ -950,10 +1119,55 @@ function setBehaviorControlMode(enabled) {
   wrap.classList.toggle("behavior-mode", behaviorControlsEnabled);
   wrap.classList.toggle("controls-collapsed", behaviorControlsEnabled && !controlsExpanded);
   if (!behaviorControlsEnabled) {
-    controlSnapshot = { available: false, busy: false, owner: null, phase: "idle" };
+    controlSnapshot = {
+      control_revision: -1, available: false, busy: false, owner: null,
+      lease_id: null, current_command: null, planning_command: null,
+      queue_depth: 0, queue_capacity: 5, last_terminal: null,
+      capture: { phase: "idle", revision: 0, error: null },
+    };
     controlStatus = "idle";
   }
   renderControlUI();
+}
+
+function controlCurrent(snapshot = controlSnapshot) {
+  return snapshot.current_command ?? snapshot.current ?? null;
+}
+
+function controlPlanning(snapshot = controlSnapshot) {
+  return snapshot.planning_command ?? snapshot.planning ?? null;
+}
+
+function controlLeaseId(snapshot = controlSnapshot) {
+  return snapshot.lease_id ?? snapshot.lease?.lease_id ??
+    snapshot.lease?.id ?? null;
+}
+
+function controlQueueDepth(snapshot = controlSnapshot) {
+  const depth = Number(snapshot.queue_depth ?? snapshot.queue?.depth ?? 0);
+  return Number.isFinite(depth) ? Math.max(0, depth) : 0;
+}
+
+function controlQueueCapacity(snapshot = controlSnapshot) {
+  const capacity = Number(snapshot.queue_capacity ?? snapshot.queue?.capacity ?? 5);
+  return Number.isFinite(capacity) ? Math.max(1, capacity) : 5;
+}
+
+function controlPhase(snapshot = controlSnapshot) {
+  const current = controlCurrent(snapshot);
+  const planning = controlPlanning(snapshot);
+  if (current) return current.phase || "moving";
+  if (planning) return planning.phase || "planning";
+  return snapshot.phase || "idle";
+}
+
+function controlCaptureOnlyBusy(snapshot = controlSnapshot) {
+  return snapshot.lease_status !== "active" &&
+    controlCurrent(snapshot) == null &&
+    controlPlanning(snapshot) == null &&
+    controlQueueDepth(snapshot) === 0 &&
+    snapshot.owner === "manual" &&
+    ["pending", "started"].includes(snapshot.capture?.phase);
 }
 
 function renderControlUI() {
@@ -969,9 +1183,11 @@ function renderControlUI() {
     button.dataset.tooltip = button.dataset.error || `Control the ${button.textContent.trim().toLowerCase()}.`;
   });
 
-  const locallyBusy = controlCommandInFlight ||
+  const locallyBusy = controlCommandInFlight || !!activeLeaseId ||
     ["planning", "moving", "stopping"].includes(controlStatus);
-  const backendBusy = !!controlSnapshot.busy;
+  const backendBusy =
+    (!!controlSnapshot.busy && !controlCaptureOnlyBusy()) || !!controlCurrent() ||
+    !!controlPlanning() || controlQueueDepth() > 0;
   const busy = locallyBusy || backendBusy;
   const available = behaviorControlsEnabled && controlSnapshot.available !== false;
   const motionAvailable = available &&
@@ -1004,11 +1220,12 @@ function renderControlUI() {
     button.setAttribute("aria-disabled", String(!available));
   });
 
-  const phase = controlStatus === "idle"
-    ? (controlSnapshot.phase || "idle")
-    : controlStatus;
+  const phase = controlStatus === "idle" ? controlPhase() : controlStatus;
+  const queueDepth = controlQueueDepth();
+  const queueCapacity = controlQueueCapacity();
   document.querySelectorAll(".control-status").forEach((el, index) => {
-    el.textContent = index === 0 && phase !== "idle" ? phase : "";
+    el.textContent = index === 0 && phase !== "idle"
+      ? `${phase} · q ${queueDepth}/${queueCapacity}` : "";
     el.classList.toggle("error", phase === "error" || phase === "failed");
   });
 }
@@ -1039,16 +1256,50 @@ function applyControlSnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== "object") return;
   const next = snapshot.control && typeof snapshot.control === "object"
     ? snapshot.control : snapshot;
-  controlSnapshot = { ...controlSnapshot, ...next };
-  const phase = next.phase;
-  if (phase === "accepted" || phase === "planning") controlStatus = "planning";
-  else if (phase === "moving") controlStatus = "moving";
+  const incomingRevision = Number(next.control_revision);
+  const currentRevision = Number(controlSnapshot.control_revision);
+  if (
+    Number.isFinite(incomingRevision) && Number.isFinite(currentRevision) &&
+    incomingRevision < currentRevision
+  ) return;
+  controlSnapshot = {
+    ...controlSnapshot,
+    ...next,
+    capture: next.capture && typeof next.capture === "object"
+      ? { ...(controlSnapshot.capture || {}), ...next.capture }
+      : controlSnapshot.capture,
+  };
+  const phase = controlPhase(controlSnapshot);
+  if (phase === "accepted" || phase === "planning" || phase === "prepared") {
+    controlStatus = "planning";
+  } else if (phase === "moving" || phase === "executing") controlStatus = "moving";
   else if (phase === "stopping") controlStatus = "stopping";
   else if (phase === "completed" || phase === "cancelled" || phase === "idle") {
     controlStatus = "idle";
   } else if (phase === "failed") {
-    showControlError(next.error || "Manual control failed.");
-    return;
+    showControlError(
+      controlSnapshot.last_terminal?.error || next.error ||
+      "Manual control failed.");
+  }
+  const terminal = controlSnapshot.last_terminal;
+  const token = activeLeaseToken;
+  const terminalBelongsToLease = !!(
+    token && terminal?.command_id &&
+    token.acceptedCommandIds.has(terminal.command_id)
+  );
+  if (
+    token &&
+    (
+      terminal?.task_success === true ||
+      controlSnapshot.success_latched === true ||
+      (terminalBelongsToLease &&
+        (terminal.phase === "failed" || !!terminal.error))
+    )
+  ) {
+    const reason = terminal?.task_success === true ||
+      controlSnapshot.success_latched === true
+      ? "official_success" : "command_failed";
+    void stopActiveLease(reason);
   }
   renderControlUI();
 }
@@ -1095,9 +1346,10 @@ function scheduleHeartbeat(leaseId, runId) {
   heartbeatTimer = setTimeout(async () => {
     if (activeLeaseId !== leaseId || curRun !== runId) return;
     try {
-      await controlRequest("/api/run/control/heartbeat", {
+      const snapshot = await controlRequest("/api/run/control/heartbeat", {
         run: runId, lease_id: leaseId,
       });
+      applyControlSnapshot(snapshot);
     } catch (error) {
       showControlError(error);
       await stopActiveLease("heartbeat_failed");
@@ -1107,108 +1359,97 @@ function scheduleHeartbeat(leaseId, runId) {
   }, CONTROL_HEARTBEAT_MS);
 }
 
-async function waitForCommand(commandId, runId, generation, signal) {
-  const deadline = performance.now() + CONTROL_COMMAND_TIMEOUT_MS;
-  while (performance.now() < deadline) {
-    if (generation !== controlLoopGeneration || runId !== curRun) {
-      return { phase: "cancelled", stop_reason: "client_stopped" };
-    }
-    const data = await controlRequest(
-      `/api/run/control/state?run=${encodeURIComponent(runId)}`, null, "GET", signal);
-    const state = data.control && typeof data.control === "object" ? data.control : data;
-    applyControlSnapshot(state);
-    // Never attribute a stale/global terminal phase to this command. The
-    // command id is the completion receipt that closes the single-flight
-    // loop; without an exact match, keep waiting.
-    if (
-      state.command_id === commandId &&
-      ["completed", "failed", "cancelled"].includes(state.phase)
-    ) return state;
-    await sleep(CONTROL_POLL_MS);
-  }
-  throw new Error("Manual control command timed out.");
-}
-
-async function submitDiscreteAction(leaseId, runId, action, camera, generation) {
+async function submitDiscreteAction(
+  leaseId, runId, action, camera, generation, leaseToken
+) {
   controlCommandInFlight = true;
   controlStatus = "planning";
   renderControlUI();
-  const sequence = ++controlSequence;
-  lastCommandSubmittedAt = performance.now();
+  const sequence = controlSequence + 1;
   try {
     const accepted = await controlRequest("/api/run/control/command", {
       run: runId,
       lease_id: leaseId,
       sequence,
-      target: selectedTarget,
+      target: leaseToken.target,
       action,
       camera,
     });
     const commandId = accepted.command_id || accepted.control?.command_id;
     if (!commandId) throw new Error("Control command was accepted without a command ID.");
-    if (generation !== controlLoopGeneration || activeLeaseId !== leaseId) {
-      // Release may race the initial POST. Stop again after acceptance so a
-      // stop that arrived before the server created the lease cannot leave a
-      // live lease behind.
-      try {
-        await controlRequest("/api/run/control/stop", {
-          run: runId, lease_id: leaseId, reason: "released_after_accept",
-        });
-      } catch {}
-      throw new DOMException("Control wait aborted.", "AbortError");
+    controlSequence = sequence;
+    leaseToken.acceptedAny = true;
+    leaseToken.acceptedCommandIds.add(commandId);
+    applyControlSnapshot(accepted);
+    if (!accepted.control && accepted.control_revision == null) {
+      await refreshControlState();
     }
-    const pollAbort = new AbortController();
-    controlPollAbort = pollAbort;
-    const terminal = ["completed", "failed", "cancelled"].includes(accepted.phase)
-      ? accepted
-      : await waitForCommand(commandId, runId, generation, pollAbort.signal);
-    if (terminal.capture_error || terminal.error) {
-      throw new Error(terminal.capture_error || terminal.error);
+    if (REPEATABLE_ACTIONS.has(action) && !leaseToken.heartbeatStarted) {
+      leaseToken.heartbeatStarted = true;
+      scheduleHeartbeat(leaseId, runId);
     }
-    if (terminal.phase !== "completed") {
-      throw new Error(terminal.error || terminal.stop_reason || `Control command ${terminal.phase}.`);
-    }
-    return terminal;
+    return accepted;
   } finally {
-    controlPollAbort = null;
     controlCommandInFlight = false;
     renderControlUI();
   }
 }
 
-async function runControlLoop(button, leaseId, runId, action, camera, generation) {
+async function runControlLoop(
+  button, leaseId, runId, action, camera, generation, leaseToken
+) {
   const repeatable = REPEATABLE_ACTIONS.has(action);
   try {
-    while (activeLeaseId === leaseId && generation === controlLoopGeneration) {
-      await submitDiscreteAction(leaseId, runId, action, camera, generation);
-      if (!repeatable) break;
-      // A repeat may only be admitted after the hold gate opens. Polling
-      // this local flag does not submit or queue backend work; it only keeps
-      // the single loop dormant until the 320 ms timer has fired.
-      while (
-        activeLeaseId === leaseId && generation === controlLoopGeneration &&
-        pressedAction === action && !repeatArmed
-      ) await sleep(16);
+    while (
+      !leaseToken.stopRequested &&
+      activeLeaseId === leaseId &&
+      generation === controlLoopGeneration
+    ) {
+      if (controlSequence > 0) {
+        if (!repeatable) break;
+        if (!repeatArmed || pressedAction !== action) {
+          await sleep(16);
+          continue;
+        }
+        const terminal = controlSnapshot.last_terminal;
+        if (
+          terminal?.task_success === true ||
+          controlSnapshot.success_latched === true ||
+          (
+            terminal?.command_id &&
+            leaseToken.acceptedCommandIds.has(terminal.command_id) &&
+            (terminal.phase === "failed" || !!terminal.error)
+          )
+        ) break;
+        if (controlQueueDepth() >= controlQueueCapacity()) {
+          await refreshControlState();
+          await sleep(CONTROL_POLL_MS);
+          continue;
+        }
+        const remaining = CONTROL_REPEAT_MIN_MS -
+          (performance.now() - lastCommandSubmittedAt);
+        if (remaining > 0) await sleep(remaining);
+      }
       if (
-        activeLeaseId !== leaseId || generation !== controlLoopGeneration ||
-        pressedAction !== action || !repeatArmed
+        leaseToken.stopRequested ||
+        activeLeaseId !== leaseId ||
+        generation !== controlLoopGeneration
       ) break;
-      const elapsedSinceSubmit = performance.now() - lastCommandSubmittedAt;
-      if (elapsedSinceSubmit < CONTROL_REPEAT_MIN_MS) {
-        await sleep(CONTROL_REPEAT_MIN_MS - elapsedSinceSubmit);
+      lastCommandSubmittedAt = performance.now();
+      const postPromise = submitDiscreteAction(
+        leaseId, runId, action, camera, generation, leaseToken);
+      leaseToken.commandPostPromise = postPromise;
+      await postPromise;
+      if (leaseToken.commandPostPromise === postPromise) {
+        leaseToken.commandPostPromise = null;
       }
     }
   } catch (error) {
-    if (activeLeaseId === leaseId) {
+    if (!leaseToken.stopRequested && activeLeaseId === leaseId) {
       showControlError(error, button);
       await stopActiveLease("command_failed");
     }
   } finally {
-    if (activeLeaseId === leaseId && !repeatable) {
-      clearControlTimers();
-      activeLeaseId = null;
-      controlStatus = "idle";
-    }
     renderControlUI();
   }
 }
@@ -1216,7 +1457,8 @@ async function runControlLoop(button, leaseId, runId, action, camera, generation
 function beginControlAction(button, pointerId = "keyboard") {
   const action = button.dataset.action;
   if (
-    pressedAction || activeLeaseId || !behaviorControlsEnabled ||
+    pressedAction || activeLeaseId || controlLoopPromise ||
+    controlCommandInFlight || stopLeasePromise || !behaviorControlsEnabled ||
     button.getAttribute("aria-disabled") === "true"
   ) return;
   const runId = curRun;
@@ -1227,23 +1469,34 @@ function beginControlAction(button, pointerId = "keyboard") {
   repeatArmed = false;
   button.classList.add("pressed");
   const leaseId = makeLeaseId();
+  const leaseToken = {
+    leaseId, runId, generation: null, target: selectedTarget,
+    action, camera: selectedCamera, heartbeatStarted: false,
+    loopPromise: null, commandPostPromise: null, stopRequested: false,
+    acceptedAny: false, acceptedCommandIds: new Set(),
+  };
   activeLeaseId = leaseId;
+  activeLeaseToken = leaseToken;
   controlSequence = 0;
   const generation = ++controlLoopGeneration;
-  const leaseCamera = selectedCamera;
-  scheduleHeartbeat(leaseId, runId);
+  leaseToken.generation = generation;
   if (REPEATABLE_ACTIONS.has(action)) {
     repeatTimer = setTimeout(() => {
       if (activeLeaseId === leaseId && pressedAction === action) repeatArmed = true;
     }, CONTROL_HOLD_DELAY_MS);
   }
-  runControlLoop(button, leaseId, runId, action, leaseCamera, generation);
+  const loopPromise = runControlLoop(
+    button, leaseId, runId, action, leaseToken.camera, generation, leaseToken);
+  leaseToken.loopPromise = loopPromise;
+  controlLoopPromise = loopPromise;
+  loopPromise.finally(() => {
+    if (controlLoopPromise === loopPromise) controlLoopPromise = null;
+  });
   renderControlUI();
 }
 
 async function endControlPress(pointerId = activePointerId) {
   if (activePointerId !== pointerId || !pressedAction) return;
-  const action = pressedAction;
   const button = activeControlButton;
   pressedAction = null;
   activePointerId = null;
@@ -1251,20 +1504,20 @@ async function endControlPress(pointerId = activePointerId) {
   if (repeatTimer) { clearTimeout(repeatTimer); repeatTimer = null; }
   if (button) button.classList.remove("pressed");
   activeControlButton = null;
-  if (REPEATABLE_ACTIONS.has(action)) await stopActiveLease("released");
   renderControlUI();
+  await stopActiveLease("released");
 }
 
 async function stopActiveLease(reason = "client_stop") {
+  if (stopLeasePromise) return stopLeasePromise;
   const leaseId = activeLeaseId;
-  const runId = curRun;
+  const leaseToken = activeLeaseToken;
+  const runId = leaseToken?.runId || curRun;
   clearControlTimers();
-  if (controlPollAbort) {
-    controlPollAbort.abort();
-    controlPollAbort = null;
-  }
+  if (leaseToken) leaseToken.stopRequested = true;
   controlLoopGeneration++;
   activeLeaseId = null;
+  activeLeaseToken = null;
   repeatArmed = false;
   pressedAction = null;
   activePointerId = null;
@@ -1277,43 +1530,131 @@ async function stopActiveLease(reason = "client_stop") {
   }
   controlStatus = "stopping";
   renderControlUI();
-  try {
-    await controlRequest("/api/run/control/stop", {
-      run: runId, lease_id: leaseId, reason,
-    });
-  } catch (error) {
-    // A completed/expired lease is already stopped. Surface other failures.
-    if (![404, 409, 410].includes(error.status)) showControlError(error);
-  } finally {
-    if (controlStatus === "stopping") controlStatus = "idle";
-    renderControlUI();
+  const promise = (async () => {
+    const sendStop = async () => {
+      try {
+        const stopped = await controlRequest("/api/run/control/stop", {
+          run: runId, lease_id: leaseId,
+          stop_mode: "clear_pending", reason,
+        });
+        applyControlSnapshot(stopped);
+        return true;
+      } catch (error) {
+        if (![404, 409, 410].includes(error.status)) throw error;
+        return false;
+      }
+    };
+    try {
+      const acceptedBeforeStop = !!leaseToken?.acceptedAny;
+      await sendStop();
+      const postAtStop = leaseToken?.commandPostPromise;
+      if (postAtStop) {
+        try { await postAtStop; } catch {}
+      }
+      // pointerup can beat the first 202 response. A second idempotent
+      // clear-pending stop closes the lease created by that response while
+      // preserving its current head command.
+      if (!acceptedBeforeStop && leaseToken?.acceptedAny) await sendStop();
+    } catch (error) {
+      showControlError(error);
+    } finally {
+      if (stopLeasePromise === promise) {
+        if (controlStatus === "stopping") controlStatus = "idle";
+        stopLeasePromise = null;
+      }
+      renderControlUI();
+    }
+  })();
+  stopLeasePromise = promise;
+  return promise;
+}
+
+function manualControlIsQuiescent(state) {
+  if (!state || typeof state !== "object") return false;
+  const actionPlaneIdle = !["active"].includes(state.lease_status) &&
+    controlCurrent(state) == null &&
+    controlPlanning(state) == null &&
+    controlQueueDepth(state) === 0;
+  const captureOnlyBusy = actionPlaneIdle && controlCaptureOnlyBusy(state);
+  return actionPlaneIdle && (
+    captureOnlyBusy || (state.busy !== true && state.owner == null)
+  );
+}
+
+async function waitForManualControlQuiescence(runId) {
+  const deadline = performance.now() + CONTROL_QUIESCE_TIMEOUT_MS;
+  while (performance.now() < deadline) {
+    if (runId !== curRun) return false;
+    if (controlCommandInFlight || controlLoopPromise) {
+      await sleep(CONTROL_POLL_MS);
+      continue;
+    }
+    const data = await controlRequest(
+      `/api/run/control/state?run=${encodeURIComponent(runId)}`, null, "GET");
+    const state = data.control && typeof data.control === "object"
+      ? data.control : data;
+    applyControlSnapshot(state);
+    if (manualControlIsQuiescent(state)) return true;
+    await sleep(CONTROL_POLL_MS);
   }
+  throw new Error("Manual control did not reach a terminal, idle state.");
+}
+
+async function stopAndWaitForManualControl(reason) {
+  const runId = curRun;
+  if (!runId || !behaviorControlsEnabled) return true;
+  await stopActiveLease(reason);
+  return waitForManualControlQuiescence(runId);
 }
 
 async function setControlsExpanded(expanded) {
-  if (!expanded) await stopActiveLease("controls_collapsed");
-  controlsExpanded = !!expanded;
+  const runId = curRun;
+  desiredControlsExpanded = !!expanded;
+  const generation = ++controlsTransitionGeneration;
+  if (!desiredControlsExpanded) {
+    try {
+      await stopAndWaitForManualControl("controls_collapsed");
+    } catch (error) {
+      if (generation === controlsTransitionGeneration && runId === curRun) {
+        showControlError(error);
+      }
+      return false;
+    }
+  }
+  if (generation !== controlsTransitionGeneration || runId !== curRun) return false;
+  controlsExpanded = desiredControlsExpanded;
   renderControlUI();
+  return true;
 }
 
 async function selectControlTarget(target) {
-  if (target === selectedTarget) return;
-  await stopActiveLease("target_changed");
+  const runId = curRun;
+  desiredTarget = target;
+  const generation = ++targetTransitionGeneration;
+  if (
+    target === selectedTarget &&
+    target === desiredTarget &&
+    !activeLeaseId &&
+    !controlCommandInFlight
+  ) return true;
+  try {
+    await stopAndWaitForManualControl("target_changed");
+  } catch (error) {
+    if (generation === targetTransitionGeneration && runId === curRun) {
+      showControlError(error);
+    }
+    return false;
+  }
+  if (generation !== targetTransitionGeneration || runId !== curRun) return false;
   selectedTarget = target;
   renderControlUI();
-}
-
-async function publishSelectedCamera(camera) {
-  if (!curRun || !behaviorControlsEnabled) return;
-  try {
-    await controlRequest("/api/run/control/camera", { run: curRun, camera });
-  } catch (error) {
-    showControlError(error);
-  }
+  return true;
 }
 
 document.querySelectorAll(".controls-toggle").forEach(button => {
-  button.addEventListener("click", () => setControlsExpanded(!controlsExpanded));
+  button.addEventListener("click", () => {
+    setControlsExpanded(!desiredControlsExpanded);
+  });
 });
 document.querySelectorAll(".target-button").forEach(button => {
   button.addEventListener("click", () => {
@@ -1334,8 +1675,12 @@ document.querySelectorAll(".control-button").forEach(button => {
     endControlPress(event.pointerId);
     try { button.releasePointerCapture(event.pointerId); } catch {}
   });
-  button.addEventListener("pointercancel", event => endControlPress(event.pointerId));
-  button.addEventListener("lostpointercapture", event => endControlPress(event.pointerId));
+  button.addEventListener("pointercancel", event => {
+    if (activeLeaseId) stopActiveLease("released");
+  });
+  button.addEventListener("lostpointercapture", event => {
+    if (activeLeaseId) stopActiveLease("released");
+  });
   button.addEventListener("keydown", event => {
     if (![" ", "Enter"].includes(event.key) || event.repeat) return;
     event.preventDefault();
@@ -1478,6 +1823,24 @@ function renderTimeline(tl, hasEpisodeVideo = episodeVideoAvailable) {
   }
 }
 
+function applyMediaRevisions(snapshot) {
+  const nextTimeline = Number(snapshot?.timeline_revision);
+  if (
+    Number.isFinite(nextTimeline) &&
+    (!Number.isFinite(Number(timelineRevision)) || nextTimeline >= timelineRevision)
+  ) timelineRevision = nextTimeline;
+  const revisions = snapshot?.frame_revisions;
+  if (!revisions || typeof revisions !== "object") return;
+  for (const [camera, revision] of Object.entries(revisions)) {
+    const next = Number(revision);
+    const current = Number(frameRevisions[camera]);
+    if (
+      Number.isFinite(next) &&
+      (!Number.isFinite(current) || next >= current)
+    ) frameRevisions[camera] = next;
+  }
+}
+
 let curToolGroup = null;
 
 function makeToolEl(ev) {
@@ -1569,38 +1932,100 @@ async function refreshTranscript() {
   }
 }
 
-function setFrameKind(kind) {
+function renderFrameTabState() {
+  document.querySelectorAll(".frame-tabs button").forEach(button => {
+    const active = button.dataset.kind === frameKind;
+    button.classList.toggle("active", active);
+    if (button.closest(".behavior-frame-tabs")) {
+      button.setAttribute("aria-pressed", String(active));
+    }
+  });
+}
+
+function applyFrameKind(kind, opts = {}) {
   cancelAutoActionReturn();
   if (isRealtimeFrameKind(kind)) {
     lastRealtimeFrameKind = kind;
     autoActionPlayback = null;
   }
-  if (PHYSICAL_CAMERAS.has(kind)) {
-    selectedCamera = kind;
-    publishSelectedCamera(kind);
-  }
   frameKind = kind;
   if (kind !== "actionVideo") actionVideo = null;
-  document.querySelectorAll(".frame-tabs button").forEach(b =>
-    b.classList.toggle("active", b.dataset.kind === kind));
+  renderFrameTabState();
   frameIdx = -1;
-  refreshFrame(undefined, { source: "user" });
+  if (opts.refresh !== false) {
+    refreshFrame(undefined, { source: opts.source || "user" });
+  }
 }
 
-function finishAutoActionPlayback() {
-  if (!autoActionPlayback || autoActionReturnTimer) return;
-  const playback = autoActionPlayback;
+function selectPhysicalCamera(camera, generation) {
+  const runId = curRun;
+  const rollbackKind = frameKind;
+  cameraSelectionQueue = cameraSelectionQueue.catch(() => false).then(async () => {
+    if (
+      generation !== frameTransitionGeneration ||
+      runId !== curRun ||
+      !behaviorControlsEnabled
+    ) return false;
+    try {
+      const response = await controlRequest(
+        "/api/run/control/camera", { run: runId, camera });
+      if (runId !== curRun) return false;
+      applyControlSnapshot(response);
+      const echoed = response.camera ?? response.selected_camera ??
+        response.control?.selected_camera;
+      if (echoed !== camera) {
+        throw new Error("Camera selection was not acknowledged by the server.");
+      }
+      publishedCamera = camera;
+      if (generation !== frameTransitionGeneration) return false;
+      selectedCamera = camera;
+      applyFrameKind(camera, { refresh: false });
+      refreshFrame(frameRevisions[camera]);
+      return true;
+    } catch (error) {
+      if (generation !== frameTransitionGeneration || runId !== curRun) return false;
+      selectedCamera = publishedCamera;
+      const restoreKind = PHYSICAL_CAMERAS.has(rollbackKind)
+        ? publishedCamera : rollbackKind;
+      applyFrameKind(restoreKind);
+      showControlError(error, null);
+      return false;
+    }
+  });
+  return cameraSelectionQueue;
+}
+
+function setFrameKind(kind, opts = {}) {
+  const generation = ++frameTransitionGeneration;
+  if (
+    PHYSICAL_CAMERAS.has(kind) &&
+    behaviorControlsEnabled &&
+    opts.publishCamera !== false
+  ) {
+    return selectPhysicalCamera(kind, generation);
+  }
+  if (PHYSICAL_CAMERAS.has(kind)) selectedCamera = kind;
+  applyFrameKind(kind, opts);
+  return Promise.resolve(true);
+}
+
+function finishAutoActionPlayback(playback = autoActionPlayback) {
+  if (
+    !playback ||
+    autoActionPlayback !== playback ||
+    playback.runId !== curRun ||
+    autoActionReturnTimer
+  ) return;
   autoActionReturnTimer = setTimeout(() => {
     autoActionReturnTimer = null;
-    if (autoActionPlayback !== playback) return;
+    if (autoActionPlayback !== playback || playback.runId !== curRun) return;
     const nextFrameIdx = playback.nextFrameIdx;
     const returnKind = playback.returnKind || lastRealtimeFrameKind || "agent";
     autoActionPlayback = null;
     actionVideo = null;
     frameKind = returnKind;
     frameIdx = -1;
-    document.querySelectorAll(".frame-tabs button").forEach(b =>
-      b.classList.toggle("active", b.dataset.kind === returnKind));
+    renderFrameTabState();
     // No video reset here — swapMedia keeps the finished video's last
     // frame painted until the realtime PNG is decoded, then flips visibility
     // — the transition never exposes the black framewrap background.
@@ -1609,8 +2034,17 @@ function finishAutoActionPlayback() {
   }, AUTO_ACTION_RETURN_DELAY_MS);
 }
 
-function playActionVideo(step, opts = {}) {
+async function playActionVideo(step, opts = {}) {
   if (!curRun || !step || !step.has_action_video) return false;
+  const runId = curRun;
+  const generation = ++frameTransitionGeneration;
+  try {
+    await stopAndWaitForManualControl("action_playback");
+  } catch (error) {
+    if (generation === frameTransitionGeneration) showControlError(error, null);
+    return false;
+  }
+  if (generation !== frameTransitionGeneration || runId !== curRun) return false;
   cancelAutoActionReturn();
   actionVideo = step;
   autoActionPlayback = opts.auto || opts.returnAfterEnd
@@ -1619,10 +2053,12 @@ function playActionVideo(step, opts = {}) {
         nextFrameIdx: opts.nextFrameIdx,
         auto: !!opts.auto,
         returnKind: opts.returnKind || lastRealtimeFrameKind,
+        runId,
+        generation,
       }
     : null;
   frameKind = "actionVideo";
-  document.querySelectorAll(".frame-tabs button").forEach(b => b.classList.remove("active"));
+  renderFrameTabState();
   frameIdx = -1;
   // Auto-triggered replays (from maybeAutoPlayNewAction) queue as "auto";
   // manual timeline clicks are user actions and jump the queue.
@@ -1630,15 +2066,25 @@ function playActionVideo(step, opts = {}) {
   return true;
 }
 
-function playEpisodeVideo() {
-  if (!curRun || !episodeVideoAvailable) return;
+async function playEpisodeVideo() {
+  if (!curRun || !episodeVideoAvailable) return false;
+  const runId = curRun;
+  const generation = ++frameTransitionGeneration;
+  try {
+    await stopAndWaitForManualControl("episode_playback");
+  } catch (error) {
+    if (generation === frameTransitionGeneration) showControlError(error, null);
+    return false;
+  }
+  if (generation !== frameTransitionGeneration || runId !== curRun) return false;
   cancelAutoActionReturn();
   autoActionPlayback = null;
   actionVideo = null;
   frameKind = "video";
-  document.querySelectorAll(".frame-tabs button").forEach(b => b.classList.remove("active"));
+  renderFrameTabState();
   frameIdx = -1;
   refreshFrame(undefined, { source: "user" });
+  return true;
 }
 
 function refreshFrame(idx, opts = {}) {
@@ -1662,16 +2108,29 @@ function refreshFrame(idx, opts = {}) {
       // cut the replay short. User clicks (source: "user") still release
       // the hold on the current in-flight swap immediately.
       holdUntilEnded: true,
-      onReady: (v) => {
+      onReady: (v, releasePlaybackHold) => {
         try { v.currentTime = 0; } catch {}
         v.playbackRate = 0.5;
-        const shouldReturn =
-          autoActionPlayback && autoActionPlayback.step === stepNum;
-        v.muted = !!(shouldReturn && autoActionPlayback.auto);
-        v.onended = shouldReturn ? finishAutoActionPlayback : null;
-        const p = v.play();
+        const playback = autoActionPlayback;
+        const shouldReturn = !!(
+          playback &&
+          playback.step === stepNum &&
+          playback.runId === curRun &&
+          playback.generation === frameTransitionGeneration
+        );
+        v.muted = !!(shouldReturn && playback.auto);
+        v.onended = shouldReturn
+          ? () => finishAutoActionPlayback(playback) : null;
+        let p = null;
+        try { p = v.play(); } catch {
+          if (releasePlaybackHold) releasePlaybackHold();
+          if (shouldReturn) finishAutoActionPlayback(playback);
+        }
         if (p && typeof p.catch === "function") {
-          p.catch(() => { if (shouldReturn) finishAutoActionPlayback(); });
+          p.catch(() => {
+            if (releasePlaybackHold) releasePlaybackHold();
+            if (shouldReturn) finishAutoActionPlayback(playback);
+          });
         }
       },
     });
@@ -1686,10 +2145,20 @@ function refreshFrame(idx, opts = {}) {
       cap: "完整回放",
       source,
       holdUntilEnded: true,
-      onReady: (v) => {
+      onReady: (v, releasePlaybackHold) => {
+        try { v.currentTime = 0; } catch {}
         v.playbackRate = 1.0;
         v.muted = false;
         v.onended = null;
+        let p = null;
+        try { p = v.play(); } catch {
+          if (releasePlaybackHold) releasePlaybackHold();
+        }
+        if (p && typeof p.catch === "function") {
+          p.catch(() => {
+            if (releasePlaybackHold) releasePlaybackHold();
+          });
+        }
       },
     });
     return;
@@ -1713,27 +2182,31 @@ function refreshFrame(idx, opts = {}) {
 
 async function refreshMeta(opts = {}) {
   if (!curRun) return;
-  const r = await fetch(`/api/run?run=${encodeURIComponent(curRun)}`).then(x => x.json());
+  const runId = curRun;
+  const r = await fetch(`/api/run?run=${encodeURIComponent(runId)}`).then(x => x.json());
+  if (runId !== curRun) return;
   const behavior = isBehaviorRun(r);
   if (behavior && !behaviorControlsEnabled) {
-    selectedCamera = "head";
-    frameKind = "head";
-    lastRealtimeFrameKind = "head";
+    const serverCamera = PHYSICAL_CAMERAS.has(r.control?.selected_camera)
+      ? r.control.selected_camera : "head";
+    selectedCamera = serverCamera;
+    publishedCamera = serverCamera;
+    frameKind = serverCamera;
+    lastRealtimeFrameKind = serverCamera;
     frameIdx = -1;
-    document.querySelectorAll(".frame-tabs button").forEach(b =>
-      b.classList.toggle("active", b.dataset.kind === "head"));
+    renderFrameTabState();
   } else if (!behavior && behaviorControlsEnabled && PHYSICAL_CAMERAS.has(frameKind)) {
     frameKind = "agent";
     lastRealtimeFrameKind = "agent";
     frameIdx = -1;
-    document.querySelectorAll(".frame-tabs button").forEach(b =>
-      b.classList.toggle("active", b.dataset.kind === "agent"));
+    renderFrameTabState();
   }
   setBehaviorControlMode(behavior);
   if (r.control) applyControlSnapshot(r.control);
   else if (behavior) refreshControlState();
   setBadge(r.state);
   setResult(r.terminated, r.state);
+  applyMediaRevisions(r);
   $("#taskMeta").innerHTML = `<b>${r.suite ?? r.name}</b> · 任务 ${r.task ?? "?"} · 种子 ${r.seed ?? "?"}`;
   if (r.usage) $("#usageMeta").textContent =
     `输入 ${r.usage.in.toLocaleString()} · 输出 ${r.usage.out.toLocaleString()} · ${r.usage.tool_calls} 次工具调用`;
@@ -1744,18 +2217,21 @@ async function refreshMeta(opts = {}) {
     autoActionPrimed = true;
   }
   const autoStarted = opts.autoPlayNewAction && autoActionPrimed && !autoActionPlayback
-    ? maybeAutoPlayNewAction(
+    ? await maybeAutoPlayNewAction(
         r.timeline || [],
-        opts.nextFrameIdx ?? r.frame_revisions?.[selectedCamera] ?? r.frame_idx)
+        opts.nextFrameIdx ?? frameRevisions[selectedCamera] ?? r.frame_idx)
     : false;
+  if (runId !== curRun) return;
   if (!r.has_video && frameKind === "video") {
-    setFrameKind(behaviorControlsEnabled ? selectedCamera : "agent");
+    setFrameKind(
+      behaviorControlsEnabled ? selectedCamera : "agent",
+      { publishCamera: false });
   }
   if (
     !autoStarted
     && !autoActionPlayback
     && isRealtimeFrameKind(frameKind)
-  ) refreshFrame(r.frame_revisions?.[selectedCamera] ?? r.frame_idx);
+  ) refreshFrame(frameRevisions[selectedCamera] ?? r.frame_idx);
 }
 
 function connectSSE() {
@@ -1766,13 +2242,19 @@ function connectSSE() {
     setBadge(sig.state);
     setResult(sig.terminated, sig.state);
     if (sig.control) applyControlSnapshot(sig.control);
+    applyMediaRevisions({ frame_revisions: sig.frame_revisions });
     if (sig.usage) $("#usageMeta").textContent =
       `输入 ${sig.usage.in.toLocaleString()} · 输出 ${sig.usage.out.toLocaleString()} · ${sig.usage.tool_calls} 次工具调用`;
     $("#connMeta").textContent = "● 实时";
     refreshTranscript();
-    // refresh timeline lazily on step change
-    if (sig.n_steps !== connectSSE._steps) {
-      connectSSE._steps = sig.n_steps;
+    // Timeline and camera publication are independent revision streams.
+    // A terminal transition changes timeline_revision without changing the
+    // number of rows, so n_steps is not a sufficient refresh key.
+    if (
+      sig.timeline_revision != null &&
+      sig.timeline_revision !== timelineRevision
+    ) {
+      timelineRevision = sig.timeline_revision;
       // Suppress realtime frame refreshes for the duration of the step
       // transition. ``refreshMeta`` is async (awaits ``/api/run``); during
       // that await, intermediate SSE snapshots carry the post-step
@@ -1788,7 +2270,7 @@ function connectSSE() {
       refreshMeta({
         autoPlayNewAction: autoActionPrimed,
         primeAutoActionStep: !autoActionPrimed,
-        nextFrameIdx: sig.frame_revisions?.[selectedCamera] ?? sig.frame_idx,
+        nextFrameIdx: frameRevisions[selectedCamera] ?? sig.frame_idx,
       }).finally(() => { stepTransitioning = false; });
       return;
     }
@@ -1797,17 +2279,23 @@ function connectSSE() {
       !autoActionPlayback
       && !stepTransitioning
       && isRealtimeFrameKind(frameKind)
-      && (sig.frame_revisions?.[selectedCamera] ?? sig.frame_idx) != null
-      && (sig.frame_revisions?.[selectedCamera] ?? sig.frame_idx) !== frameIdx
-    ) refreshFrame(sig.frame_revisions?.[selectedCamera] ?? sig.frame_idx);
+      && (frameRevisions[selectedCamera] ?? sig.frame_idx) != null
+      && (frameRevisions[selectedCamera] ?? sig.frame_idx) !== frameIdx
+    ) refreshFrame(frameRevisions[selectedCamera] ?? sig.frame_idx);
   };
   es.onerror = () => { $("#connMeta").textContent = "○ 正在重连…"; };
 }
 
 async function selectRun(id) {
-  await stopActiveLease("run_changed");
+  const selectionGeneration = ++runSelectionGeneration;
+  frameTransitionGeneration++;
+  targetTransitionGeneration++;
+  controlsTransitionGeneration++;
+  try { await stopAndWaitForManualControl("run_changed"); } catch {}
+  if (selectionGeneration !== runSelectionGeneration) return false;
   cancelAutoActionReturn();
-  curRun = id; evShown = 0; frameIdx = -1; connectSSE._steps = -1;
+  curRun = id; evShown = 0; frameIdx = -1;
+  timelineRevision = -1; frameRevisions = {};
   curToolGroup = null;
   actionVideo = null;
   episodeVideoAvailable = false;
@@ -1816,19 +2304,22 @@ async function selectRun(id) {
   autoActionPlayback = null;
   stepTransitioning = false;
   selectedTarget = "chassis";
+  desiredTarget = "chassis";
   selectedCamera = "head";
+  publishedCamera = "head";
   controlsExpanded = true;
+  desiredControlsExpanded = true;
   setBehaviorControlMode(false);
   resetAllMedia();
   frameKind = "agent"; lastRealtimeFrameKind = "agent";
-  document.querySelectorAll(".frame-tabs button").forEach(b =>
-    b.classList.toggle("active", b.dataset.kind === "agent"));
+  renderFrameTabState();
   $("#transcript").innerHTML = '<div class="empty">加载中…</div>';
   $("#timeline").innerHTML = '<div class="empty">…</div>';
   $("#frameCap").textContent = "等待第一帧…";
   refreshMeta({ primeAutoActionStep: true });
   refreshTranscript();
   connectSSE();
+  return true;
 }
 
 document.querySelectorAll(".frame-tabs button").forEach(btn => {

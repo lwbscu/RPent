@@ -57,7 +57,10 @@ from robots.behavior.schemas import (
     extract_policy_state,
     segment_ranges,
     validate_action_chunk,
+    validate_dashboard_command_id,
     validate_dashboard_manual_command,
+    validate_dashboard_plan_id,
+    validate_dashboard_prepare_request,
     validate_relative_navigation_motion,
 )
 from robots.behavior.task_specs import (
@@ -83,6 +86,10 @@ _ENV_RPC_METHODS = frozenset(
         "prepare_vla_invocation",
         "current_observation",
         "dashboard_control_capabilities",
+        "dashboard_prepare_manual_command",
+        "dashboard_execute_prepared_command",
+        "dashboard_discard_prepared_command",
+        "dashboard_capture_views",
         "dashboard_manual_command",
         "finalize_paused_runtime",
         "observe",
@@ -868,6 +875,12 @@ class BehaviorEnvFacade:
             Path(output_dir) / _PI0_NAV_PICK_DISABLE_RECEIPT_FILENAME
         )
         self._motion_in_flight = False
+        self._dashboard_planning_admitted = False
+        self._dashboard_execute_receipts: dict[
+            str,
+            tuple[str, dict[str, Any]],
+        ] = {}
+        self._dashboard_env_step_latency: dict[str, Any] | None = None
         self._official_success_latched = False
         self._official_success_receipt: dict[str, Any] | None = None
         self._official_success_receipt_path = (
@@ -3627,6 +3640,9 @@ class BehaviorEnvFacade:
         self._clear_active_vla_invocation_state()
         self._next_pi0_chunk_index = 1
         self._motion_frozen = False
+        self._dashboard_planning_admitted = False
+        self._dashboard_execute_receipts = {}
+        self._dashboard_env_step_latency = None
         self._projection_receipts.clear()
         self._consumed_projection_receipts.clear()
         self._public_observed_frame_ids.clear()
@@ -4066,12 +4082,46 @@ class BehaviorEnvFacade:
                 or (self._env_steps + 1) % interval == 0
             )
             step_action = action_tensor[:, step_index]
+            step_latency = getattr(
+                self,
+                "_dashboard_env_step_latency",
+                None,
+            )
+            env_step_started = (
+                time.monotonic() if isinstance(step_latency, dict) else None
+            )
             step_obs, step_reward, step_term, step_trunc, step_infos = (
                 self._env._direct_process.step_env(
                     step_action,
                     need_obs=need_observation,
                 )
             )
+            if isinstance(step_latency, dict) and env_step_started is not None:
+                env_step_elapsed_s = max(
+                    0.0,
+                    time.monotonic() - env_step_started,
+                )
+                count = int(step_latency.get("count", 0)) + 1
+                total_s = float(step_latency.get("total_s", 0.0))
+                total_s += env_step_elapsed_s
+                previous_min = step_latency.get("min_s")
+                previous_max = step_latency.get("max_s")
+                step_latency.update(
+                    {
+                        "count": count,
+                        "total_s": total_s,
+                        "min_s": (
+                            env_step_elapsed_s
+                            if previous_min is None
+                            else min(float(previous_min), env_step_elapsed_s)
+                        ),
+                        "max_s": (
+                            env_step_elapsed_s
+                            if previous_max is None
+                            else max(float(previous_max), env_step_elapsed_s)
+                        ),
+                    }
+                )
             self._env_steps += 1
             executed_steps += 1
             executed = np.asarray(_numpy_tree(step_action), dtype=np.float32).reshape(
@@ -4607,6 +4657,374 @@ class BehaviorEnvFacade:
             }
         return {"opening": 1.0 if action == "open" else 0.0}
 
+    @staticmethod
+    def _dashboard_motion_capability_available(
+        capabilities: dict[str, Any],
+        *,
+        target: str,
+        action: str,
+    ) -> bool:
+        if target == "chassis":
+            return bool(
+                capabilities.get("torso_available")
+                if action in {"up", "down"}
+                else capabilities.get("base_available")
+            )
+        hand = "left" if target == "left_arm" else "right"
+        if action in {"rotate_left", "rotate_right"}:
+            return bool(
+                dict(capabilities.get("wrist_rotation_available") or {}).get(
+                    hand
+                )
+            )
+        if action in {"open", "close"}:
+            return bool(
+                dict(capabilities.get("gripper_available") or {}).get(hand)
+            )
+        return bool(
+            dict(capabilities.get("eef_available") or {}).get(hand)
+        )
+
+    def dashboard_prepare_manual_command(
+        self,
+        *,
+        target: str,
+        action: str,
+        predecessor_plan_id: str | None = None,
+        background: bool = False,
+    ) -> dict[str, Any]:
+        """Prepare motion on the Env RPC FIFO."""
+
+        method_started = time.monotonic()
+        controller_switch_elapsed_s = 0.0
+        controller_state_before = str(getattr(self, "_controller_state", "unavailable"))
+        controller_switch_attempted = False
+        controller_switch_changed = False
+        request = validate_dashboard_prepare_request(
+            target=target,
+            action=action,
+            predecessor_plan_id=predecessor_plan_id,
+            background=background,
+        )
+        target = request["target"]
+        action = request["action"]
+        if action in {"open", "close"}:
+            raise ValueError(
+                "open and close are one-shot commands, not prepared motions"
+            )
+        if request["background"]:
+            if not bool(getattr(self, "_dashboard_planning_admitted", False)):
+                raise RuntimeError(
+                    "background planning requires a foreground-admitted predecessor"
+                )
+            if (
+                self._controller_state != _CONTROLLER_PLANNER
+                or self._base_controller_mode != "position"
+            ):
+                raise RuntimeError(
+                    "background planning requires verified planner position control"
+                )
+        else:
+            capabilities = self.dashboard_control_capabilities()
+            if capabilities.get("motion_available") is not True:
+                raise RuntimeError(
+                    str(
+                        capabilities.get("unavailable_reason")
+                        or "manual motion unavailable"
+                    )
+                )
+            if not self._dashboard_motion_capability_available(
+                capabilities,
+                target=target,
+                action=action,
+            ):
+                raise RuntimeError(
+                    f"{target}/{action} capability is unavailable or unsupported"
+                )
+            controller_switch_attempted = True
+            controller_switch_started = time.monotonic()
+            transition = self._switch_controller(_CONTROLLER_PLANNER)
+            controller_switch_elapsed_s = max(
+                0.0,
+                time.monotonic() - controller_switch_started,
+            )
+            controller_switch_changed = transition.get("changed") is True
+            if (
+                self._controller_state != _CONTROLLER_PLANNER
+                or self._base_controller_mode != "position"
+            ):
+                raise RuntimeError(
+                    "manual planning requires verified planner position control"
+                )
+            self._dashboard_planning_admitted = True
+
+        planner = self._require_planner()
+        prepare = getattr(planner, "prepare_dashboard_motion", None)
+        if not callable(prepare):
+            raise RuntimeError("Dashboard prepared-motion planner is unavailable")
+        prepare_started = time.monotonic()
+        prepare_preflight_s = max(
+            0.0,
+            prepare_started - method_started - controller_switch_elapsed_s,
+        )
+        result = prepare(
+            target,
+            action,
+            predecessor_plan_id=request["predecessor_plan_id"],
+            background=request["background"],
+        )
+        prepare_finished = time.monotonic()
+        planner_prepare_s = max(0.0, prepare_finished - prepare_started)
+        if self._official_success_latched or _raw_success(self._last_info):
+            raise RuntimeError(
+                "raw task success became terminal during Dashboard planning"
+            )
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "prepare_dashboard_motion returned a non-mapping result"
+            )
+        plan_id = validate_dashboard_plan_id(result.get("plan_id"))
+        for field, expected in (
+            ("target", target),
+            ("action", action),
+            ("predecessor_plan_id", request["predecessor_plan_id"]),
+            ("background", request["background"]),
+        ):
+            if result.get(field) != expected:
+                raise RuntimeError(
+                    f"prepared plan returned mismatched {field}"
+                )
+        if result.get("status") != "prepared":
+            raise RuntimeError("prepared plan omitted status='prepared'")
+
+        legacy_elapsed_s = max(0.0, time.monotonic() - prepare_started)
+        response = {
+            **_wire_safe(result),
+            "plan_id": plan_id,
+            "source": "dashboard_prepare",
+            "requested_step": self._dashboard_requested_step(target, action),
+            "elapsed_s": legacy_elapsed_s,
+        }
+        if request["background"]:
+            deadline = response.get("planning_deadline_s")
+            if (
+                isinstance(deadline, bool)
+                or not isinstance(
+                    deadline,
+                    (int, float, np.integer, np.floating),
+                )
+                or not np.isfinite(float(deadline))
+                or float(deadline) <= 0.0
+            ):
+                raise RuntimeError(
+                    "background plan omitted a positive solver deadline"
+                )
+            enforcement = response.get("deadline_enforcement")
+            enforcement = (
+                dict(enforcement) if isinstance(enforcement, dict) else {}
+            )
+            enforcement.update(
+                {
+                    "hard_wall_clock_enforced": False,
+                    "soft_deadline_s": float(deadline),
+                    "background_deadline_kind": "soft_solver_deadline",
+                }
+            )
+            response["deadline_enforcement"] = enforcement
+        postcheck_finished = time.monotonic()
+        prepare_postcheck_s = max(
+            0.0,
+            postcheck_finished - prepare_finished,
+        )
+        response["latency_metrics"] = {
+            "schema_version": 1,
+            "clock": "time.monotonic",
+            "operation": "dashboard_prepare",
+            "phases_s": {
+                "prepare_preflight": prepare_preflight_s,
+                "controller_switch": controller_switch_elapsed_s,
+                "planner_prepare": planner_prepare_s,
+                "prepare_postcheck": prepare_postcheck_s,
+            },
+            "controller_switch": {
+                "attempted": controller_switch_attempted,
+                "changed": controller_switch_changed,
+                "from_state": controller_state_before,
+                "to_state": str(getattr(self, "_controller_state", "unavailable")),
+            },
+            "total_s": (
+                prepare_preflight_s
+                + controller_switch_elapsed_s
+                + planner_prepare_s
+                + prepare_postcheck_s
+            ),
+        }
+        pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
+        return response
+
+    def dashboard_execute_prepared_command(
+        self,
+        *,
+        plan_id: str,
+        command_id: str,
+    ) -> dict[str, Any]:
+        """Execute a prepared motion once per command id, without camera I/O."""
+
+        method_started = time.monotonic()
+        plan_id = validate_dashboard_plan_id(plan_id)
+        command_id = validate_dashboard_command_id(command_id)
+        cached = self._dashboard_execute_receipts.get(command_id)
+        if cached is not None:
+            cached_plan_id, receipt = cached
+            if cached_plan_id != plan_id:
+                raise RuntimeError(
+                    "command_id is already bound to a different plan_id"
+                )
+            return deepcopy(receipt)
+        if (
+            self._controller_state != _CONTROLLER_PLANNER
+            or self._base_controller_mode != "position"
+        ):
+            raise RuntimeError(
+                "prepared execution requires verified planner position control"
+            )
+        if self._motion_in_flight:
+            raise RuntimeError("another physical action is already in flight")
+        planner = self._require_planner()
+        execute = getattr(planner, "execute_dashboard_motion", None)
+        if not callable(execute):
+            raise RuntimeError("Dashboard prepared-motion execution is unavailable")
+
+        execute_started = time.monotonic()
+        execute_preflight_s = max(0.0, execute_started - method_started)
+        env_step_latency: dict[str, Any] = {
+            "count": 0,
+            "total_s": 0.0,
+            "min_s": None,
+            "max_s": None,
+        }
+        self._dashboard_env_step_latency = env_step_latency
+        self._motion_in_flight = True
+        try:
+            result = execute(plan_id, command_id)
+        finally:
+            execute_finished = time.monotonic()
+            self._dashboard_env_step_latency = None
+            self._motion_in_flight = False
+        planner_execute_s = max(0.0, execute_finished - execute_started)
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "execute_dashboard_motion returned a non-mapping result"
+            )
+        result = self._planner_public_result(result)
+        if any(
+            key in result
+            for key in (
+                "_frames_bytes",
+                "frame_ids",
+                "capture_group_id",
+                "capture_error",
+            )
+        ):
+            raise RuntimeError(
+                "prepared motion result must not contain camera capture data"
+            )
+        legacy_elapsed_s = max(0.0, time.monotonic() - execute_started)
+        response = {
+            **result,
+            "source": "dashboard_execute",
+            "plan_id": plan_id,
+            "command_id": command_id,
+            "elapsed_s": legacy_elapsed_s,
+        }
+        postcheck_finished = time.monotonic()
+        execute_postcheck_s = max(
+            0.0,
+            postcheck_finished - execute_finished,
+        )
+        env_step_count = int(env_step_latency["count"])
+        env_step_total_s = float(env_step_latency["total_s"])
+        response["latency_metrics"] = {
+            "schema_version": 1,
+            "clock": "time.monotonic",
+            "operation": "dashboard_execute",
+            "phases_s": {
+                "execute_preflight": execute_preflight_s,
+                "planner_execute": planner_execute_s,
+                "execute_postcheck": execute_postcheck_s,
+            },
+            "env_step_aggregate": {
+                "boundary": "env._direct_process.step_env",
+                "count": env_step_count,
+                "total_s": env_step_total_s,
+                "min_s": env_step_latency["min_s"],
+                "max_s": env_step_latency["max_s"],
+                "mean_s": env_step_total_s / env_step_count if env_step_count else None,
+            },
+            "total_s": execute_preflight_s + planner_execute_s + execute_postcheck_s,
+        }
+        pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
+        self._dashboard_execute_receipts[command_id] = (
+            plan_id,
+            deepcopy(response),
+        )
+        return response
+
+    def dashboard_discard_prepared_command(
+        self,
+        *,
+        plan_id: str,
+    ) -> dict[str, Any]:
+        """Discard one unneeded prepared plan without any simulator action."""
+
+        plan_id = validate_dashboard_plan_id(plan_id)
+        discard = getattr(
+            self._require_planner(),
+            "discard_dashboard_motion",
+            None,
+        )
+        if not callable(discard):
+            raise RuntimeError("Dashboard prepared-plan discard is unavailable")
+        result = discard(plan_id)
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "discard_dashboard_motion returned a non-mapping result"
+            )
+        response = {
+            **_wire_safe(result),
+            "source": "dashboard_discard",
+            "plan_id": plan_id,
+        }
+        pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
+        return response
+
+    def dashboard_capture_views(
+        self,
+        *,
+        command_id: str,
+    ) -> dict[str, Any]:
+        """Capture one complete camera group while physical control is idle."""
+
+        command_id = validate_dashboard_command_id(command_id)
+        if self._motion_in_flight:
+            raise RuntimeError("Dashboard capture requires an idle controller")
+        capabilities = self.dashboard_control_capabilities()
+        if capabilities.get("observe_available") is not True:
+            raise RuntimeError(
+                str(
+                    capabilities.get("unavailable_reason")
+                    or "camera refresh unavailable"
+                )
+            )
+        capture = self._dashboard_capture_group()
+        response = {
+            **capture,
+            "source": "dashboard_capture",
+            "command_id": command_id,
+        }
+        pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
+        return response
+
     def dashboard_manual_command(
         self,
         *,
@@ -4614,7 +5032,7 @@ class BehaviorEnvFacade:
         action: str,
         camera: str,
     ) -> dict[str, Any]:
-        """Execute one fixed-size manual primitive and capture all cameras."""
+        """Run one legacy one-shot command; only observe captures cameras."""
 
         command = validate_dashboard_manual_command(
             target=target,
@@ -4626,6 +5044,7 @@ class BehaviorEnvFacade:
         camera = command["camera"]
         started = time.monotonic()
         capabilities = self.dashboard_control_capabilities()
+        capture: dict[str, Any] = {}
 
         if action == "observe":
             if capabilities.get("observe_available") is not True:
@@ -4726,26 +5145,6 @@ class BehaviorEnvFacade:
             if not isinstance(result, dict):
                 raise RuntimeError(f"{primitive} returned a non-mapping planner result")
             result = self._planner_public_result(result)
-            # Capture inside this same main-thread RPC, including when the
-            # planner action latched raw success. No follow-up env call occurs.
-            try:
-                capture = self._dashboard_capture_group()
-            except Exception as exc:
-                success_receipt = result.get("official_success_receipt")
-                if (
-                    result.get("task_success") is not True
-                    or not isinstance(success_receipt, dict)
-                    or success_receipt
-                    != _wire_safe(getattr(self, "_official_success_receipt", None))
-                    or success_receipt.get("source") != 'info["done"]["success"]'
-                    or not isinstance(success_receipt.get("raw_done"), dict)
-                    or success_receipt["raw_done"].get("success") is not True
-                ):
-                    raise
-                # Official success is monotonic and more important than optional
-                # Dashboard media. Return its immutable receipt from this same
-                # RPC; State will retain the prior complete frame group.
-                capture = {"capture_error": (f"{type(exc).__name__}: {exc}")}
 
         response = {
             **result,
@@ -6656,6 +7055,24 @@ class _MainThreadDispatcher:
         future: Future = Future()
         self._calls.put((method, args, kwargs, future))
         return future.result()
+
+    def submit_dashboard_prepare(
+        self,
+        method: str,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        """Fail closed if prepare is ever wired around the simulator FIFO."""
+
+        if method != "env.dashboard_prepare_manual_command":
+            raise ValueError(
+                f"unknown concurrent BEHAVIOR env RPC method: {method!r}"
+            )
+        if kwargs.get("background") is True:
+            raise RuntimeError(
+                "background Dashboard prepare cannot bypass the simulator FIFO"
+            )
+        return self.submit(method, args, kwargs)
 
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method.startswith("env."):

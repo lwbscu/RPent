@@ -1093,51 +1093,48 @@ def start_env_server(
             _record_owned_process_group(proc)
             if manifest is not None:
                 manifest.process_started("env", proc, command=command)
+        events: queue.Queue[dict[str, Any]] = queue.Queue()
+        threading.Thread(
+            target=_pump_ready_events,
+            args=(proc, log_path, events),
+            daemon=True,
+        ).start()
+        deadline = time.time() + args.env_ready_timeout_s
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    "BEHAVIOR env server exited before ready:\n" + _tail(log_path)
+                )
+            try:
+                event = events.get(timeout=2.0)
+            except queue.Empty:
+                continue
+            if (
+                event.get("kind") == "socket"
+                and event.get("host")
+                and event.get("port")
+            ):
+                proc._rpent_transport_host = str(event["host"])
+                proc._rpent_transport_port = int(event["port"])
+                if manifest is not None:
+                    manifest.process_endpoint(
+                        "env", host=str(event["host"]), port=int(event["port"])
+                    )
+                logger.info(
+                    "BEHAVIOR env server ready at %s:%s",
+                    event["host"],
+                    event["port"],
+                )
+                return proc
+        raise TimeoutError(
+            f"BEHAVIOR env server not ready after {args.env_ready_timeout_s}s:\n"
+            + _tail(log_path)
+        )
     except BaseException:
         _terminate_process(proc)
         if manifest is not None:
             manifest.process_stopped("env", proc)
         raise
-    events: queue.Queue[dict[str, Any]] = queue.Queue()
-    threading.Thread(
-        target=_pump_ready_events,
-        args=(proc, log_path, events),
-        daemon=True,
-    ).start()
-    deadline = time.time() + args.env_ready_timeout_s
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            if manifest is not None:
-                manifest.process_stopped("env", proc)
-            raise RuntimeError(
-                "BEHAVIOR env server exited before ready:\n" + _tail(log_path)
-            )
-        try:
-            event = events.get(timeout=2.0)
-        except queue.Empty:
-            continue
-        if event.get("kind") == "socket" and event.get("host") and event.get("port"):
-            proc._rpent_transport_host = str(event["host"])
-            proc._rpent_transport_port = int(event["port"])
-            if manifest is not None:
-                try:
-                    manifest.process_endpoint(
-                        "env", host=str(event["host"]), port=int(event["port"])
-                    )
-                except BaseException:
-                    _terminate_process(proc)
-                    raise
-            logger.info(
-                "BEHAVIOR env server ready at %s:%s", event["host"], event["port"]
-            )
-            return proc
-    _terminate_process(proc)
-    if manifest is not None:
-        manifest.process_stopped("env", proc)
-    raise TimeoutError(
-        f"BEHAVIOR env server not ready after {args.env_ready_timeout_s}s:\n"
-        + _tail(log_path)
-    )
 
 
 def stop_env_server(proc: subprocess.Popen | None, *, output_dir: Path) -> None:

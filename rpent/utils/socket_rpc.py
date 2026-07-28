@@ -171,13 +171,36 @@ class SocketRpcServer(socketserver.ThreadingTCPServer):
         self,
         server_address: tuple[str, int],
         dispatch: Callable[[str, tuple, dict], Any],
+        *,
+        concurrent_method: str | None = None,
+        concurrent_dispatch: Callable[[str, tuple, dict], Any] | None = None,
     ):
+        if (concurrent_method is None) != (concurrent_dispatch is None):
+            raise ValueError(
+                "concurrent_method and concurrent_dispatch must be configured together"
+            )
+        if concurrent_method is not None and (
+            not isinstance(concurrent_method, str)
+            or not concurrent_method.strip()
+            or concurrent_method == "healthz"
+        ):
+            raise ValueError("concurrent_method must be one non-health RPC method")
         super().__init__(server_address, _RequestHandler)
         self._dispatch = dispatch
+        self._concurrent_method = concurrent_method
+        self._concurrent_dispatch = concurrent_dispatch
         self._dispatch_lock = threading.Lock()
 
     def dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method == "healthz":
             return {"status": "ok"}
+        if (
+            method == self._concurrent_method
+            and self._concurrent_dispatch is not None
+        ):
+            # This is an exact-name escape hatch, not a general parallel RPC
+            # mode. The selected handler remains responsible for deciding
+            # which requests are safe to execute outside its ordinary FIFO.
+            return self._concurrent_dispatch(method, args, kwargs)
         with self._dispatch_lock:
             return self._dispatch(method, args, kwargs)

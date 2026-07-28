@@ -22,7 +22,10 @@ from robots.behavior.schemas import (
     extract_policy_state,
     segment_ranges,
     validate_action_chunk,
+    validate_dashboard_command_id,
     validate_dashboard_manual_command,
+    validate_dashboard_plan_id,
+    validate_dashboard_prepare_request,
     validate_relative_navigation_motion,
 )
 from robots.behavior.task_specs import (
@@ -598,6 +601,119 @@ class BehaviorPrimitives:
             )
         return result
 
+    def dashboard_prepare_manual_command(
+        self,
+        *,
+        target: str,
+        action: str,
+        predecessor_plan_id: str | None = None,
+        background: bool = False,
+    ) -> dict[str, Any]:
+        """Prepare one internal Dashboard motion outside the public tool surface."""
+
+        request = validate_dashboard_prepare_request(
+            target=target,
+            action=action,
+            predecessor_plan_id=predecessor_plan_id,
+            background=background,
+        )
+        result = self._env_method("dashboard_prepare_manual_command")(**request)
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "dashboard_prepare_manual_command returned a non-mapping result"
+            )
+        if result.get("status") != "prepared":
+            raise RuntimeError("dashboard motion planning did not return prepared")
+        validate_dashboard_plan_id(result.get("plan_id"))
+        return result
+
+    def dashboard_execute_prepared_command(
+        self,
+        *,
+        plan_id: str,
+        command_id: str,
+    ) -> dict[str, Any]:
+        """Execute one plan; camera publication is a separate internal RPC."""
+
+        result = self._env_method("dashboard_execute_prepared_command")(
+            plan_id=validate_dashboard_plan_id(plan_id),
+            command_id=validate_dashboard_command_id(command_id),
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "dashboard_execute_prepared_command returned a non-mapping result"
+            )
+        if any(
+            key in result
+            for key in (
+                "_frames_bytes",
+                "frame_ids",
+                "capture_group_id",
+                "capture_error",
+            )
+        ):
+            raise RuntimeError(
+                "prepared motion receipt must not contain a camera capture"
+            )
+        return result
+
+    def dashboard_discard_prepared_command(
+        self,
+        *,
+        plan_id: str,
+    ) -> dict[str, Any]:
+        """Discard one internal prepared motion."""
+
+        result = self._env_method("dashboard_discard_prepared_command")(
+            plan_id=validate_dashboard_plan_id(plan_id)
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "dashboard_discard_prepared_command returned a non-mapping result"
+            )
+        return result
+
+    def dashboard_capture_views(
+        self,
+        *,
+        command_id: str,
+    ) -> dict[str, Any]:
+        """Capture all physical cameras independently from motion execution."""
+
+        result = self._env_method("dashboard_capture_views")(
+            command_id=validate_dashboard_command_id(command_id)
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("dashboard_capture_views returned a non-mapping result")
+        frames = result.get("_frames_bytes")
+        frame_ids = result.get("frame_ids")
+        if (
+            not isinstance(frames, dict)
+            or set(frames) != {"head", "left_wrist", "right_wrist"}
+            or not all(isinstance(value, bytes) for value in frames.values())
+            or not isinstance(frame_ids, dict)
+            or set(frame_ids) != {"head", "left_wrist", "right_wrist"}
+            or not all(
+                isinstance(value, str) and bool(value)
+                for value in frame_ids.values()
+            )
+        ):
+            raise RuntimeError(
+                "dashboard_capture_views omitted the atomic three-camera capture"
+            )
+        capture_group_id = result.get("capture_group_id")
+        simulator_step = result.get("simulator_step")
+        if not isinstance(capture_group_id, str) or not capture_group_id:
+            raise RuntimeError(
+                "dashboard_capture_views omitted capture_group_id"
+            )
+        if isinstance(simulator_step, bool) or not isinstance(
+            simulator_step,
+            (int, np.integer),
+        ):
+            raise RuntimeError("dashboard_capture_views omitted simulator_step")
+        return result
+
     def dashboard_manual_command(
         self,
         *,
@@ -616,25 +732,26 @@ class BehaviorPrimitives:
         if not isinstance(result, dict):
             raise RuntimeError("dashboard_manual_command returned a non-mapping result")
         frames = result.get("_frames_bytes")
+        if action != "observe":
+            if any(
+                key in result
+                for key in (
+                    "_frames_bytes",
+                    "frame_ids",
+                    "capture_group_id",
+                    "capture_error",
+                )
+            ):
+                raise RuntimeError(
+                    "manual motion receipt must not contain a camera capture"
+                )
+            return result
         capture_complete = bool(
             isinstance(frames, dict)
             and set(frames) == {"head", "left_wrist", "right_wrist"}
             and all(isinstance(value, bytes) for value in frames.values())
         )
-        receipt = result.get("official_success_receipt")
-        raw_done = receipt.get("raw_done") if isinstance(receipt, dict) else None
-        success_without_capture = bool(
-            result.get("task_success") is True
-            and isinstance(receipt, dict)
-            and receipt.get("source") == 'info["done"]["success"]'
-            and isinstance(raw_done, dict)
-            and raw_done.get("success") is True
-            and isinstance(receipt.get("receipt_sha256"), str)
-            and bool(receipt["receipt_sha256"])
-            and isinstance(result.get("capture_error"), str)
-            and bool(result["capture_error"])
-        )
-        if not capture_complete and not success_without_capture:
+        if not capture_complete:
             raise RuntimeError(
                 "dashboard_manual_command omitted the atomic three-camera capture"
             )
