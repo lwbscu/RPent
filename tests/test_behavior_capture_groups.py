@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# This is the closed acceptance matrix for the BEHAVIOR
+# joint-limits-and-goal-only execution mode.
+# Do not add new collision, contact, attachment, tracking,
+# pose-error, isolation, settling, or safety-gate tests
+# without explicit user authorization.
 from types import SimpleNamespace
 
 import pytest
@@ -35,9 +40,10 @@ def test_dashboard_capture_returns_one_fresh_three_camera_group():
     facade = BehaviorEnvFacade.__new__(BehaviorEnvFacade)
     facade._env_steps = 5
     facade._frame_cache = _FrameCache()
+    recorded = []
 
     def refresh(*, synchronize_hand_geometry=False):
-        assert synchronize_hand_geometry is True
+        assert synchronize_hand_geometry is False
         facade._frame_cache.group = "capture:5:new"
         facade._frame_cache.step = 5
         facade._frame_cache.images = {
@@ -45,11 +51,14 @@ def test_dashboard_capture_returns_one_fresh_three_camera_group():
             "left_wrist": b"left-new",
             "right_wrist": b"right-new",
         }
+        facade._last_observation = {"capture": "fresh"}
 
     facade._refresh_observation_without_step = refresh
+    facade._append_video = recorded.append
 
     result = facade._dashboard_capture_group()
 
+    assert recorded == [{"capture": "fresh"}]
     assert result["_frames_bytes"] == {
         "head": b"head-new",
         "left_wrist": b"left-new",
@@ -68,8 +77,8 @@ def test_dashboard_capture_rejects_nonfresh_group_instead_of_republishing_old_fr
     facade._refresh_observation_without_step = (
         lambda *, synchronize_hand_geometry=False: (
             None
-            if synchronize_hand_geometry is True
-            else pytest.fail("Dashboard capture omitted hand-geometry synchronization")
+            if synchronize_hand_geometry is False
+            else pytest.fail("Dashboard capture unexpectedly requested hand geometry")
         )
     )
 
@@ -86,7 +95,7 @@ def test_dashboard_capture_rejects_partial_camera_payload():
     facade._frame_cache = _FrameCache()
 
     def refresh(*, synchronize_hand_geometry=False):
-        assert synchronize_hand_geometry is True
+        assert synchronize_hand_geometry is False
         facade._frame_cache.group = "capture:5:bad"
         facade._frame_cache.step = 5
         facade._frame_cache.images["right_wrist"] = None
@@ -104,7 +113,7 @@ def test_dashboard_capture_rejects_mixed_lineage():
     facade._frame_cache = cache
 
     def refresh(*, synchronize_hand_geometry=False):
-        assert synchronize_hand_geometry is True
+        assert synchronize_hand_geometry is False
         cache.group = "capture:5:new"
         cache.step = 5
 

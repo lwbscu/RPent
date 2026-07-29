@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# This is the closed acceptance matrix for the BEHAVIOR
+# joint-limits-and-goal-only execution mode.
+# Do not add new collision, contact, attachment, tracking,
+# pose-error, isolation, settling, or safety-gate tests
+# without explicit user authorization.
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -246,55 +251,6 @@ def test_receptacle_grounding_and_navigation_guidance_is_trash_task_local() -> N
         "call_chunk_limit",
     ):
         assert forbidden not in trash_guidance
-
-
-@pytest.mark.parametrize("selected_hand", ["left", "right"])
-@pytest.mark.parametrize("other_attached", [False, True])
-def test_radio_rotate_receipt_tracks_selected_attachment_with_single_or_dual_holds(
-    selected_hand: str,
-    other_attached: bool,
-) -> None:
-    facade = _attached_rotate_facade(
-        task_spec=TURNING_ON_RADIO_TASK_SPEC,
-        selected_hand=selected_hand,
-        other_attached=other_attached,
-    )
-
-    result = facade.rotate_wrist(
-        hand=selected_hand,
-        relative_axis_angle=[0.0, 1.0, 0.0, 0.2],
-        visual_hand_check=_visual_hand_check(selected_hand),
-    )
-
-    receipt = result["attached_rotate_receipt"]
-    assert receipt["requested_hand"] == selected_hand
-    assert receipt["resolved_hand"] == selected_hand
-    assert len(receipt["attachment_fingerprint"]) == 64
-    assert "semantic_role" not in receipt
-    assert "held" not in receipt
-    assert "/World/" not in repr(receipt)
-
-
-@pytest.mark.parametrize("selected_hand", ["left", "right"])
-@pytest.mark.parametrize("other_attached", [False, True])
-def test_trash_rotate_never_creates_radio_attachment_receipt(
-    selected_hand: str,
-    other_attached: bool,
-) -> None:
-    facade = _attached_rotate_facade(
-        task_spec=PICKING_UP_TRASH_TASK_SPEC,
-        selected_hand=selected_hand,
-        other_attached=other_attached,
-    )
-
-    result = facade.rotate_wrist(
-        hand=selected_hand,
-        relative_axis_angle=[0.0, 1.0, 0.0, 0.2],
-        visual_hand_check=_visual_hand_check(selected_hand),
-    )
-
-    assert "attached_rotate_receipt" not in result
-    assert facade._latest_successful_held_rotate_receipt is None
 
 
 def test_dashboard_and_serial_sources_do_not_reintroduce_dynamic_hand_roles() -> None:

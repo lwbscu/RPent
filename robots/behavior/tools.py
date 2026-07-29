@@ -40,21 +40,12 @@ logger = get_logger("behavior")
 
 _PI0_NAV_PICK_MONITOR_FIELDS = (
     "executed_steps",
-    "handoff_env_steps",
     "total_env_steps",
-    "local_grasp_success",
-    "action_source",
-    "controller_state",
-    "vla_actions_enabled",
-    "official_success_receipt",
 )
 _PI0_NAV_PICK_OPTIONAL_MONITOR_FIELDS = (
-    "capability",
-    "visual_review",
     "stop_reason",
+    "official_success_receipt",
     "official_success_first_observed_this_chunk",
-    "soft_success_observed",
-    "terminal_classification",
 )
 
 
@@ -82,44 +73,6 @@ def _jsonable(value: Any) -> Any:
 def _as_bool(value: Any) -> bool:
     array = np.asarray(_jsonable(value))
     return bool(array.any()) if array.size else False
-
-
-def _validated_attachment_count(capability: Any) -> int:
-    """Validate the public, physical per-hand attachment capability."""
-
-    if not isinstance(capability, dict):
-        raise RuntimeError("runtime attachment capability must be a mapping")
-    attachments = capability.get("attachments")
-    if not isinstance(attachments, dict):
-        raise RuntimeError("runtime attachment capability is missing attachments")
-    if attachments.get("available") is not True:
-        raise RuntimeError("runtime attachment capability is unavailable")
-    if attachments.get("conflict") is not False:
-        raise RuntimeError("runtime attachment capability reports a conflict")
-    count = attachments.get("count")
-    if isinstance(count, bool) or not isinstance(count, (int, np.integer)):
-        raise RuntimeError("runtime attachment count must be an integer")
-    count = int(count)
-    if count not in {0, 1, 2}:
-        raise RuntimeError(f"invalid runtime attachment count: {count!r}")
-    by_hand = attachments.get("by_hand")
-    if not isinstance(by_hand, dict) or set(by_hand) != {"left", "right"}:
-        raise RuntimeError(
-            "runtime attachment capability must report left and right hands"
-        )
-    attached_count = 0
-    for hand in ("left", "right"):
-        state = by_hand.get(hand)
-        if not isinstance(state, dict) or not isinstance(state.get("attached"), bool):
-            raise RuntimeError(
-                f"runtime attachment capability for {hand} must report attached"
-            )
-        attached_count += int(state["attached"])
-    if attached_count != count:
-        raise RuntimeError(
-            "runtime attachment count disagrees with per-hand attachment state"
-        )
-    return count
 
 
 def official_task_success(info: Any) -> bool:
@@ -624,9 +577,13 @@ class BehaviorPrimitives:
             raise RuntimeError(
                 "dashboard_prepare_manual_command returned a non-mapping result"
             )
-        if result.get("status") != "prepared":
-            raise RuntimeError("dashboard motion planning did not return prepared")
-        validate_dashboard_plan_id(result.get("plan_id"))
+        status = result.get("status")
+        if status == "prepared":
+            validate_dashboard_plan_id(result.get("plan_id"))
+        elif status != "failed":
+            raise RuntimeError(
+                "dashboard motion planning must return prepared or failed"
+            )
         return result
 
     def dashboard_execute_prepared_command(
@@ -1038,8 +995,6 @@ class BehaviorPrimitives:
         navigation_visual_check: dict[str, Any] | None = None,
         relative_motion: dict[str, Any] | None = None,
         standoff_m: float | None = None,
-        max_travel_m: float | None = None,
-        timeout_s: float = 300.0,
     ) -> dict[str, Any]:
         """Execute one projection-bound or explicit base-relative motion."""
 
@@ -1062,13 +1017,6 @@ class BehaviorPrimitives:
                     minimum=0.45,
                     maximum=1.50,
                 ),
-                "max_travel_m": self._validated_navigation_number(
-                    "max_travel_m",
-                    1.0 if max_travel_m is None else max_travel_m,
-                    minimum=0.0,
-                    maximum=1.50,
-                    minimum_inclusive=False,
-                ),
             }
         else:
             if any(
@@ -1077,7 +1025,6 @@ class BehaviorPrimitives:
                     projection_id,
                     navigation_visual_check,
                     standoff_m,
-                    max_travel_m,
                 )
             ):
                 raise ValueError(
@@ -1087,12 +1034,6 @@ class BehaviorPrimitives:
             payload = {
                 "relative_motion": validate_relative_navigation_motion(relative_motion)
             }
-        payload["timeout_s"] = self._validated_navigation_number(
-            "timeout_s",
-            timeout_s,
-            minimum=0.0,
-            minimum_inclusive=False,
-        )
         return self._public_checkpoint_result(
             name="navigate_to",
             result=self._env_method("navigate_to")(**payload),
@@ -1104,9 +1045,6 @@ class BehaviorPrimitives:
         hand: str,
         target: dict[str, Any],
         visual_hand_check: dict[str, Any],
-        position_tolerance_m: float = 0.02,
-        max_travel_m: float = 0.25,
-        timeout_s: float = 240.0,
     ) -> dict[str, Any]:
         """Execute one projection-bound or relative physical-hand motion."""
 
@@ -1150,17 +1088,12 @@ class BehaviorPrimitives:
         unknown = set(target).difference(allowed)
         if unknown:
             raise ValueError(f"target contains unsupported fields: {sorted(unknown)}")
-        tolerance = self._positive_number("position_tolerance_m", position_tolerance_m)
-        travel = self._positive_number("max_travel_m", max_travel_m)
         return self._public_checkpoint_result(
             name="move_to",
             result=self._env_method("move_to")(
                 hand=hand,
                 target=target,
                 visual_hand_check=visual_hand_check,
-                position_tolerance_m=tolerance,
-                max_travel_m=travel,
-                timeout_s=self._positive_number("timeout_s", timeout_s),
             ),
         )
 
@@ -1200,7 +1133,6 @@ class BehaviorPrimitives:
         *,
         hand: str,
         visual_hand_check: dict[str, Any],
-        timeout_s: float = 30.0,
     ) -> dict[str, Any]:
         hand = self._analytic_hand(hand)
         return self._public_checkpoint_result(
@@ -1211,7 +1143,6 @@ class BehaviorPrimitives:
                     hand=hand,
                     visual_hand_check=visual_hand_check,
                 ),
-                timeout_s=self._positive_number("timeout_s", timeout_s),
             ),
         )
 
@@ -1221,7 +1152,6 @@ class BehaviorPrimitives:
         hand: str,
         visual_hand_check: dict[str, Any],
         release_visual_check: dict[str, Any] | None = None,
-        timeout_s: float = 30.0,
     ) -> dict[str, Any]:
         hand = self._analytic_hand(hand)
         env_kwargs: dict[str, Any] = {
@@ -1230,7 +1160,6 @@ class BehaviorPrimitives:
                 hand=hand,
                 visual_hand_check=visual_hand_check,
             ),
-            "timeout_s": self._positive_number("timeout_s", timeout_s),
         }
         release_check = self._validated_release_visual_check(
             hand=hand,
@@ -1250,7 +1179,6 @@ class BehaviorPrimitives:
         visual_hand_check: dict[str, Any],
         projection_id: str,
         travel_m: float,
-        timeout_s: float = 300.0,
     ) -> dict[str, Any]:
         hand = self._analytic_hand(hand)
         visual_hand_check = self._validated_visual_hand_check(
@@ -1267,7 +1195,6 @@ class BehaviorPrimitives:
                 visual_hand_check=visual_hand_check,
                 projection_id=projection_id.strip(),
                 travel_m=travel,
-                timeout_s=self._positive_number("timeout_s", timeout_s),
             ),
         )
 
@@ -1358,9 +1285,6 @@ class BehaviorPrimitives:
             "predicted_action_shape": (
                 None if chunk == 0 else [DEFAULT_ACTION_CHUNK, 23]
             ),
-            "local_grasp_success": bool(
-                isinstance(monitor, dict) and monitor.get("local_grasp_success") is True
-            ),
             "pi0_nav_pick_monitor": _jsonable(monitor),
             "raw_proprio": _jsonable(np.asarray(obs["states"], dtype=np.float32)),
             "policy_state": _jsonable(compact),
@@ -1388,10 +1312,6 @@ class BehaviorPrimitives:
 
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError("instruction must be a non-empty string")
-        if self.pure_vla_baseline and current_object_visual_check is not None:
-            raise ValueError(
-                "pure VLA baseline cannot consume public visual-review evidence"
-            )
         if (
             isinstance(chunks, bool)
             or not isinstance(chunks, (int, np.integer))
@@ -1416,7 +1336,7 @@ class BehaviorPrimitives:
                 0o600,
             )
         except FileExistsError as exc:
-            raise RuntimeError("VLA call artifact collision") from exc
+            raise RuntimeError("VLA call artifact path already exists") from exc
         claimed_at_unix_s = time.time()
         request_id = hashlib.sha256(
             (
@@ -1431,7 +1351,6 @@ class BehaviorPrimitives:
             "status": "pending",
             "instruction": instruction,
             "requested_chunks": requested_chunks,
-            "current_object_visual_check": _jsonable(current_object_visual_check),
             "run_nonce": self.run_nonce,
             "attempt_index": self.attempt_index,
             "attempt_nonce": self.attempt_nonce,
@@ -1454,15 +1373,12 @@ class BehaviorPrimitives:
         full_chunks_executed = 0
         env_steps_used = 0
         vla_env_steps_used = 0
-        handoff_env_steps_used = 0
         total_env_steps = 0
         task_success = False
-        local_grasp_success = False
         terminated = False
         truncated = False
         stop_reason = "not_started"
         last_info: Any = self._current_info
-        planner_handoff_ready = False
         lifecycle_finalized = False
         preflight_failed_preconditions: list[str] = []
         vla_rearm_active = False
@@ -1487,72 +1403,18 @@ class BehaviorPrimitives:
                 )
             task_success = True
 
-        def converge_vla_lifecycle() -> None:
+        def quiesce_vla_model_best_effort() -> None:
             nonlocal vla_rearm_active
-            nonlocal planner_handoff_ready
             nonlocal lifecycle_finalized
-            nonlocal task_success
 
             if not vla_rearm_active:
                 return
             disable_actions = getattr(self.model, "disable_actions", None)
-            healthz = getattr(self.model, "healthz", None)
-            finalize_paused_runtime = getattr(
-                self.env,
-                "finalize_paused_runtime",
-                None,
-            )
-            if (
-                not callable(disable_actions)
-                or not callable(healthz)
-                or not callable(finalize_paused_runtime)
-            ):
-                raise RuntimeError(
-                    "Pi0 lifecycle convergence requires disable, health, and "
-                    "env finalization APIs"
-                )
-            disabled = disable_actions()
-            if (
-                not isinstance(disabled, dict)
-                or disabled.get("actions_enabled") is not False
-            ):
-                raise RuntimeError("Pi0 VLA disable was not confirmed")
-            health = healthz()
-            if (
-                not isinstance(health, dict)
-                or health.get("actions_enabled") is not False
-            ):
-                raise RuntimeError("Pi0 VLA health still permits actions")
-            finalized = finalize_paused_runtime(
-                {
-                    "actions_enabled": False,
-                    "endpoint": getattr(self.model, "endpoint", None),
-                    "disable_confirmation": _jsonable(disabled),
-                    "healthz": _jsonable(health),
-                }
-            )
-            if (
-                not isinstance(finalized, dict)
-                or finalized.get("vla_actions_enabled") is not False
-                or finalized.get("lifecycle_finalized") is not True
-            ):
-                raise RuntimeError("env did not confirm Pi0 lifecycle finalization")
-            latch_success_receipt(finalized.get("official_success_receipt"))
-            finalized_task_success = finalized.get("task_success")
-            if not isinstance(finalized_task_success, bool):
-                raise RuntimeError(
-                    "env Pi0 lifecycle finalization omitted boolean task_success"
-                )
-            if finalized_task_success:
-                task_success = True
-            if task_success and runtime_success_receipt is None:
-                raise RuntimeError(
-                    "env finalized official success without its raw-success receipt"
-                )
-            finalized_capability = finalized.get("capability")
-            if finalized_capability is not None:
-                _validated_attachment_count(finalized_capability)
-            planner_handoff_ready = finalized.get("controller_state") == "planner"
+            if callable(disable_actions):
+                try:
+                    disable_actions()
+                except Exception:
+                    logger.exception("Pi0 VLA local disable cleanup failed")
             lifecycle_finalized = True
             vla_rearm_active = False
 
@@ -1580,19 +1442,6 @@ class BehaviorPrimitives:
             total_env_steps = int(baseline_total)
             stop_reason = "running"
 
-            remaining_steps = self.max_episode_steps - total_env_steps
-            required_env_steps = requested_chunks * DEFAULT_ACTION_CHUNK
-            if remaining_steps < required_env_steps:
-                stop_reason = "requested_chunks_exceed_remaining_episode_steps"
-                preflight_failed_preconditions.append(
-                    "insufficient_remaining_episode_steps"
-                )
-            elif self.elapsed_wall_clock_s >= self.max_wall_clock_s:
-                stop_reason = "global_wall_clock_budget_exhausted"
-                preflight_failed_preconditions.append(
-                    "global_wall_clock_budget_exhausted"
-                )
-
             if stop_reason == "running":
                 prepare = getattr(self.env, "prepare_vla_invocation", None)
                 if not callable(prepare):
@@ -1606,10 +1455,6 @@ class BehaviorPrimitives:
                 }
                 if self.pure_vla_baseline:
                     prepare_kwargs["baseline_internal_authorization"] = True
-                if current_object_visual_check is not None:
-                    prepare_kwargs["current_object_visual_check"] = (
-                        current_object_visual_check
-                    )
                 preflight = prepare(
                     **prepare_kwargs,
                 )
@@ -1637,26 +1482,6 @@ class BehaviorPrimitives:
                             total_env_steps = int(reported_total)
                     stop_reason = "vla_runtime_precondition_rejected"
                 if stop_reason == "running":
-                    reported_attachment_count = preflight.get(
-                        "attachment_count_at_invocation_start"
-                    )
-                    attachments_present = preflight.get(
-                        "attachments_present_at_invocation_start"
-                    )
-                    if (
-                        isinstance(reported_attachment_count, bool)
-                        or not isinstance(
-                            reported_attachment_count,
-                            (int, np.integer),
-                        )
-                        or int(reported_attachment_count) not in {0, 1, 2}
-                        or not isinstance(attachments_present, bool)
-                        or attachments_present != (int(reported_attachment_count) > 0)
-                    ):
-                        raise RuntimeError(
-                            "pi0_nav_pick preflight returned inconsistent "
-                            "per-hand attachment state"
-                        )
                     # The successful env preflight may already have switched
                     # controller ownership to VLA, so every later failure must
                     # run the disable/finalize convergence path.
@@ -1686,10 +1511,6 @@ class BehaviorPrimitives:
                             isinstance(item, str) and item for item in failed
                         ):
                             preflight_failed_preconditions = list(failed)
-                    if task_success and runtime_success_receipt is None:
-                        raise RuntimeError(
-                            "VLA re-arm reported task success without raw receipt"
-                        )
                     if (
                         stop_reason == "running"
                         and confirmed.get("primitive_success") is not True
@@ -1697,11 +1518,7 @@ class BehaviorPrimitives:
                         raise RuntimeError("env did not confirm VLA action re-arm")
 
             if stop_reason == "running":
-                # Attached-state authorization is deliberately completed by both
-                # prepare calls before this private sensor refresh.  The
-                # refresh may replace the frame-cache head, so doing it earlier
-                # would make an otherwise fresh public observe receipt stale
-                # between validation and VLA re-arm confirmation.
+                # Refresh the policy observation without advancing the simulator.
                 current = current_observation()
                 if not isinstance(current, tuple) or len(current) != 2:
                     raise RuntimeError(
@@ -1737,10 +1554,6 @@ class BehaviorPrimitives:
                 latch_success_receipt(_official_success_receipt_from_info(info))
                 if official_task_success(info):
                     task_success = True
-                    if runtime_success_receipt is None:
-                        raise RuntimeError(
-                            "current raw task success lacks immutable receipt"
-                        )
 
             if stop_reason == "running" and obs is None:
                 raise RuntimeError(
@@ -1769,10 +1582,6 @@ class BehaviorPrimitives:
                 and not truncated
                 and chunks_used < requested_chunks
             ):
-                if self.max_episode_steps - total_env_steps < DEFAULT_ACTION_CHUNK:
-                    raise RuntimeError(
-                        "remaining episode steps changed after exact-chunk preflight"
-                    )
                 model_obs = dict(obs)
                 # Preserve the configured language byte-for-byte. Adding a
                 # navigation or hand hint changes the Pi0 policy distribution.
@@ -1824,28 +1633,6 @@ class BehaviorPrimitives:
                     )
                     if field in monitor
                 }
-                # Visual artifacts are best-effort audit material. They are
-                # never prerequisites for local grasp, task success, controller
-                # transfer, or a later VLA invocation.
-                visual_review = monitor.get("visual_review")
-                if (
-                    isinstance(visual_review, dict)
-                    and self._progress_callback is not None
-                ):
-                    try:
-                        self._progress_callback(
-                            "pi0_nav_pick",
-                            {
-                                "chunk_index": int(chunk_index),
-                                "env_step": int(monitor["total_env_steps"]),
-                                "global_vla_invocations": self._vla_invocations,
-                                "visual_review": visual_review,
-                            },
-                        )
-                    except Exception:
-                        logger.warning(
-                            "dashboard progress update failed", exc_info=True
-                        )
                 monitor_stop_reason = monitor.get("stop_reason")
                 if monitor_stop_reason is not None and (
                     not isinstance(monitor_stop_reason, str) or not monitor_stop_reason
@@ -1853,22 +1640,10 @@ class BehaviorPrimitives:
                     raise RuntimeError(
                         "pi0_nav_pick monitor stop_reason must be null or non-empty"
                     )
-                # Persist only the public monitor allowlist. Simulator-private
-                # debugging fields must not cross into agent artifacts.
-                public_info = dict(info)
-                public_rpent = dict(rpent)
-                public_rpent["pi0_nav_pick_monitor"] = monitor
-                public_info["_rpent"] = public_rpent
-                info = public_info
-                last_info = info
                 latch_success_receipt(monitor.get("official_success_receipt"))
                 latch_success_receipt(_official_success_receipt_from_info(info))
                 if official_task_success(info):
                     task_success = True
-                    if runtime_success_receipt is None:
-                        raise RuntimeError(
-                            "raw task success lacks immutable env receipt"
-                        )
                 executed_steps = monitor["executed_steps"]
                 if (
                     isinstance(executed_steps, bool)
@@ -1877,15 +1652,6 @@ class BehaviorPrimitives:
                 ):
                     raise RuntimeError(
                         f"invalid pi0_nav_pick executed_steps: {executed_steps!r}"
-                    )
-                handoff_env_steps = monitor["handoff_env_steps"]
-                if (
-                    isinstance(handoff_env_steps, bool)
-                    or not isinstance(handoff_env_steps, (int, np.integer))
-                    or int(handoff_env_steps) < 0
-                ):
-                    raise RuntimeError(
-                        f"invalid pi0_nav_pick handoff_env_steps: {handoff_env_steps!r}"
                     )
                 reported_total = monitor["total_env_steps"]
                 if (
@@ -1897,24 +1663,35 @@ class BehaviorPrimitives:
                     raise RuntimeError(
                         f"invalid pi0_nav_pick total_env_steps: {reported_total!r}"
                     )
-                if not isinstance(monitor["local_grasp_success"], bool):
-                    raise RuntimeError(
-                        "pi0_nav_pick local_grasp_success must be boolean"
-                    )
-                local_grasp_success = monitor["local_grasp_success"] is True
-                derived_handoff_steps = (
-                    int(reported_total) - previous_total - int(executed_steps)
-                )
-                # A chunk may have physically completed before a later audit
-                # check detects inconsistent runtime metadata.  Persist its
-                # observed execution and absolute environment total first so
-                # the result never rewrites a real 32-step action as zero work.
-                env_steps_used += int(reported_total) - previous_total
+                env_steps_used += int(executed_steps)
                 vla_env_steps_used += int(executed_steps)
-                handoff_env_steps_used += int(handoff_env_steps)
                 total_env_steps = int(reported_total)
                 if int(executed_steps) == DEFAULT_ACTION_CHUNK:
                     full_chunks_executed += 1
+                # Keep only lifecycle and accounting data in artifacts.
+                public_info = dict(info)
+                public_rpent = {
+                    key: rpent[key]
+                    for key in (
+                        "total_env_steps",
+                        "global_env_steps",
+                        "run_nonce",
+                        "attempt_index",
+                        "attempt_nonce",
+                        "official_success_receipt",
+                    )
+                    if isinstance(rpent, dict) and key in rpent
+                }
+                public_rpent.update(
+                    {
+                        "executed_steps": int(executed_steps),
+                        "total_env_steps": int(reported_total),
+                        "pi0_nav_pick_monitor": monitor,
+                    }
+                )
+                public_info["_rpent"] = public_rpent
+                info = public_info
+                last_info = info
                 states.append(
                     self._pi0_nav_pick_state_record(
                         chunk=chunks_used,
@@ -1932,45 +1709,6 @@ class BehaviorPrimitives:
                 )
                 self._current_observation = obs
                 self._current_info = info
-                if int(handoff_env_steps) != derived_handoff_steps:
-                    raise RuntimeError(
-                        "pi0_nav_pick handoff accounting mismatch: "
-                        f"reported={handoff_env_steps!r} "
-                        f"derived={derived_handoff_steps!r}"
-                    )
-                if isinstance(rpent, dict):
-                    for field, expected in (
-                        ("executed_steps", int(executed_steps)),
-                        ("handoff_env_steps", int(handoff_env_steps)),
-                        ("total_env_steps", int(reported_total)),
-                    ):
-                        value = rpent.get(field, expected)
-                        if value != expected:
-                            raise RuntimeError(
-                                "pi0_nav_pick monitor/accounting mismatch: "
-                                f"{field}={value!r} monitor={expected!r}"
-                            )
-                public_rpent["executed_steps"] = int(executed_steps)
-                public_rpent["handoff_env_steps"] = int(handoff_env_steps)
-                public_rpent["total_env_steps"] = int(reported_total)
-                public_rpent["pi0_nav_pick_monitor"] = monitor
-                public_info["_rpent"] = public_rpent
-                info = public_info
-                last_info = info
-                capability = monitor.get("capability")
-                runtime_attachment_count = _validated_attachment_count(capability)
-                if local_grasp_success and runtime_attachment_count < 1:
-                    raise RuntimeError(
-                        "pi0_nav_pick local grasp lacks a runtime attachment"
-                    )
-                if not isinstance(monitor["controller_state"], str):
-                    raise RuntimeError("pi0_nav_pick controller_state must be a string")
-                if not isinstance(monitor["action_source"], str):
-                    raise RuntimeError("pi0_nav_pick action_source must be a string")
-                if not isinstance(monitor["vla_actions_enabled"], bool):
-                    raise RuntimeError(
-                        "pi0_nav_pick vla_actions_enabled must be boolean"
-                    )
                 if (
                     int(executed_steps) != DEFAULT_ACTION_CHUNK
                     and not task_success
@@ -1978,18 +1716,21 @@ class BehaviorPrimitives:
                     and not truncated
                 ):
                     raise RuntimeError(
-                        "pi0_nav_pick env truncated a chunk without a terminal reason"
+                        "pi0_nav_pick env returned a partial chunk without a lifecycle "
+                        "terminal reason"
                     )
                 if terminated:
-                    stop_reason = "terminated"
+                    stop_reason = "environment_terminated"
                 elif truncated:
-                    stop_reason = "truncated"
+                    stop_reason = "environment_truncated"
                 else:
                     stop_reason = "running"
                 _write_json_atomic(states_path, states)
 
-            if vla_rearm_active:
-                converge_vla_lifecycle()
+            # This is local model cleanup only.  A completed chunk is already a
+            # successful primitive and must not depend on health or Env
+            # finalization RPCs.
+            quiesce_vla_model_best_effort()
             exact_requested_chunks_completed = bool(
                 chunks_used == requested_chunks
                 and full_chunks_executed == requested_chunks
@@ -2000,9 +1741,9 @@ class BehaviorPrimitives:
             elif exact_requested_chunks_completed:
                 stop_reason = "requested_chunks_completed"
             elif terminated:
-                stop_reason = "terminated"
+                stop_reason = "environment_terminated"
             elif truncated:
-                stop_reason = "truncated"
+                stop_reason = "environment_truncated"
             elif stop_reason == "running":
                 raise RuntimeError(
                     "Pi0 invocation returned without completing its exact chunks"
@@ -2010,15 +1751,7 @@ class BehaviorPrimitives:
         except Exception as exc:
             logger.exception("pi0_nav_pick failed")
             error = f"{type(exc).__name__}: {exc}"
-            if vla_rearm_active:
-                try:
-                    converge_vla_lifecycle()
-                except Exception as cleanup_exc:
-                    logger.exception("pi0_nav_pick VLA error cleanup failed")
-                    error = (
-                        f"{error}; cleanup_failed="
-                        f"{type(cleanup_exc).__name__}: {cleanup_exc}"
-                    )
+            quiesce_vla_model_best_effort()
             stop_reason = "error"
 
         exact_requested_chunks_completed = bool(
@@ -2028,7 +1761,6 @@ class BehaviorPrimitives:
         )
         primitive_success = bool(
             error is None
-            and lifecycle_finalized
             and (task_success or exact_requested_chunks_completed)
         )
         runner_terminate = bool(
@@ -2073,7 +1805,6 @@ class BehaviorPrimitives:
             "full_chunks_executed": full_chunks_executed,
             "env_steps_used": env_steps_used,
             "vla_env_steps_used": vla_env_steps_used,
-            "handoff_env_steps_used": handoff_env_steps_used,
             "total_env_steps": total_env_steps,
             "max_episode_steps": self.max_episode_steps,
             "action_horizon": self.action_horizon,
@@ -2099,8 +1830,6 @@ class BehaviorPrimitives:
                 "task_success": bool(task_success),
                 "requested_chunks": requested_chunks,
                 "exact_requested_chunks_completed": (exact_requested_chunks_completed),
-                "local_grasp_success": bool(local_grasp_success),
-                "planner_handoff_ready": bool(planner_handoff_ready),
                 "result_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
             }
         )

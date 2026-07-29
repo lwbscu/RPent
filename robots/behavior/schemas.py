@@ -17,9 +17,6 @@ from robots.behavior.task_specs import (
 
 ACTION_DIM = 23
 DEFAULT_ACTION_CHUNK = 32
-# Runtime-owned hard deadline. It is deliberately absent from the public tool
-# schema so the planner cannot shorten or extend CuRobo execution.
-ROTATE_WRIST_RUNTIME_TIMEOUT_S = 30.0
 # Dashboard jog amounts are a server-owned safety contract.  They are
 # intentionally not represented in the browser request schema and must not be
 # overridden by callers at the HTTP or env-RPC boundaries.
@@ -28,6 +25,11 @@ BASE_ROTATION_STEP_RAD = math.radians(5.0)
 EEF_TRANSLATION_STEP_M = 0.03
 TORSO_VERTICAL_STEP_M = 0.03
 WRIST_ROTATION_STEP_RAD = math.radians(5.0)
+DASHBOARD_CUROBO_PLAN_TIMEOUT_S = 1.0
+DASHBOARD_EXECUTION_MAX_WAYPOINTS = 3
+DASHBOARD_CONTROL_CYCLES_PER_WAYPOINT = 5
+DASHBOARD_PREDICTED_PLAN_DEPTH = 20
+DASHBOARD_HOLD_ARM_DELAY_S = 0.320
 
 DASHBOARD_CONTROL_TARGETS = ("chassis", "left_arm", "right_arm")
 DASHBOARD_CONTROL_ACTIONS = (
@@ -44,6 +46,7 @@ DASHBOARD_CONTROL_ACTIONS = (
     "observe",
 )
 DASHBOARD_CONTROL_CAMERAS = ("head", "left_wrist", "right_wrist")
+DASHBOARD_PREDICTED_PLANNING_CAPABILITY = "threaded_predicted_planning"
 CAMERA_KEYS = ("main", "left_wrist", "right_wrist")
 _PUBLIC_TOOL_CONTRACT_V1 = (
     "pi0_nav_pick",
@@ -105,6 +108,20 @@ def validate_dashboard_manual_command(
     return {"target": target, "action": action, "camera": camera}
 
 
+def validate_dashboard_control_capabilities(value: Any) -> dict[str, Any]:
+    """Validate the worker-owned predicted-planning readiness flag."""
+
+    if not isinstance(value, Mapping):
+        raise TypeError("dashboard control capabilities must be an object")
+    capability = dict(value)
+    if type(capability.get(DASHBOARD_PREDICTED_PLANNING_CAPABILITY)) is not bool:
+        raise TypeError(
+            "dashboard control capabilities must report boolean "
+            f"{DASHBOARD_PREDICTED_PLANNING_CAPABILITY}"
+        )
+    return capability
+
+
 def _dashboard_identifier(value: Any, *, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
@@ -141,15 +158,10 @@ def validate_dashboard_prepare_request(
         )
     )
     if background and predecessor is None:
-        raise ValueError(
-            "background planning requires a predecessor_plan_id"
-        )
+        raise ValueError("background planning requires a predecessor_plan_id")
     if planning_only_probe:
         probe_action = bool(
-            (
-                command["target"] == "chassis"
-                and command["action"] in {"up", "down"}
-            )
+            (command["target"] == "chassis" and command["action"] in {"up", "down"})
             or (
                 command["target"] in {"left_arm", "right_arm"}
                 and command["action"] in {"rotate_left", "rotate_right"}
@@ -181,7 +193,7 @@ def validate_dashboard_plan_id(value: Any) -> str:
 
 
 def validate_dashboard_command_id(value: Any) -> str:
-    """Validate one opaque command id used for permit and exactly-once replay."""
+    """Validate one opaque Dashboard compatibility identifier."""
 
     return _dashboard_identifier(value, name="command_id")
 
@@ -282,7 +294,7 @@ def extract_policy_state(raw_proprio: Any) -> np.ndarray:
 def validate_action_chunk(
     actions: Any, *, max_horizon: int | None = None
 ) -> np.ndarray:
-    """Validate a finite ``[T,23]`` R1Pro env-action chunk."""
+    """Validate the shape of one ``[T,23]`` R1Pro env-action chunk."""
     array = np.asarray(actions, dtype=np.float32)
     if array.ndim != 2 or array.shape[1] != ACTION_DIM or array.shape[0] < 1:
         raise ValueError(
@@ -292,8 +304,6 @@ def validate_action_chunk(
         raise ValueError(
             f"BEHAVIOR action horizon {array.shape[0]} exceeds {int(max_horizon)}"
         )
-    if not np.isfinite(array).all():
-        raise ValueError("BEHAVIOR actions contain NaN or infinity")
     return array
 
 
@@ -335,33 +345,15 @@ PI0_NAV_PICK_SPEC: dict[str, Any] = {
         "Invoke a Pi0.5/VLA skill supporting navigation, grasping, and "
         "pressing using up to the LLM-requested number of [32,23] action chunks. "
         "chunks is a positive requested work bound with no fixed maximum, not a "
-        "per-tool quota. Without raw official success or an allowed terminal "
-        "exception, an admitted invocation executes exactly the requested number "
+        "per-tool quota. Without raw official success or an environment lifecycle "
+        "stop, an admitted invocation executes the requested number "
         "of complete 32-action chunks. Raw info.done.success stops physical task "
-        "execution at the successful environment step, including mid-chunk, seals "
-        "an immutable official-success receipt, and permits no later action, "
-        "prediction, public-tool call, observation, capability read, or other "
-        "task RPC. Only no-action VLA disable/health, environment "
-        "freeze/finalize, transport shutdown, and artifact sealing remain "
-        "allowlisted. That "
-        "receipt-bound partial chunk is a normal successful terminal outcome and "
-        "is not counted as a complete chunk. Attachment, held-object, and "
-        "multiple-attachment observations alone never shorten the requested work. "
-        "Other early returns require a real environment termination/truncation or "
-        "a fail-closed runtime safety/infrastructure error. "
-        "When one or more objects are already attached, cite exactly one fresh "
-        "public observe "
-        "frame in current_object_visual_check before this invocation; this replaces "
-        "any unconditional held-object rejection. "
-        "If the head-camera view does not show either hand clearly, or a hand is "
-        "visibly far from the image center, the skill may use pose correction to "
-        "re-center the relevant hand before continuing. "
-        "Two consecutive complete runtime-accepted regressions—successful "
-        "selected-attached-hand "
-        "rotate, fresh target-surface review, this skill executing at least one "
-        "complete chunk and handing control back, then a distinct fresh "
-        "opposite-surface review—disable only pi0_nav_pick for the remainder of "
-        "the current attempt; all other public tools remain available. "
+        "execution at the successful environment step, including mid-chunk, and "
+        "permits no later action, prediction, public-tool call, observation, "
+        "capability read, or other task RPC. A partial chunk stopped by raw success "
+        "is a normal successful terminal outcome and is not counted as a complete "
+        "chunk. Other early returns require terminated, truncated, or an "
+        "infrastructure error. "
         "primitive_success reports only local skill execution; task_success "
         "independently reports the official info.done.success bit."
     ),
@@ -381,31 +373,9 @@ PI0_NAV_PICK_SPEC: dict[str, Any] = {
                 "minimum": 1,
                 "description": (
                     "Positive upper bound on [32,23] Pi0 action chunks selected by "
-                    "the LLM. In the absence of official success or an allowed "
-                    "terminal exception, exactly this many complete chunks execute."
+                    "the LLM. In the absence of official success or an environment "
+                    "lifecycle stop, this many complete chunks execute."
                 ),
-            },
-            "current_object_visual_check": {
-                "type": "object",
-                "description": (
-                    "Required whenever runtime reports one or more current "
-                    "attachments. It binds this invocation to one fresh public "
-                    "observe frame that the LLM used to review the current "
-                    "task-object configuration."
-                ),
-                "properties": {
-                    "camera": {
-                        "type": "string",
-                        "enum": ["head", "left_wrist", "right_wrist"],
-                    },
-                    "frame_id": {"type": "string", "minLength": 1},
-                    "assessment": {
-                        "type": "string",
-                        "const": "current_task_object_configuration_reviewed",
-                    },
-                },
-                "required": ["camera", "frame_id", "assessment"],
-                "additionalProperties": False,
             },
         },
         "required": ["instruction", "chunks"],
@@ -562,11 +532,7 @@ OBSERVE_SPEC: dict[str, Any] = _planner_spec(
         "follow-up does not capture or refresh an image. Runtime verifies frame "
         "provenance and freshness, not the semantic truth of an LLM assessment. "
         "A frame review must consume the immediately preceding, same-camera capture "
-        "exactly once. "
-        "Two consecutive complete runtime-accepted selected-attached-hand "
-        "rotate/Pi0/fresh-opposite-surface regression cycles disable only "
-        "pi0_nav_pick for the remainder of the current attempt; all other public "
-        "tools remain available."
+        "exactly once."
     ),
     {
         "camera": _CAMERA_ROLE_SCHEMA,
@@ -748,11 +714,10 @@ _RELATIVE_NAVIGATION_MOTION_SCHEMA: dict[str, Any] = {
 NAVIGATE_TO_SPEC: dict[str, Any] = _planner_spec(
     "navigate_to",
     (
-        "Move only the robot base while holding trunk, both arms, both grippers, "
-        "and both attachment identities fixed relative to the base, so the body "
-        "moves and rotates together with it. Use either a fresh head-camera "
+        "Request one CuRobo base goal using either a fresh head-camera "
         "projection, or one explicit relative translation (forward/backward) or "
-        "in-place rotation (left/right). The two modes are mutually exclusive."
+        "in-place rotation (left/right). CuRobo retains its internal joint limits "
+        "and goal convergence. The two target modes are mutually exclusive."
     ),
     {
         "projection_id": {
@@ -767,17 +732,6 @@ NAVIGATE_TO_SPEC: dict[str, Any] = _planner_spec(
             "minimum": 0.45,
             "maximum": 1.50,
         },
-        "max_travel_m": {
-            "type": "number",
-            "default": 1.0,
-            "exclusiveMinimum": 0.0,
-            "maximum": 1.50,
-        },
-        "timeout_s": {
-            "type": "number",
-            "default": 300.0,
-            "exclusiveMinimum": 0.0,
-        },
     },
     one_of=[
         {
@@ -791,7 +745,6 @@ NAVIGATE_TO_SPEC: dict[str, Any] = _planner_spec(
                     {"required": ["projection_id"]},
                     {"required": ["navigation_visual_check"]},
                     {"required": ["standoff_m"]},
-                    {"required": ["max_travel_m"]},
                 ]
             },
         },
@@ -880,31 +833,15 @@ _MOVE_TARGET_SCHEMA: dict[str, Any] = {
 MOVE_TO_SPEC: dict[str, Any] = _planner_spec(
     "move_to",
     (
-        "Execute one R1Pro whole-body 21-DOF CuRobo joint motion using either a "
+        "Request one R1Pro whole-body 21-DOF CuRobo joint goal using either a "
         "fresh projection or a relative translation. hand selects only the target "
-        "EEF; it does not select an isolated arm-only embodiment. The planner may "
-        "coordinate the base, trunk, and both arms, and includes objects held by "
-        "either hand in collision checking."
+        "EEF; CuRobo may coordinate the configured active joints and retains only "
+        "its internal joint limits and goal convergence."
     ),
     {
         "hand": _ANALYTIC_HAND_SCHEMA,
         "visual_hand_check": _VISUAL_HAND_CHECK_SCHEMA,
         "target": _MOVE_TARGET_SCHEMA,
-        "position_tolerance_m": {
-            "type": "number",
-            "default": 0.02,
-            "exclusiveMinimum": 0.0,
-        },
-        "max_travel_m": {
-            "type": "number",
-            "default": 0.25,
-            "exclusiveMinimum": 0.0,
-        },
-        "timeout_s": {
-            "type": "number",
-            "default": 240.0,
-            "exclusiveMinimum": 0.0,
-        },
     },
     required=["hand", "visual_hand_check", "target"],
 )
@@ -913,15 +850,14 @@ _bind_visual_checks_to_hand(MOVE_TO_SPEC)
 ROTATE_WRIST_SPEC: dict[str, Any] = _planner_spec(
     "rotate_wrist",
     (
-        "Execute one R1Pro whole-body 21-DOF CuRobo joint motion that changes the "
-        "target EEF orientation while approximately preserving its position. hand "
-        "selects only the target EEF; the planner may coordinate the base, trunk, "
-        "and both arms and includes objects held by either hand in collision "
-        "checking. Every selected hand must cite one "
+        "Request one R1Pro whole-body 21-DOF CuRobo joint goal that changes the "
+        "target EEF orientation while preserving its target position. hand "
+        "selects the target EEF; CuRobo may coordinate the configured active joints "
+        "and retains only its internal joint limits and goal convergence. Every "
+        "selected hand must cite one "
         "fresh head observe frame in visual_hand_check. "
         "left/right mean the robot's anatomical sides, not image sides. "
-        "Planning and execution use a runtime-owned 30-second hard deadline; "
-        "no caller timeout or step budget is accepted."
+        "No caller timeout or step budget is accepted."
     ),
     {
         "hand": _ANALYTIC_HAND_SCHEMA,
@@ -960,11 +896,6 @@ def _gripper_spec(
     properties: dict[str, Any] = {
         "hand": _ANALYTIC_HAND_SCHEMA,
         "visual_hand_check": _VISUAL_HAND_CHECK_SCHEMA,
-        "timeout_s": {
-            "type": "number",
-            "default": 30.0,
-            "exclusiveMinimum": 0.0,
-        },
     }
     if release_visual_policy is not None:
         release_visual_check = deepcopy(_RELEASE_VISUAL_CHECK_SCHEMA)
@@ -977,10 +908,7 @@ def _gripper_spec(
         properties["release_visual_check"] = release_visual_check
     spec = _planner_spec(
         name,
-        (
-            f"{verb} only the gripper on a visually confirmed anatomical hand. "
-            "The other gripper, both arms, base, and trunk remain isolated."
-        ),
+        (f"{verb} the gripper on a visually confirmed anatomical hand."),
         properties,
         required=["hand", "visual_hand_check"],
     )
@@ -997,10 +925,10 @@ OPEN_SPEC: dict[str, Any] = _gripper_spec("open", "Open")
 PRESS_SPEC: dict[str, Any] = _planner_spec(
     "press",
     (
-        "Execute a press against a fresh projected target using R1Pro whole-body "
-        "21-DOF CuRobo joint planning. hand selects only the target EEF; the planner "
-        "may coordinate the base, trunk, and both arms and includes objects held by "
-        "either hand in collision checking."
+        "Request a press against a fresh projected target using R1Pro whole-body "
+        "21-DOF CuRobo joint planning. hand selects the target EEF; CuRobo may "
+        "coordinate the configured active joints and retains only its internal "
+        "joint limits and goal convergence."
     ),
     {
         "hand": _ANALYTIC_HAND_SCHEMA,
@@ -1009,11 +937,6 @@ PRESS_SPEC: dict[str, Any] = _planner_spec(
         "travel_m": {
             "type": "number",
             "default": 0.03,
-            "exclusiveMinimum": 0.0,
-        },
-        "timeout_s": {
-            "type": "number",
-            "default": 300.0,
             "exclusiveMinimum": 0.0,
         },
     },
@@ -1126,17 +1049,6 @@ def behavior_tool_specs_for_task(
             "capture a fresh frame."
         )
         observe["input_schema"]["properties"].pop("frame_review", None)
-        pi0 = specs["pi0_nav_pick"]
-        pi0["description"] = pi0["description"].replace(
-            "Two consecutive complete runtime-accepted regressions—successful "
-            "selected-attached-hand rotate, fresh target-surface review, this skill "
-            "executing "
-            "at least one complete chunk and handing control back, then a distinct "
-            "fresh opposite-surface review—disable only pi0_nav_pick for the "
-            "remainder of the current attempt; all other public tools remain "
-            "available. ",
-            "",
-        )
     if task_spec.terminal_failure_policy is None:
         checkpoint = specs["save_robot_state_checkpoint"]
         checkpoint["description"] = (
@@ -1162,6 +1074,7 @@ __all__ = [
     "DASHBOARD_CONTROL_ACTIONS",
     "DASHBOARD_CONTROL_CAMERAS",
     "DASHBOARD_CONTROL_TARGETS",
+    "DASHBOARD_PREDICTED_PLANNING_CAPABILITY",
     "EEF_TRANSLATION_STEP_M",
     "ENV_ACTION_SEGMENTS",
     "ENV_WIRE_SCHEMA",
@@ -1187,6 +1100,7 @@ __all__ = [
     "segment_ranges",
     "validate_action_chunk",
     "validate_dashboard_command_id",
+    "validate_dashboard_control_capabilities",
     "validate_dashboard_manual_command",
     "validate_dashboard_plan_id",
     "validate_dashboard_prepare_request",

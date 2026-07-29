@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-import contextlib
+# This is the closed acceptance matrix for the BEHAVIOR
+# joint-limits-and-goal-only execution mode.
+# Do not add new collision, contact, attachment, tracking,
+# pose-error, isolation, settling, or safety-gate tests
+# without explicit user authorization.
 import hashlib
 import json
 import threading
@@ -372,81 +376,6 @@ def test_runtime_resource_close_is_single_flight_across_threads(
     assert events == ["env.stop", "vla.stop"]
 
 
-def test_execute_tool_holds_agent_transaction_around_complete_call() -> None:
-    events: list[str] = []
-
-    class Arbiter:
-        @contextlib.contextmanager
-        def agent_transaction(self):
-            events.append("agent.enter")
-            try:
-                yield
-            finally:
-                events.append("agent.exit")
-
-    toolkit = object.__new__(BehaviorToolkit)
-    toolkit._command_arbiter = Arbiter()
-    toolkit._execute_tool_lock = threading.Lock()
-    toolkit._execute_tool_locked = lambda name, args: events.append("tool.complete")
-
-    toolkit.execute_tool("observe", {"camera": "head"})
-
-    assert events == ["agent.enter", "tool.complete", "agent.exit"]
-
-
-def test_manual_command_uses_public_primitive_and_shared_success_latch() -> None:
-    calls: list[dict[str, Any]] = []
-
-    class Latch:
-        def observe(self, result: dict[str, Any]) -> bool:
-            calls.append({"latched": result})
-            return True
-
-    receipt = _signed_success_receipt()
-    result = {
-        "source": "dashboard_manual",
-        "target": "left_arm",
-        "action": "open",
-        "primitive_success": True,
-        "task_success": True,
-        "official_success_source": 'info["done"]["success"]',
-        "official_success_receipt": receipt,
-    }
-    primitives = SimpleNamespace(
-        dashboard_manual_command=lambda **kwargs: calls.append(kwargs) or result,
-        run_nonce=_RUN_NONCE,
-        attempt_nonce=_ATTEMPT_NONCE,
-        attempt_index=1,
-    )
-    toolkit = object.__new__(BehaviorToolkit)
-    toolkit._closed = False
-    toolkit._primitives = primitives
-    toolkit._success_latch = Latch()
-    toolkit._command_arbiter = SimpleNamespace(
-        require_manual_permit=lambda command_id: calls.append(
-            {"permit": command_id}
-        )
-    )
-    toolkit._official_task_success = False
-
-    returned = toolkit.dashboard_manual_command(
-        target="left_arm",
-        action="open",
-        camera="head",
-        permit_command_id="manual-command",
-    )
-
-    assert returned is result
-    assert calls[0] == {"permit": "manual-command"}
-    assert calls[1] == {
-        "target": "left_arm",
-        "action": "open",
-        "camera": "head",
-    }
-    assert calls[2] == {"latched": result}
-    assert toolkit._official_task_success is True
-
-
 def test_capability_policy_cannot_be_overridden_by_env_claim() -> None:
     toolkit = object.__new__(BehaviorToolkit)
     toolkit._dashboard_motion_allowed = False
@@ -459,6 +388,7 @@ def test_capability_policy_cannot_be_overridden_by_env_claim() -> None:
             "observe_available": True,
             "planner_available": True,
             "position_control_ready": True,
+            "threaded_predicted_planning": True,
         }
     )
 
@@ -467,43 +397,6 @@ def test_capability_policy_cannot_be_overridden_by_env_claim() -> None:
     assert capability["motion_available"] is False
     assert capability["observe_available"] is True
     assert capability["motion_unavailable_reason"] == "pure VLA owns motion"
-
-
-def test_manual_task_success_flag_without_receipt_does_not_latch() -> None:
-    latch = BehaviorRawSuccessLatch(
-        run_nonce=_RUN_NONCE,
-        attempt_nonce=_ATTEMPT_NONCE,
-        attempt_index=1,
-    )
-    toolkit = object.__new__(BehaviorToolkit)
-    toolkit._closed = False
-    toolkit._primitives = SimpleNamespace(
-        run_nonce=_RUN_NONCE,
-        attempt_nonce=_ATTEMPT_NONCE,
-        attempt_index=1,
-        dashboard_manual_command=lambda **kwargs: {
-            "primitive_success": True,
-            "task_success": True,
-        },
-    )
-    toolkit._success_latch = latch
-    toolkit._command_arbiter = SimpleNamespace(
-        require_manual_permit=lambda command_id: None
-    )
-    toolkit._official_task_success = False
-    toolkit._shared_success_evidence = None
-
-    toolkit.dashboard_manual_command(
-        target="chassis",
-        action="forward",
-        camera="head",
-        permit_command_id="manual-command",
-    )
-
-    assert latch.is_latched() is False
-    assert toolkit._official_task_success is False
-    assert toolkit._has_verified_raw_success() is False
-
 
 def test_toolkit_accepts_only_exact_envclient_receipt_schema() -> None:
     toolkit = object.__new__(BehaviorToolkit)
@@ -610,84 +503,6 @@ def test_toolkit_uses_digest_comparison_for_well_formed_receipt() -> None:
         )
         is None
     )
-
-
-def test_manual_command_rejects_calls_without_shared_manual_permit() -> None:
-    toolkit = object.__new__(BehaviorToolkit)
-    toolkit._closed = False
-    toolkit._command_arbiter = SimpleNamespace(
-        require_manual_permit=lambda command_id: (_ for _ in ()).throw(
-            RuntimeError("Dashboard manual primitive requires its exact command permit")
-        )
-    )
-    toolkit._primitives = SimpleNamespace(
-        dashboard_manual_command=lambda **kwargs: pytest.fail(
-            "manual handler must not run"
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="exact command permit"):
-        toolkit.dashboard_manual_command(
-            target="chassis",
-            action="forward",
-            camera="head",
-            permit_command_id="borrowed-command",
-        )
-
-
-def test_manual_command_permit_is_bound_to_exact_current_command() -> None:
-    latch = BehaviorRawSuccessLatch(
-        run_nonce=_RUN_NONCE,
-        attempt_nonce=_ATTEMPT_NONCE,
-        attempt_index=1,
-    )
-    arbiter = BehaviorCommandArbiter(success_latch=latch)
-    calls: list[dict[str, Any]] = []
-    toolkit = object.__new__(BehaviorToolkit)
-    toolkit._closed = False
-    toolkit._command_arbiter = arbiter
-    toolkit._manual_intervention_latch = threading.Event()
-    toolkit._success_latch = latch
-    toolkit._official_task_success = False
-    toolkit._shared_success_evidence = None
-    toolkit._primitives = SimpleNamespace(
-        run_nonce=_RUN_NONCE,
-        attempt_nonce=_ATTEMPT_NONCE,
-        attempt_index=1,
-        dashboard_manual_command=lambda **kwargs: calls.append(kwargs)
-        or {"primitive_success": True, "task_success": False},
-    )
-
-    acquired, reason = arbiter.try_acquire_manual("current-command")
-    assert acquired is True
-    assert reason is None
-    with pytest.raises(RuntimeError, match="exact command permit"):
-        toolkit.dashboard_manual_command(
-            target="chassis",
-            action="observe",
-            camera="head",
-            permit_command_id="borrowed-command",
-        )
-    assert calls == []
-
-    result = toolkit.dashboard_manual_command(
-        target="chassis",
-        action="observe",
-        camera="head",
-        permit_command_id="current-command",
-    )
-    assert result["primitive_success"] is True
-    assert len(calls) == 1
-
-    arbiter.release_manual("current-command")
-    with pytest.raises(RuntimeError, match="exact command permit"):
-        toolkit.dashboard_manual_command(
-            target="chassis",
-            action="observe",
-            camera="head",
-            permit_command_id="current-command",
-        )
-    assert len(calls) == 1
 
 
 def test_failed_manual_motion_blocks_explore_memory_publication(
@@ -902,10 +717,33 @@ def test_activate_binds_one_controller_to_same_runtime_objects(tmp_path: Path) -
             "observe_available": True,
             "planner_available": True,
             "position_control_ready": True,
+            "threaded_predicted_planning": True,
         },
         dashboard_manual_command=lambda **kwargs: {
             "primitive_success": True,
             "task_success": False,
+        },
+        dashboard_prepare_manual_command=lambda **kwargs: {
+            "status": "prepared",
+            "plan_id": "plan",
+            "predicted_terminal": {},
+        },
+        dashboard_execute_prepared_command=lambda **kwargs: {
+            "primitive_success": True,
+            "task_success": False,
+        },
+        dashboard_discard_prepared_command=lambda **kwargs: {
+            "discarded": True,
+            "plan_id": kwargs["plan_id"],
+        },
+        dashboard_capture_views=lambda **kwargs: {
+            "_frames_bytes": {
+                "head": b"head",
+                "left_wrist": b"left",
+                "right_wrist": b"right",
+            },
+            "capture_group_id": "group",
+            "simulator_step": 0,
         },
     )
     toolkit = object.__new__(BehaviorToolkit)

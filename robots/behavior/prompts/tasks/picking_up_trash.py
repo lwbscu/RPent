@@ -9,15 +9,64 @@ from rpent.context.prompt_utils import PromptNode
 PROMPT_PROFILE_ID: Final = "picking_up_trash"
 
 TRASH_OBJECT_HANDLING: Final = """Prompt profile: `picking_up_trash`.
-For the narrow act of releasing an attached can, the rules below are mandatory
+For the narrow act of releasing a held can, the rules below are mandatory
 task-specific safety preconditions; they do not establish general tool priority.
 For each placement, use fresh current head RGB to select the literal anatomical
 `left` or `right` hand controlling the intended soda can; never hard-code a side
 from task knowledge. Pass that physical side as `hand` to each analytic
-primitive. Either or both hands may have attachments, and this does not make
-literal hand selection ambiguous. Keep the selected can hand closed and
-preserve its same attachment throughout transport. The other arm, its gripper,
-and anything it holds remain stationary."""
+primitive. Either or both hands may control task-relevant objects, and this does
+not make literal hand selection ambiguous. Keep the selected can hand closed and
+retain control of the same can throughout transport. CuRobo may coordinate its
+configured active joints to reach each requested EEF goal."""
+
+TRASH_OBSERVATION_GATED_STAGES: Final = """Use a structured, observation-gated
+task state rather than treating every analytic motion as an undifferentiated
+`move_to`. The stages are current-state labels, not a fixed route or a mandatory
+tool order:
+
+1. `ground`: identify the unresolved soda can, receptacle, selected anatomical
+   hand, and current geometric uncertainty from fresh public evidence.
+2. `acquire`: search, approach, refine, and close only for the one currently
+   grounded can.
+3. `lift`: raise a controlled can enough to establish useful clearance before a
+   predominantly horizontal transfer.
+4. `reposition_base`: when the residual is not local, move the base with
+   `navigate_to`. For a relative base step use only
+   `navigate_to.relative_motion`: forward/backward are base-local translations
+   and left/right are in-place rotations.
+5. `transfer_and_align`: use one bounded EEF displacement at a time to move the
+   controlled can above, inward, or lower into the grounded receptacle opening.
+6. `release_and_verify`: open only after the fresh release evidence below. If raw
+   official success remains false after release, obtain fresh evidence and
+   return to whichever stage describes the remaining task.
+
+For `move_to` relative translations, use the following six intent semantics
+without adding a new tool or field. Choose a finite positive step `d` from the
+current visible clearance: use a smaller step near a can, gripper, rim, or
+release boundary and a larger bounded step only in visibly open space.
+
+- `up`: world-frame `delta_xyz=[0, 0, +d]` with `"frame": "world"`.
+- `down`: world-frame `delta_xyz=[0, 0, -d]` with `"frame": "world"`.
+- `forward`: selected-EEF local `+X`, `delta_xyz=[+d, 0, 0]`.
+- `backward`: selected-EEF local `-X`, `delta_xyz=[-d, 0, 0]`.
+- `left`: selected-EEF local `+Y`, `delta_xyz=[0, +d, 0]`.
+- `right`: selected-EEF local `-Y`, `delta_xyz=[0, -d, 0]`.
+
+Use `"frame": "eef"` for the four selected-EEF-local directions. These are
+hand-local intents, not base commands or image-column directions; use
+`navigate_to.relative_motion` for a base-local step. All six EEF direction
+intents remain available when useful; do not globally forbid one merely because
+another is preferred for the current stage. Each call names only the selected
+EEF target, while CuRobo may coordinate its configured active joints to reach
+that target.
+
+A fresh observation is a semantic stage boundary after every admitted
+scene-changing primitive while raw official success remains false, including
+`pi0_nav_pick`, `navigate_to`, `move_to`, `rotate_wrist`, `press`, `close`, and
+`open` when used. Reassess the stage and choose the next single action from that
+evidence. A rejected zero-action call does not by itself change the scene. Once
+raw `info["done"]["success"]` is true, issue no further action, hold,
+observation, or capture."""
 
 TRASH_RECEPTACLE_GROUNDING_AND_NAVIGATION: Final = """Ground the receptacle and
 verify a safe local base stage; relocate only when needed. Operator review of s2
@@ -49,7 +98,7 @@ frozen while obtaining non-scene-changing observations. If a safe reserve
 cannot be estimated from current evidence and runtime accounting, do not invoke
 Pi0.
 
-Never choose `N` merely from attachment count, a legacy chunk value, a fixed
+Never choose `N` merely from held-object count, a legacy chunk value, a fixed
 public seed, a remembered instance layout, or `primitive_success` from a prior
 call. Adapt `N` only between invocations after fresh public evidence; the
 planner cannot observe or replan inside an admitted invocation. Do not
@@ -58,14 +107,13 @@ only after a fresh frame proves monotonic, low-risk progress toward the same
 subgoal, and reduce it or switch tools when progress is absent, ambiguous, or
 physically risky.
 
-A narrow two-held-cans search rule applies only when fresh runtime attachment
-facts report that `left` and `right` each currently holds an attachment that the
-fresh head evidence identifies as a required task soda can, while that same
-fresh head frame has not yet identified the task receptacle's body, rim, or
-opening. In exactly that state, Pi0 may perform one bounded receptacle-search
-subgoal using the global adaptive horizon rule above.
-The instruction must preserve both attachments, keep both grippers closed, and
-forbid releasing, placing, dropping, swapping, or re-grasping either can.
+A narrow two-held-cans search rule applies only when fresh head evidence shows
+that `left` and `right` each currently controls a required task soda can, while
+that same fresh head frame has not yet identified the task receptacle's body,
+rim, or opening. In exactly that state, Pi0 may perform one bounded
+receptacle-search subgoal using the global adaptive horizon rule above.
+The instruction must preserve control of both cans, keep both grippers closed,
+and forbid releasing, placing, dropping, swapping, or re-grasping either can.
 
 After the bounded invocation returns, immediately call
 `observe(camera="head")` and reassess the task residual from that fresh frame.
@@ -86,7 +134,7 @@ raw official success remains false, use only fresh non-scene-changing
 observations to seek evidence that resolves the uncertainty until a safe local
 analytic action or a trusted stop condition is available; do not declare
 completion or impossibility on your own. Preserve the receptacle, every
-contained or possibly contained can, and every current hand attachment while
+contained or possibly contained can, and every currently controlled can while
 recovering.
 
 As soon as fresh head RGB shows enough of the task receptacle's body, rim, or
@@ -95,17 +143,11 @@ need not be perfectly centered or completely visible to establish receptacle
 identity and ground a base-navigation target. If base relocation is needed
 before safe local transfer, select an interior, stable visible point on the
 receptacle away from silhouette and depth discontinuities, then project that
-current point with `pixel_to_world`. Pass the fresh receipt to `navigate_to`
-with a standoff chosen from current visible clearance. Use the public tool's
-default `timeout_s=300` by omitting `timeout_s`; if an explicit timeout is
-required by current runtime accounting, choose one sufficient for planning and
-execution and never force `timeout_s=20`. The runtime selects a traversable base
-station around the projected target and executes one bounded pure-base stage.
+current point with `pixel_to_world`. Pass the fresh receipt to `navigate_to` with
+the matching `navigation_visual_check` and a standoff chosen from current visible
+clearance. CuRobo plans one bounded pure-base stage toward that standoff.
 Use current evidence to prefer an approach that keeps the robot and any held
-object clear of the receptacle, furniture, and other obstacles. Visual evidence
-alone does not certify the path. Runtime traversability and isolation guards
-remain authoritative, and no visual or traversability check guarantees
-clearance from all dynamic or held geometry.
+object clear of the receptacle, furniture, and other obstacles.
 After navigation returns, immediately obtain another fresh
 `observe(camera="head")`; the base motion invalidates the earlier viewpoint and
 geometry. If another base stage is justified by the new evidence, select and
@@ -124,8 +166,8 @@ same hand.
 This conditional safety flow encodes no fixed route, waypoint, room or landmark
 order, physical hand, pixel, coordinate, base pose, standoff, Pi0 invocation
 count, or fixed `chunks` value. Derive every target, stage, hand, and VLA horizon
-from current public evidence, runtime guards, the single current subgoal, the
-scripted finishing and recovery reserve, and remaining accounting."""
+from current public evidence, the capability schemas, the single current
+subgoal, the scripted finishing and recovery reserve, and remaining accounting."""
 
 TRASH_PREGRASP_DEPTH_CONFIRMATION: Final = """Confirm depth before grasping.
 Before calling `close` on a soda can, obtain current public evidence that clearly
@@ -142,8 +184,8 @@ physical wrist camera matching the selected hand, use its frame-bound
 geometric guidance for whether another cautious refinement is needed. A head
 probe intentionally has no hand-relative distances. Visual centering, scalar
 depth, and the runtime-computed distances are all insufficient to close by
-themselves: they do not verify object identity, clearance, contact, or a safe
-gripper command.
+themselves: they do not verify object identity or establish that `close` is the
+right next semantic action.
 
 If fresh RGB-D evidence indicates that the selected gripper remains too high,
 request only a small, predominantly downward world-Z relative correction for
@@ -152,16 +194,16 @@ directly from camera depth or range. After any correction, obtain fresh head
 evidence for the analytic hand authorization and fresh target RGB-D evidence
 before `close`. Never prescribe a fixed hand, wrist-camera side, pixel, depth
 threshold, coordinate, descent distance, trunk displacement, or instance
-layout. If a collision-certified whole-body `move_to` is unreachable, do not
-request an arm-only or trunk-assisted fallback. Re-observe and re-ground; if
+layout. If a whole-body `move_to` is unreachable, re-observe and re-ground; if
 the target is remote and a safe fresh head projection exists, use
 `navigate_to` for the separate pure-base approach before retrying a local
 whole-body target."""
 
 TRASH_LIFT_BEFORE_TRANSFER: Final = """Lift before transfer. When the selected
-hand holds a can at a low position, do not move it directly or diagonally toward
-the trash can. First call `move_to` for that same hand with a small, predominantly
-upward positive world-frame Z relative translation, using a target shaped as
+hand holds a can at a low position, establish a distinct lift stage before a
+predominantly horizontal transfer toward the trash can. First call `move_to` for
+that same hand with a small, predominantly upward positive world-frame Z
+relative translation, using a target shaped as
 `{"delta_xyz": [0, 0, <positive_z>], "frame": "world"}` and selecting the lift
 from current visual clearance. After the lift action, obtain a fresh
 `observe(camera="head")`.
@@ -189,7 +231,7 @@ still holds the same can, the complete can is fully inside the receptacle
 opening's circular rim (rather than outside or overlapping the rim), and it has
 a clear downward path into the receptacle.
 
-When `open` would release an attachment, pass both the ordinary
+When `open` would release a held can, pass both the ordinary
 `visual_hand_check` and:
 
 ```json
@@ -206,11 +248,12 @@ The release check must cite exactly the same frame and physical hand as
 open; re-observe or correct the above-opening position first. Exact depth and
 hand-distance outputs remain guidance only and cannot substitute for this
 semantic release confirmation. This lift-transfer-confirm rule applies only
-when `open` would release an attachment; opening an empty hand does not require
+when `open` would release a held can; opening an empty hand does not require
 `release_visual_check`."""
 
 PICKING_UP_TRASH_PROMPT_NODES: Final[PromptNode] = (
     TRASH_OBJECT_HANDLING,
+    TRASH_OBSERVATION_GATED_STAGES,
     TRASH_RECEPTACLE_GROUNDING_AND_NAVIGATION,
     TRASH_PREGRASP_DEPTH_CONFIRMATION,
     TRASH_LIFT_BEFORE_TRANSFER,
@@ -224,6 +267,7 @@ __all__ = [
     "PROMPT_PROFILE_ID",
     "TRASH_LIFT_BEFORE_TRANSFER",
     "TRASH_OBJECT_HANDLING",
+    "TRASH_OBSERVATION_GATED_STAGES",
     "TRASH_PREGRASP_DEPTH_CONFIRMATION",
     "TRASH_PROMPT_NODES",
     "TRASH_RECEPTACLE_GROUNDING_AND_NAVIGATION",

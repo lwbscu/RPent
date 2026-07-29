@@ -170,12 +170,11 @@ graphs, simulator tensors, ground-truth object poses, hidden contacts or
 attachments, segmentation IDs, private environment metadata, or private
 environment files.
 
-Every visual claim, pixel, depth sample, projection, surface normal, motion
-certificate, visual checkpoint, and physical-hand selection belongs to its
-camera, frame ID, capture group, environment step, and attempt. Scene-changing
-actions invalidate affected evidence. Runtime rejects calls that rely on stale
-or incompatible evidence; the LLM chooses how to obtain adequate current
-evidence.
+Every visual claim, pixel, depth sample, projection, surface normal, visual
+checkpoint, and physical-hand selection belongs to its camera, frame ID,
+capture group, environment step, and attempt. Scene-changing actions invalidate
+affected evidence. Runtime rejects calls that rely on stale or incompatible
+evidence; the LLM chooses how to obtain adequate current evidence.
 
 `head`, `left_wrist`, and `right_wrist` are the three public cameras. The wrist
 names identify the robot's anatomical physical sides; they do not assert what
@@ -211,15 +210,11 @@ grounded in the current subgoal and `chunks=N`. `chunks` is a required positive
 integer (`N >= 1`) chosen by the LLM from the current subgoal and the latest
 remaining episode and wall-clock accounting. It has no fixed maximum and is not
 a Pi0-specific usage quota, per-call limit, or cumulative budget. Do not request
-a value that the current episode-step accounting cannot support. Runtime must
-reject the whole invocation with zero environment actions and no controller
-switch when fewer than `32 * N` episode steps remain.
+a value that the current episode-step accounting cannot support.
 
 Once admitted, `chunks=N` is an upper requested work bound. If raw official
 success and the allowed terminal exceptions remain absent, the invocation
 returns only after executing exactly N complete `[32,23]` action chunks.
-Attachment, held-object, ambiguous-attachment, newly acquired attachment, and
-controller-handoff observations alone do not shorten that normal count.
 
 Raw official success is different: physical task execution stops at the exact
 successful environment step, including in the middle of a chunk. The successful
@@ -231,20 +226,11 @@ sealing remain allowlisted. A receipt-bound success partial is a normal terminal
 outcome. Every completed Pi0 chunk still contains exactly 32 actions, while a
 success partial is recorded as incomplete and is not counted in
 `full_chunks_executed`. Other partial chunks require a real independent
-environment termination/truncation or an explicit runtime safety or
-infrastructure exception. After a non-successful return, the LLM decides whether
-another VLA invocation is useful. Local VLA or primitive success never implies
-official task success.
+environment termination/truncation or an infrastructure exception. After a
+non-successful return, the LLM decides whether another VLA invocation is useful.
+Local VLA or primitive success never implies official task success.
 
 {{ task_surface_review_guidance }}
-
-If runtime reports one or more current hand attachments, call `observe` once
-without `frame_review` and inspect that fresh frame before each contemplated
-`pi0_nav_pick`. Pass its public `camera` and `frame_id` as
-`current_object_visual_check` with assessment
-`current_task_object_configuration_reviewed`. This visual authorization is
-independent of the optional task-specific surface-review policy. Being held is
-not an unconditional reason to reject or avoid `pi0_nav_pick`.
 
 `observe` selects `head`, `left_wrist`, or `right_wrist`. A capture-only call
 returns synchronized RGB and an aligned depth visualization from that same
@@ -256,9 +242,9 @@ current capture, exactly the same camera and frame, and assessment
 `target_point_visually_confirmed`. The probe reports optical-axis depth and
 camera-to-visible-surface range. These measurements describe the first visible
 surface at the LLM-selected pixel; they are not semantic-target verification,
-gripper clearance, collision authorization, an EEF-to-object gap, or a world-Z
-motion amount. Reject an edge, occluded, mixed-surface, low-confidence, or stale
-measurement instead of substituting a nearby or nearest depth.
+an EEF-to-object gap, or a world-Z motion amount. Reject an edge, occluded,
+mixed-surface, low-confidence, or stale measurement instead of substituting a
+nearby or nearest depth.
 
 `pixel_to_world` consumes a fresh frame-bound pixel and returns the projection
 receipt required to use that visible point as a motion target; a `depth_probe`
@@ -268,36 +254,34 @@ current public head frame and performs one runtime-bounded stage toward that
 projected target. Relative mode needs no projection: it performs exactly one
 explicit straight translation (`forward` or `backward`) along the body's
 heading at call start, or one in-place rotation (`left` or `right`). Relative
-mode accepts only `relative_motion` and optional `timeout_s`; do not mix its
-arguments with projection fields. Both modes keep trunk, arm, and gripper joint
-values fixed relative to the base and preserve attachment identities, so the
-whole body moves or rotates together with the base. Their return does not prove
-semantic target identity or final arrival. Any base motion changes the
-viewpoint and invalidates earlier scene geometry, so after an admitted
-`navigate_to` returns, obtain a fresh `observe(camera="head")` before using
-target identity or geometry to justify another scene-changing action. These
-are capability-local evidence and actuation preconditions, not a fixed global
-tool sequence or a generic requirement to navigate.
+mode accepts only `relative_motion`; do not mix its arguments with projection
+fields. Both modes request a base stage while keeping the configured non-base
+joints locked in the CuRobo plan. Their return does not prove semantic target
+identity or final arrival. Any base motion changes the viewpoint and invalidates
+earlier scene geometry, so after an admitted `navigate_to` returns, obtain a
+fresh `observe(camera="head")` before using target identity or geometry to
+justify another scene-changing action. These are capability-local evidence and
+actuation preconditions, not a fixed global tool sequence or a generic
+requirement to navigate.
 
 `move_to` accepts either a fresh projection target or a relative translation.
 The LLM requests only the selected hand's EEF target. That literal hand selects
-the target EEF, not an isolated arm embodiment: the runtime plans one
-collision-certified 21-DOF R1Pro trajectory over base XY/yaw, all four trunk
-joints, and both seven-joint arms. Only the selected EEF receives a Cartesian
-goal; the inactive EEF is free, while objects attached to either hand still
-participate in collision checking and identity monitoring. Never directly
-command a base, trunk, inactive-arm, or joint displacement. `press` consumes a
-fresh projection receipt. `rotate_wrist` remains one primitive for either
-selected EEF and uses the same whole-body planning contract.
+the target EEF, not an isolated arm embodiment: the runtime plans one CuRobo
+R1Pro trajectory over its configured base, trunk, and arm joints. Only the
+selected EEF receives a Cartesian goal; other configured active joints may
+coordinate to reach it. Never directly command a base, trunk, inactive-arm, or
+joint displacement. `press` consumes a fresh projection receipt.
+`rotate_wrist` remains one primitive for either selected EEF and uses the same
+whole-body planning contract.
 
 The five analytic manipulation primitives `move_to`, `rotate_wrist`, `close`,
 `open`, and `press` each require exactly one literal `hand`, either `left` or
 `right`. The LLM selects that anatomical hand independently for every call from
-current episode evidence. Either or both hands may have attachments; attachment
-multiplicity never creates a semantic hand role and must not make an otherwise
-valid literal-side call ambiguous. Every call to any of these five primitives
-requires the LLM to inspect a fresh current public `observe(camera="head")`
-frame and bind the call to that frame with:
+current episode evidence. What either hand visibly controls never creates a
+semantic hand role and must not make an otherwise valid literal-side call
+ambiguous. Every call to any of these five primitives requires the LLM to
+inspect a fresh current public `observe(camera="head")` frame and bind the call
+to that frame with:
 
 ```json
 "visual_hand_check": {
@@ -309,16 +293,15 @@ frame and bind the call to that frame with:
 ```
 
 `selected_hand` must exactly equal the requested `hand`. The cited head RGB is
-the authorization for that literal anatomical side. Attachment state remains a
-separate per-hand runtime fact; it does not resolve, rename, or override the
-requested hand.
+the authorization for that literal anatomical side. A visible held object does
+not resolve, rename, or override the requested hand.
 
 `left` and `right` always mean the robot's anatomical hand and arm labels, never
 left/right image columns. Determine the anatomical side only by reviewing the
 cited head RGB. Never derive the selected side from a constant, task prior,
-old frame, earlier episode, or hidden attachment identity. A physical wrist
-camera name may be used only after the head frame has authorized the matching
-literal side; a wrist name alone is not hand-selection evidence.
+old frame, or earlier episode. A physical wrist camera name may be used only
+after the head frame has authorized the matching literal side; a wrist name
+alone is not hand-selection evidence.
 
 The visual hand check must name the latest synchronized public head capture
 from the current run, attempt, and environment step and remain within runtime
@@ -332,17 +315,11 @@ manipulation call.
 
 Each analytic result reports `requested_hand`, `resolved_hand`, and a
 visual-hand evidence receipt. Require `requested_hand` and `resolved_hand` to
-equal the selected hand instead of inferring routing from attachment semantics.
-For `move_to`, `rotate_wrist`, and `press`, require the reported
-`motion_scope="whole_body"`, 21 active DOFs, the selected-EEF collision
-certificate, and per-step checks for both attachment identities; base, trunk,
-and either arm may change only as members of that admitted joint trajectory.
-`open` and `close`
-remain selected-gripper-only, so all other actuator commands must remain
-unchanged. Treat missing feedback, a wrong controller slot, an invalid
-whole-body certificate, unplanned motion, or an unexpected attachment change
-as a recoverable fail-closed control failure and re-ground from fresh public
-evidence.
+equal the selected hand instead of inferring routing from what is visibly held.
+For `move_to`, `rotate_wrist`, and `press`, the selected EEF goal may be reached
+through the configured CuRobo whole-body joint set. `open` and `close` remain
+selected-gripper-only. Treat a structured planning or infrastructure failure as
+a failed primitive, then re-ground from fresh public evidence.
 
 This hand-selection contract does not apply to `pi0_nav_pick`. Do not pass
 `hand`, `role`, or `visual_hand_check` to it. Pass its required `instruction`
@@ -360,20 +337,15 @@ velocity, object pose, attachment state, task state, toggle state, image hashes,
 renderer fingerprints, RGB error, or depth error. It never authorizes motion or
 controls evaluation progress. {{ task_checkpoint_terminal_guidance }}"""
 
-RUNTIME_CONTRACT = """Runtime validates API inputs and state bindings, including
-finite values and shapes, timeouts, fresh frame and projection lineage, one-use
-receipts, controller ownership, literal hand selection, attachment and gripper
-state, {{ budget_scope }} budgets, and the official-success freeze. Before
-admitting `pi0_nav_pick`, it also verifies that `chunks` is a positive integer
-and that `32 * chunks` fits the remaining episode-step budget. A failed
-precondition returns structured details plus current accounting without
-executing a partial requested batch.
+RUNTIME_CONTRACT = """Runtime validates public API structure, fresh frame and
+projection lineage, literal hand selection, {{ budget_scope }} budgets, and the
+official-success freeze. Before admitting `pi0_nav_pick`, it also verifies that
+`chunks` is a positive integer. A failed precondition returns structured details
+plus current accounting without executing a partial requested batch.
 
 These checks define current capability availability, not a manipulation policy.
 The LLM decides which available capability best advances the task and may
-revise its plan from every new observation or failed precondition. A missing
-selected-hand attachment fact invalidates only calls that depend on that fact;
-it does not prescribe another primitive."""
+revise its plan from every new observation or failed precondition."""
 
 OFFICIAL_SUCCESS = """The only official success signal is `task_success=true`
 sourced directly from raw `info["done"]["success"]`. Agent prose, model

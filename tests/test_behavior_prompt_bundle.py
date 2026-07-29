@@ -85,7 +85,7 @@ COMMON_MARKERS = (
     "`head`, `left_wrist`, and `right_wrist` are the three public cameras",
     "five analytic manipulation primitives",
     "latest synchronized public head capture",
-    '`motion_scope="whole_body"`',
+    "configured CuRobo whole-body joint set",
     "does not apply to `pi0_nav_pick`",
     "read-only visual anchor",
     "Task target prior",
@@ -416,7 +416,7 @@ def test_common_navigation_prompt_covers_projection_and_relative_pure_base_modes
         "Relative mode needs no projection",
         "`forward` or `backward`",
         "`left` or `right`",
-        "whole body moves or rotates together with the base",
+        "request a base stage while keeping the configured non-base joints locked",
         "after an admitted `navigate_to` returns, obtain a fresh "
         '`observe(camera="head")`',
         "not a fixed global tool sequence",
@@ -730,12 +730,12 @@ def test_continuation_requirement_has_exact_stop_conditions(phase):
 
 
 @pytest.mark.parametrize("phase", ["explore", "eval"])
-def test_pi0_held_state_requires_fresh_visual_review(phase):
+def test_pi0_contract_uses_only_instruction_and_adaptive_chunks(phase):
     system = _normalized(_instructions(phase)["behavior_system_instructions"])
-    assert "one or more current hand attachments" in system
-    assert "current_object_visual_check" in system
-    assert "call `observe` once without `frame_review`" in system
-    assert "not an unconditional reason to reject" in system
+    assert "required `instruction` and `chunks` fields" in system
+    assert "`chunks` is a required positive integer" in system
+    assert "current_object_visual_check" not in system
+    assert "current hand attachments" not in system
 
 
 @pytest.mark.parametrize("phase", ["explore", "eval"])
@@ -747,7 +747,7 @@ def test_every_analytic_tool_requires_literal_fresh_head_bound_hand_selection(ph
     ) in system
     assert "exactly one literal `hand`, either `left` or `right`" in system
     assert "Every call to any of these five primitives" in system
-    assert "Either or both hands may have attachments" in system
+    assert "What either hand visibly controls" in system
     assert "must not make an otherwise valid literal-side call ambiguous" in system
     assert 'public `observe(camera="head")` frame' in system
     for field in (
@@ -758,7 +758,7 @@ def test_every_analytic_tool_requires_literal_fresh_head_bound_hand_selection(ph
     ):
         assert field in system
     assert "must exactly equal the requested `hand`" in system
-    assert "separate per-hand runtime fact" in system
+    assert "A visible held object" in system
     assert "does not resolve, rename, or override the requested hand" in system
     assert "never left/right image columns" in system
     assert "only by reviewing the cited head RGB" in system
@@ -779,16 +779,11 @@ def test_visual_hand_evidence_lifetime_and_whole_body_contract_are_explicit(phas
     assert "must be rejected before any controller switch" in system
     assert "Any admitted environment action advances the step" in system
     assert "requires another fresh head observation" in system
-    for result_field in (
-        "`requested_hand`",
-        "`resolved_hand`",
-        '`motion_scope="whole_body"`',
-    ):
+    for result_field in ("`requested_hand`", "`resolved_hand`"):
         assert result_field in system
-    assert "21 active DOFs" in system
-    assert "base, trunk, and either arm may change only as members" in system
+    assert "configured CuRobo whole-body joint set" in system
     assert "`open` and `close` remain selected-gripper-only" in system
-    assert "recoverable fail-closed control failure" in system
+    assert "structured planning or infrastructure failure" in system
 
 
 @pytest.mark.parametrize("phase", ["explore", "eval"])
@@ -1075,9 +1070,32 @@ def test_task_profile_is_identical_and_injected_once_across_explore_and_eval(fac
 def test_trash_profile_requires_lift_center_confirm_then_open(phase):
     guidance = _normalized(_trash_instructions(phase)["behavior_task_prompt"])
 
+    stage_positions = [
+        guidance.index(f"`{stage}`")
+        for stage in (
+            "ground",
+            "acquire",
+            "lift",
+            "reposition_base",
+            "transfer_and_align",
+            "release_and_verify",
+        )
+    ]
+    assert stage_positions == sorted(stage_positions)
+    for direction_marker in (
+        '`up`: world-frame `delta_xyz=[0, 0, +d]` with `"frame": "world"`',
+        '`down`: world-frame `delta_xyz=[0, 0, -d]` with `"frame": "world"`',
+        '`forward`: selected-EEF local `+X`, `delta_xyz=[+d, 0, 0]`',
+        '`backward`: selected-EEF local `-X`, `delta_xyz=[-d, 0, 0]`',
+        '`left`: selected-EEF local `+Y`, `delta_xyz=[0, +d, 0]`',
+        '`right`: selected-EEF local `-Y`, `delta_xyz=[0, -d, 0]`',
+        'Use `"frame": "eef"` for the four selected-EEF-local directions',
+    ):
+        assert direction_marker in guidance
+
     ordered_markers = (
         "Lift before transfer",
-        "do not move it directly or diagonally toward the trash can",
+        "establish a distinct lift stage",
         '"delta_xyz": [0, 0, <positive_z>]',
         '"frame": "world"',
         'After the lift action, obtain a fresh `observe(camera="head")`',
@@ -1099,19 +1117,19 @@ def test_trash_profile_requires_lift_center_confirm_then_open(phase):
     positions = [release_flow.index(marker) for marker in ordered_markers]
     assert positions == sorted(positions)
     for safety_marker in (
-        "For the narrow act of releasing an attached can",
+        "For the narrow act of releasing a held can",
         "mandatory task-specific safety preconditions",
         "do not establish general tool priority",
         "never hard-code a side",
         "Pass that physical side as `hand`",
-        "Either or both hands may have attachments",
+        "Either or both hands may control task-relevant objects",
         "`target_point_camera_xyz_m`",
         "`target_to_palm_m`",
         "`target_to_grip_point_m`",
         "`target_to_finger_roots_m`",
         "A head probe intentionally has no hand-relative distances",
-        "do not verify object identity, clearance, contact, or a safe gripper command",
-        "other arm, its gripper, and anything it holds remain stationary",
+        "do not verify object identity or establish that `close` is the right",
+        "CuRobo may coordinate its configured active joints",
         "receptacle rim",
         "the other hand",
         "another small upward move",
@@ -1121,7 +1139,7 @@ def test_trash_profile_requires_lift_center_confirm_then_open(phase):
         '"assessment": "attached_object_fully_inside_receptacle_opening"',
         "exactly the same frame and physical hand",
         "hand-distance outputs remain guidance only",
-        "applies only when `open` would release an attachment",
+        "applies only when `open` would release a held can",
         "opening an empty hand does not require",
     ):
         assert safety_marker in guidance
@@ -1145,13 +1163,13 @@ def test_trash_adaptive_two_can_search_then_scripted_navigation_order(phase):
         "smallest positive number of complete 32-action chunks",
         "episode action steps",
         "complete-chunk budget",
-        "never choose `n` merely from attachment count",
+        "never choose `n` merely from held-object count",
         "adapt `n` only between invocations",
         "do not automatically repeat or increase the previous `n`",
     )
     condition_markers = (
-        "fresh runtime attachment facts",
-        "`left` and `right` each currently holds an attachment",
+        "fresh head evidence shows",
+        "`left` and `right` each currently controls",
         "required task soda can",
         "same fresh head frame has not yet identified",
     )
@@ -1163,15 +1181,14 @@ def test_trash_adaptive_two_can_search_then_scripted_navigation_order(phase):
         "need not be perfectly centered or completely visible",
         "project that current point with `pixel_to_world`",
         "pass the fresh receipt to `navigate_to`",
-        "default `timeout_s=300`",
-        "never force `timeout_s=20`",
+        "matching `navigation_visual_check`",
         "after navigation returns, immediately obtain another fresh "
         '`observe(camera="head")`',
     )
     condition_positions = [lowered.index(marker) for marker in condition_markers]
     adaptive_positions = [lowered.index(marker) for marker in adaptive_markers]
     followup_positions = [lowered.index(marker) for marker in followup_markers]
-    preserve = lowered.index("preserve both attachments")
+    preserve = lowered.index("preserve control of both cans")
 
     assert condition_positions == sorted(condition_positions)
     assert adaptive_positions == sorted(adaptive_positions)

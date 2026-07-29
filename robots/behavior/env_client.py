@@ -12,8 +12,8 @@ from typing import Any
 import numpy as np
 
 from robots.behavior.schemas import (
-    ROTATE_WRIST_RUNTIME_TIMEOUT_S,
     validate_dashboard_command_id,
+    validate_dashboard_control_capabilities,
     validate_dashboard_manual_command,
     validate_dashboard_plan_id,
     validate_dashboard_prepare_request,
@@ -376,32 +376,9 @@ class BehaviorEnvClient:
     def _planner_call(
         self,
         method: str,
-        *,
-        _runtime_deadline_s: float | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         rpc_timeout_s = _TIMEOUT_S.get(f"env.{method}", _TIMEOUT_S["default"])
-        requested_timeout = kwargs.get("timeout_s")
-        if _runtime_deadline_s is not None and requested_timeout is not None:
-            raise ValueError(
-                "runtime deadline and public primitive timeout are mutually exclusive"
-            )
-        primitive_deadline_s = (
-            _runtime_deadline_s
-            if _runtime_deadline_s is not None
-            else requested_timeout
-        )
-        if primitive_deadline_s is not None:
-            # The primitive owns the hard deadline.  Keep a bounded transport
-            # grace period for serializing its structured timeout result rather
-            # than leaving every planner RPC blocked for the global 30 minutes.
-            primitive_deadline_s = float(primitive_deadline_s)
-            if not np.isfinite(primitive_deadline_s) or primitive_deadline_s <= 0.0:
-                raise ValueError("runtime deadline must be finite and positive")
-            rpc_timeout_s = min(
-                rpc_timeout_s,
-                max(30.0, primitive_deadline_s + 60.0),
-            )
         ret = self._rpc_call(
             f"env.{method}",
             kwargs=kwargs,
@@ -436,7 +413,9 @@ class BehaviorEnvClient:
     def dashboard_control_capabilities(self) -> dict[str, Any]:
         """Return fail-closed simulator-owned manual-control capabilities."""
 
-        return self._planner_call("dashboard_control_capabilities")
+        return validate_dashboard_control_capabilities(
+            self._planner_call("dashboard_control_capabilities")
+        )
 
     def dashboard_prepare_manual_command(
         self,
@@ -460,25 +439,11 @@ class BehaviorEnvClient:
             "dashboard_prepare_manual_command",
             **request,
         )
-        if result.get("status") != "prepared":
-            raise RuntimeError("Dashboard motion planning did not return prepared")
-        validate_dashboard_plan_id(result.get("plan_id"))
-        if request["background"]:
-            enforcement = result.get("deadline_enforcement")
-            if (
-                not isinstance(enforcement, dict)
-                or enforcement.get("hard_wall_clock_enforced") is not False
-                or not isinstance(
-                    enforcement.get("soft_deadline_s"),
-                    (int, float, np.integer, np.floating),
-                )
-                or isinstance(enforcement.get("soft_deadline_s"), (bool, np.bool_))
-                or not np.isfinite(float(enforcement["soft_deadline_s"]))
-                or float(enforcement["soft_deadline_s"]) <= 0.0
-            ):
-                raise RuntimeError(
-                    "background planning omitted its soft solver deadline"
-                )
+        status = result.get("status")
+        if status == "prepared":
+            validate_dashboard_plan_id(result.get("plan_id"))
+        elif status != "failed":
+            raise RuntimeError("Dashboard motion planning returned an invalid status")
         return result
 
     def dashboard_execute_prepared_command(
@@ -487,7 +452,7 @@ class BehaviorEnvClient:
         plan_id: str,
         command_id: str,
     ) -> dict[str, Any]:
-        """Execute one prepared plan and return its exactly-once motion receipt."""
+        """Execute one prepared plan; command_id is an opaque compatibility token."""
 
         result = self._planner_call(
             "dashboard_execute_prepared_command",
@@ -545,8 +510,7 @@ class BehaviorEnvClient:
             not isinstance(frame_ids, dict)
             or set(frame_ids) != {"head", "left_wrist", "right_wrist"}
             or not all(
-                isinstance(value, str) and bool(value)
-                for value in frame_ids.values()
+                isinstance(value, str) and bool(value) for value in frame_ids.values()
             )
         ):
             raise RuntimeError("env.dashboard_capture_views omitted frame_ids")
@@ -622,9 +586,6 @@ class BehaviorEnvClient:
         hand: str,
         target: dict[str, Any],
         visual_hand_check: dict[str, Any],
-        position_tolerance_m: float = 0.02,
-        max_travel_m: float = 0.25,
-        timeout_s: float = 240.0,
     ) -> dict[str, Any]:
         hand = self._validated_analytic_hand(hand)
         return self._planner_call(
@@ -632,9 +593,6 @@ class BehaviorEnvClient:
             hand=hand,
             target=target,
             visual_hand_check=visual_hand_check,
-            position_tolerance_m=position_tolerance_m,
-            max_travel_m=max_travel_m,
-            timeout_s=timeout_s,
         )
 
     @staticmethod
@@ -702,8 +660,6 @@ class BehaviorEnvClient:
         navigation_visual_check: dict[str, Any] | None = None,
         relative_motion: dict[str, Any] | None = None,
         standoff_m: float | None = None,
-        max_travel_m: float | None = None,
-        timeout_s: float = 300.0,
     ) -> dict[str, Any]:
         if relative_motion is None:
             if not isinstance(projection_id, str) or not projection_id.strip():
@@ -723,13 +679,6 @@ class BehaviorEnvClient:
                     minimum=0.45,
                     maximum=1.50,
                 ),
-                "max_travel_m": self._validated_navigation_number(
-                    "max_travel_m",
-                    1.0 if max_travel_m is None else max_travel_m,
-                    minimum=0.0,
-                    maximum=1.50,
-                    minimum_inclusive=False,
-                ),
             }
         else:
             if any(
@@ -738,7 +687,6 @@ class BehaviorEnvClient:
                     projection_id,
                     navigation_visual_check,
                     standoff_m,
-                    max_travel_m,
                 )
             ):
                 raise ValueError(
@@ -748,12 +696,6 @@ class BehaviorEnvClient:
             payload = {
                 "relative_motion": validate_relative_navigation_motion(relative_motion)
             }
-        payload["timeout_s"] = self._validated_navigation_number(
-            "timeout_s",
-            timeout_s,
-            minimum=0.0,
-            minimum_inclusive=False,
-        )
         return self._planner_call("navigate_to", **payload)
 
     def rotate_wrist(
@@ -767,7 +709,6 @@ class BehaviorEnvClient:
         hand = self._validated_analytic_hand(hand)
         return self._planner_call(
             "rotate_wrist",
-            _runtime_deadline_s=ROTATE_WRIST_RUNTIME_TIMEOUT_S,
             hand=hand,
             relative_axis_angle=relative_axis_angle,
             frame=frame,
@@ -779,14 +720,12 @@ class BehaviorEnvClient:
         *,
         hand: str,
         visual_hand_check: dict[str, Any],
-        timeout_s: float = 30.0,
     ) -> dict[str, Any]:
         hand = self._validated_analytic_hand(hand)
         return self._planner_call(
             "close",
             hand=hand,
             visual_hand_check=visual_hand_check,
-            timeout_s=timeout_s,
         )
 
     def open(
@@ -795,13 +734,11 @@ class BehaviorEnvClient:
         hand: str,
         visual_hand_check: dict[str, Any],
         release_visual_check: dict[str, Any] | None = None,
-        timeout_s: float = 30.0,
     ) -> dict[str, Any]:
         hand = self._validated_analytic_hand(hand)
         kwargs: dict[str, Any] = {
             "hand": hand,
             "visual_hand_check": visual_hand_check,
-            "timeout_s": timeout_s,
         }
         if release_visual_check is not None:
             kwargs["release_visual_check"] = release_visual_check
@@ -814,7 +751,6 @@ class BehaviorEnvClient:
         visual_hand_check: dict[str, Any],
         projection_id: str,
         travel_m: float,
-        timeout_s: float = 300.0,
     ) -> dict[str, Any]:
         hand = self._validated_analytic_hand(hand)
         return self._planner_call(
@@ -823,7 +759,6 @@ class BehaviorEnvClient:
             visual_hand_check=visual_hand_check,
             projection_id=projection_id,
             travel_m=travel_m,
-            timeout_s=timeout_s,
         )
 
     def pixel_to_world(

@@ -1,3 +1,8 @@
+# This is the closed acceptance matrix for the BEHAVIOR
+# joint-limits-and-goal-only execution mode.
+# Do not add new collision, contact, attachment, tracking,
+# pose-error, isolation, settling, or safety-gate tests
+# without explicit user authorization.
 import pytest
 
 from robots.behavior.env_client import BehaviorEnvClient
@@ -182,7 +187,7 @@ def test_raw_success_rejects_dashboard_pipeline_before_transport(invoke):
     assert [method for method, *_rest in rpc.calls] == ["env.get_env_meta"]
 
 
-def test_neutral_rpc_timeout_tracks_deadline_with_bounded_grace():
+def test_neutral_rpc_uses_fixed_infrastructure_timeout():
     rpc = _Rpc()
     client = BehaviorEnvClient(rpc, expected_meta={"seed": 211})
 
@@ -190,14 +195,12 @@ def test_neutral_rpc_timeout_tracks_deadline_with_bounded_grace():
         hand="left",
         target={"delta_xyz": [0.0, 0.0, 0.1], "frame": "world"},
         visual_hand_check=_visual_hand_check("left"),
-        timeout_s=45,
     )
     client.press(
         hand="right",
         projection_id="fresh-projection",
         travel_m=0.03,
         visual_hand_check=_visual_hand_check("right"),
-        timeout_s=90,
     )
 
     assert rpc.calls[1] == (
@@ -207,11 +210,8 @@ def test_neutral_rpc_timeout_tracks_deadline_with_bounded_grace():
             "hand": "left",
             "target": {"delta_xyz": [0.0, 0.0, 0.1], "frame": "world"},
             "visual_hand_check": _visual_hand_check("left"),
-            "position_tolerance_m": 0.02,
-            "max_travel_m": 0.25,
-            "timeout_s": 45,
         },
-        105.0,
+        1800.0,
     )
     assert rpc.calls[2] == (
         "env.press",
@@ -221,13 +221,12 @@ def test_neutral_rpc_timeout_tracks_deadline_with_bounded_grace():
             "projection_id": "fresh-projection",
             "travel_m": 0.03,
             "visual_hand_check": _visual_hand_check("right"),
-            "timeout_s": 90,
         },
-        150.0,
+        1800.0,
     )
 
 
-def test_navigate_to_rpc_is_projection_bound_base_only_and_has_bounded_grace():
+def test_navigate_to_rpc_is_projection_bound_base_only():
     rpc = _Rpc()
     client = BehaviorEnvClient(rpc, expected_meta={"seed": 211})
     visual_check = {
@@ -240,8 +239,6 @@ def test_navigate_to_rpc_is_projection_bound_base_only_and_has_bounded_grace():
         projection_id=" projection-current ",
         navigation_visual_check=visual_check,
         standoff_m=0.9,
-        max_travel_m=1.25,
-        timeout_s=300,
     )
 
     assert rpc.calls[1] == (
@@ -251,10 +248,8 @@ def test_navigate_to_rpc_is_projection_bound_base_only_and_has_bounded_grace():
             "projection_id": "projection-current",
             "navigation_visual_check": visual_check,
             "standoff_m": 0.9,
-            "max_travel_m": 1.25,
-            "timeout_s": 300.0,
         },
-        360.0,
+        1800.0,
     )
     assert {
         "hand",
@@ -277,7 +272,6 @@ def test_navigate_to_rpc_supports_relative_base_rotation_without_projection():
             "direction": "left",
             "angle_deg": 90,
         },
-        timeout_s=120,
     )
 
     assert rpc.calls[1] == (
@@ -289,9 +283,8 @@ def test_navigate_to_rpc_supports_relative_base_rotation_without_projection():
                 "direction": "left",
                 "angle_deg": 90.0,
             },
-            "timeout_s": 120.0,
         },
-        180.0,
+        1800.0,
     )
 
 
@@ -302,7 +295,6 @@ def test_close_open_use_neutral_rpc_names_and_transport_close_is_separate():
     client.close(
         hand="right",
         visual_hand_check=_visual_hand_check("right"),
-        timeout_s=10,
     )
     client.open(
         hand="left",
@@ -313,7 +305,6 @@ def test_close_open_use_neutral_rpc_names_and_transport_close_is_separate():
             "selected_hand": "left",
             "assessment": "attached_object_fully_inside_receptacle_opening",
         },
-        timeout_s=20,
     )
     client.close_transport()
 
@@ -321,9 +312,8 @@ def test_close_open_use_neutral_rpc_names_and_transport_close_is_separate():
     assert rpc.calls[1][2] == {
         "hand": "right",
         "visual_hand_check": _visual_hand_check("right"),
-        "timeout_s": 10,
     }
-    assert rpc.calls[1][3] == 70.0
+    assert rpc.calls[1][3] == 120.0
     assert rpc.calls[2][0] == "env.open"
     assert rpc.calls[2][2] == {
         "hand": "left",
@@ -334,9 +324,8 @@ def test_close_open_use_neutral_rpc_names_and_transport_close_is_separate():
             "selected_hand": "left",
             "assessment": "attached_object_fully_inside_receptacle_opening",
         },
-        "timeout_s": 20,
     }
-    assert rpc.calls[2][3] == 80.0
+    assert rpc.calls[2][3] == 120.0
 
 
 def test_legacy_role_and_semantic_hand_values_are_rejected_without_rpc():

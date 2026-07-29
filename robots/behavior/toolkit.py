@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import hashlib
 import hmac
 import json
@@ -19,6 +18,7 @@ from typing import Any
 from robots.behavior.schemas import (
     BEHAVIOR_TOOL_NAMES,
     behavior_tool_specs_for_task,
+    validate_dashboard_control_capabilities,
 )
 from robots.behavior.spec import BEHAVIOR_CONTROL_DRAIN_TIMEOUT_S
 from robots.behavior.task_specs import (
@@ -54,13 +54,6 @@ _DEPRECATED_PI0_LIMIT_REASONS = frozenset(
     {
         "call_chunk_limit",
         "global_vla_chunk_budget_exhausted",
-    }
-)
-_HARD_EXECUTION_BUDGET_PRECONDITIONS = frozenset(
-    {
-        "global_env_step_budget_exhausted",
-        "global_tool_call_budget_exhausted",
-        "global_wall_clock_budget_exhausted",
     }
 )
 _FORBIDDEN_PUBLICATION_KEYS = {
@@ -250,8 +243,6 @@ class BehaviorToolkit(Toolkit):
         )
         self._dashboard_controller = None
         self._close_lock = threading.RLock()
-        self._dashboard_plan_bindings_lock = threading.RLock()
-        self._dashboard_plan_bindings: dict[str, str] = {}
         self._manual_intervention_latch = threading.Event()
         self._closed = False
         initial_info = primitives_kwargs.get("initial_info")
@@ -389,10 +380,9 @@ class BehaviorToolkit(Toolkit):
     def dashboard_control_capabilities(self) -> dict[str, Any]:
         """Return a sanitized fail-closed capability snapshot for the UI."""
 
-        capability = self._primitives.dashboard_control_capabilities()
-        if not isinstance(capability, dict):
-            raise RuntimeError("dashboard control capability must be an object")
-        public = dict(capability)
+        public = validate_dashboard_control_capabilities(
+            self._primitives.dashboard_control_capabilities()
+        )
         simulation_verified = (
             public.get("simulation_identity") == "behavior_omnigibson_r1pro"
         )
@@ -401,7 +391,6 @@ class BehaviorToolkit(Toolkit):
             and public.get("motion_available") is True
             and simulation_verified
             and public.get("planner_available") is True
-            and public.get("position_control_ready") is True
         )
         public["observe_available"] = bool(
             self._dashboard_observe_allowed
@@ -430,45 +419,13 @@ class BehaviorToolkit(Toolkit):
             public["unavailable_reason"] = public["motion_unavailable_reason"]
         return public
 
-    def _require_dashboard_manual_reservation(self) -> None:
-        """Require a live manual reservation for planning without borrowing it."""
+    @staticmethod
+    def _dashboard_compatibility_id(value: str, *, name: str) -> str:
+        """Normalize an opaque compatibility token without granting a permit."""
 
-        arbiter = getattr(self, "_command_arbiter", None)
-        snapshot = getattr(arbiter, "snapshot", None)
-        ownership = snapshot() if callable(snapshot) else {}
-        if (
-            not isinstance(ownership, dict)
-            or ownership.get("owner") != "manual"
-            or not isinstance(ownership.get("command_id"), str)
-            or not ownership["command_id"]
-        ):
-            raise RuntimeError(
-                "Dashboard planning requires an active manual reservation"
-            )
-        latch = getattr(self, "_success_latch", None)
-        is_latched = getattr(latch, "is_latched", None)
-        if callable(is_latched) and is_latched():
-            raise RuntimeError(
-                "raw task success is terminal; Dashboard RPC rejected"
-            )
-
-    def _require_dashboard_command_permit(self, command_id: str) -> str:
-        """Return the exact command id after checking the shared arbiter."""
-
-        arbiter = getattr(self, "_command_arbiter", None)
-        require_permit = getattr(arbiter, "require_manual_permit", None)
-        if not callable(require_permit):
-            raise RuntimeError(
-                "Dashboard primitive requires the shared command arbiter"
-            )
-        normalized = str(command_id or "").strip()
-        require_permit(normalized)
-        latch = getattr(self, "_success_latch", None)
-        is_latched = getattr(latch, "is_latched", None)
-        if callable(is_latched) and is_latched():
-            raise RuntimeError(
-                "raw task success is terminal; Dashboard RPC rejected"
-            )
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError(f"{name} must be a non-empty string")
         return normalized
 
     def dashboard_prepare_manual_command(
@@ -481,12 +438,13 @@ class BehaviorToolkit(Toolkit):
         background: bool = False,
         planning_only_probe: bool = False,
     ) -> dict[str, Any]:
-        """Prepare one reserved manual motion without entering the public tools."""
+        """Prepare one manual motion without command-scoped execution admission."""
 
         if self._closed:
             raise RuntimeError("BEHAVIOR toolkit is closed")
-        permit_command_id = self._require_dashboard_command_permit(
-            permit_command_id
+        self._dashboard_compatibility_id(
+            permit_command_id,
+            name="permit_command_id",
         )
         self._manual_intervention_latch.set()
         handler = getattr(
@@ -505,16 +463,13 @@ class BehaviorToolkit(Toolkit):
         )
         if not isinstance(result, dict):
             raise RuntimeError("Dashboard motion planning returned a non-object")
+        if result.get("status") == "failed":
+            return result
+        if result.get("status") != "prepared":
+            raise RuntimeError("Dashboard motion planning returned an invalid status")
         plan_id = str(result.get("plan_id") or "").strip()
         if not plan_id:
             raise RuntimeError("Dashboard motion planning omitted plan_id")
-        with self._dashboard_plan_bindings_lock:
-            existing = self._dashboard_plan_bindings.get(plan_id)
-            if existing is not None and existing != permit_command_id:
-                raise RuntimeError(
-                    "Dashboard motion planning reused plan_id across commands"
-                )
-            self._dashboard_plan_bindings[plan_id] = permit_command_id
         return result
 
     def dashboard_execute_prepared_command(
@@ -523,20 +478,15 @@ class BehaviorToolkit(Toolkit):
         plan_id: str,
         command_id: str,
     ) -> dict[str, Any]:
-        """Execute one prepared motion with an exact command-scoped permit."""
+        """Execute one prepared motion; command_id is an opaque compatibility token."""
 
         if self._closed:
             raise RuntimeError("BEHAVIOR toolkit is closed")
-        command_id = self._require_dashboard_command_permit(command_id)
-        plan_id = str(plan_id or "").strip()
-        with self._dashboard_plan_bindings_lock:
-            prepared_command_id = self._dashboard_plan_bindings.get(plan_id)
-        if prepared_command_id is None:
-            raise RuntimeError("Dashboard prepared plan has no command binding")
-        if prepared_command_id != command_id:
-            raise RuntimeError(
-                "Dashboard prepared plan belongs to a different command"
-            )
+        command_id = self._dashboard_compatibility_id(
+            command_id,
+            name="command_id",
+        )
+        plan_id = self._dashboard_compatibility_id(plan_id, name="plan_id")
         self._manual_intervention_latch.set()
         handler = getattr(
             self._primitives,
@@ -548,14 +498,14 @@ class BehaviorToolkit(Toolkit):
         result = handler(plan_id=plan_id, command_id=command_id)
         if not isinstance(result, dict):
             raise RuntimeError("Dashboard prepared execution returned a non-object")
-        with self._dashboard_plan_bindings_lock:
-            self._dashboard_plan_bindings.pop(plan_id, None)
-        receipt_binding = self._receipt_binding_from_result(result)
-        if receipt_binding is not None:
-            latch = self._success_latch
-            if latch is not None and latch.observe(result):
-                self._shared_success_evidence = self._success_evidence(result)
-                self._official_task_success = True
+        if result.get("task_success") is True:
+            receipt_binding = self._receipt_binding_from_result(result)
+            if receipt_binding is not None:
+                latch = self._success_latch
+                if latch is not None:
+                    latch.observe(result)
+            self._shared_success_evidence = self._success_evidence(result)
+            self._official_task_success = True
         return result
 
     def dashboard_discard_prepared_command(
@@ -577,15 +527,6 @@ class BehaviorToolkit(Toolkit):
         result = handler(plan_id=plan_id)
         if not isinstance(result, dict):
             raise RuntimeError("Dashboard plan discard returned a non-object")
-        receipt_plan_id = str(result.get("plan_id") or "").strip()
-        if (
-            receipt_plan_id != str(plan_id or "").strip()
-            or result.get("discarded") is not True
-            or result.get("status") != "discarded"
-        ):
-            raise RuntimeError("Dashboard plan discard returned an invalid receipt")
-        with self._dashboard_plan_bindings_lock:
-            self._dashboard_plan_bindings.pop(receipt_plan_id, None)
         return result
 
     def dashboard_capture_views(
@@ -593,11 +534,14 @@ class BehaviorToolkit(Toolkit):
         *,
         command_id: str,
     ) -> dict[str, Any]:
-        """Capture one full camera group under an exact manual permit."""
+        """Capture one full camera group; command_id is metadata only."""
 
         if self._closed:
             raise RuntimeError("BEHAVIOR toolkit is closed")
-        command_id = self._require_dashboard_command_permit(command_id)
+        command_id = self._dashboard_compatibility_id(
+            command_id,
+            name="command_id",
+        )
         handler = getattr(self._primitives, "dashboard_capture_views", None)
         if not callable(handler):
             raise RuntimeError("Dashboard camera capture is unavailable")
@@ -614,17 +558,15 @@ class BehaviorToolkit(Toolkit):
         camera: str,
         permit_command_id: str | None = None,
     ) -> dict[str, Any]:
-        """Execute one controller-arbitrated manual primitive."""
+        """Execute one manual primitive without a command-scoped permit."""
 
         if self._closed:
             raise RuntimeError("BEHAVIOR toolkit is closed")
-        arbiter = getattr(self, "_command_arbiter", None)
-        require_permit = getattr(arbiter, "require_manual_permit", None)
-        if not callable(require_permit):
-            raise RuntimeError(
-                "Dashboard manual primitive requires the shared command arbiter"
+        if permit_command_id is not None:
+            self._dashboard_compatibility_id(
+                permit_command_id,
+                name="permit_command_id",
             )
-        require_permit(str(permit_command_id or ""))
         if action != "observe":
             latch = getattr(self, "_manual_intervention_latch", None)
             if latch is None:
@@ -639,12 +581,14 @@ class BehaviorToolkit(Toolkit):
         result = handler(target=target, action=action, camera=camera)
         if not isinstance(result, dict):
             raise RuntimeError("Dashboard manual primitive returned a non-object")
-        receipt_binding = self._receipt_binding_from_result(result)
-        if receipt_binding is not None:
-            latch = self._success_latch
-            if latch is not None and latch.observe(result):
-                self._shared_success_evidence = self._success_evidence(result)
-                self._official_task_success = True
+        if result.get("task_success") is True:
+            receipt_binding = self._receipt_binding_from_result(result)
+            if receipt_binding is not None:
+                latch = self._success_latch
+                if latch is not None:
+                    latch.observe(result)
+            self._shared_success_evidence = self._success_evidence(result)
+            self._official_task_success = True
         return result
 
     def _dashboard_progress(self, name: str, payload: dict[str, Any]) -> None:
@@ -839,16 +783,19 @@ class BehaviorToolkit(Toolkit):
         )
 
     def _has_verified_raw_success(self) -> bool:
-        """Accept only a nonce-bound runtime raw-success receipt."""
+        """Use the Env-derived task_success latch; receipts remain audit-only."""
 
         latch = getattr(self, "_success_latch", None)
         is_latched = getattr(latch, "is_latched", None)
         shared_evidence = getattr(self, "_shared_success_evidence", None)
         shared_success = bool(
-            callable(is_latched)
-            and is_latched()
-            and isinstance(shared_evidence, dict)
-            and self._receipt_binding_from_result(shared_evidence) is not None
+            (callable(is_latched) and is_latched())
+            or (
+                isinstance(shared_evidence, dict)
+                and shared_evidence.get("task_success") is True
+                and shared_evidence.get("official_success_source")
+                in _OFFICIAL_SUCCESS_SOURCES
+            )
         )
         return bool(
             shared_success
@@ -860,7 +807,6 @@ class BehaviorToolkit(Toolkit):
                     and record["result"].get("task_success") is True
                     and record["result"].get("official_success_source")
                     in _OFFICIAL_SUCCESS_SOURCES
-                    and self._receipt_binding_from_result(record["result"]) is not None
                     for record in self._tool_trace
                 )
             )
@@ -963,7 +909,7 @@ class BehaviorToolkit(Toolkit):
 
     @staticmethod
     def _success_evidence(result: dict[str, Any]) -> dict[str, Any]:
-        """Copy only immutable receipt material from one verified result."""
+        """Copy Env-derived success facts and optional audit receipt material."""
 
         receipt = result.get("official_success_receipt")
         if not isinstance(receipt, dict):
@@ -985,13 +931,13 @@ class BehaviorToolkit(Toolkit):
                 ):
                     receipt = monitor["official_success_receipt"]
                     break
-        if not isinstance(receipt, dict):
-            raise RuntimeError("verified success result lost its immutable receipt")
-        return {
+        evidence: dict[str, Any] = {
             "task_success": True,
             "official_success_source": 'info["done"]["success"]',
-            "official_success_receipt": dict(receipt),
         }
+        if isinstance(receipt, dict):
+            evidence["official_success_receipt"] = dict(receipt)
+        return evidence
 
     @staticmethod
     def validate_symbolic_publication(records: list[dict[str, Any]]) -> None:
@@ -1112,41 +1058,23 @@ class BehaviorToolkit(Toolkit):
                 "_execute_tool_lock",
                 threading.Lock(),
             )
-        arbiter = getattr(self, "_command_arbiter", None)
-        transaction = getattr(arbiter, "agent_transaction", None)
-        transaction_context = (
-            transaction() if callable(transaction) else contextlib.nullcontext()
-        )
-        with transaction_context:
-            with execute_tool_lock:
-                return self._execute_tool_locked(name, input_dict)
+        with execute_tool_lock:
+            return self._execute_tool_locked(name, input_dict)
 
     def _execute_tool_locked(self, name: str, input_dict: dict[str, Any]):
         call_started = time.monotonic()
         rejected: list[str] = []
-        precondition_error: str | None = None
-        elapsed = self._primitives.elapsed_wall_clock_s
         verified_success = self._has_verified_raw_success()
         if name not in self._tools:
             rejected.append("unknown_tool")
-        if self._tool_calls >= self._max_tool_calls:
-            rejected.append("global_tool_call_budget_exhausted")
-        if elapsed >= self._primitives.max_wall_clock_s:
-            rejected.append("global_wall_clock_budget_exhausted")
         if verified_success:
             rejected.append("official_success_latched")
         if self._terminal_failure_latched:
             rejected.append("terminal_failure_latched")
-        if not rejected and name in BEHAVIOR_TOOL_NAMES:
-            try:
-                rejected.extend(self._primitives.failed_preconditions(name, input_dict))
-            except Exception as exc:
-                rejected.append("precondition_check_error")
-                precondition_error = type(exc).__name__
         rejected = [
             reason for reason in rejected if reason not in _DEPRECATED_PI0_LIMIT_REASONS
         ]
-        if name in self._tools and self._tool_calls < self._max_tool_calls:
+        if name in self._tools:
             self._tool_calls += 1
         if rejected:
             if name in self._tools:
@@ -1156,7 +1084,6 @@ class BehaviorToolkit(Toolkit):
                 input_dict,
                 rejected,
                 elapsed_s=time.monotonic() - call_started,
-                precondition_error=precondition_error,
             )
             if name in self._tools:
                 self._record_tool_result(name, input_dict, result.result)
@@ -1189,23 +1116,15 @@ class BehaviorToolkit(Toolkit):
             if isinstance(payload, dict):
                 if payload.get("task_success") is True:
                     receipt_binding = self._receipt_binding_from_result(payload)
-                    if receipt_binding is None:
-                        # A positive primitive flag without the runtime-owned,
-                        # nonce-bound raw-success receipt is not task success.
-                        payload["task_success"] = False
-                        payload["_finish"] = False
-                        payload["official_success_receipt_valid"] = False
-                        payload["stop_reason"] = (
-                            "invalid_or_missing_official_success_receipt"
-                        )
-                    else:
-                        payload["official_success_receipt_valid"] = True
+                    if receipt_binding is not None:
                         latch = getattr(self, "_success_latch", None)
                         if latch is not None and latch.observe(payload):
                             self._shared_success_evidence = self._success_evidence(
                                 payload
                             )
-                        self._official_task_success = True
+                    if self._shared_success_evidence is None:
+                        self._shared_success_evidence = self._success_evidence(payload)
+                    self._official_task_success = True
                 self._last_tool_result = payload
                 terminal_policy = self._task_spec.terminal_failure_policy
                 if (
@@ -1236,7 +1155,6 @@ class BehaviorToolkit(Toolkit):
         failed_preconditions: list[str],
         *,
         elapsed_s: float,
-        precondition_error: str | None = None,
     ) -> ToolResult:
         """Return a side-effect-free, machine-readable guard rejection."""
 
@@ -1246,14 +1164,8 @@ class BehaviorToolkit(Toolkit):
             if reason not in _DEPRECATED_PI0_LIMIT_REASONS
         ]
         verified_success = self._has_verified_raw_success()
-        budget_exhausted = any(
-            reason in _HARD_EXECUTION_BUDGET_PRECONDITIONS
-            for reason in ordered_failures
-        )
         payload = {
-            "_finish": bool(
-                verified_success or self._terminal_failure_latched or budget_exhausted
-            ),
+            "_finish": bool(verified_success or self._terminal_failure_latched),
             "runner_termination_reason": (
                 "official_task_success"
                 if verified_success
@@ -1263,8 +1175,6 @@ class BehaviorToolkit(Toolkit):
                     else None
                 )
                 if self._terminal_failure_latched
-                else "attempt_budget_exhausted"
-                if budget_exhausted
                 else None
             ),
             "name": name,
@@ -1278,8 +1188,6 @@ class BehaviorToolkit(Toolkit):
             "elapsed_s": round(max(0.0, elapsed_s), 6),
             **self._budget_progress_payload(),
         }
-        if precondition_error is not None:
-            payload["precondition_error"] = precondition_error
         dashboard = self._dashboard
         callback = getattr(dashboard, "on_tool_result", None)
         if callable(callback):
@@ -1334,12 +1242,6 @@ class BehaviorToolkit(Toolkit):
             env_close = getattr(env, "close_transport", None)
             if resource is None and callable(env_close):
                 env_close()
-            plan_bindings_lock = getattr(
-                self, "_dashboard_plan_bindings_lock", None
-            )
-            if plan_bindings_lock is not None:
-                with plan_bindings_lock:
-                    self._dashboard_plan_bindings.clear()
             self._closed = True
 
     def write_recipe(self, recipe_tag: str) -> str | None:
@@ -1349,9 +1251,7 @@ class BehaviorToolkit(Toolkit):
         final_record = self._tool_trace[-1] if self._tool_trace else None
         task_success = self._has_verified_raw_success()
         manual_latch = getattr(self, "_manual_intervention_latch", None)
-        manual_intervention = bool(
-            manual_latch is not None and manual_latch.is_set()
-        )
+        manual_intervention = bool(manual_latch is not None and manual_latch.is_set())
         recipe_path = None
         publish_task_memory = bool(
             task_success
@@ -1468,21 +1368,18 @@ class BehaviorToolkit(Toolkit):
                 "kind": "evidence_contract",
                 "requirements": (
                     "Fresh evidence selects the anatomical hand for each analytic action. "
-                    "Semantic identity, object control, the current attachment state of "
-                    "each hand, target projection, and contact geometry remain current, "
-                    "public, and bound to the active episode."
+                    "Semantic identity, object control, and target projection remain "
+                    "current, public, and bound to the active episode."
                 ),
             },
             {
-                "kind": "safety_contract",
+                "kind": "execution_contract",
                 "requirements": (
                     "Action capabilities attempt requested execution directly. The Agent "
-                    "chooses subsequent actions from fresh public evidence and returned "
-                    "feedback; runtime lifecycle, evidence-lineage, the independently "
-                    "observed attachment identity of each hand, capability-specific state "
-                    "requirements for the selected anatomical hand, finite budgets, "
-                    "raw-success latching, and any terminal policy explicitly registered "
-                    "for this task remain authoritative."
+                    "chooses subsequent actions from fresh public visual evidence and "
+                    "returned environment lifecycle feedback. Raw-success latching and "
+                    "any terminal policy explicitly registered for this task remain "
+                    "authoritative."
                 ),
             },
             {
@@ -1570,9 +1467,8 @@ class BehaviorToolkit(Toolkit):
 
 - Re-localize from fresh public RGB-D in every episode; no pose, pixel, frame, checkpoint, native instance, camera schedule, or physical-side assignment is transferable.
 - Select the anatomical hand for each analytic action from fresh current head RGB-D evidence; never inherit a hand assignment from task prior or history.
-- Evaluate the current attachment identity and gripper state of the left and right hands independently; both hands may carry attachments, and capability-specific requirements apply only to the freshly selected anatomical hand.
-- Use current public evidence to judge each precision action. Fresh projection receipts and current per-hand attachment state are required where the capability calls for them.
-- Action capabilities attempt requested execution directly; no planner collision, clearance, joint-margin, or dynamics safety certificate is provided. Use fresh visual evidence and returned feedback when choosing an action.
+- Use current public visual evidence to judge each precision action and select the anatomical hand.
+- Action capabilities attempt requested execution directly. Use fresh visual evidence and returned lifecycle feedback when choosing an action.
 - Capability choice, model instruction, invocation count, and camera choice remain decisions for the current episode; recorded success does not prescribe them.
 - A failed Explore attempt may be retried only by the outer harness in a fresh environment; Eval never retries.
 - Only raw `info[\"done\"][\"success\"]` is task success.

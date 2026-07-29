@@ -18,6 +18,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping
 
+from robots.behavior.schemas import (
+    DASHBOARD_HOLD_ARM_DELAY_S,
+    DASHBOARD_PREDICTED_PLAN_DEPTH,
+)
+
 LEASE_TIMEOUT_S = 1.2
 _WATCHDOG_PERIOD_S = 0.1
 _TARGETS = frozenset({"chassis", "left_arm", "right_arm"})
@@ -42,17 +47,18 @@ _CHASSIS_ACTIONS = frozenset(
 )
 _ONE_SHOT_ACTIONS = frozenset({"open", "close", "observe"})
 _QUEUE_CAPACITY = 5
-_CAPTURE_IDLE_DELAY_S = 0.34
+_CAPTURE_IDLE_DELAY_S = 0.0
 _PLANNING_METADATA_FIELDS = (
     "planning_elapsed_s",
     "planning_profile",
     "fast_solver_deadline_s",
     "fast_solver_deadline",
     "latency_metrics",
-    "obstacle_refresh",
-    "safety_certificate",
     "selected_solver_stage",
     "solver_stages",
+    "predicted_terminal",
+    "predicted_start_digest",
+    "predicted_terminal_digest",
 )
 _PLANNING_TRAJECTORY_FIELD_FRAGMENT = "trajectory"
 _PLANNING_METADATA_MAX_DEPTH = 4
@@ -70,6 +76,12 @@ class ControlRequestError(RuntimeError):
 
     def payload(self) -> dict[str, Any]:
         return {"error": self.message, "code": self.code}
+
+
+class _PreparedPlanningFailure(RuntimeError):
+    def __init__(self, stop_reason: str, error: str) -> None:
+        super().__init__(error)
+        self.stop_reason = stop_reason
 
 
 class BehaviorRawSuccessLatch:
@@ -245,19 +257,55 @@ class BehaviorRawSuccessLatch:
     def observe_with_binding(
         self, result: Any
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Latch success and identify whether this exact result supplied it."""
+        """Latch the raw lifecycle boolean; receipts are optional audit data."""
 
-        binding = self._validated_receipt(result)
+        raw_source: str | None = None
+        raw_env_step: int | None = None
+        if isinstance(result, Mapping):
+            for info_key in ("info", "last_info"):
+                info = result.get(info_key)
+                done = info.get("done") if isinstance(info, Mapping) else None
+                if isinstance(done, Mapping) and done.get("success") is True:
+                    raw_source = f'{info_key}["done"]["success"]'
+                    env_step = result.get("env_step")
+                    if type(env_step) is int:
+                        raw_env_step = env_step
+                    break
+            if raw_source is None:
+                info_done = result.get("info_done")
+                if (
+                    isinstance(info_done, Mapping)
+                    and info_done.get("success") is True
+                ):
+                    raw_source = 'info_done["success"]'
+                    env_step = result.get("env_step")
+                    if type(env_step) is int:
+                        raw_env_step = env_step
+        receipt_audit = self._validated_receipt(result)
+        if raw_source is None and receipt_audit is not None:
+            raw_source = str(receipt_audit["source"])
+            raw_env_step = int(receipt_audit["env_step"])
+        binding = (
+            {
+                "source": raw_source,
+                **(
+                    {"env_step": raw_env_step}
+                    if raw_env_step is not None
+                    else {}
+                ),
+                **(
+                    {"receipt": receipt_audit}
+                    if receipt_audit is not None
+                    else {}
+                ),
+            }
+            if raw_source is not None
+            else None
+        )
         with self._lock:
             if binding is not None:
-                if (
-                    self._receipt_binding is not None
-                    and self._receipt_binding != binding
-                ):
-                    raise RuntimeError(
-                        "official success receipt changed after the first latch"
-                    )
-                self._receipt_binding = binding
+                if self._receipt_binding is None:
+                    self._receipt_binding = dict(binding)
                 self._latched = True
             return self._latched, (
                 dict(binding) if binding is not None else None
@@ -289,11 +337,7 @@ class BehaviorRawSuccessLatch:
 
 
 class BehaviorCommandArbiter:
-    """Serialize complete Agent and Dashboard transactions.
-
-    Agent waiters have priority over a new manual repeat.  The currently
-    executing discrete manual trajectory is never interrupted by this class.
-    """
+    """Serialize actual Env transactions without command-scoped permits."""
 
     def __init__(self, *, success_latch: BehaviorRawSuccessLatch | None = None) -> None:
         self.success_latch = success_latch or BehaviorRawSuccessLatch()
@@ -334,6 +378,8 @@ class BehaviorCommandArbiter:
                     self._condition.wait()
                 if self._quiescing:
                     raise RuntimeError("behavior command arbiter is quiescing")
+                if self.success_latch.is_latched():
+                    raise RuntimeError("raw task success is terminal")
                 self._owner = "agent"
                 self._command_id = None
             finally:
@@ -349,76 +395,67 @@ class BehaviorCommandArbiter:
                     self._condition.notify_all()
             self._notify_listeners()
 
+    @contextmanager
+    def manual_execution(self, command_id: str) -> Iterator[None]:
+        """Wait for the one global Env execution slot.
+
+        ``command_id`` is retained only for observability.  It is not a permit,
+        idempotency key, or admission predicate.
+        """
+
+        command_id = str(command_id or "").strip()
+        with self._condition:
+            while self._owner is not None and not self._quiescing:
+                self._condition.wait()
+            if self._quiescing:
+                raise RuntimeError("behavior command arbiter is quiescing")
+            if self.success_latch.is_latched():
+                raise RuntimeError("raw task success is terminal")
+            self._owner = "manual"
+            self._command_id = command_id or None
+        self._notify_listeners()
+        try:
+            yield
+        finally:
+            with self._condition:
+                if self._owner == "manual":
+                    self._owner = None
+                    self._command_id = None
+                    self._condition.notify_all()
+            self._notify_listeners()
+
     def try_acquire_manual(self, command_id: str) -> tuple[bool, str | None]:
+        """Compatibility-only admission; does not reserve the execution slot."""
+
         with self._condition:
             if self._quiescing:
                 return False, "controller_unavailable"
             if self.success_latch.is_latched():
                 return False, "official_success_latched"
-            if self._owner is not None:
-                return False, "controller_busy"
-            if self._agent_waiters:
-                return False, "agent_waiting"
-            self._owner = "manual"
-            self._command_id = str(command_id)
             return True, None
 
     def release_manual(self, command_id: str) -> None:
-        with self._condition:
-            if self._owner == "manual" and self._command_id == str(command_id):
-                self._owner = None
-                self._command_id = None
-                self._condition.notify_all()
+        """Compatibility no-op; manual ownership exists only in execution."""
 
     def handoff_manual(self, command_id: str, next_command_id: str) -> bool:
-        """Retain a manual reservation unless an Agent is already waiting.
+        """Compatibility no-op; command IDs do not own the Env mutex."""
 
-        The check and permit change are one condition-locked operation.  A
-        separate ``snapshot()`` check would leave a race in which an Agent
-        waiter could arrive immediately before the manual tail handoff.
-        """
-
-        command_id = str(command_id or "").strip()
-        next_command_id = str(next_command_id or "").strip()
         with self._condition:
-            if (
-                not command_id
-                or not next_command_id
-                or self._owner != "manual"
-                or self._command_id != command_id
-            ):
-                raise RuntimeError("manual reservation handoff does not match owner")
-            if (
-                self._quiescing
-                or self.success_latch.is_latched()
-                or self._agent_waiters
-            ):
-                # Keep the old exact permit until the controller publishes the
-                # deferred command's cancellation terminal.  The caller
-                # explicitly releases only after that publication barrier.
+            if self._quiescing or self.success_latch.is_latched():
                 return False
-            self._command_id = next_command_id
             return True
 
     def require_manual_permit(self, command_id: str) -> None:
-        """Require the exact command-scoped manual permit.
-
-        Checking only ``owner == "manual"`` would let an unrelated internal
-        caller borrow another command's permit while its Env RPC is in flight.
-        The opaque command id therefore remains part of the permit until the
-        controller publishes the terminal receipt and releases it.
-        """
+        """Compatibility lifecycle check; command IDs are not permits."""
 
         command_id = str(command_id or "").strip()
         with self._condition:
-            if (
-                not command_id
-                or self._owner != "manual"
-                or self._command_id != command_id
-            ):
-                raise RuntimeError(
-                    "Dashboard manual primitive requires its exact command permit"
-                )
+            if not command_id:
+                raise RuntimeError("Dashboard command_id is required")
+            if self._quiescing:
+                raise RuntimeError("behavior command arbiter is quiescing")
+            if self.success_latch.is_latched():
+                raise RuntimeError("raw task success is terminal")
 
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
@@ -455,12 +492,19 @@ class BehaviorCommandArbiter:
 @dataclass
 class _Lease:
     lease_id: str
+    generation: int
     deadline: float
+    accepted_at: float = field(default_factory=time.monotonic)
     last_sequence: int = 0
     stopped: bool = False
     expired: bool = False
     stop_reason: str | None = None
     payload_fingerprint: tuple[str, str, str] | None = None
+    hold_armed: bool = False
+    compatibility_command_id: str | None = None
+    executed_count: int = 0
+    last_executed_plan_id: str | None = None
+    terminal_capture_requested: bool = False
 
 
 @dataclass
@@ -478,8 +522,12 @@ class _Command:
     plan_id: str | None = None
     planning_metadata: dict[str, Any] = field(default_factory=dict)
     predecessor_plan_id: str | None = None
+    predicted_start_digest: str | None = None
+    predicted_terminal: dict[str, Any] | None = None
+    predicted_terminal_digest: str | None = None
     timeline_started: bool = False
     acceptance_snapshot: dict[str, Any] | None = None
+    initial_lease_command: bool = False
 
     def public(self) -> dict[str, Any]:
         return {
@@ -492,8 +540,64 @@ class _Command:
             "phase": self.phase,
             "result": self.result,
             "plan_id": self.plan_id,
+            "predecessor_plan_id": self.predecessor_plan_id,
+            "predicted_start_digest": self.predicted_start_digest,
+            "predicted_terminal_digest": self.predicted_terminal_digest,
             "planning_metadata": dict(self.planning_metadata),
         }
+
+
+@dataclass
+class _PredictedPlan:
+    """One non-executing trajectory prediction owned by an active hold lease."""
+
+    plan_id: str
+    lease_id: str
+    lease_generation: int
+    target: str
+    action: str
+    camera: str
+    predecessor_plan_id: str
+    predicted_start_digest: str
+    predicted_terminal: dict[str, Any]
+    predicted_terminal_digest: str
+    planning_metadata: dict[str, Any] = field(default_factory=dict)
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "lease_id": self.lease_id,
+            "lease_generation": self.lease_generation,
+            "target": self.target,
+            "action": self.action,
+            "camera": self.camera,
+            "predecessor_plan_id": self.predecessor_plan_id,
+            "predicted_start_digest": self.predicted_start_digest,
+            "predicted_terminal_digest": self.predicted_terminal_digest,
+        }
+
+
+@dataclass(frozen=True)
+class _PredictionRequest:
+    lease_id: str
+    lease_generation: int
+    target: str
+    action: str
+    camera: str
+    predecessor_plan_id: str
+    predicted_start_digest: str
+    compatibility_command_id: str
+
+
+def _prediction_digest(value: Any) -> str:
+    bounded = _bounded_planning_value(value)
+    encoded = json.dumps(
+        bounded,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _planning_metadata(
@@ -572,9 +676,13 @@ class BehaviorDashboardController:
         self._work = threading.Condition(self._lock)
         self._commands: dict[tuple[str, int], _Command] = {}
         self._lease: _Lease | None = None
+        self._lease_generation = 0
         self._head: _Command | None = None
         self._pending: list[_Command] = []
         self._planning_command: _Command | None = None
+        self._prediction_planning: _PredictionRequest | None = None
+        self._predicted_plans: list[_PredictedPlan] = []
+        self._prediction_error: str | None = None
         self._plans_to_discard: list[str] = []
         self._last_terminal: dict[str, Any] | None = None
         self._pending_cleared_count = 0
@@ -746,12 +854,8 @@ class BehaviorDashboardController:
                         )
                     raise ControlRequestError(
                         409,
-                        reason or "controller_busy",
-                        (
-                            "agent command is waiting"
-                            if reason == "agent_waiting"
-                            else "robot controller is busy"
-                        ),
+                        reason or "controller_unavailable",
+                        "robot controller is unavailable",
                     )
                 self._touch_locked()
                 self._work.notify_all()
@@ -771,6 +875,11 @@ class BehaviorDashboardController:
                 if not isinstance(prepared, Mapping):
                     raise RuntimeError(
                         "planning-only probe returned a non-object result"
+                    )
+                if prepared.get("status") == "failed":
+                    raise _PreparedPlanningFailure(
+                        str(prepared.get("stop_reason") or "planning_error"),
+                        str(prepared.get("error") or "CuRobo planning failed"),
                     )
                 plan_id = str(prepared.get("plan_id") or "").strip()
                 if not plan_id:
@@ -799,34 +908,6 @@ class BehaviorDashboardController:
                     raise RuntimeError(
                         "planning-only probe omitted zero-action verification"
                     )
-                safety_certificate = prepared.get("safety_certificate")
-                safety_checks = (
-                    safety_certificate.get("checks")
-                    if isinstance(safety_certificate, Mapping)
-                    else None
-                )
-                expected_motion_kind = (
-                    "torso" if target == "chassis" else "eef"
-                )
-                if (
-                    not isinstance(safety_certificate, Mapping)
-                    or safety_certificate.get("admitted") is not True
-                    or safety_certificate.get("motion_kind")
-                    != expected_motion_kind
-                    or int(
-                        safety_certificate.get(
-                            "attachment_hand_count",
-                            -1,
-                        )
-                    )
-                    != 2
-                    or not isinstance(safety_checks, Mapping)
-                    or not safety_checks
-                    or any(value is not True for value in safety_checks.values())
-                ):
-                    raise RuntimeError(
-                        "planning-only probe omitted a verified safety certificate"
-                    )
                 result = {
                     "ok": True,
                     "planning_only": True,
@@ -837,10 +918,6 @@ class BehaviorDashboardController:
                     "plan_id": plan_id,
                     "env_step_delta": 0,
                     "zero_action_verified": True,
-                    "safety_certificate": _bounded_planning_value(
-                        safety_certificate
-                    ),
-                    "prepared": _bounded_planning_value(prepared),
                     "discarded": True,
                     "discard_receipt": _bounded_planning_value(discarded),
                 }
@@ -896,24 +973,13 @@ class BehaviorDashboardController:
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
             raise ControlRequestError(422, "invalid_sequence", "sequence must be positive")
         self._validate_target_action(target, action, camera)
-        key = (lease_id, sequence)
         fingerprint = (target, action, camera)
-
-        with self._lock:
-            existing = self._commands.get(key)
-            if existing is not None:
-                self._require_matching_fingerprint(existing, fingerprint)
-                return existing, True
         lifecycle = self._state.control_admission_snapshot()
         if lifecycle["state"] != "running" or lifecycle["official_task_success"]:
             raise ControlRequestError(410, "run_finished", "run is already finished")
 
         command_id = uuid.uuid4().hex
         with self._work:
-            existing = self._commands.get(key)
-            if existing is not None:
-                self._require_matching_fingerprint(existing, fingerprint)
-                return existing, True
             self._expire_lease_locked(time.monotonic())
             if self.success_latch.is_latched():
                 raise ControlRequestError(410, "run_finished", "official success latched")
@@ -940,21 +1006,20 @@ class BehaviorDashboardController:
                 or self._lease.expired
             )
             if new_lease:
+                self._clear_predictions_locked()
+                self._prediction_error = None
                 if self._head is not None or self._pending:
                     raise ControlRequestError(
                         409, "controller_busy", "another manual queue is active"
                     )
-                if sequence != 1:
-                    raise ControlRequestError(
-                        409,
-                        "invalid_sequence",
-                        "a new control lease must start at sequence 1",
-                    )
                 self._reserve_for_new_head_locked(command_id)
+                self._lease_generation += 1
                 self._lease = _Lease(
                     lease_id=lease_id,
+                    generation=self._lease_generation,
                     deadline=time.monotonic() + self._lease_timeout_s,
                     payload_fingerprint=fingerprint,
+                    compatibility_command_id=command_id,
                 )
             elif self._lease.lease_id != lease_id:
                 raise ControlRequestError(
@@ -969,13 +1034,18 @@ class BehaviorDashboardController:
                     "lease_command_conflict",
                     "a repeat lease cannot change target, action, or camera",
                 )
-            if sequence != lease.last_sequence + 1:
+            if (
+                not new_lease
+                and action not in _ONE_SHOT_ACTIONS
+                and self._capabilities.get("threaded_predicted_planning")
+                is not True
+            ):
                 raise ControlRequestError(
                     409,
-                    "invalid_sequence",
-                    "sequence must follow the previous accepted command",
+                    "predicted_planning_unavailable",
+                    "threaded predicted planning is unavailable",
                 )
-            if action in _ONE_SHOT_ACTIONS and sequence != 1:
+            if action in _ONE_SHOT_ACTIONS and lease.last_sequence > 0:
                 raise ControlRequestError(
                     409,
                     "non_repeatable_action",
@@ -986,7 +1056,7 @@ class BehaviorDashboardController:
                     409, "queue_full", "manual command queue is full"
                 )
             if not new_lease and self._head is None:
-                self._reserve_for_new_head_locked(command_id)
+                self._reserve_for_repeat_head_locked(lease, command_id)
 
             command = _Command(
                 command_id=command_id,
@@ -996,10 +1066,36 @@ class BehaviorDashboardController:
                 action=action,
                 camera=camera,
                 payload_fingerprint=fingerprint,
+                initial_lease_command=new_lease,
             )
-            self._commands[key] = command
-            lease.last_sequence = sequence
+            # command_id/lease_id/sequence remain wire-compatibility metadata.
+            # They intentionally do not provide idempotency: repeating an HTTP
+            # request is allowed to enqueue and execute another robot command.
+            self._commands[(lease_id, sequence)] = command
+            lease.last_sequence = max(lease.last_sequence, sequence)
             lease.deadline = time.monotonic() + self._lease_timeout_s
+            if (
+                action not in _ONE_SHOT_ACTIONS
+                and self._predicted_plans
+                and self._prediction_matches_locked(
+                    self._predicted_plans[0],
+                    lease=lease,
+                )
+            ):
+                predicted = self._predicted_plans.pop(0)
+                command.plan_id = predicted.plan_id
+                command.predecessor_plan_id = predicted.predecessor_plan_id
+                command.predicted_start_digest = (
+                    predicted.predicted_start_digest
+                )
+                command.predicted_terminal = dict(
+                    predicted.predicted_terminal
+                )
+                command.predicted_terminal_digest = (
+                    predicted.predicted_terminal_digest
+                )
+                command.planning_metadata = dict(predicted.planning_metadata)
+                command.phase = "prepared"
             if self._head is None:
                 self._head = command
             else:
@@ -1064,11 +1160,47 @@ class BehaviorDashboardController:
             lease = self._lease
             if lease is None or lease.lease_id != lease_id:
                 raise ControlRequestError(409, "unknown_lease", "control lease not found")
+            if not lease.stopped:
+                self._invalidate_lease_generation_locked(lease)
             lease.stopped = True
             lease.stop_reason = str(reason or "client_stop")
-            cleared, exposed_terminal = self._clear_deferred_head_locked(
-                lease.stop_reason
+            # ``clear_pending`` preserves the lease's initial short-press step
+            # through accepted, planning, prepared, and moving.  A repeat only
+            # survives release after its Env execution has actually started;
+            # accepted/planning/prepared repeats are still speculative tail.
+            preserve_head = bool(
+                self._head is not None
+                and (
+                    self._head.initial_lease_command
+                    or self._head.phase == "moving"
+                )
             )
+            if preserve_head:
+                cleared = self._clear_pending_locked(lease.stop_reason)
+                exposed_terminal = False
+            else:
+                cleared, exposed_terminal = self._clear_unstarted_locked(
+                    lease.stop_reason
+                )
+            self._clear_predictions_locked()
+            release_command_id = (
+                lease.compatibility_command_id
+                if (
+                    self._head is None
+                    and self._planning_command is None
+                    and self._prediction_planning is None
+                )
+                else None
+            )
+            if (
+                self._head is None
+                and self._planning_command is None
+                and self._prediction_planning is None
+                and not self.success_latch.is_latched()
+            ):
+                self._schedule_capture_locked()
+            if release_command_id is not None:
+                lease.compatibility_command_id = None
             self._touch_locked()
             self._work.notify_all()
             published = self._publish_cleared(
@@ -1078,6 +1210,8 @@ class BehaviorDashboardController:
             if not published:
                 self._mark_publication_failed_locked("cancel terminal rejected")
             result = self._snapshot_locked()
+        if release_command_id is not None:
+            self.arbiter.release_manual(release_command_id)
         if not published:
             self.arbiter.quiesce()
         self._publish_snapshot()
@@ -1109,15 +1243,27 @@ class BehaviorDashboardController:
         return result
 
     def quiesce(self) -> None:
+        release_command_id: str | None = None
         with self._work:
             self._quiescing = True
             self._active = False
             if self._lease is not None:
+                if not self._lease.stopped:
+                    self._invalidate_lease_generation_locked(self._lease)
                 self._lease.stopped = True
                 self._lease.stop_reason = "controller_quiescing"
-            cleared, exposed_terminal = self._clear_deferred_head_locked(
+            cleared, exposed_terminal = self._clear_unstarted_locked(
                 "controller_quiescing"
             )
+            self._clear_predictions_locked()
+            if (
+                self._lease is not None
+                and self._head is None
+                and self._planning_command is None
+                and self._prediction_planning is None
+            ):
+                release_command_id = self._lease.compatibility_command_id
+                self._lease.compatibility_command_id = None
             if self._capture["phase"] == "pending":
                 self._capture.update({"phase": "discarded", "error": None})
                 self._capture_ready_at = 0.0
@@ -1130,6 +1276,8 @@ class BehaviorDashboardController:
             if not published:
                 self._mark_publication_failed_locked("cancel terminal rejected")
         self.arbiter.quiesce()
+        if release_command_id is not None:
+            self.arbiter.release_manual(release_command_id)
         self._publish_snapshot()
 
     def drain(self, timeout_s: float = 10.0) -> bool:
@@ -1139,6 +1287,8 @@ class BehaviorDashboardController:
                 self._head is not None
                 or self._pending
                 or self._planning_command is not None
+                or self._prediction_planning is not None
+                or self._predicted_plans
                 or self._capture["phase"] in {"pending", "started"}
                 or self._plans_to_discard
             ):
@@ -1173,6 +1323,7 @@ class BehaviorDashboardController:
         while True:
             discard_plan: str | None = None
             command: _Command | None = None
+            prediction: _PredictionRequest | None = None
             with self._work:
                 while True:
                     if self._workers_stop:
@@ -1186,49 +1337,151 @@ class BehaviorDashboardController:
                         command.phase = "planning"
                         self._touch_locked()
                         break
-                    self._work.wait()
+                    prediction = self._next_prediction_request_locked()
+                    if prediction is not None:
+                        self._prediction_planning = prediction
+                        self._touch_locked()
+                        break
+                    timeout = self._prediction_wait_timeout_locked()
+                    self._work.wait(timeout)
             if discard_plan is not None:
                 self._discard_plan(discard_plan)
                 with self._work:
                     self._work.notify_all()
                 continue
-            assert command is not None
+            assert command is not None or prediction is not None
             self._publish_snapshot()
+            plan_id: str | None = None
             try:
                 toolkit = self._require_toolkit()
+                target = command.target if command is not None else prediction.target
+                action = command.action if command is not None else prediction.action
+                predecessor_plan_id = (
+                    command.predecessor_plan_id
+                    if command is not None
+                    else prediction.predecessor_plan_id
+                )
+                compatibility_command_id = (
+                    command.command_id
+                    if command is not None
+                    else prediction.compatibility_command_id
+                )
                 prepared = toolkit.dashboard_prepare_manual_command(
-                    target=command.target,
-                    action=command.action,
-                    predecessor_plan_id=command.predecessor_plan_id,
-                    permit_command_id=command.command_id,
-                    # Controller admission only plans the current FIFO head.
-                    # Never re-enable the Env RPC background escape hatch here.
-                    background=False,
+                    target=target,
+                    action=action,
+                    predecessor_plan_id=predecessor_plan_id,
+                    permit_command_id=compatibility_command_id,
+                    background=predecessor_plan_id is not None,
                 )
                 if not isinstance(prepared, Mapping):
                     raise RuntimeError("manual planner returned a non-object result")
+                if prepared.get("status") == "failed":
+                    raise _PreparedPlanningFailure(
+                        str(prepared.get("stop_reason") or "planning_error"),
+                        str(
+                            prepared.get("error")
+                            or "CuRobo planning failed"
+                        ),
+                    )
+                if prepared.get("status") not in (None, "prepared"):
+                    raise RuntimeError(
+                        "manual planner returned an invalid status"
+                    )
                 plan_id = str(prepared.get("plan_id") or "").strip()
                 if not plan_id:
                     raise RuntimeError("manual planner did not return plan_id")
+                if prediction is not None and not isinstance(
+                    _bounded_planning_value(prepared.get("predicted_terminal")),
+                    dict,
+                ):
+                    raise RuntimeError(
+                        "predicted plan omitted a bounded predicted_terminal"
+                    )
             except BaseException as exc:
-                self._finish_planning_failure(command, exc)
+                if plan_id:
+                    self._discard_plan(plan_id)
+                if command is not None:
+                    self._finish_planning_failure(command, exc)
+                else:
+                    assert prediction is not None
+                    self._finish_prediction_failure(prediction, exc)
                 continue
             discard_after_prepare = False
             with self._work:
-                if self._planning_command is command:
-                    self._planning_command = None
-                if not self._command_is_active_locked(command):
-                    discard_after_prepare = True
+                if command is not None:
+                    if self._planning_command is command:
+                        self._planning_command = None
+                    if not self._command_is_active_locked(command):
+                        discard_after_prepare = True
+                    else:
+                        command.plan_id = plan_id
+                        command.planning_metadata = _planning_metadata(
+                            prepared, plan_id=plan_id
+                        )
+                        predicted_terminal = _bounded_planning_value(
+                            prepared.get("predicted_terminal")
+                        )
+                        if isinstance(predicted_terminal, dict):
+                            command.predicted_terminal = predicted_terminal
+                            command.predicted_terminal_digest = (
+                                _prediction_digest(predicted_terminal)
+                            )
+                        predicted_start_digest = prepared.get(
+                            "predicted_start_digest"
+                        )
+                        if isinstance(predicted_start_digest, str):
+                            command.predicted_start_digest = (
+                                predicted_start_digest
+                            )
+                        command.phase = "prepared"
                 else:
-                    command.plan_id = plan_id
-                    command.planning_metadata = _planning_metadata(
-                        prepared, plan_id=plan_id
-                    )
-                    command.phase = "prepared"
+                    assert prediction is not None
+                    if self._prediction_planning == prediction:
+                        self._prediction_planning = None
+                    if not self._prediction_request_is_active_locked(prediction):
+                        discard_after_prepare = True
+                    else:
+                        predicted_terminal = _bounded_planning_value(
+                            prepared.get("predicted_terminal")
+                        )
+                        assert isinstance(predicted_terminal, dict)
+                        prepared_start_digest = prepared.get(
+                            "predicted_start_digest"
+                        )
+                        self._predicted_plans.append(
+                            _PredictedPlan(
+                                plan_id=plan_id,
+                                lease_id=prediction.lease_id,
+                                lease_generation=(
+                                    prediction.lease_generation
+                                ),
+                                target=prediction.target,
+                                action=prediction.action,
+                                camera=prediction.camera,
+                                predecessor_plan_id=(
+                                    prediction.predecessor_plan_id
+                                ),
+                                predicted_start_digest=(
+                                    prepared_start_digest
+                                    if isinstance(prepared_start_digest, str)
+                                    and prepared_start_digest
+                                    else prediction.predicted_start_digest
+                                ),
+                                predicted_terminal=predicted_terminal,
+                                predicted_terminal_digest=(
+                                    _prediction_digest(predicted_terminal)
+                                ),
+                                planning_metadata=_planning_metadata(
+                                    prepared,
+                                    plan_id=plan_id,
+                                ),
+                            )
+                        )
                 self._touch_locked()
                 self._work.notify_all()
             if discard_after_prepare:
                 self._discard_plan(plan_id)
+                self._release_stopped_idle_lease()
             self._publish_snapshot()
 
     def _executor_loop(self) -> None:
@@ -1241,7 +1494,7 @@ class BehaviorDashboardController:
                         return
                     head = self._head
                     if head is not None and (
-                        self._command_has_exact_permit_locked(head)
+                        self._command_has_manual_permit_locked(head)
                         and head.timeline_started
                         and (
                             head.action in _ONE_SHOT_ACTIONS
@@ -1250,6 +1503,14 @@ class BehaviorDashboardController:
                     ):
                         command = head
                         command.phase = "moving"
+                        lease = self._lease
+                        if (
+                            lease is not None
+                            and lease.lease_id == command.lease_id
+                        ):
+                            # A later executed step makes any capture from an
+                            # earlier step non-terminal for this lease.
+                            lease.terminal_capture_requested = False
                         self._touch_locked()
                         break
                     capture = self._start_capture_if_ready_locked()
@@ -1269,47 +1530,49 @@ class BehaviorDashboardController:
 
     def _execute_command(self, command: _Command) -> None:
         started = time.monotonic()
+        success_latched = False
+        manual_success_binding: dict[str, Any] | None = None
         try:
             toolkit = self._require_toolkit()
-            if command.action in _ONE_SHOT_ACTIONS:
-                payload = toolkit.dashboard_manual_command(
-                    target=command.target,
-                    action=command.action,
-                    camera=command.camera,
-                    permit_command_id=command.command_id,
+            with self.arbiter.manual_execution(command.command_id):
+                if command.action in _ONE_SHOT_ACTIONS:
+                    payload = toolkit.dashboard_manual_command(
+                        target=command.target,
+                        action=command.action,
+                        camera=command.camera,
+                        permit_command_id=command.command_id,
+                    )
+                else:
+                    payload = toolkit.dashboard_execute_prepared_command(
+                        plan_id=str(command.plan_id or ""),
+                        command_id=command.command_id,
+                    )
+                if not isinstance(payload, Mapping):
+                    raise RuntimeError(
+                        "manual executor returned a non-object result"
+                    )
+                result = dict(payload)
+                success_latched, manual_success_binding = (
+                    self.success_latch.observe_with_binding(result)
                 )
-            else:
-                payload = toolkit.dashboard_execute_prepared_command(
-                    plan_id=str(command.plan_id or ""),
-                    command_id=command.command_id,
-                )
-            if not isinstance(payload, Mapping):
-                raise RuntimeError("manual executor returned a non-object result")
-            result = dict(payload)
         except BaseException as exc:
             result = {
                 "primitive_success": False,
                 "stop_reason": "tool_error",
                 "error": f"{type(exc).__name__}: {exc}",
             }
+            success_latched = self.success_latch.is_latched()
+            manual_success_binding = None
         self._attach_planning_metadata(command, result)
         result.setdefault("elapsed_s", max(0.0, time.monotonic() - started))
         capture_result = self._detach_capture_payload(result)
-        try:
-            success_latched, manual_success_binding = (
-                self.success_latch.observe_with_binding(result)
+        with self._work:
+            suppress_hold_capture = bool(
+                self._lease is not None
+                and self._lease.lease_id == command.lease_id
+                and self._lease.hold_armed
+                and not self.success_latch.is_latched()
             )
-        except BaseException as exc:
-            result.update(
-                {
-                    "primitive_success": False,
-                    "stop_reason": "dashboard_control_worker_error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "worker_exception_type": type(exc).__name__,
-                }
-            )
-            success_latched = self.success_latch.is_latched()
-            manual_success_binding = None
         if manual_success_binding is not None:
             result["task_success"] = True
             result.setdefault("stop_reason", "official_task_success")
@@ -1325,6 +1588,10 @@ class BehaviorDashboardController:
                     ),
                 }
             )
+        lifecycle_terminal = str(result.get("stop_reason") or "") in {
+            "environment_terminated",
+            "environment_truncated",
+        }
         failed = self._action_failed(result)
         command.result = result
         command.phase = "failed" if failed else "completed"
@@ -1339,7 +1606,12 @@ class BehaviorDashboardController:
         if not timeline_published:
             result["state_publish_error"] = str(timeline_error)
             command.phase = "failed"
-        if capture_result is not None and not success_latched:
+        embedded_terminal_capture = bool(
+            manual_success_binding is not None or lifecycle_terminal
+        )
+        if capture_result is not None and (
+            embedded_terminal_capture or not suppress_hold_capture
+        ):
             revision = self._new_capture_revision()
             publish_error = self._publish_capture_result(
                 revision, capture_result
@@ -1360,6 +1632,22 @@ class BehaviorDashboardController:
                     }
                 )
                 self._touch_locked()
+        elif embedded_terminal_capture:
+            # Lifecycle terminals forbid a follow-up capture RPC.  Their one
+            # terminal capture must be embedded in the same Env action response.
+            with self._work:
+                revision = int(self._capture["revision"]) + 1
+                self._capture.update(
+                    {
+                        "phase": "failed",
+                        "revision": revision,
+                        "error": "terminal_capture_missing_from_terminal_action",
+                    }
+                )
+                self._capture_ready_at = 0.0
+                if self._lease is not None:
+                    self._lease.terminal_capture_requested = True
+                self._touch_locked()
 
         with self._work:
             if self._head is not command:
@@ -1371,14 +1659,19 @@ class BehaviorDashboardController:
             if success_latched:
                 self._active = False
                 if lease is not None:
+                    if not lease.stopped:
+                        self._invalidate_lease_generation_locked(lease)
                     lease.stopped = True
                     lease.stop_reason = "official_task_success"
                 cleared = self._clear_pending_locked("official_task_success")
+                self._clear_predictions_locked()
                 if self._capture["phase"] == "pending":
                     self._capture.update({"phase": "discarded", "error": None})
                     self._capture_ready_at = 0.0
             elif failed:
                 if lease is not None:
+                    if not lease.stopped:
+                        self._invalidate_lease_generation_locked(lease)
                     lease.stopped = True
                     lease.stop_reason = str(
                         result.get("stop_reason") or "command_error"
@@ -1386,18 +1679,24 @@ class BehaviorDashboardController:
                 cleared = self._clear_pending_locked(
                     str(result.get("stop_reason") or "command_error")
                 )
+                self._clear_predictions_locked()
             elif self._pending:
                 self._head = self._pending.pop(0)
             elif lease is not None and command.action in _ONE_SHOT_ACTIONS:
+                if not lease.stopped:
+                    self._invalidate_lease_generation_locked(lease)
                 lease.stopped = True
                 lease.stop_reason = "command_complete"
+            if lease is not None and not failed and command.plan_id:
+                lease.executed_count += 1
+                lease.last_executed_plan_id = command.plan_id
 
             next_head = self._head
             self._touch_locked()
             self._work.notify_all()
 
-        # The current action and every cancellation caused by it must be
-        # committed while the old exact permit is still held.
+        # Publish the current terminal and every derived cancellation before
+        # advancing the controller-visible queue.
         terminal_published = timeline_published and self._publish_snapshot()
         if not terminal_published:
             self._fail_closed_publication(
@@ -1424,6 +1723,8 @@ class BehaviorDashboardController:
                     handed_off = self.arbiter.handoff_manual(
                         command.command_id, next_head.command_id
                     )
+                    if handed_off and lease is not None:
+                        lease.compatibility_command_id = next_head.command_id
         if next_head is not None:
             if not handed_off:
                 arbiter_snapshot = self.arbiter.snapshot()
@@ -1432,7 +1733,7 @@ class BehaviorDashboardController:
                     if arbiter_snapshot.get("success_latched") is True
                     else "controller_quiescing"
                     if arbiter_snapshot.get("quiescing") is True
-                    else "agent_waiting"
+                    else "controller_unavailable"
                 )
                 with self._work:
                     preempted: list[_Command] = []
@@ -1442,32 +1743,58 @@ class BehaviorDashboardController:
                         self._pending.clear()
                         self._mark_cleared_locked(preempted, reason)
                         if lease is not None:
+                            if not lease.stopped:
+                                self._invalidate_lease_generation_locked(lease)
                             lease.stopped = True
                             lease.stop_reason = reason
+                            lease.compatibility_command_id = None
+                        self._clear_predictions_locked()
                         self._touch_locked()
                         self._work.notify_all()
                 if preempted and not self._publish_cleared(
                     preempted,
-                    expose_first_terminal=reason == "agent_waiting",
+                    expose_first_terminal=False,
                 ):
                     self._fail_closed_publication(
                         owner_command_id=command.command_id,
                         error="preempted cancellation terminal was rejected",
                     )
                     return
-                # handoff_manual deliberately retains the old permit on a
-                # refusal so cancellation remains observable first.
                 self.arbiter.release_manual(command.command_id)
         else:
-            self.arbiter.release_manual(command.command_id)
+            retain_hold_permit = bool(
+                lease is not None
+                and not lease.stopped
+                and not lease.expired
+                and command.action not in _ONE_SHOT_ACTIONS
+                and not success_latched
+                and not failed
+            )
+            if retain_hold_permit:
+                with self._work:
+                    lease.compatibility_command_id = command.command_id
+                    self._work.notify_all()
+            else:
+                self.arbiter.release_manual(command.command_id)
+                if lease is not None:
+                    with self._work:
+                        if lease.compatibility_command_id == command.command_id:
+                            lease.compatibility_command_id = None
             with self._work:
                 if (
                     not success_latched
+                    and not lifecycle_terminal
                     and command.action != "observe"
                     and result.get("cancelled_before_execution") is not True
                     and not self._quiescing
                     and not self._closed
                     and not self._publication_failed
+                    and (
+                        failed
+                        or command.action in _ONE_SHOT_ACTIONS
+                        or lease is None
+                        or lease.stopped
+                    )
                 ):
                     self._schedule_capture_locked()
                 self._touch_locked()
@@ -1476,9 +1803,10 @@ class BehaviorDashboardController:
 
     def _execute_capture(self, revision: int, command_id: str) -> None:
         try:
-            payload = self._require_toolkit().dashboard_capture_views(
-                command_id=command_id
-            )
+            with self.arbiter.manual_execution(command_id):
+                payload = self._require_toolkit().dashboard_capture_views(
+                    command_id=command_id
+                )
             if not isinstance(payload, Mapping):
                 raise RuntimeError("Dashboard capture returned a non-object result")
             result = dict(payload)
@@ -1503,8 +1831,7 @@ class BehaviorDashboardController:
             self._touch_locked()
             self._work.notify_all()
 
-        # Capture completion/failure is visible before its exact permit can be
-        # handed to a deferred motion or released.
+        # Capture completion/failure is visible before the deferred motion.
         if not self._publish_snapshot():
             self._fail_closed_publication(
                 owner_command_id=command_id,
@@ -1523,6 +1850,8 @@ class BehaviorDashboardController:
                     handed_off = self.arbiter.handoff_manual(
                         command_id, next_head.command_id
                     )
+                    if handed_off and self._lease is not None:
+                        self._lease.compatibility_command_id = next_head.command_id
         if next_head is not None:
             if not handed_off:
                 arbiter_snapshot = self.arbiter.snapshot()
@@ -1531,7 +1860,7 @@ class BehaviorDashboardController:
                     if arbiter_snapshot.get("success_latched") is True
                     else "controller_quiescing"
                     if arbiter_snapshot.get("quiescing") is True
-                    else "agent_waiting"
+                    else "controller_unavailable"
                 )
                 with self._work:
                     cleared: list[_Command] = []
@@ -1541,13 +1870,19 @@ class BehaviorDashboardController:
                         self._pending.clear()
                         self._mark_cleared_locked(cleared, reason)
                         if self._lease is not None:
+                            if not self._lease.stopped:
+                                self._invalidate_lease_generation_locked(
+                                    self._lease
+                                )
                             self._lease.stopped = True
                             self._lease.stop_reason = reason
+                            self._lease.compatibility_command_id = None
+                        self._clear_predictions_locked()
                         self._touch_locked()
                         self._work.notify_all()
                 if cleared and not self._publish_cleared(
                     cleared,
-                    expose_first_terminal=reason == "agent_waiting",
+                    expose_first_terminal=False,
                 ):
                     self._fail_closed_publication(
                         owner_command_id=command_id,
@@ -1590,47 +1925,65 @@ class BehaviorDashboardController:
     def _finish_planning_failure(
         self, command: _Command, exc: BaseException
     ) -> None:
+        stop_reason = self._planning_failure_reason(exc)
         result = {
             "primitive_success": False,
-            "stop_reason": "planning_error",
-            "error": f"{type(exc).__name__}: {exc}",
+            "stop_reason": stop_reason,
+            "error": self._planning_error_text(exc),
         }
         release_command_id: str | None = None
+        inactive = False
         with self._work:
             if self._planning_command is command:
                 self._planning_command = None
             if not self._command_is_active_locked(command):
+                inactive = True
                 self._work.notify_all()
-                return
-            command.phase = "failed"
-            command.result = result
-            cleared: list[_Command] = []
-            if self._head is command:
-                self._head = None
-                self._last_terminal = self._terminal_public(command)
-                cleared = self._clear_pending_locked("planning_error")
-                if self._lease is not None:
-                    self._lease.stopped = True
-                    self._lease.stop_reason = "planning_error"
-                release_command_id = command.command_id
             else:
-                index = self._pending.index(command)
-                cleared = self._pending[index + 1 :]
-                del self._pending[index:]
-                self._pending_cleared_count += 1
-                self._mark_cleared_locked(cleared, "planning_error")
-                if self._lease is not None:
-                    self._lease.stopped = True
-                    self._lease.stop_reason = "planning_error"
-            self._touch_locked()
-            self._work.notify_all()
+                command.phase = "failed"
+                command.result = result
+                cleared = []
+                if self._head is command:
+                    self._head = None
+                    self._last_terminal = self._terminal_public(command)
+                    cleared = self._clear_pending_locked(stop_reason)
+                    if self._lease is not None:
+                        if not self._lease.stopped:
+                            self._invalidate_lease_generation_locked(
+                                self._lease
+                            )
+                        self._lease.stopped = True
+                        self._lease.stop_reason = stop_reason
+                    self._lease.compatibility_command_id = None
+                    release_command_id = command.command_id
+                else:
+                    index = self._pending.index(command)
+                    cleared = self._pending[index + 1 :]
+                    del self._pending[index:]
+                    self._pending_cleared_count += 1
+                    self._mark_cleared_locked(cleared, stop_reason)
+                    if self._lease is not None:
+                        if not self._lease.stopped:
+                            self._invalidate_lease_generation_locked(
+                                self._lease
+                            )
+                        self._lease.stopped = True
+                        self._lease.stop_reason = stop_reason
+                self._clear_predictions_locked()
+                if not self.success_latch.is_latched():
+                    self._schedule_capture_locked()
+                self._touch_locked()
+                self._work.notify_all()
+        if inactive:
+            self._release_stopped_idle_lease()
+            return
         timeline_published, timeline_error = self._publish_manual_result(
             command,
             result,
             official_success_latched=False,
         )
-        # State and control readers must see the immutable terminal before the
-        # exact permit is released to an Agent or a fresh manual lease.
+        # State and control readers must see the immutable planning terminal
+        # before another execution is published.
         terminal_published = timeline_published and self._publish_snapshot()
         cleared = [item for item in cleared if item is not command]
         if terminal_published and cleared:
@@ -1654,6 +2007,76 @@ class BehaviorDashboardController:
             self.arbiter.release_manual(release_command_id)
         self._publish_snapshot()
 
+    def _finish_prediction_failure(
+        self,
+        prediction: _PredictionRequest,
+        exc: BaseException,
+    ) -> None:
+        stop_reason = self._planning_failure_reason(exc)
+        release_command_id: str | None = None
+        already_stopped = False
+        with self._work:
+            if self._prediction_planning == prediction:
+                self._prediction_planning = None
+            if not self._prediction_request_is_active_locked(prediction):
+                already_stopped = True
+                self._work.notify_all()
+                published = True
+            else:
+                self._prediction_error = self._planning_error_text(exc)
+                lease = self._lease
+                assert lease is not None
+                self._invalidate_lease_generation_locked(lease)
+                lease.stopped = True
+                lease.stop_reason = stop_reason
+                cleared, exposed_terminal = self._clear_unstarted_locked(
+                    stop_reason
+                )
+                self._clear_predictions_locked()
+                if self._head is None:
+                    release_command_id = lease.compatibility_command_id
+                    lease.compatibility_command_id = None
+                    if not self.success_latch.is_latched():
+                        self._schedule_capture_locked()
+                self._touch_locked()
+                self._work.notify_all()
+                published = self._publish_cleared(
+                    cleared,
+                    expose_first_terminal=exposed_terminal,
+                )
+        if already_stopped:
+            self._release_stopped_idle_lease()
+            return
+        if release_command_id is not None:
+            self.arbiter.release_manual(release_command_id)
+        if not published:
+            self.arbiter.quiesce()
+        self._publish_snapshot()
+
+    @staticmethod
+    def _planning_failure_reason(exc: BaseException) -> str:
+        for attribute in ("stop_reason", "code"):
+            value = getattr(exc, attribute, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        message = str(exc).lower()
+        for reason in (
+            "unreachable",
+            "solver_timeout",
+            "goal_not_converged",
+            "joint_limits",
+            "numerical_error",
+        ):
+            if reason in message:
+                return reason
+        return "planning_error"
+
+    @staticmethod
+    def _planning_error_text(exc: BaseException) -> str:
+        if isinstance(exc, _PreparedPlanningFailure):
+            return str(exc)
+        return f"{type(exc).__name__}: {exc}"
+
     def _fail_admission(self, command: _Command, exc: BaseException) -> None:
         result = {
             "primitive_success": False,
@@ -1670,6 +2093,8 @@ class BehaviorDashboardController:
             elif command in self._pending:
                 self._pending.remove(command)
             if self._lease is not None:
+                if not self._lease.stopped:
+                    self._invalidate_lease_generation_locked(self._lease)
                 self._lease.stopped = True
                 self._lease.stop_reason = "dashboard_state_error"
             self._last_terminal = self._terminal_public(command)
@@ -1701,26 +2126,30 @@ class BehaviorDashboardController:
             and arbiter.get("command_id") == self._capture_command_id
         ):
             # The already-started capture cannot be cancelled honestly.  Admit
-            # one deferred head, but neither plan nor execute it until capture
-            # completion atomically hands over the exact permit.
+            # one deferred head; the single executor runs it after capture.
             return
         acquired, reason = self.arbiter.try_acquire_manual(command_id)
         if acquired:
             return
         if reason == "official_success_latched":
             raise ControlRequestError(410, "run_finished", "official success latched")
-        message = (
-            "agent command is waiting"
-            if reason == "agent_waiting"
-            else "robot controller is busy"
+        raise ControlRequestError(
+            409,
+            reason or "controller_unavailable",
+            "robot controller is unavailable",
         )
-        raise ControlRequestError(409, reason or "controller_busy", message)
+
+    def _reserve_for_repeat_head_locked(
+        self,
+        lease: _Lease,
+        command_id: str,
+    ) -> None:
+        """Update the compatibility command context for an idle hold."""
+
+        self._reserve_for_new_head_locked(command_id)
+        lease.compatibility_command_id = command_id
 
     def _next_unplanned_locked(self) -> _Command | None:
-        # Planning and physical execution both enter the simulator backend.
-        # A pending background prepare must therefore not overlap the current
-        # head's physics steps.  Keep accepting the bounded tail, but promote
-        # each item to head before planning it from the then-live state.
         command = self._head
         if (
             command is None
@@ -1729,16 +2158,137 @@ class BehaviorDashboardController:
             or command.plan_id
         ):
             return None
-        if not self._command_has_exact_permit_locked(command):
+        if not self._command_has_manual_permit_locked(command):
             return None
-        command.predecessor_plan_id = None
+        lease = self._lease
+        command.predecessor_plan_id = (
+            lease.last_executed_plan_id
+            if lease is not None and lease.executed_count > 0
+            else None
+        )
         return command
 
-    def _command_has_exact_permit_locked(self, command: _Command) -> bool:
-        arbiter = self.arbiter.snapshot()
+    def _command_has_manual_permit_locked(self, _command: _Command) -> bool:
         return bool(
-            arbiter.get("owner") == "manual"
-            and arbiter.get("command_id") == command.command_id
+            self._active
+            and not self._quiescing
+            and not self._closed
+            and not self.success_latch.is_latched()
+        )
+
+    def _prediction_wait_timeout_locked(self) -> float | None:
+        lease = self._lease
+        if (
+            lease is None
+            or lease.stopped
+            or lease.expired
+            or lease.payload_fingerprint is None
+            or lease.payload_fingerprint[1] in _ONE_SHOT_ACTIONS
+            or self._capabilities.get("threaded_predicted_planning") is not True
+            or len(self._predicted_plans) >= DASHBOARD_PREDICTED_PLAN_DEPTH
+        ):
+            return None
+        remaining = (
+            lease.accepted_at + DASHBOARD_HOLD_ARM_DELAY_S - time.monotonic()
+        )
+        return max(0.01, remaining) if remaining > 0.0 else None
+
+    def _next_prediction_request_locked(
+        self,
+    ) -> _PredictionRequest | None:
+        lease = self._lease
+        if (
+            lease is None
+            or lease.stopped
+            or lease.expired
+            or lease.payload_fingerprint is None
+            or lease.payload_fingerprint[1] in _ONE_SHOT_ACTIONS
+            or self._capabilities.get("threaded_predicted_planning") is not True
+            or len(self._predicted_plans) >= DASHBOARD_PREDICTED_PLAN_DEPTH
+            or self._prediction_planning is not None
+            or time.monotonic()
+            < lease.accepted_at + DASHBOARD_HOLD_ARM_DELAY_S
+        ):
+            return None
+        compatibility_command_id = str(
+            lease.compatibility_command_id or ""
+        )
+        if not compatibility_command_id:
+            return None
+        predecessor_plan_id: str | None = None
+        predicted_start: Any = None
+        if self._predicted_plans:
+            tail = self._predicted_plans[-1]
+            predecessor_plan_id = tail.plan_id
+            predicted_start = tail.predicted_terminal
+        else:
+            candidates = [*self._pending]
+            if self._head is not None:
+                candidates.insert(0, self._head)
+            planned = [item for item in candidates if item.plan_id]
+            if planned:
+                predecessor_plan_id = planned[-1].plan_id
+                predicted_start = planned[-1].planning_metadata.get(
+                    "predicted_terminal"
+                )
+            elif lease.last_executed_plan_id is not None:
+                predecessor_plan_id = lease.last_executed_plan_id
+        if predecessor_plan_id is None:
+            return None
+        lease.hold_armed = True
+        target, action, camera = lease.payload_fingerprint
+        return _PredictionRequest(
+            lease_id=lease.lease_id,
+            lease_generation=lease.generation,
+            target=target,
+            action=action,
+            camera=camera,
+            predecessor_plan_id=predecessor_plan_id,
+            predicted_start_digest=_prediction_digest(
+                predicted_start
+                if predicted_start is not None
+                else {"predecessor_plan_id": predecessor_plan_id}
+            ),
+            compatibility_command_id=compatibility_command_id,
+        )
+
+    def _prediction_request_is_active_locked(
+        self,
+        prediction: _PredictionRequest,
+    ) -> bool:
+        lease = self._lease
+        return bool(
+            lease is not None
+            and lease.lease_id == prediction.lease_id
+            and lease.generation == prediction.lease_generation
+            and not lease.stopped
+            and not lease.expired
+            and lease.payload_fingerprint
+            == (
+                prediction.target,
+                prediction.action,
+                prediction.camera,
+            )
+            and len(self._predicted_plans)
+            < DASHBOARD_PREDICTED_PLAN_DEPTH
+        )
+
+    @staticmethod
+    def _prediction_matches_locked(
+        prediction: _PredictedPlan,
+        *,
+        lease: _Lease,
+    ) -> bool:
+        return bool(
+            lease.payload_fingerprint is not None
+            and prediction.lease_id == lease.lease_id
+            and prediction.lease_generation == lease.generation
+            and (
+                prediction.target,
+                prediction.action,
+                prediction.camera,
+            )
+            == lease.payload_fingerprint
         )
 
     def _start_capture_if_ready_locked(self) -> tuple[int, str] | None:
@@ -1762,6 +2312,13 @@ class BehaviorDashboardController:
         return revision, command_id
 
     def _schedule_capture_locked(self) -> None:
+        lease = self._lease
+        if lease is not None and lease.terminal_capture_requested:
+            return
+        if self._capture["phase"] in {"pending", "started"}:
+            return
+        if lease is not None:
+            lease.terminal_capture_requested = True
         revision = int(self._capture["revision"]) + 1
         self._capture = {
             "phase": "pending",
@@ -1772,6 +2329,8 @@ class BehaviorDashboardController:
 
     def _new_capture_revision(self) -> int:
         with self._work:
+            if self._lease is not None:
+                self._lease.terminal_capture_requested = True
             revision = int(self._capture["revision"]) + 1
             self._capture.update(
                 {"phase": "started", "revision": revision, "error": None}
@@ -1782,6 +2341,18 @@ class BehaviorDashboardController:
     def _detach_capture_payload(
         self, result: dict[str, Any]
     ) -> dict[str, Any] | None:
+        terminal_capture = result.pop("terminal_capture", None)
+        terminal_capture_error = result.pop("terminal_capture_error", None)
+        if isinstance(terminal_capture, Mapping):
+            capture = dict(terminal_capture)
+            if terminal_capture_error not in (None, "", False):
+                capture.setdefault(
+                    "capture_error",
+                    str(terminal_capture_error),
+                )
+            return capture
+        if terminal_capture_error not in (None, "", False):
+            return {"capture_error": str(terminal_capture_error)}
         capture_keys = {
             "_frames_bytes",
             "capture_group_id",
@@ -1803,22 +2374,15 @@ class BehaviorDashboardController:
         self._mark_cleared_locked(cleared, reason)
         return cleared
 
-    def _clear_deferred_head_locked(
+    def _clear_unstarted_locked(
         self, reason: str
     ) -> tuple[list[_Command], bool]:
-        """Clear queued work without cancelling an exact-permit motion.
+        """Cancel every command that has not begun its Env execution."""
 
-        A head accepted while capture is already running has no permit of its
-        own.  It is therefore queued work, not an in-flight robot action, and
-        must be cancelled together with the tail on stop/expiry/quiesce.
-        """
-
-        deferred_head = bool(
-            self._head is not None
-            and self._head.phase == "accepted"
-            and not self._command_has_exact_permit_locked(self._head)
+        unstarted_head = bool(
+            self._head is not None and self._head.phase != "moving"
         )
-        if not deferred_head:
+        if not unstarted_head:
             return self._clear_pending_locked(reason), False
         assert self._head is not None
         cleared = [self._head, *self._pending]
@@ -1826,6 +2390,34 @@ class BehaviorDashboardController:
         self._pending.clear()
         self._mark_cleared_locked(cleared, reason)
         return cleared, True
+
+    def _clear_predictions_locked(self) -> None:
+        for prediction in self._predicted_plans:
+            self._plans_to_discard.append(prediction.plan_id)
+        self._predicted_plans.clear()
+
+    def _release_stopped_idle_lease(self) -> None:
+        release_command_id: str | None = None
+        with self._work:
+            lease = self._lease
+            if (
+                lease is not None
+                and lease.stopped
+                and self._head is None
+                and self._planning_command is None
+                and self._prediction_planning is None
+            ):
+                release_command_id = lease.compatibility_command_id
+                lease.compatibility_command_id = None
+                if (
+                    self._capture["phase"] not in {"pending", "started"}
+                    and not self.success_latch.is_latched()
+                ):
+                    self._schedule_capture_locked()
+                self._touch_locked()
+                self._work.notify_all()
+        if release_command_id is not None:
+            self.arbiter.release_manual(release_command_id)
 
     def _mark_cleared_locked(
         self, commands: list[_Command], reason: str
@@ -1891,6 +2483,8 @@ class BehaviorDashboardController:
         self._quiescing = True
         self._unavailable_reason = "dashboard_state_publication_failed"
         if self._lease is not None:
+            if not self._lease.stopped:
+                self._invalidate_lease_generation_locked(self._lease)
             self._lease.stopped = True
             self._lease.stop_reason = "dashboard_state_publication_failed"
         self._touch_locked()
@@ -1901,7 +2495,7 @@ class BehaviorDashboardController:
         owner_command_id: str,
         error: str,
     ) -> None:
-        """Disable all admission before releasing a permit with no State ack."""
+        """Disable admission when the immutable State publication fails."""
 
         with self._work:
             remaining: list[_Command] = []
@@ -1916,9 +2510,7 @@ class BehaviorDashboardController:
             )
             self._mark_publication_failed_locked(error)
             self._work.notify_all()
-        # Quiescing is the fail-closed barrier: waiting Agent transactions and
-        # every future manual admission are rejected before the old permit is
-        # released for cleanup.
+        # Quiescing rejects future work before cleanup releases execution.
         self.arbiter.quiesce()
         self.arbiter.release_manual(owner_command_id)
         self._publish_snapshot()
@@ -1938,6 +2530,8 @@ class BehaviorDashboardController:
         return bool(
             result.get("primitive_success") is False
             or result.get("success") is False
+            or result.get("terminated") is True
+            or result.get("truncated") is True
             or result.get("error") not in (None, "", False)
         )
 
@@ -1968,17 +2562,6 @@ class BehaviorDashboardController:
                 }
             )
         return terminal
-
-    @staticmethod
-    def _require_matching_fingerprint(
-        command: _Command, fingerprint: tuple[str, str, str]
-    ) -> None:
-        if command.payload_fingerprint != fingerprint:
-            raise ControlRequestError(
-                409,
-                "idempotency_conflict",
-                "lease_id and sequence were used with a different command",
-            )
 
     def _require_toolkit(self) -> Any:
         with self._lock:
@@ -2011,11 +2594,32 @@ class BehaviorDashboardController:
         ):
             return False, True
         lease.expired = True
+        self._invalidate_lease_generation_locked(lease)
         lease.stopped = True
         lease.stop_reason = "lease_expired"
-        cleared, exposed_terminal = self._clear_deferred_head_locked(
+        cleared, exposed_terminal = self._clear_unstarted_locked(
             "lease_expired"
         )
+        self._clear_predictions_locked()
+        release_command_id = (
+            lease.compatibility_command_id
+            if (
+                self._head is None
+                and self._planning_command is None
+                and self._prediction_planning is None
+            )
+            else None
+        )
+        if release_command_id is not None:
+            lease.compatibility_command_id = None
+            self.arbiter.release_manual(release_command_id)
+        if (
+            self._head is None
+            and self._planning_command is None
+            and self._prediction_planning is None
+            and not self.success_latch.is_latched()
+        ):
+            self._schedule_capture_locked()
         self._touch_locked()
         published = self._publish_cleared(
             cleared,
@@ -2038,14 +2642,20 @@ class BehaviorDashboardController:
 
     def _on_arbiter_change(self) -> None:
         with self._work:
-            if self.success_latch.is_latched():
+            manual_result_pending = bool(
+                self._head is not None and self._head.phase == "moving"
+            )
+            if self.success_latch.is_latched() and not manual_result_pending:
                 self._active = False
                 if self._lease is not None:
+                    if not self._lease.stopped:
+                        self._invalidate_lease_generation_locked(self._lease)
                     self._lease.stopped = True
                     self._lease.stop_reason = "official_task_success"
-                cleared, _ = self._clear_deferred_head_locked(
+                cleared, _ = self._clear_unstarted_locked(
                     "official_task_success"
                 )
+                self._clear_predictions_locked()
                 if self._capture["phase"] == "pending":
                     self._capture.update({"phase": "discarded", "error": None})
                     self._capture_ready_at = 0.0
@@ -2071,12 +2681,35 @@ class BehaviorDashboardController:
     def _touch_locked(self) -> None:
         self._control_revision += 1
 
+    def _invalidate_lease_generation_locked(self, lease: _Lease) -> None:
+        self._lease_generation += 1
+        lease.generation = self._lease_generation
+
     def _snapshot_locked(self) -> dict[str, Any]:
         arbiter = self.arbiter.snapshot()
         head = self._head.public() if self._head is not None else None
         planning = (
             self._planning_command.public()
             if self._planning_command is not None
+            else None
+        )
+        prediction_planning = (
+            {
+                "lease_id": self._prediction_planning.lease_id,
+                "lease_generation": (
+                    self._prediction_planning.lease_generation
+                ),
+                "target": self._prediction_planning.target,
+                "action": self._prediction_planning.action,
+                "camera": self._prediction_planning.camera,
+                "predecessor_plan_id": (
+                    self._prediction_planning.predecessor_plan_id
+                ),
+                "predicted_start_digest": (
+                    self._prediction_planning.predicted_start_digest
+                ),
+            }
+            if self._prediction_planning is not None
             else None
         )
         queue = [command.public() for command in self._pending]
@@ -2112,7 +2745,11 @@ class BehaviorDashboardController:
             else "idle"
         )
         result = display.get("result")
-        error = result.get("error") if isinstance(result, Mapping) else None
+        error = (
+            result.get("error")
+            if isinstance(result, Mapping)
+            else self._prediction_error
+        )
         stop_reason = (
             "official_task_success"
             if run_success_latched
@@ -2140,6 +2777,16 @@ class BehaviorDashboardController:
             "queue": queue,
             "queue_depth": len(queue),
             "queue_capacity": _QUEUE_CAPACITY,
+            "prediction_pipeline_available": bool(
+                self._capabilities.get("threaded_predicted_planning") is True
+            ),
+            "prediction_planning": prediction_planning,
+            "predicted_plans": [
+                prediction.public() for prediction in self._predicted_plans
+            ],
+            "predicted_plan_depth": len(self._predicted_plans),
+            "predicted_plan_capacity": DASHBOARD_PREDICTED_PLAN_DEPTH,
+            "hold_armed": bool(lease is not None and lease.hold_armed),
             "last_terminal": terminal,
             "pending_cleared_count": self._pending_cleared_count,
             "owner": arbiter.get("owner"),
@@ -2184,5 +2831,7 @@ __all__ = [
     "BehaviorDashboardController",
     "BehaviorRawSuccessLatch",
     "ControlRequestError",
+    "DASHBOARD_HOLD_ARM_DELAY_S",
+    "DASHBOARD_PREDICTED_PLAN_DEPTH",
     "LEASE_TIMEOUT_S",
 ]

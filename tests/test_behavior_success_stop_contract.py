@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# This is the closed acceptance matrix for the BEHAVIOR
+# joint-limits-and-goal-only execution mode.
+# Do not add new collision, contact, attachment, tracking,
+# pose-error, isolation, settling, or safety-gate tests
+# without explicit user authorization.
 import json
 import sys
 from pathlib import Path
@@ -42,13 +47,13 @@ class _DirectProcess:
         self.action_count = 0
 
     def step_env(self, _action, *, need_obs):
-        assert need_obs is True
         self.action_count += 1
         if self.action_count > _SUCCESS_ACTION:
             raise AssertionError("an env action executed after raw task success")
         success = self.action_count == _SUCCESS_ACTION
+        assert need_obs is (self.action_count % 4 == 0)
         return (
-            object(),
+            object() if need_obs else None,
             np.array([float(success)]),
             np.array([success]),
             np.array([False]),
@@ -89,6 +94,8 @@ def _runtime(tmp_path) -> tuple[BehaviorEnvFacade, _DirectProcess]:
     facade._planner_video_interval_steps = 4
     facade._record_rgbd_frames = lambda *_args, **_kwargs: None
     facade._append_video = lambda *_args, **_kwargs: None
+    facade._refresh_observation_without_step = lambda: None
+    facade._frame_cache = None
     facade._video_error = None
     facade._video_path = tmp_path / "episode.mp4"
     facade._video_sealed = False
@@ -264,7 +271,7 @@ def test_raw_success_mid_chunk_stops_all_further_actions_and_predictions(
     assert direct.action_count == _SUCCESS_ACTION
     assert model.predict_calls == 1
     assert env.chunk_step_calls == 1
-    assert env.finalize_calls == 1
+    assert env.finalize_calls == 0
     assert primitives._vla_invocations == 1
     assert result["task_success"] is True
     assert result["stop_reason"] == "official_task_success"

@@ -1,3 +1,8 @@
+# This is the closed acceptance matrix for the BEHAVIOR
+# joint-limits-and-goal-only execution mode.
+# Do not add new collision, contact, attachment, tracking,
+# pose-error, isolation, settling, or safety-gate tests
+# without explicit user authorization.
 import inspect
 
 import pytest
@@ -143,7 +148,6 @@ def test_nav_pick_schema_requires_unbounded_exact_chunk_count():
     assert set(schema["properties"]) == {
         "instruction",
         "chunks",
-        "current_object_visual_check",
     }
     assert schema["required"] == ["instruction", "chunks"]
     assert schema["additionalProperties"] is False
@@ -172,18 +176,11 @@ def test_nav_pick_schema_requires_unbounded_exact_chunk_count():
         )
     with pytest.raises(ValidationError):
         validator.validate({"instruction": "pick up the task object"})
-    assert schema["properties"]["current_object_visual_check"]["properties"]["camera"][
-        "enum"
-    ] == ["head", "left_wrist", "right_wrist"]
     description = PI0_NAV_PICK_SPEC["description"].lower()
     for capability in ("navigation", "grasping", "pressing"):
         assert capability in description
     assert "no fixed maximum" in description
     assert "requested work bound" in description
-    assert "exactly the requested number" in description
-    assert "successful environment step" in description
-    assert "receipt-bound partial chunk" in description
-    assert "fresh public observe frame" in description
     assert "first" not in description
     assert "exactly once" not in description
     assert "single permitted" not in description
@@ -412,8 +409,6 @@ def test_navigate_to_schema_supports_projection_or_explicit_relative_base_motion
         "navigation_visual_check",
         "relative_motion",
         "standoff_m",
-        "max_travel_m",
-        "timeout_s",
     }
     assert schema["additionalProperties"] is False
     visual = schema["properties"]["navigation_visual_check"]
@@ -427,12 +422,6 @@ def test_navigate_to_schema_supports_projection_or_explicit_relative_base_motion
         "type": "number",
         "default": 0.85,
         "minimum": 0.45,
-        "maximum": 1.5,
-    }
-    assert schema["properties"]["max_travel_m"] == {
-        "type": "number",
-        "default": 1.0,
-        "exclusiveMinimum": 0.0,
         "maximum": 1.5,
     }
     assert "hand" not in repr(schema)
@@ -560,19 +549,12 @@ def test_navigate_to_schema_supports_projection_or_explicit_relative_base_motion
 def test_move_to_schema_accepts_projection_or_relative_delta_only():
     schema = MOVE_TO_SPEC["input_schema"]
     validator = _validator(MOVE_TO_SPEC)
-    assert schema["properties"]["position_tolerance_m"]["default"] == 0.02
-    assert schema["properties"]["timeout_s"]["default"] == 240.0
-    assert "maximum" not in schema["properties"]["position_tolerance_m"]
-    assert "maximum" not in schema["properties"]["max_travel_m"]
     assert "maximum" not in schema["properties"]["target"]["properties"]["standoff_m"]
     validator.validate(
         {
             "hand": "right",
             "target": {"projection_id": "projection-current", "standoff_m": 0.04},
             "visual_hand_check": _visual_hand_check("right"),
-            "position_tolerance_m": 0.01,
-            "max_travel_m": 0.2,
-            "timeout_s": 90,
         }
     )
     validator.validate(
@@ -758,15 +740,13 @@ def test_visual_hand_check_schema_rejects_wrong_camera_assessment_or_shape():
 
 
 @pytest.mark.parametrize("spec", [CLOSE_SPEC, OPEN_SPEC])
-def test_gripper_specs_use_physical_hand_visual_check_and_timeout(spec):
+def test_gripper_specs_use_physical_hand_visual_check(spec):
     schema = spec["input_schema"]
     assert schema["required"] == ["hand", "visual_hand_check"]
-    assert schema["properties"]["timeout_s"]["exclusiveMinimum"] == 0.0
     _validator(spec).validate(
         {
             "hand": "left",
             "visual_hand_check": _visual_hand_check("left"),
-            "timeout_s": 10,
         }
     )
 

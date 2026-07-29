@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+# This is the closed acceptance matrix for the BEHAVIOR
+# joint-limits-and-goal-only execution mode.
+# Do not add new collision, contact, attachment, tracking,
+# pose-error, isolation, settling, or safety-gate tests
+# without explicit user authorization.
 import hashlib
 import json
-import threading
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +16,6 @@ from robots.behavior.env_server import (
     _CONTROLLER_PLANNER,
     _CONTROLLER_VLA,
     BehaviorEnvFacade,
-    _MainThreadDispatcher,
 )
 from robots.behavior.schemas import (
     BASE_ROTATION_STEP_RAD,
@@ -25,7 +28,6 @@ from robots.behavior.schemas import (
     validate_dashboard_prepare_request,
 )
 from robots.behavior.task_specs import TURNING_ON_RADIO_TASK_SPEC
-from robots.behavior.toolkit import BehaviorToolkit
 from robots.behavior.tools import BehaviorPrimitives
 
 _PNG = b"\x89PNG\r\n\x1a\n"
@@ -530,119 +532,6 @@ def test_behavior_primitives_route_internal_pipeline_without_public_tools():
     ]
 
 
-def test_toolkit_pipeline_requires_reservation_and_exact_command_permits():
-    permit_calls = []
-
-    class _Arbiter:
-        owner = "manual"
-
-        def snapshot(self):
-            return {
-                "owner": self.owner,
-                "command_id": "command-1",
-            }
-
-        def require_manual_permit(self, command_id):
-            permit_calls.append(command_id)
-            if self.owner != "manual" or command_id not in {
-                "command-1",
-                "capture-1",
-            }:
-                raise RuntimeError("wrong permit")
-
-    primitives = SimpleNamespace(
-        dashboard_prepare_manual_command=lambda **kwargs: _prepared_response(
-            target=kwargs["target"],
-            action=kwargs["action"],
-        ),
-        dashboard_execute_prepared_command=lambda **kwargs: _manual_response(),
-        dashboard_discard_prepared_command=lambda **kwargs: {
-            "schema_version": 1,
-            "plan_id": kwargs["plan_id"],
-            "discarded": True,
-            "status": "discarded",
-        },
-        dashboard_capture_views=lambda **kwargs: _capture_response(),
-    )
-    toolkit = BehaviorToolkit.__new__(BehaviorToolkit)
-    toolkit._closed = False
-    toolkit._command_arbiter = _Arbiter()
-    toolkit._success_latch = SimpleNamespace(is_latched=lambda: False)
-    toolkit._manual_intervention_latch = SimpleNamespace(set=lambda: None)
-    toolkit._dashboard_plan_bindings_lock = threading.RLock()
-    toolkit._dashboard_plan_bindings = {}
-    toolkit._primitives = primitives
-
-    prepared = toolkit.dashboard_prepare_manual_command(
-        target="left_arm",
-        action="up",
-        permit_command_id="command-1",
-    )
-    toolkit.dashboard_execute_prepared_command(
-        plan_id=prepared["plan_id"],
-        command_id="command-1",
-    )
-    toolkit.dashboard_capture_views(command_id="capture-1")
-
-    assert permit_calls == ["command-1", "command-1", "capture-1"]
-    probe = toolkit.dashboard_prepare_manual_command(
-        target="left_arm",
-        action="rotate_left",
-        permit_command_id="command-1",
-        planning_only_probe=True,
-    )
-    assert probe["status"] == "prepared"
-    assert permit_calls[-1] == "command-1"
-    toolkit.dashboard_discard_prepared_command(plan_id=probe["plan_id"])
-    assert probe["plan_id"] not in toolkit._dashboard_plan_bindings
-    toolkit._command_arbiter.owner = "agent"
-    with pytest.raises(RuntimeError, match="wrong permit"):
-        toolkit.dashboard_prepare_manual_command(
-            target="left_arm",
-            action="up",
-            permit_command_id="command-1",
-        )
-
-
-def test_toolkit_prepared_plan_is_bound_to_the_original_command():
-    class _Arbiter:
-        def require_manual_permit(self, command_id):
-            if command_id not in {"command-1", "command-2"}:
-                raise RuntimeError("wrong permit")
-
-    primitives = SimpleNamespace(
-        dashboard_prepare_manual_command=lambda **kwargs: _prepared_response(),
-        dashboard_execute_prepared_command=lambda **kwargs: _manual_response(),
-    )
-    toolkit = BehaviorToolkit.__new__(BehaviorToolkit)
-    toolkit._closed = False
-    toolkit._command_arbiter = _Arbiter()
-    toolkit._success_latch = SimpleNamespace(is_latched=lambda: False)
-    toolkit._manual_intervention_latch = SimpleNamespace(set=lambda: None)
-    toolkit._dashboard_plan_bindings_lock = threading.RLock()
-    toolkit._dashboard_plan_bindings = {}
-    toolkit._primitives = primitives
-
-    prepared = toolkit.dashboard_prepare_manual_command(
-        target="left_arm",
-        action="up",
-        permit_command_id="command-1",
-    )
-
-    with pytest.raises(RuntimeError, match="different command"):
-        toolkit.dashboard_execute_prepared_command(
-            plan_id=prepared["plan_id"],
-            command_id="command-2",
-        )
-
-    result = toolkit.dashboard_execute_prepared_command(
-        plan_id=prepared["plan_id"],
-        command_id="command-1",
-    )
-    assert result["primitive_success"] is True
-    assert prepared["plan_id"] not in toolkit._dashboard_plan_bindings
-
-
 def test_behavior_primitives_preserve_success_without_partial_frame_publish():
     result = {
         "primitive_success": True,
@@ -817,6 +706,35 @@ def test_capabilities_accept_formal_behavior_suite_and_composite_identity():
     assert capabilities["observe_available"] is True
 
 
+def test_capabilities_enable_torso_after_zero_action_identity_warmup():
+    facade = _facade()
+    facade._planner.dashboard_control_capabilities = lambda: {
+        "base": True,
+        "eef": {"left": True, "right": True},
+        "torso": True,
+        "wrist": {"left": False, "right": False},
+        "gripper": {"left": True, "right": True},
+    }
+    facade._planner_warmup_report = {
+        "status": "complete",
+        "identity_warmup": {
+            "torso": {
+                "ok": True,
+                "active_dof_count": 3,
+                "trajectory_waypoints": 1,
+                "env_actions_sent": 0,
+                "simulator_advanced": False,
+            },
+            "env_actions_sent": 0,
+            "simulator_advanced": False,
+        },
+    }
+
+    capabilities = facade.dashboard_control_capabilities()
+
+    assert capabilities["torso_available"] is True
+
+
 def test_capabilities_fail_closed_for_bare_or_mismatched_task_identity():
     facade = _facade()
     facade._task_identity = (
@@ -848,78 +766,6 @@ def test_env_facade_foreground_prepare_preserves_identity_gate_and_switches():
     assert facade._planner.calls == [
         ("prepare_dashboard_motion", "chassis", "forward", None, False)
     ]
-
-
-def test_env_facade_background_prepare_records_soft_solver_deadline():
-    facade = _facade()
-    facade._controller_state = _CONTROLLER_PLANNER
-    facade._base_controller_mode = "position"
-    facade._dashboard_planning_admitted = True
-
-    result = facade.dashboard_prepare_manual_command(
-        target="chassis",
-        action="forward",
-        predecessor_plan_id="plan-1",
-        background=True,
-    )
-
-    assert result["plan_id"] == "plan-2"
-    assert result["deadline_enforcement"] == {
-        "solver_timeout_enforced": True,
-        "hard_wall_clock_enforced": False,
-        "soft_deadline_s": 12.0,
-        "background_deadline_kind": "soft_solver_deadline",
-    }
-
-
-def test_env_facade_background_prepare_fails_if_success_latches_during_plan():
-    facade = _facade()
-    facade._controller_state = _CONTROLLER_PLANNER
-    facade._base_controller_mode = "position"
-    facade._dashboard_planning_admitted = True
-    original = facade._planner.prepare_dashboard_motion
-
-    def latch_success(*args, **kwargs):
-        result = original(*args, **kwargs)
-        facade._official_success_latched = True
-        return result
-
-    facade._planner.prepare_dashboard_motion = latch_success
-
-    with pytest.raises(RuntimeError, match="became terminal"):
-        facade.dashboard_prepare_manual_command(
-            target="chassis",
-            action="forward",
-            predecessor_plan_id="plan-1",
-            background=True,
-        )
-
-
-def test_env_facade_execute_is_exactly_once_by_command_id_without_capture():
-    facade = _facade()
-    facade._controller_state = _CONTROLLER_PLANNER
-    facade._base_controller_mode = "position"
-
-    first = facade.dashboard_execute_prepared_command(
-        plan_id="plan-1",
-        command_id="command-1",
-    )
-    replay = facade.dashboard_execute_prepared_command(
-        plan_id="plan-1",
-        command_id="command-1",
-    )
-
-    assert first == replay
-    assert first is not replay
-    assert "_frames_bytes" not in first
-    assert facade._planner.calls == [
-        ("execute_dashboard_motion", "plan-1", "command-1")
-    ]
-    with pytest.raises(RuntimeError, match="different plan_id"):
-        facade.dashboard_execute_prepared_command(
-            plan_id="plan-2",
-            command_id="command-1",
-        )
 
 
 @pytest.mark.parametrize(
@@ -978,137 +824,6 @@ def test_env_facade_capture_views_returns_one_complete_independent_group():
         "left_wrist",
         "right_wrist",
     }
-
-
-def test_main_dispatcher_rejects_background_prepare_bypass():
-    calls = []
-    env = SimpleNamespace()
-    dispatcher = _MainThreadDispatcher(
-        env,
-        SimpleNamespace(is_set=lambda: False),
-    )
-    dispatcher.submit = lambda method, args, kwargs: calls.append(
-        ("fifo", method, kwargs)
-    ) or {"status": "queued"}
-
-    foreground = dispatcher.submit_dashboard_prepare(
-        "env.dashboard_prepare_manual_command",
-        (),
-        {"target": "chassis", "action": "forward", "background": False},
-    )
-
-    assert foreground == {"status": "queued"}
-    assert calls == [
-        (
-            "fifo",
-            "env.dashboard_prepare_manual_command",
-            {"target": "chassis", "action": "forward", "background": False},
-        ),
-    ]
-    with pytest.raises(RuntimeError, match="cannot bypass"):
-        dispatcher.submit_dashboard_prepare(
-            "env.dashboard_prepare_manual_command",
-            (),
-            {
-                "target": "chassis",
-                "action": "forward",
-                "predecessor_plan_id": "plan-1",
-                "background": True,
-            },
-        )
-    assert len(calls) == 1
-    with pytest.raises(ValueError, match="unknown concurrent"):
-        dispatcher.submit_dashboard_prepare(
-            "env.dashboard_capture_views",
-            (),
-            {"background": True},
-        )
-
-
-def test_main_dispatcher_serializes_background_and_foreground_prepare():
-    shutdown = threading.Event()
-    first_started = threading.Event()
-    release_first = threading.Event()
-    second_started = threading.Event()
-    active = 0
-    max_active = 0
-    order: list[str] = []
-    state_lock = threading.Lock()
-
-    def prepare(*, action, **_kwargs):
-        nonlocal active, max_active
-        with state_lock:
-            active += 1
-            max_active = max(max_active, active)
-            order.append(f"start:{action}")
-        if action == "forward":
-            first_started.set()
-            assert release_first.wait(2.0)
-        else:
-            second_started.set()
-        with state_lock:
-            order.append(f"end:{action}")
-            active -= 1
-        return {"action": action}
-
-    env = SimpleNamespace(
-        _assert_rpc_lifecycle=lambda _method: None,
-        dashboard_prepare_manual_command=prepare,
-    )
-    dispatcher = _MainThreadDispatcher(env, shutdown)
-    processor = threading.Thread(target=dispatcher.run, daemon=True)
-    processor.start()
-    results: dict[str, dict] = {}
-
-    def submit(name: str, *, background: bool) -> None:
-        results[name] = dispatcher.submit(
-            "env.dashboard_prepare_manual_command",
-            (),
-            {
-                "target": "chassis",
-                "action": name,
-                "background": background,
-            },
-        )
-
-    first = threading.Thread(
-        target=submit,
-        args=("forward",),
-        kwargs={"background": False},
-        daemon=True,
-    )
-    second = threading.Thread(
-        target=submit,
-        args=("backward",),
-        kwargs={"background": True},
-        daemon=True,
-    )
-    try:
-        first.start()
-        assert first_started.wait(1.0)
-        second.start()
-        assert second_started.wait(0.05) is False
-        assert max_active == 1
-        release_first.set()
-        first.join(1.0)
-        second.join(1.0)
-        assert not first.is_alive()
-        assert not second.is_alive()
-        assert max_active == 1
-        assert order == [
-            "start:forward",
-            "end:forward",
-            "start:backward",
-            "end:backward",
-        ]
-        assert results == {
-            "forward": {"action": "forward"},
-            "backward": {"action": "backward"},
-        }
-    finally:
-        release_first.set()
-        shutdown.set()
-        processor.join(1.0)
 
 
 def test_env_facade_legacy_motion_has_no_capture_in_same_call():

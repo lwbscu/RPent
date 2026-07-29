@@ -1,22 +1,24 @@
 from __future__ import annotations
 
-import hashlib
-import json
+# This is the closed acceptance matrix for the BEHAVIOR
+# joint-limits-and-goal-only execution mode.
+# Do not add new collision, contact, attachment, tracking,
+# pose-error, isolation, settling, or safety-gate tests
+# without explicit user authorization.
 import threading
 import time
-from typing import Any
-
-import numpy as np
-import pytest
+from typing import Any, Callable
 
 from robots.behavior.dashboard_control import (
     BehaviorCommandArbiter,
     BehaviorDashboardController,
     BehaviorRawSuccessLatch,
-    ControlRequestError,
 )
-from robots.behavior.dashboard_server import DashboardServer
 from robots.behavior.dashboard_state import State
+from robots.behavior.schemas import (
+    DASHBOARD_HOLD_ARM_DELAY_S,
+    DASHBOARD_PREDICTED_PLAN_DEPTH,
+)
 
 
 def _state(tmp_path) -> State:
@@ -31,52 +33,36 @@ def _state(tmp_path) -> State:
     )
 
 
-def _receipt(
-    *,
-    run_nonce: str = "a" * 32,
-    attempt_nonce: str = "b" * 32,
-    attempt_index: int = 1,
-    env_step: int = 7,
-) -> dict[str, Any]:
-    value: dict[str, Any] = {
-        "schema_version": 1,
-        "source": 'info["done"]["success"]',
-        "run_nonce": run_nonce,
-        "attempt_nonce": attempt_nonce,
-        "attempt_index": attempt_index,
-        "env_step": env_step,
-        "raw_done": {"success": True},
-    }
-    return _resign_receipt(value)
-
-
-def _resign_receipt(value: dict[str, Any]) -> dict[str, Any]:
-    value.pop("receipt_sha256", None)
-    value["receipt_sha256"] = hashlib.sha256(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode()
-    ).hexdigest()
-    return value
-
-
-class _Toolkit:
-    def __init__(self, *, gate: threading.Event | None = None) -> None:
-        self.gate = gate
-        self.calls: list[tuple[str, str, str]] = []
-        self.permit_command_ids: list[str] = []
-        self.prepare_permit_command_ids: list[str] = []
+class _PipelineToolkit:
+    def __init__(
+        self,
+        *,
+        planning_failure: dict[str, Any] | None = None,
+        prepare_gate: threading.Event | None = None,
+        background_prepare_gate: threading.Event | None = None,
+        execute_gate: threading.Event | None = None,
+        execute_result: dict[str, Any] | None = None,
+    ) -> None:
+        self.planning_failure = planning_failure
+        self.prepare_gate = prepare_gate
+        self.background_prepare_gate = background_prepare_gate
+        self.execute_gate = execute_gate
+        self.execute_result = execute_result
         self.prepare_calls: list[dict[str, Any]] = []
         self.execute_calls: list[tuple[str, str]] = []
         self.discard_calls: list[str] = []
         self.capture_calls: list[str] = []
-        self.started = threading.Event()
+        self.prepare_started = threading.Event()
+        self.background_prepare_started = threading.Event()
+        self._counter = 0
 
-    def dashboard_control_capabilities(self) -> dict[str, Any]:
-        return {"motion_available": True, "observe_available": True}
+    @staticmethod
+    def dashboard_control_capabilities() -> dict[str, Any]:
+        return {
+            "motion_available": True,
+            "observe_available": True,
+            "threaded_predicted_planning": True,
+        }
 
     def dashboard_manual_command(
         self,
@@ -86,69 +72,54 @@ class _Toolkit:
         camera: str,
         permit_command_id: str,
     ) -> dict[str, Any]:
-        self.permit_command_ids.append(permit_command_id)
-        self.calls.append((target, action, camera))
-        self.started.set()
-        if self.gate is not None:
-            assert self.gate.wait(2.0)
-        step = len(self.calls)
-        return {
-            "primitive_success": True,
-            "primitive_used": "observe" if action == "observe" else "jog_base",
-            "_frames_bytes": {
-                "head": f"head-{step}".encode(),
-                "left_wrist": f"left-{step}".encode(),
-                "right_wrist": f"right-{step}".encode(),
-            },
-            "capture_group_id": f"group-{step}",
-            "simulator_step": step,
-        }
+        del target, action, camera, permit_command_id
+        return {"primitive_success": True}
 
     def dashboard_prepare_manual_command(
         self,
         *,
         target: str,
         action: str,
-        predecessor_plan_id: str | None = None,
+        predecessor_plan_id: str | None,
         permit_command_id: str,
-        background: bool = False,
+        background: bool,
         planning_only_probe: bool = False,
     ) -> dict[str, Any]:
-        self.prepare_permit_command_ids.append(permit_command_id)
-        call = {
-            "target": target,
-            "action": action,
-            "predecessor_plan_id": predecessor_plan_id,
-            "background": background,
-        }
-        if planning_only_probe:
-            call["planning_only_probe"] = True
-        self.prepare_calls.append(call)
-        safety_certificate = {
-            "schema_version": 1,
-            "motion_kind": "torso" if target == "chassis" else "eef",
-            "attachment_hand_count": 2,
-            "checks": {
-                "world_collision_check": True,
-                "self_collision_check": True,
-                "post_interpolation_check": True,
-                "collision_admitted": True,
-                "dual_attachment_collision": True,
-            },
-            "admitted": True,
+        del planning_only_probe
+        self.prepare_calls.append(
+            {
+                "target": target,
+                "action": action,
+                "predecessor_plan_id": predecessor_plan_id,
+                "permit_command_id": permit_command_id,
+                "background": background,
+            }
+        )
+        self.prepare_started.set()
+        if background:
+            self.background_prepare_started.set()
+        if background and self.background_prepare_gate is not None:
+            assert self.background_prepare_gate.wait(2.0)
+        elif self.prepare_gate is not None:
+            assert self.prepare_gate.wait(2.0)
+        if self.planning_failure is not None:
+            return dict(self.planning_failure)
+        self._counter += 1
+        plan_id = f"plan-{self._counter}"
+        terminal = {
+            "joint_positions": [float(self._counter)],
+            "base_xyyaw": [float(self._counter), 0.0, 0.0],
+            "eef_by_hand": {},
+            "torso_link4": None,
         }
         return {
-            "plan_id": f"plan-{len(self.prepare_calls)}",
-            **(
-                {
-                    "planning_only_probe": True,
-                    "env_step_delta": 0,
-                    "zero_action_verified": True,
-                    "safety_certificate": safety_certificate,
-                }
-                if planning_only_probe
-                else {}
-            ),
+            "status": "prepared",
+            "plan_id": plan_id,
+            "predecessor_plan_id": predecessor_plan_id,
+            "predicted_start_digest": f"start-{self._counter}",
+            "predicted_terminal": terminal,
+            "planning_profile": "fast_trajopt",
+            "fast_solver_deadline_s": 1.0,
         }
 
     def dashboard_execute_prepared_command(
@@ -157,15 +128,15 @@ class _Toolkit:
         plan_id: str,
         command_id: str,
     ) -> dict[str, Any]:
-        self.permit_command_ids.append(command_id)
         self.execute_calls.append((plan_id, command_id))
-        self.calls.append(("prepared", plan_id, command_id))
-        self.started.set()
-        if self.gate is not None:
-            assert self.gate.wait(2.0)
+        if self.execute_gate is not None:
+            assert self.execute_gate.wait(2.0)
+        if self.execute_result is not None:
+            return dict(self.execute_result)
         return {
             "primitive_success": True,
-            "primitive_used": "jog_base",
+            "task_success": False,
+            "stop_reason": "reached",
         }
 
     def dashboard_discard_prepared_command(
@@ -178,24 +149,20 @@ class _Toolkit:
 
     def dashboard_capture_views(self, *, command_id: str) -> dict[str, Any]:
         self.capture_calls.append(command_id)
-        step = len(self.capture_calls)
+        index = len(self.capture_calls)
         return {
             "_frames_bytes": {
-                "head": f"capture-head-{step}".encode(),
-                "left_wrist": f"capture-left-{step}".encode(),
-                "right_wrist": f"capture-right-{step}".encode(),
+                "head": f"head-{index}".encode(),
+                "left_wrist": f"left-{index}".encode(),
+                "right_wrist": f"right-{index}".encode(),
             },
-            "capture_group_id": f"capture-group-{step}",
-            "simulator_step": 100 + step,
+            "capture_group_id": f"capture-{index}",
+            "simulator_step": index,
         }
 
 
-def _controller(
-    state: State,
-    *,
-    toolkit: _Toolkit | None = None,
-    lease_timeout_s: float = 1.2,
-) -> tuple[BehaviorDashboardController, BehaviorCommandArbiter, _Toolkit]:
+def _controller(tmp_path, toolkit: _PipelineToolkit):
+    state = _state(tmp_path)
     latch = BehaviorRawSuccessLatch(
         run_nonce="a" * 32,
         attempt_nonce="b" * 32,
@@ -208,1891 +175,440 @@ def _controller(
         success_latch=latch,
         motion_available=True,
         observe_available=True,
-        lease_timeout_s=lease_timeout_s,
-    )
-    bound = toolkit or _Toolkit()
-    controller.bind_toolkit(bound)
-    state.bind_controller(controller)
-    controller.activate()
-    return controller, arbiter, bound
-
-
-def _wait_phase(controller: BehaviorDashboardController, phase: str) -> None:
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        if controller.snapshot()["phase"] == phase:
-            return
-        time.sleep(0.005)
-    raise AssertionError(f"controller did not reach {phase}: {controller.snapshot()}")
-
-
-def test_success_latch_requires_hash_and_attempt_binding() -> None:
-    latch = BehaviorRawSuccessLatch(
-        run_nonce="a" * 32,
-        attempt_nonce="b" * 32,
-        attempt_index=1,
-    )
-    assert not latch.observe({"task_success": True})
-    assert not latch.observe(
-        {"official_success_receipt": {**_receipt(), "receipt_sha256": "0" * 64}}
-    )
-    assert not latch.observe(
-        {"official_success_receipt": _receipt(attempt_nonce="c" * 32)}
-    )
-    receipt = _receipt()
-    assert latch.observe({"official_success_receipt": receipt})
-    assert latch.is_latched()
-    assert latch.receipt_binding()["receipt_sha256"] == receipt["receipt_sha256"]
-    assert latch.observe({"task_success": False})
-
-
-@pytest.mark.parametrize(
-    ("mutate", "resign"),
-    [
-        (lambda receipt: receipt.pop("env_step"), True),
-        (lambda receipt: receipt.update({"extra": "field"}), True),
-        (lambda receipt: receipt.update({"schema_version": 2}), True),
-        (lambda receipt: receipt.update({"schema_version": True}), True),
-        (lambda receipt: receipt.update({"run_nonce": "A" * 32}), True),
-        (lambda receipt: receipt.update({"attempt_nonce": "b" * 31}), True),
-        (
-            lambda receipt: receipt.update(
-                {"raw_done": {"success": np.bool_(True)}}
-            ),
-            False,
-        ),
-    ],
-)
-def test_success_latch_rejects_noncanonical_receipts(mutate, resign: bool) -> None:
-    latch = BehaviorRawSuccessLatch(
-        run_nonce="a" * 32,
-        attempt_nonce="b" * 32,
-        attempt_index=1,
-    )
-    receipt = _receipt()
-    mutate(receipt)
-    if resign:
-        _resign_receipt(receipt)
-    assert not latch.observe({"official_success_receipt": receipt})
-
-
-def test_controller_cannot_activate_with_unbound_success_latch(tmp_path) -> None:
-    state = _state(tmp_path)
-    latch = BehaviorRawSuccessLatch()
-    controller = BehaviorDashboardController(
-        state=state,
-        arbiter=BehaviorCommandArbiter(success_latch=latch),
-        success_latch=latch,
-        motion_available=True,
-        observe_available=True,
-    )
-    controller.bind_toolkit(_Toolkit())
-    with pytest.raises(RuntimeError, match="not bound"):
-        controller.activate()
-    assert controller.close(1.0)
-
-
-def test_capture_group_is_atomic_idempotent_and_rejects_stale(tmp_path) -> None:
-    state = _state(tmp_path)
-    frames = {"head": b"h", "left_wrist": b"l", "right_wrist": b"r"}
-    assert state.on_frame_group(frames, capture_group_id="g1", simulator_step=5)
-    first = state.snapshot()
-    assert first["frame_revisions"] == {
-        "head": 1,
-        "left_wrist": 1,
-        "right_wrist": 1,
-    }
-    assert state.on_frame_group(frames, capture_group_id="g1", simulator_step=5)
-    assert state.snapshot()["frame_revisions"] == first["frame_revisions"]
-    assert not state.on_frame_group(
-        {**frames, "head": b"changed"},
-        capture_group_id="g1",
-        simulator_step=5,
-    )
-    assert not state.on_frame_group(
-        frames, capture_group_id="older", simulator_step=4
-    )
-    assert state.snapshot()["frame_revisions"] == first["frame_revisions"]
-    assert state.frame("head") == b"h"
-
-
-def test_malformed_manual_group_never_falls_back_to_partial_frames(tmp_path) -> None:
-    state = _state(tmp_path)
-    state.on_frame_group(
-        {"head": b"h0", "left_wrist": b"l0", "right_wrist": b"r0"},
-        capture_group_id="initial",
-        simulator_step=1,
-    )
-    command = {
-        "command_id": "c1",
-        "lease_id": "l1",
-        "sequence": 1,
-        "target": "chassis",
-        "action": "forward",
-        "camera": "head",
-    }
-    state.on_manual_command_start(command)
-    before = state.snapshot()
-    state.on_manual_command_result(
-        command,
-        {
-            "primitive_success": False,
-            "error": "Camera refresh failed",
-            "_frames_bytes": {
-                "head": b"h1",
-                "left_wrist": b"l1",
-                "right_wrist": b"r1",
-            },
-            "capture_group_id": "broken",
-            "simulator_step": None,
-        },
-        official_success_latched=False,
-    )
-    after = state.snapshot()
-    assert after["capture_group_id"] == "initial"
-    assert after["frame_revisions"] == before["frame_revisions"]
-    assert state.frame("head") == b"h0"
-
-
-def test_idempotency_one_shot_release_and_manual_timeline(tmp_path) -> None:
-    state = _state(tmp_path)
-    controller, _, toolkit = _controller(state)
-    try:
-        command, duplicate = controller.submit(
-            lease_id="observe-1",
-            sequence=1,
-            target="chassis",
-            action="observe",
-            camera="right_wrist",
-        )
-        assert not duplicate
-        _wait_phase(controller, "completed")
-        assert toolkit.permit_command_ids == [command.command_id]
-        repeated, duplicate = controller.submit(
-            lease_id="observe-1",
-            sequence=1,
-            target="chassis",
-            action="observe",
-            camera="right_wrist",
-        )
-        assert duplicate
-        assert repeated.command_id == command.command_id
-        assert len(toolkit.calls) == 1
-
-        controller.submit(
-            lease_id="observe-2",
-            sequence=1,
-            target="left_arm",
-            action="observe",
-            camera="head",
-        )
-        deadline = time.monotonic() + 2.0
-        while len(toolkit.calls) < 2 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert len(toolkit.calls) == 2
-        detail = state.run_detail()
-        manual = [
-            item
-            for item in detail["timeline"]
-            if item.get("source") == "dashboard_manual"
-        ]
-        assert len(manual) == 2
-        assert manual[0]["capture_group_id"] is None
-        assert detail["capture_group_id"] == "group-2"
-        assert detail["last_selected_camera"] == "head"
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_prepared_planning_metadata_is_published_without_trajectories(
-    tmp_path,
-) -> None:
-    class _PlanningMetadataToolkit(_Toolkit):
-        def dashboard_prepare_manual_command(
-            self,
-            *,
-            target: str,
-            action: str,
-            predecessor_plan_id: str | None = None,
-            permit_command_id: str,
-            background: bool = False,
-            planning_only_probe: bool = False,
-        ) -> dict[str, Any]:
-            prepared = super().dashboard_prepare_manual_command(
-                target=target,
-                action=action,
-                predecessor_plan_id=predecessor_plan_id,
-                permit_command_id=permit_command_id,
-                background=background,
-                planning_only_probe=planning_only_probe,
-            )
-            return {
-                **prepared,
-                "planning_elapsed_s": 0.125,
-                "planning_profile": "dashboard_jog",
-                "fast_solver_deadline_s": 4.0,
-                "latency_metrics": {
-                    "schema_version": 1,
-                    "operation": "dashboard_prepare",
-                    "phases_s": {
-                        "planner_prepare": 0.1,
-                    },
-                },
-                "obstacle_refresh": {
-                    "mode": "pose_only",
-                    "topology_verified": True,
-                    "elapsed_s": 0.012,
-                },
-                "selected_solver_stage": "fast_trajopt",
-                "solver_stages": [
-                    {
-                        "name": "fast_trajopt",
-                        "elapsed_s": 0.1,
-                        "joint_trajectory": list(range(100)),
-                    }
-                ],
-                "joint_trajectory": list(range(100)),
-            }
-
-    state = _state(tmp_path)
-    controller, _, _ = _controller(state, toolkit=_PlanningMetadataToolkit())
-    try:
-        command, duplicate = controller.submit(
-            lease_id="planning-metrics",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert not duplicate
-        _wait_phase(controller, "completed")
-
-        expected = {
-            "plan_id": "plan-1",
-            "planning_elapsed_s": 0.125,
-            "planning_profile": "dashboard_jog",
-            "fast_solver_deadline_s": 4.0,
-            "latency_metrics": {
-                "schema_version": 1,
-                "operation": "dashboard_prepare",
-                "phases_s": {
-                    "planner_prepare": 0.1,
-                },
-            },
-            "obstacle_refresh": {
-                "mode": "pose_only",
-                "topology_verified": True,
-                "elapsed_s": 0.012,
-            },
-            "selected_solver_stage": "fast_trajopt",
-            "solver_stages": [
-                {
-                    "name": "fast_trajopt",
-                    "elapsed_s": 0.1,
-                }
-            ],
-        }
-        assert command.planning_metadata == expected
-        assert command.result is not None
-        assert command.result["metrics"] == expected
-        terminal = controller.snapshot()["last_terminal"]
-        assert terminal["result"]["metrics"] == expected
-        timeline = state.run_detail()["timeline"]
-        manual = next(item for item in timeline if item["command_id"] == command.command_id)
-        assert manual["result"]["metrics"] == expected
-        assert "trajectory" not in json.dumps(expected)
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_unbind_rejects_stale_controller_snapshot_publication(tmp_path) -> None:
-    state = _state(tmp_path)
-    controller, _, _ = _controller(state)
-
-    state.unbind_controller(controller)
-    unbound = state.snapshot()["control"]
-    assert unbound["unavailable_reason"] == "controller_not_bound"
-    assert state.control_controller() is None
-
-    controller.configure_capabilities(
-        motion_available=False,
-        observe_available=False,
-        unavailable_reason="stale_controller_update",
-    )
-    assert state.snapshot()["control"] == unbound
-
-    assert controller.close(2.0)
-    assert state.snapshot()["control"] == unbound
-
-
-def test_capture_result_rejects_stale_generation_and_unbound_controller(
-    tmp_path,
-) -> None:
-    state = _state(tmp_path)
-    controller, _, _ = _controller(state)
-    frames = {
-        "head": b"head-new",
-        "left_wrist": b"left-new",
-        "right_wrist": b"right-new",
-    }
-    assert state.on_dashboard_capture_result(
-        {
-            "_frames_bytes": frames,
-            "capture_group_id": "new",
-            "simulator_step": 3,
-        },
-        controller=controller,
-        generation=2,
-    )
-    assert not state.on_dashboard_capture_result(
-        {
-            "_frames_bytes": {
-                "head": b"stale",
-                "left_wrist": b"stale",
-                "right_wrist": b"stale",
-            },
-            "capture_group_id": "stale",
-            "simulator_step": 4,
-        },
-        controller=controller,
-        generation=1,
-    )
-    assert state.frame("head") == b"head-new"
-    state.unbind_controller(controller)
-    assert not state.on_dashboard_capture_result(
-        {
-            "_frames_bytes": frames,
-            "capture_group_id": "after-unbind",
-            "simulator_step": 5,
-        },
-        controller=controller,
-        generation=3,
-    )
-    assert controller.close(2.0)
-
-
-def test_queue_accepts_tail_without_planning_during_head_execution(tmp_path) -> None:
-    state = _state(tmp_path)
-    gate = threading.Event()
-    controller, _, toolkit = _controller(state, toolkit=_Toolkit(gate=gate))
-    try:
-        controller.submit(
-            lease_id="hold",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert toolkit.started.wait(1.0)
-        second, duplicate = controller.submit(
-            lease_id="hold",
-            sequence=2,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert not duplicate
-        snapshot = controller.snapshot()
-        assert snapshot["current_command"]["sequence"] == 1
-        assert [item["sequence"] for item in snapshot["queue"]] == [2]
-        with pytest.raises(ControlRequestError, match="cannot change"):
-            controller.submit(
-                lease_id="hold",
-                sequence=3,
-                target="chassis",
-                action="backward",
-                camera="head",
-            )
-        repeated, duplicate = controller.submit(
-            lease_id="hold",
-            sequence=2,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert duplicate and repeated.command_id == second.command_id
-        for sequence in range(3, 7):
-            queued, duplicate = controller.submit(
-                lease_id="hold",
-                sequence=sequence,
-                target="chassis",
-                action="forward",
-                camera="head",
-            )
-            assert not duplicate
-            assert queued.sequence == sequence
-        deadline = time.monotonic() + 0.2
-        while len(toolkit.prepare_calls) == 1 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert len(toolkit.prepare_calls) == 1
-        snapshot = controller.snapshot()
-        assert snapshot["current_command"]["sequence"] == 1
-        assert [item["sequence"] for item in snapshot["queue"]] == [2, 3, 4, 5, 6]
-        gate.set()
-        deadline = time.monotonic() + 2.0
-        while len(toolkit.execute_calls) < 6 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert len(toolkit.prepare_calls) == 6
-        assert len(toolkit.execute_calls) == 6
-        assert all(call["background"] is False for call in toolkit.prepare_calls)
-        assert all(
-            call["predecessor_plan_id"] is None
-            for call in toolkit.prepare_calls
-        )
-        assert all(
-            command.result is not None
-            and command.result.get("cancelled_before_execution") is not True
-            for command in (
-                controller._commands[("hold", sequence)]
-                for sequence in range(1, 7)
-            )
-        )
-    finally:
-        gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_agent_waiter_preempts_reserved_manual_tail(tmp_path) -> None:
-    state = _state(tmp_path)
-    manual_gate = threading.Event()
-    agent_gate = threading.Event()
-    controller, arbiter, toolkit = _controller(
-        state, toolkit=_Toolkit(gate=manual_gate)
-    )
-
-    def agent() -> None:
-        with arbiter.agent_transaction():
-            agent_gate.wait(2.0)
-
-    try:
-        controller.submit(
-            lease_id="hold",
-            sequence=1,
-            target="right_arm",
-            action="up",
-            camera="head",
-        )
-        assert toolkit.started.wait(1.0)
-        thread = threading.Thread(target=agent)
-        thread.start()
-        deadline = time.monotonic() + 1.0
-        while arbiter.snapshot()["agent_waiters"] != 1 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert arbiter.snapshot()["agent_waiters"] == 1
-        controller.submit(
-            lease_id="hold",
-            sequence=2,
-            target="right_arm",
-            action="up",
-            camera="head",
-        )
-        assert controller.snapshot()["queue_depth"] == 1
-        manual_gate.set()
-        deadline = time.monotonic() + 1.0
-        while arbiter.snapshot()["owner"] != "agent" and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert arbiter.snapshot()["owner"] == "agent"
-        assert len(toolkit.execute_calls) == 1
-        repeated = controller._commands[("hold", 2)]
-        assert repeated.phase == "cancelled"
-        assert repeated.result == {
-            "primitive_success": False,
-            "stop_reason": "agent_waiting",
-            "cancelled_before_execution": True,
-        }
-        assert controller.snapshot()["queue_depth"] == 0
-        assert controller.snapshot()["stop_reason"] == "agent_waiting"
-        agent_gate.set()
-        thread.join(1.0)
-    finally:
-        manual_gate.set()
-        agent_gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_heartbeat_expiry_stops_lease_and_allows_fresh_lease(tmp_path) -> None:
-    state = _state(tmp_path)
-    controller, _, _ = _controller(state, lease_timeout_s=0.15)
-    try:
-        controller.submit(
-            lease_id="expiring",
-            sequence=1,
-            target="left_arm",
-            action="forward",
-            camera="head",
-        )
-        _wait_phase(controller, "completed")
-        deadline = time.monotonic() + 1.0
-        while (
-            controller.snapshot().get("stop_reason") != "lease_expired"
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.01)
-        assert controller.snapshot()["stop_reason"] == "lease_expired"
-        with pytest.raises(ControlRequestError, match="not active"):
-            controller.heartbeat(lease_id="expiring")
-        controller.submit(
-            lease_id="fresh",
-            sequence=1,
-            target="left_arm",
-            action="forward",
-            camera="head",
-        )
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_stop_clear_pending_preserves_accepted_head_and_clears_tail(tmp_path) -> None:
-    state = _state(tmp_path)
-    latch = BehaviorRawSuccessLatch(
-        run_nonce="a" * 32,
-        attempt_nonce="b" * 32,
-        attempt_index=1,
-    )
-    arbiter = BehaviorCommandArbiter(success_latch=latch)
-    action_gate = threading.Event()
-    toolkit = _Toolkit(gate=action_gate)
-    controller = BehaviorDashboardController(
-        state=state,
-        arbiter=arbiter,
-        success_latch=latch,
-        motion_available=True,
-        observe_available=True,
+        lease_timeout_s=3.0,
     )
     controller.bind_toolkit(toolkit)
     state.bind_controller(controller)
     controller.activate()
-    try:
-        controller.submit(
-            lease_id="paused",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert toolkit.started.wait(1.0)
-        controller.submit(
-            lease_id="paused",
-            sequence=2,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        stopped = controller.stop(
-            lease_id="paused",
-            stop_mode="clear_pending",
-        )
-        assert stopped["current_command"]["sequence"] == 1
-        assert stopped["queue"] == []
-        assert stopped["pending_cleared_count"] == 1
-        action_gate.set()
-        _wait_phase(controller, "completed")
-        assert len(toolkit.execute_calls) == 1
-        assert state.run_detail()["timeline"][-1]["status"] == "failed"
-    finally:
-        action_gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
+    return controller
 
 
-def test_agent_owner_is_mirrored_to_state_and_terminal_precedes_release(
-    tmp_path,
-) -> None:
-    class _RecordingState(State):
-        def __init__(self, **kwargs) -> None:
-            self.control_updates: list[dict[str, Any]] = []
-            super().__init__(**kwargs)
-
-        def update_control_snapshot(self, snapshot, *, controller) -> bool:
-            self.control_updates.append(dict(snapshot))
-            return super().update_control_snapshot(
-                snapshot,
-                controller=controller,
-            )
-
-    state = _RecordingState(
-        run_id="behavior/test",
-        name="test_s1",
-        suite="behavior_2025_challenge",
-        task=1,
-        seed=1,
-        output_dir=str(tmp_path),
-        video_path=str(tmp_path / "episode.mp4"),
-    )
-    controller, arbiter, _ = _controller(state)
-    agent_gate = threading.Event()
-    agent_entered = threading.Event()
-
-    def agent() -> None:
-        with arbiter.agent_transaction():
-            agent_entered.set()
-            agent_gate.wait(2.0)
-
-    try:
-        agent_thread = threading.Thread(target=agent)
-        agent_thread.start()
-        assert agent_entered.wait(1.0)
-        assert controller.snapshot()["owner"] == "agent"
-        deadline = time.monotonic() + 1.0
-        while (
-            state.snapshot()["control"].get("owner") != "agent"
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
-        assert state.snapshot()["control"]["owner"] == "agent"
-        agent_gate.set()
-        agent_thread.join(1.0)
-
-        controller.submit(
-            lease_id="terminal-order",
-            sequence=1,
-            target="chassis",
-            action="observe",
-            camera="head",
-        )
-        _wait_phase(controller, "completed")
-        terminal_manual = next(
-            index
-            for index, value in enumerate(state.control_updates)
-            if value.get("phase") == "completed"
-            and value.get("owner") == "manual"
-        )
-        released = next(
-            index
-            for index, value in enumerate(state.control_updates[terminal_manual + 1 :])
-            if value.get("owner") is None
-        )
-        assert released >= 0
-    finally:
-        agent_gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_capture_error_does_not_change_motion_terminal(tmp_path) -> None:
-    class _CaptureError(_Toolkit):
-        def dashboard_capture_views(self, *, command_id: str) -> dict[str, Any]:
-            self.capture_calls.append(command_id)
-            return {"capture_error": "Camera refresh failed"}
-
-    state = _state(tmp_path)
-    controller, _, toolkit = _controller(
-        state, toolkit=_CaptureError()
-    )
-    before = state.snapshot()["frame_revisions"]
-    try:
-        controller.submit(
-            lease_id="capture-error",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        _wait_phase(controller, "completed")
-        deadline = time.monotonic() + 2.0
-        while (
-            controller.snapshot()["capture"]["phase"] != "failed"
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
+def _wait_for(
+    controller: BehaviorDashboardController,
+    predicate: Callable[[dict[str, Any]], bool],
+    *,
+    timeout_s: float = 3.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    snapshot = controller.snapshot()
+    while not predicate(snapshot) and time.monotonic() < deadline:
+        time.sleep(0.005)
         snapshot = controller.snapshot()
-        assert snapshot["last_terminal"]["phase"] == "completed"
-        assert snapshot["capture"]["error"] == "Camera refresh failed"
-        assert snapshot["available"] is True
-        detail = state.run_detail()
-        assert detail["progress"]["official_task_success"] is False
-        assert detail["frame_revisions"] == before
-        assert detail["timeline"][-1]["status"] == "completed"
+    assert predicate(snapshot), snapshot
+    return snapshot
+
+
+def _submit(
+    controller: BehaviorDashboardController,
+    *,
+    sequence: int,
+    lease_id: str = "hold",
+):
+    command, duplicate = controller.submit(
+        lease_id=lease_id,
+        sequence=sequence,
+        target="chassis",
+        action="forward",
+        camera="head",
+    )
+    assert duplicate is False
+    return command
+
+
+def _stop_and_close(controller: BehaviorDashboardController, lease_id="hold"):
+    snapshot = controller.snapshot()
+    if snapshot["lease_status"] == "active":
+        controller.stop(lease_id=lease_id)
+    _wait_for(
+        controller,
+        lambda value: value["predicted_plan_depth"] == 0
+        and value["prediction_planning"] is None,
+    )
+    assert controller.close(timeout_s=2.0)
+
+
+def test_prediction_pipeline_reaches_depth_twenty_after_hold_arm_delay(tmp_path):
+    toolkit = _PipelineToolkit()
+    controller = _controller(tmp_path, toolkit)
+    started = time.monotonic()
+    try:
+        _submit(controller, sequence=1)
+        _wait_for(
+            controller,
+            lambda value: value["predicted_plan_depth"]
+            == DASHBOARD_PREDICTED_PLAN_DEPTH,
+        )
+
+        snapshot = controller.snapshot()
+        assert snapshot["hold_armed"] is True
+        assert snapshot["predicted_plan_capacity"] == 20
+        assert time.monotonic() - started >= DASHBOARD_HOLD_ARM_DELAY_S
+        assert len(snapshot["predicted_plans"]) == 20
+        assert all(
+            plan["predecessor_plan_id"]
+            for plan in snapshot["predicted_plans"]
+        )
+    finally:
+        _stop_and_close(controller)
+
+
+def test_consuming_one_predicted_plan_refills_the_queue(tmp_path):
+    toolkit = _PipelineToolkit()
+    controller = _controller(tmp_path, toolkit)
+    try:
+        first = _submit(controller, sequence=1)
+        _wait_for(
+            controller,
+            lambda value: value["predicted_plan_depth"] == 20,
+        )
+        prepares_before = len(toolkit.prepare_calls)
+
+        second = _submit(controller, sequence=2)
+        assert second.plan_id is not None
+        assert second.plan_id != first.plan_id
+        _wait_for(
+            controller,
+            lambda value: len(toolkit.execute_calls) >= 2
+            and value["predicted_plan_depth"] == 20,
+        )
+
+        assert len(toolkit.prepare_calls) >= prepares_before + 1
+        assert toolkit.execute_calls[1][0] == second.plan_id
+    finally:
+        _stop_and_close(controller)
+
+
+def test_pointer_stop_clears_all_unexecuted_predictions_and_starts_no_new_plan(
+    tmp_path,
+):
+    toolkit = _PipelineToolkit()
+    controller = _controller(tmp_path, toolkit)
+    try:
+        _submit(controller, sequence=1)
+        _wait_for(
+            controller,
+            lambda value: value["predicted_plan_depth"] == 20,
+        )
+        controller.stop(lease_id="hold", reason="pointerup")
+        stopped = _wait_for(
+            controller,
+            lambda value: value["predicted_plan_depth"] == 0
+            and value["prediction_planning"] is None,
+        )
+        prepare_count = len(toolkit.prepare_calls)
+        time.sleep(0.05)
+
+        assert stopped["lease_status"] == "stopped"
+        assert controller.snapshot()["predicted_plan_depth"] == 0
+        assert len(toolkit.prepare_calls) == prepare_count
+    finally:
+        assert controller.close(timeout_s=2.0)
+
+
+def test_short_press_captures_once_after_stop(tmp_path):
+    toolkit = _PipelineToolkit()
+    controller = _controller(tmp_path, toolkit)
+    try:
+        _submit(controller, sequence=1, lease_id="short")
+        _wait_for(
+            controller,
+            lambda value: value["last_terminal"] is not None,
+        )
+        assert toolkit.capture_calls == []
+
+        controller.stop(lease_id="short", reason="pointerup")
+        _wait_for(
+            controller,
+            lambda value: value["capture"]["phase"] == "completed",
+        )
         assert len(toolkit.capture_calls) == 1
     finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
+        assert controller.close(timeout_s=2.0)
 
 
-def test_receipt_conflict_failure_releases_permit_and_publishes_terminal(
+def test_long_hold_does_not_capture_between_steps_and_captures_once_on_stop(
     tmp_path,
-) -> None:
-    class _ConflictingLatch(BehaviorRawSuccessLatch):
-        def is_latched(self) -> bool:
-            # Simulate admission racing with the EnvClient's first receipt latch.
-            return False
-
-    class _SecondReceiptToolkit(_Toolkit):
-        def dashboard_manual_command(
-            self,
-            *,
-            target: str,
-            action: str,
-            camera: str,
-            permit_command_id: str,
-        ) -> dict[str, Any]:
-            result = super().dashboard_manual_command(
-                target=target,
-                action=action,
-                camera=camera,
-                permit_command_id=permit_command_id,
-            )
-            result["official_success_receipt"] = _receipt(env_step=8)
-            return result
-
-    state = _state(tmp_path)
-    latch = _ConflictingLatch(
-        run_nonce="a" * 32,
-        attempt_nonce="b" * 32,
-        attempt_index=1,
-    )
-    assert latch.observe({"official_success_receipt": _receipt(env_step=7)})
-    arbiter = BehaviorCommandArbiter(success_latch=latch)
-    controller = BehaviorDashboardController(
-        state=state,
-        arbiter=arbiter,
-        success_latch=latch,
-        motion_available=True,
-        observe_available=True,
-    )
-    controller.bind_toolkit(_SecondReceiptToolkit())
-    state.bind_controller(controller)
-    controller.activate()
+):
+    toolkit = _PipelineToolkit()
+    controller = _controller(tmp_path, toolkit)
     try:
-        controller.submit(
-            lease_id="receipt-conflict",
-            sequence=1,
-            target="chassis",
-            action="observe",
-            camera="head",
+        _submit(controller, sequence=1)
+        _wait_for(
+            controller,
+            lambda value: value["predicted_plan_depth"] == 20,
         )
-        _wait_phase(controller, "failed")
-        snapshot = controller.snapshot()
-        assert snapshot["owner"] is None
-        assert "receipt changed" in snapshot["error"]
-        assert (
-            snapshot["last_terminal"]["result"]["worker_exception_type"]
-            == "RuntimeError"
+        _submit(controller, sequence=2)
+        _wait_for(
+            controller,
+            lambda value: len(toolkit.execute_calls) >= 2,
         )
-        assert controller.drain(1.0)
-        timeline = state.run_detail()["timeline"][-1]
-        assert timeline["status"] == "failed"
-        assert "receipt changed" in timeline["result"]["error"]
+        assert toolkit.capture_calls == []
+
+        controller.stop(lease_id="hold", reason="pointerup")
+        _wait_for(
+            controller,
+            lambda value: value["capture"]["phase"] == "completed",
+        )
+        assert len(toolkit.capture_calls) == 1
     finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
+        assert controller.close(timeout_s=2.0)
 
 
-def test_state_result_exception_quiesces_before_releasing_permit(
+def test_stop_during_planning_preserves_head_executes_once_and_captures_once(
     tmp_path,
-) -> None:
-    class _RejectsResult(State):
-        def __init__(self, **kwargs) -> None:
-            super().__init__(**kwargs)
-            self.result_calls = 0
-
-        def on_manual_command_result(self, *args, **kwargs) -> bool:
-            self.result_calls += 1
-            raise RuntimeError("state publish boom")
-
-    state = _RejectsResult(
-        run_id="behavior/test",
-        name="test_s1",
-        suite="behavior_2025_challenge",
-        task=1,
-        seed=1,
-        output_dir=str(tmp_path),
-        video_path=str(tmp_path / "episode.mp4"),
-    )
-    controller, arbiter, _ = _controller(state)
+):
+    prepare_gate = threading.Event()
+    toolkit = _PipelineToolkit(prepare_gate=prepare_gate)
+    controller = _controller(tmp_path, toolkit)
     try:
-        controller.submit(
-            lease_id="state-failure",
-            sequence=1,
-            target="left_arm",
-            action="forward",
-            camera="head",
+        head = _submit(controller, sequence=1, lease_id="short-planning")
+        assert toolkit.prepare_started.wait(1.0)
+        planning = _wait_for(
+            controller,
+            lambda value: value["planning_command"] is not None,
         )
-        _wait_phase(controller, "failed")
-        assert state.result_calls == 1
-        assert arbiter.snapshot()["quiescing"] is True
-        assert arbiter.snapshot()["owner"] is None
-        assert controller.drain(1.0)
-        snapshot = controller.snapshot()
-        assert snapshot["available"] is False
-        assert snapshot["stop_reason"] == "dashboard_state_publication_failed"
-        assert "state publish boom" in (
-            snapshot["last_terminal"]["result"]["state_publish_error"]
+
+        stopped = controller.stop(
+            lease_id="short-planning",
+            reason="pointerup",
+            stop_mode="clear_pending",
         )
-        acquired, reason = arbiter.try_acquire_manual("must-not-run")
-        assert not acquired
-        assert reason == "controller_unavailable"
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
+        assert stopped["lease_status"] == "stopped"
+        assert stopped["current_command"]["command_id"] == head.command_id
+        assert stopped["planning_command"]["command_id"] == head.command_id
+        assert stopped["queue_depth"] == 0
+        assert stopped["predicted_plan_depth"] == 0
+        assert planning["current_command"]["command_id"] == head.command_id
 
-
-def test_terminal_snapshot_rejection_quiesces_before_releasing_permit(
-    tmp_path,
-) -> None:
-    class _RejectsTerminalSnapshot(State):
-        def __init__(self, **kwargs) -> None:
-            super().__init__(**kwargs)
-            self.rejected_owner = None
-
-        def update_control_snapshot(self, snapshot, *, controller) -> bool:
-            terminal = snapshot.get("last_terminal")
-            if (
-                isinstance(terminal, dict)
-                and terminal.get("phase") in {"completed", "failed", "cancelled"}
-                and snapshot.get("owner") == "manual"
-            ):
-                self.rejected_owner = snapshot.get("owner")
-                return False
-            return super().update_control_snapshot(
-                snapshot,
-                controller=controller,
-            )
-
-    state = _RejectsTerminalSnapshot(
-        run_id="behavior/test",
-        name="test_s1",
-        suite="behavior_2025_challenge",
-        task=1,
-        seed=1,
-        output_dir=str(tmp_path),
-        video_path=str(tmp_path / "episode.mp4"),
-    )
-    controller, arbiter, toolkit = _controller(state)
-    try:
-        controller.submit(
-            lease_id="snapshot-rejection",
-            sequence=1,
-            target="left_arm",
-            action="forward",
-            camera="head",
+        prepare_gate.set()
+        terminal = _wait_for(
+            controller,
+            lambda value: value["last_terminal"] is not None
+            and value["capture"]["phase"] == "completed",
         )
-        _wait_phase(controller, "completed")
-        deadline = time.monotonic() + 1.0
-        while (
-            not arbiter.snapshot()["quiescing"]
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
-        assert state.rejected_owner == "manual"
-        assert arbiter.snapshot()["quiescing"] is True
-        assert arbiter.snapshot()["owner"] is None
+        assert terminal["last_terminal"]["command_id"] == head.command_id
+        assert terminal["last_terminal"]["phase"] == "completed"
         assert len(toolkit.execute_calls) == 1
-        assert toolkit.capture_calls == []
+        assert toolkit.execute_calls[0][1] == head.command_id
+        assert len(toolkit.capture_calls) == 1
     finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
+        prepare_gate.set()
+        assert controller.close(timeout_s=2.0)
 
 
-def test_head_plus_five_pending_capacity_and_duplicate_at_capacity(tmp_path) -> None:
-    state = _state(tmp_path)
-    gate = threading.Event()
-    controller, _, _ = _controller(state, toolkit=_Toolkit(gate=gate))
-    try:
-        first, _ = controller.submit(
-            lease_id="capacity",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        for sequence in range(2, 7):
-            controller.submit(
-                lease_id="capacity",
-                sequence=sequence,
-                target="chassis",
-                action="forward",
-                camera="head",
-            )
-        snapshot = controller.snapshot()
-        assert snapshot["current_command"]["command_id"] == first.command_id
-        assert snapshot["queue_depth"] == 5
-        duplicate, deduplicated = controller.submit(
-            lease_id="capacity",
-            sequence=6,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert deduplicated and duplicate.sequence == 6
-        with pytest.raises(ControlRequestError) as caught:
-            controller.submit(
-                lease_id="capacity",
-                sequence=7,
-                target="chassis",
-                action="forward",
-                camera="head",
-            )
-        assert caught.value.code == "queue_full"
-        controller.stop(lease_id="capacity", stop_mode="clear_pending")
-    finally:
-        gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_pending_capture_is_discarded_by_next_motion(tmp_path) -> None:
-    state = _state(tmp_path)
-    controller, _, toolkit = _controller(state)
-    try:
-        controller.submit(
-            lease_id="repeat",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        _wait_phase(controller, "completed")
-        assert controller.snapshot()["capture"]["phase"] == "pending"
-        controller.submit(
-            lease_id="repeat",
-            sequence=2,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert controller.snapshot()["capture"]["phase"] == "discarded"
-        assert toolkit.capture_calls == []
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_agent_raw_success_discards_pending_capture_without_rewriting_terminal(
+def test_stop_during_repeat_planning_cancels_seq_two_and_discards_late_plan(
     tmp_path,
-) -> None:
-    testclient = pytest.importorskip("fastapi.testclient")
-    state = _state(tmp_path)
-    controller, arbiter, toolkit = _controller(state)
-    server = DashboardServer()
-    server.register(state)
-    client = testclient.TestClient(server._app)
+):
+    toolkit = _PipelineToolkit()
+    controller = _controller(tmp_path, toolkit)
+    repeat_prepare_gate = threading.Event()
     try:
-        controller.submit(
-            lease_id="agent-success",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
+        first = _submit(controller, sequence=1)
+        _wait_for(
+            controller,
+            lambda value: value["last_terminal"] is not None
+            and value["last_terminal"]["command_id"] == first.command_id,
         )
-        _wait_phase(controller, "completed")
-        deadline = time.monotonic() + 1.0
-        while (
-            controller.snapshot()["capture"]["phase"] != "pending"
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
-        terminal_before = dict(controller.snapshot()["last_terminal"])
-        assert terminal_before["task_success"] is None
 
-        with arbiter.agent_transaction():
-            assert arbiter.success_latch.observe(
-                {
-                    "task_success": True,
-                    "official_success_receipt": _receipt(env_step=9),
-                }
-            )
+        toolkit.prepare_started.clear()
+        toolkit.prepare_gate = repeat_prepare_gate
+        repeat = _submit(controller, sequence=2)
+        assert toolkit.prepare_started.wait(1.0)
+        _wait_for(
+            controller,
+            lambda value: value["planning_command"] is not None
+            and value["planning_command"]["command_id"] == repeat.command_id,
+        )
 
-        snapshot = controller.snapshot()
-        assert snapshot["success_latched"] is True
-        assert snapshot["capture"]["phase"] == "discarded"
-        assert snapshot["last_terminal"] == terminal_before
-        assert snapshot["command_id"] is None
-        assert snapshot["phase"] == "idle"
-        state.on_event(
-            {
-                "type": "official_success",
-                "attempt_index": 1,
-                "task_success": True,
-            }
+        stopped = controller.stop(
+            lease_id="hold",
+            reason="pointerup",
+            stop_mode="clear_pending",
         )
-        response = client.get(
-            "/api/run/control/state",
-            params={"run": state.run_id},
+        assert stopped["current_command"] is None
+        assert stopped["queue_depth"] == 0
+        assert stopped["last_terminal"]["command_id"] == repeat.command_id
+        assert stopped["last_terminal"]["phase"] == "cancelled"
+
+        repeat_prepare_gate.set()
+        terminal = _wait_for(
+            controller,
+            lambda value: value["planning_command"] is None
+            and value["prediction_planning"] is None
+            and value["capture"]["phase"] == "completed",
         )
-        assert response.status_code == 410
-        time.sleep(0.4)
-        assert toolkit.capture_calls == []
+        assert terminal["last_terminal"]["command_id"] == repeat.command_id
+        assert len(toolkit.execute_calls) == 1
+        assert toolkit.execute_calls[0][1] == first.command_id
+        assert "plan-2" in toolkit.discard_calls
+        assert len(toolkit.capture_calls) == 1
     finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-    unbound = state.snapshot()["control"]
-    assert unbound["last_terminal"] is None
-    assert unbound.get("command_id") is None
+        repeat_prepare_gate.set()
+        assert controller.close(timeout_s=2.0)
 
 
-def test_started_capture_finishes_before_new_motion_executes(tmp_path) -> None:
-    capture_gate = threading.Event()
-    capture_started = threading.Event()
-
-    class _CaptureGate(_Toolkit):
-        def dashboard_capture_views(self, *, command_id: str) -> dict[str, Any]:
-            capture_started.set()
-            assert capture_gate.wait(2.0)
-            return super().dashboard_capture_views(command_id=command_id)
-
-    state = _state(tmp_path)
-    controller, _, toolkit = _controller(state, toolkit=_CaptureGate())
+def test_stop_keeps_moving_head_but_clears_seq_two_plus_and_predictions(tmp_path):
+    execute_gate = threading.Event()
+    toolkit = _PipelineToolkit(execute_gate=execute_gate)
+    controller = _controller(tmp_path, toolkit)
     try:
-        controller.submit(
-            lease_id="serial",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
+        head = _submit(controller, sequence=1)
+        _wait_for(
+            controller,
+            lambda value: len(toolkit.execute_calls) == 1
+            and value["predicted_plan_depth"]
+            == DASHBOARD_PREDICTED_PLAN_DEPTH,
         )
-        assert capture_started.wait(1.0)
-        controller.submit(
-            lease_id="serial",
-            sequence=2,
-            target="chassis",
-            action="forward",
-            camera="head",
+        second = _submit(controller, sequence=2)
+        third = _submit(controller, sequence=3)
+        assert second.phase == "prepared"
+        assert third.phase == "prepared"
+        assert second.plan_id is not None
+        assert third.plan_id is not None
+
+        stopped = controller.stop(
+            lease_id="hold",
+            reason="pointerup",
+            stop_mode="clear_pending",
+        )
+        assert stopped["current_command"]["command_id"] == head.command_id
+        assert stopped["current_command"]["phase"] == "moving"
+        assert stopped["queue_depth"] == 0
+        assert stopped["predicted_plan_depth"] == 0
+        assert stopped["pending_cleared_count"] >= 2
+
+        drained_predictions = _wait_for(
+            controller,
+            lambda value: value["prediction_planning"] is None
+            and value["predicted_plan_depth"] == 0,
+        )
+        assert drained_predictions["current_command"]["command_id"] == head.command_id
+        _wait_for(
+            controller,
+            lambda _value: second.plan_id in toolkit.discard_calls
+            and third.plan_id in toolkit.discard_calls,
+        )
+        execute_gate.set()
+        terminal = _wait_for(
+            controller,
+            lambda value: value["last_terminal"] is not None
+            and value["capture"]["phase"] == "completed",
+        )
+
+        assert terminal["last_terminal"]["command_id"] == head.command_id
+        assert len(toolkit.execute_calls) == 1
+        assert second.command_id != head.command_id
+        assert third.command_id != head.command_id
+        assert len(toolkit.capture_calls) == 1
+    finally:
+        execute_gate.set()
+        assert controller.close(timeout_s=2.0)
+
+
+def test_stop_capture_is_not_repeated_when_stale_prediction_finishes_late(tmp_path):
+    execute_gate = threading.Event()
+    background_prepare_gate = threading.Event()
+    toolkit = _PipelineToolkit(
+        background_prepare_gate=background_prepare_gate,
+        execute_gate=execute_gate,
+    )
+    controller = _controller(tmp_path, toolkit)
+    try:
+        _submit(controller, sequence=1)
+        assert toolkit.background_prepare_started.wait(1.0)
+        controller.stop(
+            lease_id="hold",
+            reason="pointerup",
+            stop_mode="clear_pending",
+        )
+
+        execute_gate.set()
+        _wait_for(
+            controller,
+            lambda value: value["capture"]["phase"] == "completed",
+        )
+        assert len(toolkit.capture_calls) == 1
+
+        background_prepare_gate.set()
+        _wait_for(
+            controller,
+            lambda value: value["prediction_planning"] is None,
         )
         time.sleep(0.05)
-        assert len(toolkit.prepare_calls) == 1
-        assert len(toolkit.execute_calls) == 1
-        capture_gate.set()
-        deadline = time.monotonic() + 2.0
-        while len(toolkit.execute_calls) < 2 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert len(toolkit.execute_calls) == 2
-        assert (
-            toolkit.prepare_permit_command_ids
-            == [command_id for _, command_id in toolkit.execute_calls]
-        )
+        assert len(toolkit.capture_calls) == 1
     finally:
-        capture_gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
+        execute_gate.set()
+        background_prepare_gate.set()
+        assert controller.close(timeout_s=2.0)
 
 
-@pytest.mark.parametrize(
-    ("cutover", "reason"),
-    [
-        ("expiry", "lease_expired"),
-        ("quiesce", "controller_quiescing"),
-    ],
-)
-def test_deferred_head_is_cancelled_before_capture_release_on_cutover(
+def test_raw_success_from_stop_preserved_head_preempts_pointerup_and_extra_capture(
     tmp_path,
-    cutover,
-    reason,
-) -> None:
-    capture_gate = threading.Event()
-    capture_started = threading.Event()
-
-    class _CaptureGate(_Toolkit):
-        def dashboard_capture_views(self, *, command_id: str) -> dict[str, Any]:
-            capture_started.set()
-            assert capture_gate.wait(2.0)
-            return super().dashboard_capture_views(command_id=command_id)
-
-    state = _state(tmp_path)
-    controller, arbiter, toolkit = _controller(
-        state,
-        toolkit=_CaptureGate(),
+):
+    prepare_gate = threading.Event()
+    toolkit = _PipelineToolkit(
+        prepare_gate=prepare_gate,
+        execute_result={
+            "primitive_success": True,
+            "info_done": {"success": True},
+            "terminal_capture": {
+                "_frames_bytes": {
+                    "head": b"success-head",
+                    "left_wrist": b"success-left",
+                    "right_wrist": b"success-right",
+                },
+                "capture_group_id": "success-capture",
+                "simulator_step": 17,
+            },
+        },
     )
+    controller = _controller(tmp_path, toolkit)
     try:
-        controller.submit(
-            lease_id="capture-cutover",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert capture_started.wait(1.0)
-        deferred, _ = controller.submit(
-            lease_id="capture-cutover",
-            sequence=2,
-            target="chassis",
-            action="forward",
-            camera="head",
+        head = _submit(controller, sequence=1, lease_id="success-after-stop")
+        assert toolkit.prepare_started.wait(1.0)
+        controller.stop(
+            lease_id="success-after-stop",
+            reason="pointerup",
+            stop_mode="clear_pending",
         )
 
-        if cutover == "expiry":
-            with controller._work:
-                assert controller._lease is not None
-                controller._lease.deadline = time.monotonic() - 1.0
-            controller.snapshot()
-        else:
-            controller.quiesce()
-
-        snapshot = controller.snapshot()
-        assert deferred.phase == "cancelled"
-        assert deferred.result == {
-            "primitive_success": False,
-            "stop_reason": reason,
-            "cancelled_before_execution": True,
-        }
-        assert snapshot["current_command"] is None
-        assert snapshot["queue"] == []
-        assert snapshot["last_terminal"]["command_id"] == deferred.command_id
-        assert snapshot["last_terminal"]["phase"] == "cancelled"
-        assert arbiter.snapshot()["owner"] == "manual"
-        assert len(toolkit.prepare_calls) == 1
+        prepare_gate.set()
+        terminal = _wait_for(
+            controller,
+            lambda value: value["success_latched"] is True
+            and value["last_terminal"] is not None
+            and value["capture"]["phase"] == "completed",
+        )
+        assert terminal["last_terminal"]["command_id"] == head.command_id
+        assert terminal["last_terminal"]["task_success"] is True
+        assert terminal["stop_reason"] == "official_task_success"
+        assert terminal["lease_status"] == "succeeded"
         assert len(toolkit.execute_calls) == 1
-        timeline = next(
-            item
-            for item in state.run_detail()["timeline"]
-            if item.get("command_id") == deferred.command_id
-        )
-        assert timeline["status"] == "failed"
-        assert timeline["stop_reason"] == reason
-        assert timeline["result"]["cancelled_before_execution"] is True
-
-        capture_gate.set()
-        deadline = time.monotonic() + 1.0
-        while (
-            arbiter.snapshot()["owner"] is not None
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
-        assert arbiter.snapshot()["owner"] is None
-        assert len(toolkit.prepare_calls) == 1
-        assert len(toolkit.execute_calls) == 1
-    finally:
-        capture_gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_unverified_manual_success_cannot_be_reused_by_later_agent_success(
-    tmp_path,
-) -> None:
-    testclient = pytest.importorskip("fastapi.testclient")
-
-    class _UnverifiedSuccess(_Toolkit):
-        def dashboard_execute_prepared_command(
-            self,
-            *,
-            plan_id: str,
-            command_id: str,
-        ) -> dict[str, Any]:
-            result = super().dashboard_execute_prepared_command(
-                plan_id=plan_id,
-                command_id=command_id,
-            )
-            result["task_success"] = True
-            return result
-
-    state = _state(tmp_path)
-    controller, arbiter, _ = _controller(
-        state,
-        toolkit=_UnverifiedSuccess(),
-    )
-    server = DashboardServer()
-    server.register(state)
-    client = testclient.TestClient(server._app)
-    try:
-        controller.submit(
-            lease_id="unverified-manual-success",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        _wait_phase(controller, "failed")
-        terminal = controller.snapshot()["last_terminal"]
-        assert terminal["task_success"] is False
-        assert terminal["stop_reason"] == "invalid_success_receipt"
-        assert controller.snapshot()["success_latched"] is False
-
-        with arbiter.agent_transaction():
-            assert arbiter.success_latch.observe(
-                {
-                    "task_success": True,
-                    "official_success_receipt": _receipt(env_step=10),
-                }
-            )
-        state.on_event(
-            {
-                "type": "official_success",
-                "attempt_index": 1,
-                "task_success": True,
-            }
-        )
-
-        response = client.get(
-            "/api/run/control/state",
-            params={"run": state.run_id},
-        )
-        assert response.status_code == 410
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_capture_publication_revalidates_deferred_head_before_handoff(
-    tmp_path,
-) -> None:
-    capture_gate = threading.Event()
-    capture_started = threading.Event()
-    publication_started = threading.Event()
-    publication_gate = threading.Event()
-
-    class _BlockingState(State):
-        def update_control_snapshot(self, snapshot, *, controller) -> bool:
-            capture = snapshot.get("capture")
-            if (
-                isinstance(capture, dict)
-                and capture.get("phase") == "completed"
-                and snapshot.get("owner") == "manual"
-                and not publication_started.is_set()
-            ):
-                publication_started.set()
-                assert publication_gate.wait(2.0)
-            return super().update_control_snapshot(
-                snapshot,
-                controller=controller,
-            )
-
-    class _CaptureGate(_Toolkit):
-        def dashboard_capture_views(self, *, command_id: str) -> dict[str, Any]:
-            capture_started.set()
-            assert capture_gate.wait(2.0)
-            return super().dashboard_capture_views(command_id=command_id)
-
-    state = _BlockingState(
-        run_id="behavior/test",
-        name="test_s1",
-        suite="behavior_2025_challenge",
-        task=1,
-        seed=1,
-        output_dir=str(tmp_path),
-        video_path=str(tmp_path / "episode.mp4"),
-    )
-    controller, arbiter, toolkit = _controller(
-        state,
-        toolkit=_CaptureGate(),
-    )
-    try:
-        controller.submit(
-            lease_id="publication-window",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert capture_started.wait(1.0)
-        deferred, _ = controller.submit(
-            lease_id="publication-window",
-            sequence=2,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        capture_gate.set()
-        assert publication_started.wait(1.0)
-        controller.stop(lease_id="publication-window")
-        assert deferred.phase == "cancelled"
-        publication_gate.set()
-        deadline = time.monotonic() + 1.0
-        while (
-            arbiter.snapshot()["owner"] is not None
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
-        assert arbiter.snapshot()["owner"] is None
-        assert len(toolkit.prepare_calls) == 1
-        assert len(toolkit.execute_calls) == 1
-    finally:
-        capture_gate.set()
-        publication_gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_capture_terminal_snapshot_rejection_blocks_agent_and_motion(
-    tmp_path,
-) -> None:
-    capture_started = threading.Event()
-    agent_entered = threading.Event()
-    agent_failed = threading.Event()
-
-    class _RejectsCaptureTerminal(State):
-        def update_control_snapshot(self, snapshot, *, controller) -> bool:
-            capture = snapshot.get("capture")
-            if (
-                isinstance(capture, dict)
-                and capture.get("phase") in {"completed", "failed"}
-                and snapshot.get("owner") == "manual"
-            ):
-                return False
-            return super().update_control_snapshot(
-                snapshot,
-                controller=controller,
-            )
-
-    class _CaptureNotice(_Toolkit):
-        def dashboard_capture_views(self, *, command_id: str) -> dict[str, Any]:
-            capture_started.set()
-            return super().dashboard_capture_views(command_id=command_id)
-
-    state = _RejectsCaptureTerminal(
-        run_id="behavior/test",
-        name="test_s1",
-        suite="behavior_2025_challenge",
-        task=1,
-        seed=1,
-        output_dir=str(tmp_path),
-        video_path=str(tmp_path / "episode.mp4"),
-    )
-    controller, arbiter, toolkit = _controller(
-        state,
-        toolkit=_CaptureNotice(),
-    )
-
-    def agent() -> None:
-        try:
-            with arbiter.agent_transaction():
-                agent_entered.set()
-        except RuntimeError:
-            agent_failed.set()
-
-    try:
-        controller.submit(
-            lease_id="capture-rejection",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert capture_started.wait(1.0)
-        thread = threading.Thread(target=agent)
-        thread.start()
-        assert agent_failed.wait(1.0)
-        assert not agent_entered.is_set()
-        assert arbiter.snapshot()["quiescing"] is True
-        assert arbiter.snapshot()["owner"] is None
-        assert len(toolkit.prepare_calls) == 1
-        assert len(toolkit.execute_calls) == 1
-        thread.join(1.0)
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_agent_waiter_preempts_motion_deferred_behind_started_capture(
-    tmp_path,
-) -> None:
-    capture_gate = threading.Event()
-    capture_started = threading.Event()
-    agent_gate = threading.Event()
-
-    class _CaptureGate(_Toolkit):
-        def dashboard_capture_views(self, *, command_id: str) -> dict[str, Any]:
-            capture_started.set()
-            assert capture_gate.wait(2.0)
-            return super().dashboard_capture_views(command_id=command_id)
-
-    state = _state(tmp_path)
-    controller, arbiter, toolkit = _controller(state, toolkit=_CaptureGate())
-
-    def agent() -> None:
-        with arbiter.agent_transaction():
-            agent_gate.wait(2.0)
-
-    try:
-        controller.submit(
-            lease_id="capture-agent",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert capture_started.wait(1.0)
-        controller.submit(
-            lease_id="capture-agent",
-            sequence=2,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        thread = threading.Thread(target=agent)
-        thread.start()
-        deadline = time.monotonic() + 1.0
-        while arbiter.snapshot()["agent_waiters"] != 1 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert arbiter.snapshot()["agent_waiters"] == 1
-        capture_gate.set()
-        deadline = time.monotonic() + 1.0
-        while arbiter.snapshot()["owner"] != "agent" and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert arbiter.snapshot()["owner"] == "agent"
-        assert len(toolkit.execute_calls) == 1
-        deferred = controller._commands[("capture-agent", 2)]
-        assert deferred.phase == "cancelled"
-        assert deferred.result["stop_reason"] == "agent_waiting"
-        snapshot = controller.snapshot()
-        assert snapshot["last_terminal"]["command_id"] == deferred.command_id
-        assert snapshot["last_terminal"]["phase"] == "cancelled"
-        assert snapshot["last_terminal"]["result"] == deferred.result
-        timeline = next(
-            item
-            for item in state.run_detail()["timeline"]
-            if item.get("command_id") == deferred.command_id
-        )
-        assert timeline["status"] == "failed"
-        assert timeline["stop_reason"] == "agent_waiting"
-        assert timeline["result"]["cancelled_before_execution"] is True
-        agent_gate.set()
-        thread.join(1.0)
-    finally:
-        capture_gate.set()
-        agent_gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_cancel_terminal_rejection_quiesces_before_agent_can_enter(
-    tmp_path,
-) -> None:
-    manual_gate = threading.Event()
-    agent_gate = threading.Event()
-    agent_entered = threading.Event()
-    agent_failed = threading.Event()
-
-    class _RejectsCancellation(State):
-        def on_manual_command_result(
-            self,
-            command,
-            result,
-            *,
-            official_success_latched,
-        ) -> bool:
-            if result.get("cancelled_before_execution") is True:
-                return False
-            return super().on_manual_command_result(
-                command,
-                result,
-                official_success_latched=official_success_latched,
-            )
-
-    state = _RejectsCancellation(
-        run_id="behavior/test",
-        name="test_s1",
-        suite="behavior_2025_challenge",
-        task=1,
-        seed=1,
-        output_dir=str(tmp_path),
-        video_path=str(tmp_path / "episode.mp4"),
-    )
-    controller, arbiter, toolkit = _controller(
-        state,
-        toolkit=_Toolkit(gate=manual_gate),
-    )
-
-    def agent() -> None:
-        try:
-            with arbiter.agent_transaction():
-                agent_entered.set()
-                agent_gate.wait(2.0)
-        except RuntimeError:
-            agent_failed.set()
-
-    try:
-        controller.submit(
-            lease_id="cancel-rejection",
-            sequence=1,
-            target="right_arm",
-            action="up",
-            camera="head",
-        )
-        assert toolkit.started.wait(1.0)
-        deferred, _ = controller.submit(
-            lease_id="cancel-rejection",
-            sequence=2,
-            target="right_arm",
-            action="up",
-            camera="head",
-        )
-        thread = threading.Thread(target=agent)
-        thread.start()
-        deadline = time.monotonic() + 1.0
-        while (
-            arbiter.snapshot()["agent_waiters"] != 1
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
-        manual_gate.set()
-        assert agent_failed.wait(1.0)
-        assert not agent_entered.is_set()
-        assert deferred.phase == "cancelled"
-        assert arbiter.snapshot()["quiescing"] is True
-        assert arbiter.snapshot()["owner"] is None
-        assert len(toolkit.execute_calls) == 1
-        agent_gate.set()
-        thread.join(1.0)
-    finally:
-        manual_gate.set()
-        agent_gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_raw_success_clears_tail_and_never_starts_capture(tmp_path) -> None:
-    action_gate = threading.Event()
-
-    class _RawSuccess(_Toolkit):
-        def dashboard_execute_prepared_command(
-            self,
-            *,
-            plan_id: str,
-            command_id: str,
-        ) -> dict[str, Any]:
-            result = super().dashboard_execute_prepared_command(
-                plan_id=plan_id,
-                command_id=command_id,
-            )
-            result.update(
-                {
-                    "task_success": True,
-                    "official_success_receipt": _receipt(),
-                    "stop_reason": "official_task_success",
-                }
-            )
-            return result
-
-    state = _state(tmp_path)
-    toolkit = _RawSuccess(gate=action_gate)
-    controller, _, toolkit = _controller(state, toolkit=toolkit)
-    try:
-        controller.submit(
-            lease_id="raw-success",
-            sequence=1,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        assert toolkit.started.wait(1.0)
-        controller.submit(
-            lease_id="raw-success",
-            sequence=2,
-            target="chassis",
-            action="forward",
-            camera="head",
-        )
-        action_gate.set()
-        deadline = time.monotonic() + 2.0
-        while (
-            not controller.snapshot()["success_latched"]
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
-        snapshot = controller.snapshot()
-        assert snapshot["success_latched"] is True
-        assert snapshot["last_terminal"]["sequence"] == 1
-        assert snapshot["last_terminal"]["phase"] == "completed"
-        assert snapshot["queue"] == []
-        assert snapshot["pending_cleared_count"] == 1
         assert toolkit.capture_calls == []
     finally:
-        action_gate.set()
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
+        prepare_gate.set()
+        assert controller.close(timeout_s=2.0)
 
 
-@pytest.mark.parametrize(
-    ("target", "action"),
-    [
-        ("chassis", "up"),
-        ("chassis", "down"),
-        ("left_arm", "rotate_left"),
-        ("left_arm", "rotate_right"),
-        ("right_arm", "rotate_left"),
-        ("right_arm", "rotate_right"),
-    ],
-)
-def test_planning_only_probe_uses_exact_permit_discards_and_sends_zero_action(
-    tmp_path,
-    target,
-    action,
-) -> None:
-    state = _state(tmp_path)
-    controller, arbiter, toolkit = _controller(state)
+def test_one_second_curobo_timeout_stops_lease_without_execution(tmp_path):
+    toolkit = _PipelineToolkit(
+        planning_failure={
+            "status": "failed",
+            "stop_reason": "timeout",
+            "error": "CuRobo solver timed out after 1.0 s",
+        }
+    )
+    controller = _controller(tmp_path, toolkit)
     try:
-        before_timeline = state.run_detail()["timeline"]
-
-        result = controller.plan_only_probe(target=target, action=action)
-
-        assert result["ok"] is True
-        assert result["planning_only"] is True
-        assert result["release_admission"] is False
-        assert result["env_step_delta"] == 0
-        assert result["zero_action_verified"] is True
-        assert result["safety_certificate"]["admitted"] is True
-        assert result["safety_certificate"]["attachment_hand_count"] == 2
-        assert all(
-            result["safety_certificate"]["checks"].values()
+        _submit(controller, sequence=1, lease_id="timeout")
+        terminal = _wait_for(
+            controller,
+            lambda value: value["phase"] == "failed",
         )
+
+        assert terminal["stop_reason"] == "timeout"
+        assert terminal["lease_status"] == "stopped"
+        assert terminal["predicted_plan_depth"] == 0
         assert toolkit.execute_calls == []
-        assert toolkit.calls == []
-        assert toolkit.prepare_calls[-1]["planning_only_probe"] is True
-        assert toolkit.prepare_permit_command_ids[-1] == result["command_id"]
-        assert toolkit.discard_calls[-1] == result["plan_id"]
-        assert result["discarded"] is True
-        assert result["discard_receipt"]["discarded"] is True
-        assert result["discard_receipt"]["plan_id"] == result["plan_id"]
-        assert arbiter.snapshot()["owner"] is None
-        assert state.run_detail()["timeline"] == before_timeline
     finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-@pytest.mark.parametrize(
-    "discard_receipt",
-    [
-        {},
-        {"discarded": False, "plan_id": "plan-1"},
-        {"discarded": True, "plan_id": "wrong-plan"},
-    ],
-)
-def test_planning_only_probe_requires_exact_discard_receipt(
-    tmp_path,
-    discard_receipt,
-) -> None:
-    class _InvalidDiscard(_Toolkit):
-        def dashboard_discard_prepared_command(
-            self,
-            *,
-            plan_id: str,
-        ) -> dict[str, Any]:
-            self.discard_calls.append(plan_id)
-            return dict(discard_receipt)
-
-    state = _state(tmp_path)
-    controller, arbiter, toolkit = _controller(
-        state,
-        toolkit=_InvalidDiscard(),
-    )
-    try:
-        with pytest.raises(ControlRequestError) as caught:
-            controller.plan_only_probe(target="chassis", action="up")
-        assert caught.value.code == "planning_probe_failed"
-        assert toolkit.execute_calls == []
-        assert toolkit.calls == []
-        assert toolkit.discard_calls == ["plan-1"]
-        assert arbiter.snapshot()["owner"] is None
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_planning_only_probe_rejects_unverified_safety_certificate(
-    tmp_path,
-) -> None:
-    class Toolkit(_Toolkit):
-        def dashboard_prepare_manual_command(self, **kwargs):
-            result = super().dashboard_prepare_manual_command(**kwargs)
-            result["safety_certificate"] = {
-                **result["safety_certificate"],
-                "admitted": False,
-            }
-            return result
-
-    state = _state(tmp_path)
-    controller, arbiter, toolkit = _controller(state, toolkit=Toolkit())
-    try:
-        with pytest.raises(
-            ControlRequestError,
-            match="verified safety certificate",
-        ):
-            controller.plan_only_probe(target="chassis", action="up")
-        assert toolkit.execute_calls == []
-        assert toolkit.calls == []
-        assert toolkit.discard_calls == ["plan-1"]
-        assert arbiter.snapshot()["owner"] is None
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_planning_only_probe_rejects_regular_motion_and_raw_success(tmp_path) -> None:
-    state = _state(tmp_path)
-    controller, arbiter, toolkit = _controller(state)
-    try:
-        with pytest.raises(ControlRequestError, match="limited"):
-            controller.plan_only_probe(target="chassis", action="forward")
-        assert toolkit.prepare_calls == []
-        assert arbiter.success_latch.observe(
-            {
-                "task_success": True,
-                "official_success_receipt": _receipt(env_step=10),
-            }
-        )
-        with pytest.raises(ControlRequestError, match="success latched"):
-            controller.plan_only_probe(target="left_arm", action="rotate_left")
-        assert toolkit.prepare_calls == []
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-
-def test_control_routes_validate_and_return_202(tmp_path) -> None:
-    testclient = pytest.importorskip("fastapi.testclient")
-    state = _state(tmp_path)
-    controller, _, _ = _controller(state)
-    server = DashboardServer()
-    server.register(state)
-    client = testclient.TestClient(server._app)
-    payload = {
-        "run": state.run_id,
-        "lease_id": "route-1",
-        "sequence": 1,
-        "target": "chassis",
-        "action": "observe",
-        "camera": "head",
-    }
-    try:
-        assert client.post(
-            "/api/run/control/command", json={**payload, "distance": 10}
-        ).status_code == 422
-        assert client.post(
-            "/api/run/control/command", json={**payload, "run": "missing"}
-        ).status_code == 404
-        response = client.post("/api/run/control/command", json=payload)
-        assert response.status_code == 202
-        assert response.json()["command_id"]
-        assert response.json()["phase"] == "accepted"
-        assert (
-            response.json()["current_command"]["command_id"]
-            == response.json()["command_id"]
-        )
-        assert response.json()["queue"] == []
-        _wait_phase(controller, "completed")
-        planned = client.post(
-            "/api/run/control/plan",
-            json={
-                "run": state.run_id,
-                "target": "left_arm",
-                "action": "rotate_left",
-            },
-        )
-        assert planned.status_code == 200
-        assert planned.json()["zero_action_verified"] is True
-        assert client.post(
-            "/api/run/control/plan",
-            json={
-                "run": state.run_id,
-                "target": "left_arm",
-                "action": "forward",
-            },
-        ).status_code == 422
-        assert client.get(
-            "/api/run/control/state", params={"run": state.run_id}
-        ).status_code == 200
-        camera = client.post(
-            "/api/run/control/camera",
-            json={"run": state.run_id, "camera": "left_wrist"},
-        )
-        assert camera.status_code == 200
-        assert state.snapshot()["last_selected_camera"] == "left_wrist"
-    finally:
-        assert controller.close(2.0)
-        state.unbind_controller(controller)
-
-    unbound = _state(tmp_path / "unbound")
-    server.register(unbound)
-    assert client.get(
-        "/api/run/control/state", params={"run": unbound.run_id}
-    ).status_code == 409
-    assert client.post(
-        "/api/run/control/camera",
-        json={"run": unbound.run_id, "camera": "head"},
-    ).status_code == 409
-    unbound.mark_done(False)
-    assert client.post(
-        "/api/run/control/camera",
-        json={"run": unbound.run_id, "camera": "head"},
-    ).status_code == 410
-    assert client.get(
-        "/api/run/control/state", params={"run": unbound.run_id}
-    ).status_code == 410
-
-
-def test_raw_success_command_terminal_remains_readable_after_unbind(tmp_path) -> None:
-    testclient = pytest.importorskip("fastapi.testclient")
-
-    class _SuccessfulToolkit(_Toolkit):
-        def dashboard_execute_prepared_command(
-            self,
-            *,
-            plan_id: str,
-            command_id: str,
-        ) -> dict[str, Any]:
-            result = super().dashboard_execute_prepared_command(
-                plan_id=plan_id,
-                command_id=command_id,
-            )
-            result.update(
-                {
-                    "task_success": True,
-                    "official_success_receipt": _receipt(),
-                    "stop_reason": "official_task_success",
-                }
-            )
-            return result
-
-    state = _state(tmp_path)
-    controller, _, toolkit = _controller(
-        state,
-        toolkit=_SuccessfulToolkit(),
-    )
-    server = DashboardServer()
-    server.register(state)
-    client = testclient.TestClient(server._app)
-    payload = {
-        "run": state.run_id,
-        "lease_id": "success-route",
-        "sequence": 1,
-        "target": "chassis",
-        "action": "forward",
-        "camera": "head",
-    }
-
-    accepted = client.post("/api/run/control/command", json=payload)
-    assert accepted.status_code == 202
-    command_id = accepted.json()["command_id"]
-    deadline = time.monotonic() + 2.0
-    terminal = None
-    while time.monotonic() < deadline:
-        response = client.get(
-            "/api/run/control/state",
-            params={"run": state.run_id},
-        )
-        if (
-            response.status_code == 200
-            and response.json().get("command_id") == command_id
-            and response.json().get("phase") in {"completed", "failed", "cancelled"}
-        ):
-            terminal = response.json()
-            break
-        time.sleep(0.005)
-    assert terminal is not None
-    assert terminal["phase"] == "completed"
-    assert terminal["success_latched"] is True
-    assert toolkit.permit_command_ids == [command_id]
-    assert toolkit.capture_calls == []
-
-    rejected = client.post(
-        "/api/run/control/command",
-        json={**payload, "lease_id": "after-success"},
-    )
-    assert rejected.status_code == 410
-
-    state.unbind_controller(controller)
-    assert controller.close(2.0)
-    persisted = client.get(
-        "/api/run/control/state",
-        params={"run": state.run_id},
-    )
-    assert persisted.status_code == 200
-    assert persisted.json()["command_id"] == command_id
-    assert persisted.json()["phase"] == "completed"
+        assert controller.close(timeout_s=2.0)

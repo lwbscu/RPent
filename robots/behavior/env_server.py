@@ -13,10 +13,10 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import Any
 
 os.environ.setdefault("OMNIGIBSON_HEADLESS", "1")
@@ -44,8 +44,8 @@ from robots.behavior.camera_geometry import (
     validated_rigid_transform,
 )
 from robots.behavior.planner_executor import (
+    CuroboPlanningError,
     PlannerExecutor,
-    _attachment_identity_status,
     _quat_rotate_vector_xyzw,
 )
 from robots.behavior.schemas import (
@@ -55,7 +55,6 @@ from robots.behavior.schemas import (
     ENV_ACTION_SEGMENTS,
     POLICY_STATE_SEGMENTS,
     RAW_PROPRIO_SEGMENTS,
-    ROTATE_WRIST_RUNTIME_TIMEOUT_S,
     TORSO_VERTICAL_STEP_M,
     WRIST_ROTATION_STEP_RAD,
     extract_policy_state,
@@ -114,10 +113,15 @@ _CONTROLLER_PLANNER = "planner"
 _CONTROLLER_SWITCHING = "switching"
 _CONTROLLER_FAILED = "failed"
 _CONTROLLER_FROZEN = "frozen"
-_PHYSICAL_GRIPPER_CLOSED_M = 0.003
-_HELD_CLOSE_LATCH_MAX = -0.99
-_HELD_ATTACHMENT_CONFIRMATION_STEPS = 10
-_PI0_NAV_PICK_DISABLE_RECEIPT_FILENAME = "pi0_nav_pick_disable_receipt.json"
+_BEHAVIOR_ROBOT_COLLISION_GROUP = "rpent_behavior_r1pro"
+_BEHAVIOR_NONFLOOR_COLLISION_GROUP = "rpent_behavior_nonfloor_world"
+_R1PRO_FLOOR_SUPPORT_LINK_NAMES = frozenset(
+    {
+        "wheel_motor_link1",
+        "wheel_motor_link2",
+        "wheel_motor_link3",
+    }
+)
 _HAND_GEOMETRY_SYNC_RENDER_ITERATIONS = HAND_GEOMETRY_SYNC_RENDER_ITERATIONS
 _HAND_GEOMETRY_TRANSLATION_TOLERANCE_M = (
     HAND_GEOMETRY_TRANSLATION_TOLERANCE_M
@@ -128,15 +132,6 @@ _HAND_GEOMETRY_ROTATION_TOLERANCE_DEG = (
 _HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M = (
     HAND_GEOMETRY_FINGER_JOINT_TOLERANCE_M
 )
-_FRAME_REVIEW_ASSESSMENTS = frozenset(
-    {
-        "target_bearing_surface_confirmed",
-        "opposite_surface_confirmed",
-        "side_or_indeterminate",
-    }
-)
-
-
 def _numpy_tree(value: Any) -> Any:
     try:
         import torch
@@ -824,6 +819,12 @@ class BehaviorEnvFacade:
             worker_info=None,
             record_metrics=False,
         )
+        robot = self._robot()
+        if robot is None or not self._is_r1pro_robot(robot):
+            raise RuntimeError(
+                "BEHAVIOR collision configuration requires the live R1Pro robot"
+            )
+        self._configure_behavior_robot_collisions(robot)
         self._meta = dict(meta)
         self._controller_mode = str(meta.get("controller_mode", "hybrid"))
         if self._controller_mode not in {"hybrid", "pi0_nav_pick_only"}:
@@ -868,23 +869,11 @@ class BehaviorEnvFacade:
         self._attempt_nonce = secrets.token_hex(16)
         self._active_vla_invocation: str | None = None
         self._active_vla_call_index: int | None = None
-        self._pending_vla_visual_authorization: dict[str, Any] | None = None
-        self._pending_vla_attachment_snapshot: dict[str, Any] | None = None
         self._pending_vla_baseline_internal_authorization = False
-        self._latest_successful_held_rotate_receipt: dict[str, Any] | None = None
-        self._latest_successful_held_rotate_attachment: Any = None
-        self._latest_successful_held_rotate_public_frame_ids: set[str] = set()
-        self._held_rotate_target_surface_review: dict[str, Any] | None = None
         self._public_capture_sequence = 0
         self._latest_unconsumed_public_capture_receipt: dict[str, Any] | None = None
-        self._active_rotate_pi0_candidate: dict[str, Any] | None = None
-        self._awaiting_opposite_surface_review: dict[str, Any] | None = None
-        self._completed_opposite_surface_cycles: list[dict[str, Any]] = []
-        self._pi0_nav_pick_disable_receipt: dict[str, Any] | None = None
-        self._pi0_nav_pick_disable_receipt_path = (
-            Path(output_dir) / _PI0_NAV_PICK_DISABLE_RECEIPT_FILENAME
-        )
         self._motion_in_flight = False
+        self._threaded_predicted_planning_dispatcher_ready = False
         self._dashboard_planning_admitted = False
         self._dashboard_execute_receipts: dict[
             str,
@@ -909,6 +898,16 @@ class BehaviorEnvFacade:
         self._video_error: str | None = None
         self._video_sealed = False
         self._video_source_shapes: dict[str, list[int]] = {}
+        self._video_queue: Queue[Any] = Queue(maxsize=64)
+        self._video_queue_stop = object()
+        self._video_queue_closed = False
+        self._video_frames_dropped = 0
+        self._video_worker = threading.Thread(
+            target=self._video_writer_loop,
+            name="behavior-mp4-writer",
+            daemon=True,
+        )
+        self._video_worker.start()
         self._planner_video_interval_steps = max(
             1, int(os.environ.get("RPENT_PLANNER_VIDEO_INTERVAL_STEPS", "4"))
         )
@@ -926,7 +925,6 @@ class BehaviorEnvFacade:
         self._last_observation: dict[str, Any] | None = None
         self._last_info: Any = None
         self._gripper_latch = {"left": 1.0, "right": 1.0}
-        self._held_closure_receipts: dict[str, dict[str, Any]] = {}
         self._live_observation_counter = 0
         self._visual_checkpoint_counter = 0
         self._base_controller_mode = "velocity"
@@ -935,14 +933,12 @@ class BehaviorEnvFacade:
         self._vla_actions_enabled = True
         self._controller_state = _CONTROLLER_VLA
         self._motion_frozen = False
-        self._next_pi0_chunk_index = 1
         self._reset_completed = False
         self._last_capture_step: int | None = None
         self._public_observed_frame_ids: set[str] = set()
         self._latest_public_head_frame_id: str | None = None
         self._latest_public_observation_lineage: dict[str, Any] | None = None
         self._projection_receipts: dict[str, dict[str, Any]] = {}
-        self._consumed_projection_receipts: set[str] = set()
 
     def _active_task_spec(self) -> BehaviorTaskSpec:
         """Return the selected task contract.
@@ -977,6 +973,349 @@ class BehaviorEnvFacade:
                         return robots[0]
                     env = getattr(env, "env", None) or getattr(env, "_env", None)
         return None
+
+    @staticmethod
+    def _is_r1pro_robot(robot: Any) -> bool:
+        robot_class = type(robot).__name__.strip().lower()
+        robot_name = str(getattr(robot, "name", "")).strip().lower()
+        return bool(
+            robot_class in {"r1", "r1pro"}
+            or "r1pro" in robot_name
+            or robot_name == "r1"
+        )
+
+    @staticmethod
+    def _collision_relation_paths(relation: Any) -> set[str]:
+        get_targets = getattr(relation, "GetTargets", None)
+        if not callable(get_targets):
+            raise RuntimeError("PhysX collision relationship is unavailable")
+        paths: set[str] = set()
+        for target in get_targets():
+            value = getattr(target, "pathString", None)
+            path = str(value if value is not None else target).strip()
+            if not path.startswith("/"):
+                raise RuntimeError(
+                    f"PhysX collision relationship returned an invalid path: {path!r}"
+                )
+            paths.add(path)
+        return paths
+
+    @classmethod
+    def _collision_group_includes(cls, group: Any) -> set[str]:
+        collection = getattr(group, "GetCollidersCollectionAPI", None)
+        if not callable(collection):
+            raise RuntimeError("PhysX collision group collection API is unavailable")
+        includes = getattr(collection(), "GetIncludesRel", None)
+        if not callable(includes):
+            raise RuntimeError("PhysX collision group includes API is unavailable")
+        return cls._collision_relation_paths(includes())
+
+    @classmethod
+    def _collision_group_filters(cls, group: Any) -> set[str]:
+        filtered_groups = getattr(group, "GetFilteredGroupsRel", None)
+        if not callable(filtered_groups):
+            raise RuntimeError("PhysX collision group filter API is unavailable")
+        return cls._collision_relation_paths(filtered_groups())
+
+    def _apply_behavior_robot_collision_policy(
+        self,
+        robot: Any,
+        *,
+        scene: Any,
+        collision_api: Any,
+        ground_categories: frozenset[str],
+    ) -> dict[str, int]:
+        """Keep wheel-floor support while filtering all other robot collisions."""
+
+        if not self._is_r1pro_robot(robot):
+            raise RuntimeError("collision policy requires the live R1Pro robot")
+        links = getattr(robot, "links", None)
+        if not isinstance(links, dict) or not links:
+            raise RuntimeError("R1Pro links are unavailable for collision policy")
+        support_link_names = frozenset(
+            str(name).strip()
+            for name in getattr(robot, "floor_touching_base_link_names", ())
+        )
+        if support_link_names != _R1PRO_FLOOR_SUPPORT_LINK_NAMES:
+            raise RuntimeError(
+                "R1Pro floor-support link identity is not the verified "
+                "three-wheel set"
+            )
+        missing_support_links = support_link_names.difference(links)
+        if missing_support_links:
+            raise RuntimeError(
+                "R1Pro floor-support links are unavailable: "
+                f"{sorted(missing_support_links)!r}"
+            )
+        scene_objects = getattr(scene, "objects", None)
+        if scene_objects is None:
+            raise RuntimeError("BEHAVIOR scene objects are unavailable")
+        scene_objects = list(scene_objects)
+        if not scene_objects:
+            raise RuntimeError("BEHAVIOR scene has no objects for collision policy")
+        if not isinstance(ground_categories, frozenset) or not ground_categories:
+            raise RuntimeError("OmniGibson ground categories are unavailable")
+
+        try:
+            robot.self_collisions = False
+        except Exception as exc:
+            raise RuntimeError(
+                "failed to disable R1Pro PhysX self collision"
+            ) from exc
+
+        support_link_paths: set[str] = set()
+        support_collision_mesh_count = 0
+        disabled_non_support_link_count = 0
+        disabled_non_support_mesh_count = 0
+        for link_name, link in links.items():
+            enable_collisions = getattr(link, "enable_collisions", None)
+            disable_collisions = getattr(link, "disable_collisions", None)
+            collision_meshes = getattr(link, "collision_meshes", None)
+            link_path = str(getattr(link, "prim_path", "")).strip()
+            if (
+                not callable(enable_collisions)
+                or not callable(disable_collisions)
+                or not isinstance(collision_meshes, dict)
+                or not link_path.startswith("/")
+            ):
+                raise RuntimeError(
+                    f"R1Pro link {link_name!r} lacks the OmniGibson collision API"
+                )
+            if link_name in support_link_names:
+                enable_collisions()
+                support_link_paths.add(link_path)
+                support_collision_mesh_count += len(collision_meshes)
+                disabled_meshes = [
+                    str(mesh_name)
+                    for mesh_name, mesh in collision_meshes.items()
+                    if not bool(getattr(mesh, "collision_enabled", False))
+                ]
+                if disabled_meshes:
+                    raise RuntimeError(
+                        f"R1Pro support link {link_name!r} retained disabled "
+                        f"collision meshes: {disabled_meshes!r}"
+                    )
+            else:
+                disable_collisions()
+                disabled_non_support_link_count += 1
+                disabled_non_support_mesh_count += len(collision_meshes)
+                enabled_meshes = [
+                    str(mesh_name)
+                    for mesh_name, mesh in collision_meshes.items()
+                    if bool(getattr(mesh, "collision_enabled", False))
+                ]
+                if enabled_meshes:
+                    raise RuntimeError(
+                        f"R1Pro non-support link {link_name!r} retained enabled "
+                        f"collision meshes: {enabled_meshes!r}"
+                    )
+        if support_collision_mesh_count < 1:
+            raise RuntimeError("R1Pro floor-support links have no collision meshes")
+        if len(support_link_paths) != len(support_link_names):
+            raise RuntimeError("R1Pro support-link prim paths are not unique")
+        if bool(robot.self_collisions):
+            raise RuntimeError("R1Pro PhysX self collision remained enabled")
+
+        robot_path = str(getattr(robot, "prim_path", "")).rstrip("/")
+        ground_paths: set[str] = set()
+        nonfloor_paths: set[str] = set()
+        ground_collision_mesh_count = 0
+        for obj in scene_objects:
+            obj_path = str(getattr(obj, "prim_path", "")).rstrip("/")
+            if not obj_path.startswith("/"):
+                raise RuntimeError("BEHAVIOR scene object has no absolute prim path")
+            if obj is robot or obj_path == robot_path:
+                continue
+            category = str(getattr(obj, "category", "")).strip().lower()
+            if category in ground_categories:
+                ground_paths.add(obj_path)
+                object_links = getattr(obj, "links", None)
+                if isinstance(object_links, dict):
+                    for ground_link in object_links.values():
+                        collision_meshes = getattr(
+                            ground_link, "collision_meshes", None
+                        )
+                        if isinstance(collision_meshes, dict):
+                            ground_collision_mesh_count += sum(
+                                bool(getattr(mesh, "collision_enabled", False))
+                                for mesh in collision_meshes.values()
+                            )
+            else:
+                nonfloor_paths.add(obj_path)
+        if not ground_paths:
+            raise RuntimeError(
+                "BEHAVIOR scene contains no OmniGibson ground-category object"
+            )
+        if ground_collision_mesh_count < 1:
+            raise RuntimeError(
+                "BEHAVIOR ground objects contain no enabled collision mesh"
+            )
+        if ground_paths & nonfloor_paths:
+            raise RuntimeError("ground and non-floor collision sets overlap")
+
+        active_groups = getattr(collision_api, "ACTIVE_COLLISION_GROUPS", None)
+        if not isinstance(active_groups, dict):
+            raise RuntimeError("OmniGibson CollisionAPI registry is unavailable")
+        group_names = (
+            _BEHAVIOR_ROBOT_COLLISION_GROUP,
+            _BEHAVIOR_NONFLOOR_COLLISION_GROUP,
+        )
+        if any(name in active_groups for name in group_names):
+            raise RuntimeError("BEHAVIOR collision groups already exist")
+        collision_api.create_collision_group(
+            _BEHAVIOR_ROBOT_COLLISION_GROUP,
+            filter_self_collisions=True,
+        )
+        collision_api.create_collision_group(
+            _BEHAVIOR_NONFLOOR_COLLISION_GROUP,
+            filter_self_collisions=False,
+        )
+        for link_path in sorted(support_link_paths):
+            collision_api.add_to_collision_group(
+                _BEHAVIOR_ROBOT_COLLISION_GROUP,
+                link_path,
+            )
+        for object_path in sorted(nonfloor_paths):
+            collision_api.add_to_collision_group(
+                _BEHAVIOR_NONFLOOR_COLLISION_GROUP,
+                object_path,
+            )
+        collision_api.add_group_filter(
+            _BEHAVIOR_ROBOT_COLLISION_GROUP,
+            _BEHAVIOR_NONFLOOR_COLLISION_GROUP,
+        )
+
+        robot_group = active_groups.get(_BEHAVIOR_ROBOT_COLLISION_GROUP)
+        nonfloor_group = active_groups.get(_BEHAVIOR_NONFLOOR_COLLISION_GROUP)
+        if robot_group is None or nonfloor_group is None:
+            raise RuntimeError("BEHAVIOR collision groups were not created")
+        if self._collision_group_includes(robot_group) != support_link_paths:
+            raise RuntimeError("R1Pro collision group membership verification failed")
+        if self._collision_group_includes(nonfloor_group) != nonfloor_paths:
+            raise RuntimeError(
+                "non-floor world collision group membership verification failed"
+            )
+        robot_group_path = (
+            f"/World/collision_groups/{_BEHAVIOR_ROBOT_COLLISION_GROUP}"
+        )
+        nonfloor_group_path = (
+            f"/World/collision_groups/{_BEHAVIOR_NONFLOOR_COLLISION_GROUP}"
+        )
+        expected_filters = {robot_group_path, nonfloor_group_path}
+        if self._collision_group_filters(robot_group) != expected_filters:
+            raise RuntimeError("R1Pro collision group filter verification failed")
+        if self._collision_group_filters(nonfloor_group):
+            raise RuntimeError("non-floor collision group unexpectedly filters itself")
+
+        logger.info(
+            "configured R1Pro collision policy: %d support links, "
+            "%d support meshes, %d disabled non-support links, "
+            "%d ground objects, %d non-floor objects",
+            len(support_link_paths),
+            support_collision_mesh_count,
+            disabled_non_support_link_count,
+            len(ground_paths),
+            len(nonfloor_paths),
+        )
+        return {
+            "support_links": len(support_link_paths),
+            "support_collision_meshes": support_collision_mesh_count,
+            "disabled_non_support_links": disabled_non_support_link_count,
+            "disabled_non_support_collision_meshes": (
+                disabled_non_support_mesh_count
+            ),
+            "ground_objects": len(ground_paths),
+            "ground_collision_meshes": ground_collision_mesh_count,
+            "nonfloor_objects": len(nonfloor_paths),
+        }
+
+    def _configure_behavior_robot_collisions(self, robot: Any) -> None:
+        """Apply the collision policy in a stopped-simulator transaction."""
+
+        try:
+            import omnigibson as og
+            from omnigibson.utils.usd_utils import CollisionAPI
+        except Exception as exc:  # pragma: no cover - production dependency
+            raise RuntimeError(
+                "OmniGibson is unavailable for R1Pro collision configuration"
+            ) from exc
+        simulator = getattr(og, "sim", None)
+        if simulator is None:
+            raise RuntimeError(
+                "OmniGibson simulator is unavailable for collision configuration"
+            )
+        is_playing = getattr(simulator, "is_playing", None)
+        is_paused = getattr(simulator, "is_paused", None)
+        is_stopped = getattr(simulator, "is_stopped", None)
+        stop = getattr(simulator, "stop", None)
+        play = getattr(simulator, "play", None)
+        pause = getattr(simulator, "pause", None)
+        required = (is_playing, is_paused, is_stopped, stop, play, pause)
+        if not all(callable(method) for method in required):
+            raise RuntimeError(
+                "OmniGibson simulator lifecycle API is incomplete"
+            )
+        was_playing = bool(is_playing())
+        was_paused = bool(is_paused())
+        was_stopped = bool(is_stopped())
+        if sum((was_playing, was_paused, was_stopped)) != 1:
+            raise RuntimeError(
+                "OmniGibson simulator reported an invalid lifecycle state"
+            )
+        configuration_complete = False
+        try:
+            if not was_stopped:
+                stop()
+            if not bool(is_stopped()):
+                raise RuntimeError(
+                    "OmniGibson simulator did not stop for collision configuration"
+                )
+            omni_env = getattr(self._env, "omnigibson_env", None)
+            scene = getattr(omni_env, "scene", None)
+            if scene is None:
+                raise RuntimeError("BEHAVIOR OmniGibson scene is unavailable")
+            self._apply_behavior_robot_collision_policy(
+                robot,
+                scene=scene,
+                collision_api=CollisionAPI,
+                # The user authorized only robot-floor support.  Carpets,
+                # lawns, driveways, walls, furniture and task objects remain
+                # in the filtered non-floor world group.
+                ground_categories=frozenset({"floors"}),
+            )
+            configuration_complete = True
+        except Exception as exc:
+            raise RuntimeError(
+                "BEHAVIOR R1Pro collision configuration failed"
+            ) from exc
+        finally:
+            # A partially built filter must never be resumed.  Keeping the
+            # simulator stopped makes a failed constructor inert until its
+            # owning process exits.
+            if configuration_complete and (was_playing or was_paused):
+                try:
+                    # OmniGibson.play() rebuilds the Physics Tensor simulation
+                    # view and all initialized object handles before it returns.
+                    play()
+                    if was_paused:
+                        pause()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "failed to restore OmniGibson after R1Pro collision "
+                        "configuration"
+                    ) from exc
+        if was_playing and not bool(is_playing()):
+            raise RuntimeError(
+                "OmniGibson simulator did not resume after collision configuration"
+            )
+        if was_paused and not bool(is_paused()):
+            raise RuntimeError(
+                "OmniGibson simulator pause state was not restored"
+            )
+        if was_stopped and not bool(is_stopped()):
+            raise RuntimeError(
+                "OmniGibson simulator stopped state was not preserved"
+            )
 
     def _require_planner(self) -> PlannerExecutor:
         if self._planner is None:
@@ -1033,158 +1372,21 @@ class BehaviorEnvFacade:
     ) -> dict[str, Any]:
         """Return read-only runtime facts used for side-effect-free rejection."""
 
+        del input_dict
         failed: list[str] = []
         if not self._reset_completed:
             failed.append("episode_not_initialized")
-        if self._motion_in_flight:
-            failed.append("motion_in_flight")
         if self._official_success_latched or _raw_success(self._last_info):
             failed.append("official_success_latched")
         if getattr(self, "_terminal_failure_receipt", None) is not None:
             failed.append("terminal_failure_latched")
         if name == "pi0_nav_pick":
-            if (
-                not (self._official_success_latched or _raw_success(self._last_info))
-                and self._pi0_nav_pick_is_receipt_disabled()
-            ):
-                failed.append("pi0_nav_pick_disabled_by_opposite_surface_receipt")
-            attachments = self._attachment_runtime_facts()
-            if attachments.get("available") is not True:
-                failed.append(
-                    "attachment_identity_conflict"
-                    if attachments.get("identity_conflict") is True
-                    else "attachment_feedback_unavailable"
-                )
-            elif int(attachments.get("attachment_count", 0)) > 0:
-                try:
-                    self._current_object_visual_authorization(
-                        input_dict.get("current_object_visual_check"),
-                        invocation_id=None,
-                    )
-                except Exception:
-                    failed.append("fresh_object_visual_check_required")
             if self._controller_state not in {
                 _CONTROLLER_VLA,
                 _CONTROLLER_PLANNER,
                 _CONTROLLER_FAILED,
             }:
                 failed.append("controller_not_vla_rearmable")
-        if name in {"move_to", "rotate_wrist", "close", "open", "press"}:
-            try:
-                analytic_hand, _selection_source, _visual_evidence = (
-                    self._authorize_analytic_hand(
-                        str(input_dict.get("hand", "")),
-                        input_dict.get("visual_hand_check"),
-                    )
-                )
-            except Exception:
-                failed.append("visual_hand_selection_unavailable")
-            else:
-                if (
-                    name == "open"
-                    and self._active_task_spec().release_visual_policy is not None
-                ):
-                    attachment_snapshot = self._attachment_fingerprint_snapshot()
-                    if analytic_hand in attachment_snapshot.get("hands", []):
-                        try:
-                            self._release_visual_authorization(
-                                selected_hand=analytic_hand,
-                                expected_attachment_fingerprint=dict(
-                                    attachment_snapshot.get("fingerprints", {})
-                                ).get(analytic_hand),
-                                release_visual_check=input_dict.get(
-                                    "release_visual_check"
-                                ),
-                            )
-                        except Exception:
-                            failed.append("fresh_release_visual_check_required")
-        if name == "navigate_to":
-            relative_mode = "relative_motion" in input_dict
-            if relative_mode:
-                try:
-                    if not set(input_dict).issubset({"relative_motion", "timeout_s"}):
-                        raise ValueError(
-                            "relative navigation contains projection arguments"
-                        )
-                    validate_relative_navigation_motion(
-                        input_dict.get("relative_motion")
-                    )
-                    self._validated_navigation_timeout(
-                        input_dict.get("timeout_s", 300.0)
-                    )
-                except Exception:
-                    failed.append("navigation_parameters_invalid")
-            else:
-                try:
-                    if not set(input_dict).issubset(
-                        {
-                            "projection_id",
-                            "navigation_visual_check",
-                            "standoff_m",
-                            "max_travel_m",
-                            "timeout_s",
-                        }
-                    ):
-                        raise ValueError("unknown projection navigation argument")
-                    self._validated_navigation_parameters(
-                        standoff_m=input_dict.get("standoff_m", 0.85),
-                        max_travel_m=input_dict.get("max_travel_m", 1.0),
-                        timeout_s=input_dict.get("timeout_s", 300.0),
-                    )
-                except Exception:
-                    failed.append("navigation_parameters_invalid")
-                projection_id = input_dict.get("projection_id")
-                receipt = (
-                    self._projection_receipts.get(str(projection_id))
-                    if isinstance(projection_id, str) and projection_id.strip()
-                    else None
-                )
-                if not self._projection_receipt_is_fresh(receipt):
-                    failed.append("fresh_projection_required")
-                elif str(projection_id) in self._consumed_projection_receipts:
-                    failed.append("projection_receipt_consumed")
-                else:
-                    try:
-                        self._navigation_visual_authorization(
-                            projection_receipt=receipt,
-                            navigation_visual_check=input_dict.get(
-                                "navigation_visual_check"
-                            ),
-                        )
-                    except Exception:
-                        failed.append("fresh_navigation_visual_check_required")
-            attachment_snapshot = self._attachment_fingerprint_snapshot()
-            if attachment_snapshot.get("available") is not True:
-                failed.append(
-                    "attachment_identity_conflict"
-                    if attachment_snapshot.get("identity_conflict") is True
-                    else "attachment_feedback_unavailable"
-                )
-        projection_id = None
-        if name == "move_to" and isinstance(input_dict.get("target"), dict):
-            projection_id = input_dict["target"].get("projection_id")
-        elif name == "press":
-            projection_id = input_dict.get("projection_id")
-        if name in {"move_to", "press"} and projection_id is not None:
-            projection_id = str(projection_id)
-            receipt = self._projection_receipts.get(projection_id)
-            if not self._projection_receipt_is_fresh(receipt):
-                failed.append("fresh_projection_required")
-            if projection_id in self._consumed_projection_receipts:
-                failed.append("projection_receipt_consumed")
-        if name == "press":
-            try:
-                hand, _source, _evidence = self._authorize_analytic_hand(
-                    str(input_dict.get("hand", "")),
-                    input_dict.get("visual_hand_check"),
-                )
-                facts = self._attachment_runtime_facts()
-                if hand in facts.get("hands", []):
-                    failed.append("press_hand_must_be_attachment_free")
-                if not self._press_gripper_is_strictly_closed(hand):
-                    failed.append("closed_gripper_required")
-            except Exception:
-                failed.append("gripper_state_unavailable")
         failed = list(dict.fromkeys(failed))
         return {
             "primitive_success": not failed,
@@ -1197,148 +1399,6 @@ class BehaviorEnvFacade:
             "attempt_index": self._attempt_index,
             "attempt_nonce": self._attempt_nonce,
             "total_env_steps": int(self._env_steps),
-        }
-
-    def _attachment_runtime_facts(self) -> dict[str, Any]:
-        attached_hands: list[str] = []
-        attached_objects: dict[str, Any] = {}
-        backend = getattr(getattr(self, "_planner", None), "backend", None)
-        getter = getattr(backend, "get_attached_object", None)
-        if not callable(getter):
-            facts = {
-                "available": False,
-                "attachment_count": 0,
-                "hands": [],
-                "identity_conflict": False,
-                "attached_objects": {},
-                "by_hand": {hand: {"attached": False} for hand in ("left", "right")},
-            }
-            self._invalidate_stale_held_closure_receipts(facts)
-            return facts
-        for hand in ("left", "right"):
-            try:
-                attached = getter(hand)
-                if attached:
-                    attached_hands.append(hand)
-                    attached_objects[hand] = attached
-            except Exception:
-                facts = {
-                    "available": False,
-                    "attachment_count": 0,
-                    "hands": [],
-                    "identity_conflict": False,
-                    "attached_objects": {},
-                    "by_hand": {
-                        side: {"attached": False} for side in ("left", "right")
-                    },
-                }
-                self._invalidate_stale_held_closure_receipts(facts)
-                return facts
-        identity_conflict = self._attachments_share_identity(
-            attached_objects.get("left"),
-            attached_objects.get("right"),
-        )
-        facts = {
-            "attachment_count": len(attached_hands),
-            "hands": attached_hands,
-            "identity_conflict": bool(identity_conflict),
-            "available": not identity_conflict,
-            # Private runtime objects are never copied into a public result.
-            # They let lifecycle receipts compare stable assisted-grasp roots.
-            "attached_objects": attached_objects,
-            "by_hand": {
-                hand: {"attached": hand in attached_hands} for hand in ("left", "right")
-            },
-        }
-        self._invalidate_stale_held_closure_receipts(facts)
-        return facts
-
-    @staticmethod
-    def _attachments_share_identity(left: Any, right: Any) -> bool:
-        """Reject one simulator object being reported under both physical hands."""
-
-        if left is None or right is None:
-            return False
-
-        def identities(attached: Any) -> set[tuple[str, Any]]:
-            if not isinstance(attached, dict):
-                return set()
-            result: set[tuple[str, Any]] = set()
-            for root in attached.values():
-                prim_path = str(getattr(root, "prim_path", "")).rstrip("/")
-                result.add(
-                    ("prim_path", prim_path)
-                    if prim_path
-                    else ("python_object_id", int(id(root)))
-                )
-            return result
-
-        left_identities = identities(left)
-        right_identities = identities(right)
-        return bool(
-            left_identities and right_identities and left_identities & right_identities
-        )
-
-    def _attachment_lineage_fingerprint(
-        self,
-        attached_object: Any,
-        *,
-        hand: str,
-    ) -> str | None:
-        """Hash one attempt-local assisted-grasp root without exposing its path."""
-
-        if not isinstance(attached_object, dict) or not attached_object:
-            return None
-        roots: list[dict[str, Any]] = []
-        for link_name, root in sorted(
-            attached_object.items(),
-            key=lambda item: str(item[0]),
-        ):
-            prim_path = str(getattr(root, "prim_path", "")).rstrip("/")
-            roots.append(
-                {
-                    "link_name": str(link_name),
-                    "root_identity": (
-                        {"kind": "prim_path", "value": prim_path}
-                        if prim_path
-                        else {"kind": "python_object_id", "value": int(id(root))}
-                    ),
-                }
-            )
-        return hashlib.sha256(
-            _canonical_json_bytes(
-                {
-                    "run_nonce": str(getattr(self, "_run_nonce", "unbound")),
-                    "attempt_nonce": str(getattr(self, "_attempt_nonce", "unbound")),
-                    "hand": str(hand),
-                    "roots": roots,
-                }
-            )
-        ).hexdigest()
-
-    def _attachment_fingerprint_snapshot(
-        self,
-        facts: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Capture both attachment identities without exposing simulator paths."""
-
-        current = self._attachment_runtime_facts() if facts is None else facts
-        attached_objects = current.get("attached_objects", {})
-        if not isinstance(attached_objects, dict):
-            attached_objects = {}
-        return {
-            "available": bool(current.get("available", True)),
-            "identity_conflict": bool(current.get("identity_conflict", False)),
-            "attachment_count": int(current.get("attachment_count", 0)),
-            "hands": list(current.get("hands", [])),
-            "env_step": int(getattr(self, "_env_steps", 0)),
-            "fingerprints": {
-                hand: self._attachment_lineage_fingerprint(
-                    attached_objects.get(hand),
-                    hand=hand,
-                )
-                for hand in ("left", "right")
-            },
         }
 
     def _seal_attempt_receipt(self, value: dict[str, Any]) -> dict[str, Any]:
@@ -1381,38 +1441,12 @@ class BehaviorEnvFacade:
         except (TypeError, ValueError):
             return False
 
-    def _clear_active_vla_invocation_state(
-        self,
-        *,
-        clear_candidate: bool = True,
-    ) -> None:
+    def _clear_active_vla_invocation_state(self) -> None:
         """Remove invocation-local authority after finalization or failure."""
 
         self._active_vla_invocation = None
         self._active_vla_call_index = None
-        self._pending_vla_visual_authorization = None
-        self._pending_vla_attachment_snapshot = None
         self._pending_vla_baseline_internal_authorization = False
-        self._next_pi0_chunk_index = 1
-        if clear_candidate:
-            self._active_rotate_pi0_candidate = None
-
-    def _invalidate_pi0_visual_regression_chain(
-        self,
-        *,
-        reset_completed: bool,
-    ) -> None:
-        """Invalidate every unconsumed receipt in the rotate/Pi0 review chain."""
-
-        self._latest_successful_held_rotate_receipt = None
-        self._latest_successful_held_rotate_attachment = None
-        self._latest_successful_held_rotate_public_frame_ids = set()
-        self._held_rotate_target_surface_review = None
-        self._latest_unconsumed_public_capture_receipt = None
-        self._active_rotate_pi0_candidate = None
-        self._awaiting_opposite_surface_review = None
-        if reset_completed:
-            self._completed_opposite_surface_cycles = []
 
     def _register_public_capture(
         self,
@@ -1427,8 +1461,6 @@ class BehaviorEnvFacade:
         if self._active_task_spec().surface_review_policy is None:
             self._latest_unconsumed_public_capture_receipt = None
             return {}
-        if getattr(self, "_held_rotate_target_surface_review", None) is not None:
-            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
         self._public_capture_sequence = (
             int(getattr(self, "_public_capture_sequence", 0)) + 1
         )
@@ -1591,50 +1623,6 @@ class BehaviorEnvFacade:
         self._latest_public_observation_lineage = receipt
         return receipt
 
-    def _pi0_nav_pick_is_receipt_disabled(self) -> bool:
-        """Return whether this attempt has a valid two-cycle disable receipt."""
-
-        if self._active_task_spec().surface_review_policy is None:
-            return False
-        receipt = getattr(self, "_pi0_nav_pick_disable_receipt", None)
-        if not self._attempt_receipt_is_current(receipt):
-            return False
-        cycle_receipts = receipt.get("cycle_receipts")
-        return bool(
-            receipt.get("kind") == "pi0_nav_pick_attempt_disable"
-            and receipt.get("reason") == "two_consecutive_opposite_surface_cycles"
-            and isinstance(cycle_receipts, list)
-            and len(cycle_receipts) == 2
-            and len(
-                {
-                    item.get("cycle_id")
-                    for item in cycle_receipts
-                    if isinstance(item, dict)
-                }
-            )
-            == 2
-        )
-
-    def _pi0_nav_pick_disable_guard_result(self) -> dict[str, Any]:
-        return {
-            "primitive_success": False,
-            "task_success": bool(
-                getattr(self, "_official_success_latched", False)
-                or _raw_success(getattr(self, "_last_info", None))
-            ),
-            "official_success_source": 'info["done"]["success"]',
-            "stop_reason": "precondition_rejected",
-            "failed_preconditions": [
-                "pi0_nav_pick_disabled_by_opposite_surface_receipt"
-            ],
-            "attempt_index": int(getattr(self, "_attempt_index", 1)),
-            "attempt_nonce": str(getattr(self, "_attempt_nonce", "unbound")),
-            "total_env_steps": int(getattr(self, "_env_steps", 0)),
-            "pi0_nav_pick_disable_receipt": self._public_visual_receipt(
-                getattr(self, "_pi0_nav_pick_disable_receipt", None)
-            ),
-        }
-
     @classmethod
     def _public_visual_receipt(cls, value: Any) -> Any:
         """Remove private dynamic-side lineage from Agent-visible receipts."""
@@ -1651,151 +1639,6 @@ class BehaviorEnvFacade:
             return tuple(cls._public_visual_receipt(item) for item in value)
         return _wire_safe(value)
 
-    def _bind_rotate_receipt_to_vla_invocation(
-        self,
-        *,
-        invocation_id: str,
-        call_index: int,
-    ) -> dict[str, Any] | None:
-        """Consume the immediately preceding held rotation for one Pi0 call."""
-
-        if self._active_task_spec().surface_review_policy is None:
-            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
-            return None
-        rotate_receipt = getattr(self, "_latest_successful_held_rotate_receipt", None)
-        expected_attachment = getattr(
-            self, "_latest_successful_held_rotate_attachment", None
-        )
-        target_review = getattr(self, "_held_rotate_target_surface_review", None)
-        self._latest_successful_held_rotate_receipt = None
-        self._latest_successful_held_rotate_attachment = None
-        self._latest_successful_held_rotate_public_frame_ids = set()
-        self._held_rotate_target_surface_review = None
-        self._latest_unconsumed_public_capture_receipt = None
-        if (
-            not self._attempt_receipt_is_current(rotate_receipt)
-            or not self._attempt_receipt_is_current(target_review)
-            or int(rotate_receipt.get("env_step", -1)) != int(self._env_steps)
-            or int(target_review.get("env_step", -1)) != int(self._env_steps)
-            or target_review.get("rotate_receipt_sha256")
-            != rotate_receipt.get("receipt_sha256")
-            or target_review.get("assessment") != "target_bearing_surface_confirmed"
-            or expected_attachment is None
-        ):
-            self._completed_opposite_surface_cycles = []
-            return None
-        facts = self._attachment_runtime_facts()
-        hand = str(rotate_receipt.get("resolved_hand", ""))
-        current_attachment = facts.get("attached_objects", {}).get(hand)
-        matches, identity = _attachment_identity_status(
-            current_attachment,
-            expected_attachment,
-            hand=hand,
-        )
-        attachment_fingerprint = self._attachment_lineage_fingerprint(
-            current_attachment,
-            hand=hand,
-        )
-        if (
-            facts.get("available") is not True
-            or hand not in facts.get("hands", [])
-            or not matches
-            or attachment_fingerprint != rotate_receipt.get("attachment_fingerprint")
-        ):
-            self._completed_opposite_surface_cycles = []
-            return None
-        candidate = {
-            "rotate_receipt": rotate_receipt,
-            "target_surface_review_receipt": target_review,
-            "expected_attachment": expected_attachment,
-            "invocation_id": invocation_id,
-            "call_index": int(call_index),
-            "bound_env_step": int(self._env_steps),
-            "attachment_identity_at_bind": _wire_safe(identity),
-            "attachment_fingerprint": attachment_fingerprint,
-            "full_chunks_executed": 0,
-            "last_chunk_env_step": None,
-        }
-        self._active_rotate_pi0_candidate = candidate
-        return candidate
-
-    def _record_full_pi0_chunk_for_rotate_candidate(
-        self,
-        *,
-        executed_steps: int,
-        terminated: bool,
-        truncated: bool,
-    ) -> None:
-        if self._active_task_spec().surface_review_policy is None:
-            return
-        candidate = getattr(self, "_active_rotate_pi0_candidate", None)
-        if not isinstance(candidate, dict):
-            return
-        if (
-            int(executed_steps) != 32
-            or bool(terminated)
-            or bool(truncated)
-            or self._active_vla_invocation != candidate.get("invocation_id")
-        ):
-            self._active_rotate_pi0_candidate = None
-            self._completed_opposite_surface_cycles = []
-            return
-        candidate["full_chunks_executed"] = (
-            int(candidate.get("full_chunks_executed", 0)) + 1
-        )
-        candidate["last_chunk_env_step"] = int(self._env_steps)
-
-    def _finalize_rotate_pi0_candidate(self) -> dict[str, Any] | None:
-        """Finalize an admitted rotate→Pi0 cycle after planner transfer."""
-
-        if self._active_task_spec().surface_review_policy is None:
-            self._active_rotate_pi0_candidate = None
-            return None
-        candidate = getattr(self, "_active_rotate_pi0_candidate", None)
-        if (
-            not isinstance(candidate, dict)
-            or int(candidate.get("full_chunks_executed", 0)) < 1
-            or candidate.get("invocation_id") != self._active_vla_invocation
-        ):
-            self._active_rotate_pi0_candidate = None
-            return None
-        hand = str(candidate["rotate_receipt"].get("resolved_hand", ""))
-        facts = self._attachment_runtime_facts()
-        current_attachment = facts.get("attached_objects", {}).get(hand)
-        matches, identity = _attachment_identity_status(
-            current_attachment,
-            candidate.get("expected_attachment"),
-            hand=hand,
-        )
-        attachment_fingerprint = self._attachment_lineage_fingerprint(
-            current_attachment,
-            hand=hand,
-        )
-        if (
-            facts.get("available") is not True
-            or hand not in facts.get("hands", [])
-            or not matches
-            or attachment_fingerprint != candidate.get("attachment_fingerprint")
-        ):
-            self._active_rotate_pi0_candidate = None
-            self._completed_opposite_surface_cycles = []
-            return None
-        finalized = {
-            **candidate,
-            "finalized_env_step": int(self._env_steps),
-            "attachment_identity_at_finalize": _wire_safe(identity),
-            "attachment_fingerprint": attachment_fingerprint,
-            "public_frame_ids_at_finalize": set(
-                getattr(self, "_public_observed_frame_ids", set())
-            ),
-            "public_capture_sequence_at_finalize": int(
-                getattr(self, "_public_capture_sequence", 0)
-            ),
-        }
-        self._awaiting_opposite_surface_review = finalized
-        self._active_rotate_pi0_candidate = None
-        return finalized
-
     def _record_frame_review_cycle(
         self,
         *,
@@ -1805,7 +1648,7 @@ class BehaviorEnvFacade:
         capture_receipt: dict[str, Any],
         assessment: str,
     ) -> dict[str, Any]:
-        """Consume a post-finalization frame review and maybe disable Pi0."""
+        """Record one visual assessment without physical-state admission."""
 
         surface_policy = self._active_task_spec().surface_review_policy
         if surface_policy is None:
@@ -1826,391 +1669,10 @@ class BehaviorEnvFacade:
                 "assessment": assessment,
             }
         )
-        if assessment == surface_policy.target_assessment and not isinstance(
-            getattr(self, "_awaiting_opposite_surface_review", None), dict
-        ):
-            rotate_receipt = getattr(
-                self, "_latest_successful_held_rotate_receipt", None
-            )
-            expected_attachment = getattr(
-                self, "_latest_successful_held_rotate_attachment", None
-            )
-            prior_frame_ids = getattr(
-                self,
-                "_latest_successful_held_rotate_public_frame_ids",
-                set(),
-            )
-            target_qualifies = False
-            target_reason = "no_successful_held_rotate"
-            if (
-                self._attempt_receipt_is_current(rotate_receipt)
-                and expected_attachment is not None
-            ):
-                hand = str(rotate_receipt.get("resolved_hand", ""))
-                facts = self._attachment_runtime_facts()
-                current_attachment = facts.get("attached_objects", {}).get(hand)
-                matches, identity = _attachment_identity_status(
-                    current_attachment,
-                    expected_attachment,
-                    hand=hand,
-                )
-                attachment_fingerprint = self._attachment_lineage_fingerprint(
-                    current_attachment,
-                    hand=hand,
-                )
-                if int(rotate_receipt.get("env_step", -1)) != int(self._env_steps):
-                    target_reason = "target_review_not_at_rotate_env_step"
-                elif int(frame.step_index) != int(self._env_steps):
-                    target_reason = "target_review_frame_not_current"
-                elif frame.frame_id in prior_frame_ids or int(
-                    capture_receipt["env_step"]
-                ) != int(rotate_receipt.get("env_step", -1)):
-                    target_reason = "target_review_frame_was_not_captured_after_rotate"
-                elif (
-                    facts.get("available") is not True
-                    or hand not in facts.get("hands", [])
-                    or not matches
-                    or attachment_fingerprint
-                    != rotate_receipt.get("attachment_fingerprint")
-                ):
-                    target_reason = "held_attachment_changed_before_target_review"
-                else:
-                    authorization = self._seal_attempt_receipt(
-                        {
-                            "kind": "held_rotate_target_surface_review",
-                            "env_step": int(self._env_steps),
-                            "resolved_hand": hand,
-                            "rotate_receipt_sha256": rotate_receipt["receipt_sha256"],
-                            "frame_review_receipt_sha256": review_receipt[
-                                "receipt_sha256"
-                            ],
-                            "assessment": assessment,
-                            "attachment_identity": _wire_safe(identity),
-                            "attachment_fingerprint": attachment_fingerprint,
-                        }
-                    )
-                    self._held_rotate_target_surface_review = authorization
-                    target_qualifies = True
-                    target_reason = ""
-            if not target_qualifies:
-                self._held_rotate_target_surface_review = None
-                self._completed_opposite_surface_cycles = []
-            return {
-                "accepted": True,
-                "qualifying_cycle": False,
-                "qualifying_pre_vla_target_review": target_qualifies,
-                "nonqualifying_reason": target_reason or None,
-                "frame_review_receipt": review_receipt,
-                "capture_receipt": capture_receipt,
-                "target_surface_review_receipt": _wire_safe(
-                    getattr(self, "_held_rotate_target_surface_review", None)
-                ),
-                "cycle_receipt": None,
-                "completed_qualifying_cycles": len(
-                    getattr(self, "_completed_opposite_surface_cycles", [])
-                ),
-                "pi0_nav_pick_disabled": self._pi0_nav_pick_is_receipt_disabled(),
-                "pi0_nav_pick_disable_receipt": _wire_safe(
-                    getattr(self, "_pi0_nav_pick_disable_receipt", None)
-                ),
-            }
-        candidate = getattr(self, "_awaiting_opposite_surface_review", None)
-        self._awaiting_opposite_surface_review = None
-        qualifies = False
-        nonqualifying_reason = "no_finalized_rotate_pi0_candidate"
-        cycle_receipt = None
-        if isinstance(candidate, dict):
-            hand = str(candidate["rotate_receipt"].get("resolved_hand", ""))
-            facts = self._attachment_runtime_facts()
-            current_attachment = facts.get("attached_objects", {}).get(hand)
-            matches, identity = _attachment_identity_status(
-                current_attachment,
-                candidate.get("expected_attachment"),
-                hand=hand,
-            )
-            attachment_fingerprint = self._attachment_lineage_fingerprint(
-                current_attachment,
-                hand=hand,
-            )
-            if assessment != surface_policy.opposite_assessment:
-                nonqualifying_reason = "assessment_did_not_confirm_opposite_surface"
-            elif int(frame.step_index) != int(candidate["finalized_env_step"]):
-                nonqualifying_reason = "review_frame_not_at_finalized_env_step"
-            elif frame.frame_id in candidate["public_frame_ids_at_finalize"] or int(
-                capture_receipt["capture_sequence"]
-            ) <= int(candidate["public_capture_sequence_at_finalize"]):
-                nonqualifying_reason = "review_frame_was_not_captured_after_finalize"
-            elif (
-                facts.get("available") is not True
-                or hand not in facts.get("hands", [])
-                or not matches
-                or attachment_fingerprint != candidate.get("attachment_fingerprint")
-            ):
-                nonqualifying_reason = "held_attachment_changed_before_review"
-            else:
-                cycle_base = {
-                    "kind": "rotate_pi0_opposite_surface_cycle",
-                    "env_step": int(self._env_steps),
-                    "resolved_hand": hand,
-                    "rotate_receipt_sha256": candidate["rotate_receipt"][
-                        "receipt_sha256"
-                    ],
-                    "target_surface_review_receipt_sha256": candidate[
-                        "target_surface_review_receipt"
-                    ]["receipt_sha256"],
-                    "vla_invocation_id": candidate["invocation_id"],
-                    "vla_call_index": int(candidate["call_index"]),
-                    "vla_bound_env_step": int(candidate["bound_env_step"]),
-                    "full_chunks_executed": int(candidate["full_chunks_executed"]),
-                    "vla_finalized_env_step": int(candidate["finalized_env_step"]),
-                    "attachment_identity": _wire_safe(identity),
-                    "attachment_fingerprint": attachment_fingerprint,
-                    "frame_review_receipt_sha256": review_receipt["receipt_sha256"],
-                }
-                cycle_base["cycle_id"] = (
-                    "cycle_"
-                    + hashlib.sha256(_canonical_json_bytes(cycle_base)).hexdigest()[:24]
-                )
-                cycle_receipt = self._seal_attempt_receipt(cycle_base)
-                qualifies = True
-                nonqualifying_reason = ""
-        if qualifies and isinstance(cycle_receipt, dict):
-            completed = list(getattr(self, "_completed_opposite_surface_cycles", []))
-            if completed and (
-                completed[-1].get("resolved_hand") != cycle_receipt.get("resolved_hand")
-                or completed[-1].get("attachment_fingerprint")
-                != cycle_receipt.get("attachment_fingerprint")
-            ):
-                completed = []
-            if completed and (
-                completed[-1].get("cycle_id") == cycle_receipt.get("cycle_id")
-                or completed[-1].get("vla_invocation_id")
-                == cycle_receipt.get("vla_invocation_id")
-            ):
-                completed = []
-            completed.append(cycle_receipt)
-            cycle_limit = surface_policy.opposite_cycles_before_pi0_disable
-            self._completed_opposite_surface_cycles = completed[-cycle_limit:]
-            if (
-                len(self._completed_opposite_surface_cycles)
-                == surface_policy.opposite_cycles_before_pi0_disable
-                and not self._pi0_nav_pick_is_receipt_disabled()
-                and not (
-                    self._official_success_latched or _raw_success(self._last_info)
-                )
-            ):
-                disable = self._seal_attempt_receipt(
-                    {
-                        "kind": "pi0_nav_pick_attempt_disable",
-                        "reason": "two_consecutive_opposite_surface_cycles",
-                        "env_step": int(self._env_steps),
-                        "cycle_receipts": deepcopy(
-                            self._completed_opposite_surface_cycles
-                        ),
-                    }
-                )
-                _write_json_atomic(self._pi0_nav_pick_disable_receipt_path, disable)
-                self._pi0_nav_pick_disable_receipt = disable
-        else:
-            self._completed_opposite_surface_cycles = []
         return {
             "accepted": True,
-            "qualifying_cycle": qualifies,
-            "nonqualifying_reason": nonqualifying_reason or None,
             "frame_review_receipt": review_receipt,
             "capture_receipt": capture_receipt,
-            "cycle_receipt": cycle_receipt,
-            "completed_qualifying_cycles": len(
-                getattr(self, "_completed_opposite_surface_cycles", [])
-            ),
-            "pi0_nav_pick_disabled": self._pi0_nav_pick_is_receipt_disabled(),
-            "pi0_nav_pick_disable_receipt": _wire_safe(
-                getattr(self, "_pi0_nav_pick_disable_receipt", None)
-            ),
-        }
-
-    def _held_closure_receipt_matches(
-        self,
-        *,
-        hand: str,
-        attached_object: Any,
-    ) -> bool:
-        receipts = getattr(self, "_held_closure_receipts", {})
-        receipt = receipts.get(hand) if isinstance(receipts, dict) else None
-        if not isinstance(receipt, dict):
-            return False
-        if (
-            receipt.get("run_nonce") != getattr(self, "_run_nonce", None)
-            or receipt.get("attempt_nonce") != getattr(self, "_attempt_nonce", None)
-            or int(receipt.get("attempt_index", -1))
-            != int(getattr(self, "_attempt_index", -2))
-            or receipt.get("hand") != hand
-            or float(receipt.get("close_latch", 1.0)) > _HELD_CLOSE_LATCH_MAX
-            or int(receipt.get("confirmed_env_step", -1)) < 0
-            or int(receipt.get("confirmed_env_step", -1))
-            > int(getattr(self, "_env_steps", -2))
-            or int(receipt.get("attachment_endpoint_held_steps", 0))
-            < _HELD_ATTACHMENT_CONFIRMATION_STEPS
-            or float(getattr(self, "_gripper_latch", {}).get(hand, 1.0))
-            > _HELD_CLOSE_LATCH_MAX
-        ):
-            return False
-        matches, _identity = _attachment_identity_status(
-            attached_object,
-            receipt.get("expected_attachment"),
-            hand=hand,
-        )
-        return bool(matches)
-
-    def _press_gripper_is_strictly_closed(self, hand: str) -> bool:
-        return bool(
-            self._physical_gripper_opening(hand) <= _PHYSICAL_GRIPPER_CLOSED_M
-            and float(getattr(self, "_gripper_latch", {}).get(hand, 1.0))
-            <= _HELD_CLOSE_LATCH_MAX
-        )
-
-    def _invalidate_stale_held_closure_receipts(self, facts: dict[str, Any]) -> None:
-        receipts = getattr(self, "_held_closure_receipts", None)
-        if not isinstance(receipts, dict):
-            self._held_closure_receipts = {}
-            return
-        attached_objects = facts.get("attached_objects", {})
-        attached_objects = (
-            attached_objects if isinstance(attached_objects, dict) else {}
-        )
-        for hand in tuple(receipts):
-            if facts.get(
-                "available"
-            ) is not True or not self._held_closure_receipt_matches(
-                hand=hand,
-                attached_object=attached_objects.get(hand),
-            ):
-                receipts.pop(hand, None)
-
-    def _current_object_visual_authorization(
-        self,
-        visual_check: Any,
-        *,
-        invocation_id: str | None,
-    ) -> dict[str, Any]:
-        """Bind one LLM-reviewed public frame to a held-state VLA invocation."""
-
-        if not isinstance(visual_check, dict):
-            raise ValueError("current_object_visual_check must be an object")
-        required = {"camera", "frame_id", "assessment"}
-        if set(visual_check) != required:
-            raise ValueError(
-                "current_object_visual_check requires exactly camera, frame_id, "
-                "and assessment"
-            )
-        camera = str(visual_check["camera"])
-        if camera not in {"head", "left_wrist", "right_wrist"}:
-            raise ValueError(
-                "current_object_visual_check.camera must be head, left_wrist, "
-                "or right_wrist"
-            )
-        frame_id = str(visual_check["frame_id"]).strip()
-        if not frame_id:
-            raise ValueError("current_object_visual_check.frame_id must be non-empty")
-        if (
-            str(visual_check["assessment"])
-            != "current_task_object_configuration_reviewed"
-        ):
-            raise ValueError(
-                "current_object_visual_check.assessment must confirm that the "
-                "current task-object configuration was reviewed"
-            )
-        resolved_camera = self._resolve_camera_role(camera)
-        frame = self._frame_cache.get_current(resolved_camera, frame_id)
-        if frame.frame_id not in self._public_observed_frame_ids:
-            raise RuntimeError(
-                "current_object_visual_check must reference a public observe result"
-            )
-        if int(frame.step_index) != int(self._env_steps):
-            raise RuntimeError(
-                "current_object_visual_check must reference the current env step"
-            )
-        if not isinstance(frame.capture_group_id, str) or not frame.capture_group_id:
-            raise RuntimeError(
-                "current_object_visual_check must reference a synchronized public "
-                "observe capture"
-            )
-        return {
-            "schema_version": 1,
-            "source": "llm_fresh_public_observation",
-            "run_nonce": self._run_nonce,
-            "attempt_nonce": self._attempt_nonce,
-            "attempt_index": int(self._attempt_index),
-            "invocation_id": invocation_id,
-            "env_step": int(self._env_steps),
-            "camera": camera,
-            "resolved_camera": resolved_camera,
-            "frame_id": frame.frame_id,
-            "capture_group_id": frame.capture_group_id,
-            "assessment": "current_task_object_configuration_reviewed",
-        }
-
-    def _baseline_internal_visual_authorization(
-        self,
-        *,
-        invocation_id: str,
-        attachment_snapshot: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Bind a private synchronized capture for the pure-VLA baseline.
-
-        This is not a public ``observe`` receipt and cannot authorize any
-        analytic primitive. It exists only so the baseline can repeatedly
-        invoke Pi0 while attachments are present without introducing an LLM or
-        an additional public tool call.
-        """
-
-        if self._controller_mode != "pi0_nav_pick_only":
-            raise RuntimeError(
-                "baseline internal authorization requires pi0_nav_pick_only mode"
-            )
-        self._refresh_observation_without_step(synchronize_hand_geometry=True)
-        refreshed = self._attachment_fingerprint_snapshot()
-        if (
-            refreshed.get("available") is not True
-            or refreshed.get("hands") != attachment_snapshot.get("hands")
-            or refreshed.get("fingerprints") != attachment_snapshot.get("fingerprints")
-        ):
-            raise RuntimeError(
-                "attachment identity changed during baseline synchronized capture"
-            )
-        frames = {
-            camera: self._frame_cache.latest(camera)
-            for camera in ("head", "left_wrist", "right_wrist")
-        }
-        capture_groups = {frame.capture_group_id for frame in frames.values()}
-        if len(capture_groups) != 1 or None in capture_groups:
-            raise RuntimeError(
-                "baseline internal authorization lacks one synchronized capture"
-            )
-        if any(
-            int(frame.step_index) != int(self._env_steps) for frame in frames.values()
-        ):
-            raise RuntimeError(
-                "baseline internal authorization capture is not at current env step"
-            )
-        head = frames["head"]
-        return {
-            "schema_version": 1,
-            "source": "baseline_internal_synchronized_capture",
-            "controller_mode": self._controller_mode,
-            "run_nonce": self._run_nonce,
-            "attempt_nonce": self._attempt_nonce,
-            "attempt_index": int(self._attempt_index),
-            "invocation_id": invocation_id,
-            "env_step": int(self._env_steps),
-            "resolved_camera": "head",
-            "frame_id": head.frame_id,
-            "capture_group_id": head.capture_group_id,
-            "camera_frame_ids": {
-                camera: frame.frame_id for camera, frame in frames.items()
-            },
-            "attachment_fingerprints": dict(refreshed.get("fingerprints", {})),
-            "assessment": "runtime_synchronized_state_only",
         }
 
     def _visual_hand_authorization(
@@ -2352,201 +1814,21 @@ class BehaviorEnvFacade:
             }
         )
 
-    @staticmethod
-    def _validated_navigation_parameters(
-        *,
-        standoff_m: Any,
-        max_travel_m: Any,
-        timeout_s: Any,
-    ) -> tuple[float, float, float]:
-        """Mirror the public navigate_to numeric bounds at the RPC boundary."""
-
-        values = {
-            "standoff_m": (standoff_m, 0.45, 1.50, True),
-            "max_travel_m": (max_travel_m, 0.0, 1.50, False),
-            "timeout_s": (timeout_s, 0.0, None, False),
-        }
-        validated: dict[str, float] = {}
-        for name, (value, minimum, maximum, minimum_inclusive) in values.items():
-            if isinstance(value, bool) or not isinstance(
-                value, (int, float, np.integer, np.floating)
-            ):
-                raise ValueError(f"{name} must be a finite number")
-            number = float(value)
-            lower_ok = number >= minimum if minimum_inclusive else number > minimum
-            upper_ok = maximum is None or number <= maximum
-            if not np.isfinite(number) or not lower_ok or not upper_ok:
-                raise ValueError(f"{name} is outside the public schema bounds")
-            validated[name] = number
-        return (
-            validated["standoff_m"],
-            validated["max_travel_m"],
-            validated["timeout_s"],
-        )
-
-    @staticmethod
-    def _validated_navigation_timeout(value: Any) -> float:
-        """Validate the timeout shared by both navigate_to modes."""
-
-        if isinstance(value, bool) or not isinstance(
-            value, (int, float, np.integer, np.floating)
-        ):
-            raise ValueError("timeout_s must be a finite number")
-        timeout = float(value)
-        if not np.isfinite(timeout) or timeout <= 0.0:
-            raise ValueError("timeout_s is outside the public schema bounds")
-        return timeout
-
-    def _release_visual_authorization(
-        self,
-        *,
-        selected_hand: str,
-        expected_attachment_fingerprint: str,
-        release_visual_check: Any,
-    ) -> dict[str, Any]:
-        """Bind a task-scoped release decision to one attachment and fresh RGB."""
-
-        policy = self._active_task_spec().release_visual_policy
-        if policy is None:
-            raise RuntimeError("the active task has no visual release policy")
-        if not isinstance(release_visual_check, dict):
-            raise ValueError(
-                "release_visual_check is required before releasing an attached "
-                "task object"
-            )
-        required = {"camera", "frame_id", "selected_hand", "assessment"}
-        if set(release_visual_check) != required:
-            raise ValueError(
-                "release_visual_check requires exactly camera, frame_id, "
-                "selected_hand, and assessment"
-            )
-        if release_visual_check.get("camera") != policy.camera:
-            raise ValueError(f"release_visual_check.camera must be {policy.camera}")
-        if release_visual_check.get("selected_hand") != selected_hand:
-            raise ValueError(
-                "release_visual_check.selected_hand must match the selected hand"
-            )
-        if release_visual_check.get("assessment") != policy.assessment:
-            raise ValueError(
-                f"release_visual_check.assessment must be {policy.assessment}"
-            )
-        frame_id = str(release_visual_check.get("frame_id", "")).strip()
-        if not frame_id:
-            raise ValueError("release_visual_check.frame_id must be non-empty")
-        resolved_camera = canonical_camera(policy.camera)
-        frame = self._frame_cache.get_current(resolved_camera, frame_id)
-        if frame.frame_id not in getattr(self, "_public_observed_frame_ids", set()):
-            raise RuntimeError(
-                "release_visual_check must reference a public observe result"
-            )
-        if frame.frame_id != getattr(self, "_latest_public_head_frame_id", None):
-            raise RuntimeError(
-                "release_visual_check must reference the latest public head observation"
-            )
-        if int(frame.step_index) != int(self._env_steps):
-            raise RuntimeError(
-                "release_visual_check must reference the current env step"
-            )
-        if not isinstance(frame.capture_group_id, str) or not frame.capture_group_id:
-            raise RuntimeError(
-                "release_visual_check must reference a synchronized public observe "
-                "capture"
-            )
-        if not isinstance(expected_attachment_fingerprint, str) or not (
-            expected_attachment_fingerprint
-        ):
-            raise RuntimeError(
-                "release_visual_check requires one stable selected attachment identity"
-            )
-        return self._seal_attempt_receipt(
-            {
-                "kind": "trash_release_visual_authorization",
-                "source": "llm_fresh_public_head_observation",
-                "env_step": int(self._env_steps),
-                "camera": policy.camera,
-                "resolved_camera": resolved_camera,
-                "frame_id": frame.frame_id,
-                "capture_group_id": frame.capture_group_id,
-                "selected_hand": selected_hand,
-                "assessment": policy.assessment,
-                "attachment_fingerprint": expected_attachment_fingerprint,
-                "semantic_target_verified": False,
-                "collision_authorization": False,
-                "distance_authorization": False,
-            }
-        )
-
     def _authorize_analytic_hand(
         self,
         hand: str,
         visual_hand_check: Any,
     ) -> tuple[str, str, dict[str, Any]]:
-        """Authorize one explicit anatomical hand for an analytic primitive."""
+        """Bind one explicit anatomical hand to public visual evidence."""
 
         selected_hand = str(hand)
         if selected_hand not in {"left", "right"}:
             raise ValueError("hand must be left or right")
-        facts = self._attachment_runtime_facts()
-        if facts.get("available") is not True:
-            raise RuntimeError(
-                "attachment identity conflict"
-                if facts.get("identity_conflict") is True
-                else "attachment feedback is unavailable"
-            )
         evidence = self._visual_hand_authorization(
             selected_hand=selected_hand,
             visual_hand_check=visual_hand_check,
         )
         return selected_hand, "llm_visual_hand_selection", evidence
-
-    def _sanitized_capability_summary(self) -> dict[str, Any]:
-        facts = self._attachment_runtime_facts()
-        grippers: dict[str, str] = {}
-        gripper_basis: dict[str, str] = {}
-        attached_objects = facts.get("attached_objects", {})
-        attached_objects = (
-            attached_objects if isinstance(attached_objects, dict) else {}
-        )
-        for hand in ("left", "right"):
-            try:
-                opening = self._physical_gripper_opening(hand)
-                physically_closed = opening <= _PHYSICAL_GRIPPER_CLOSED_M
-                stable_object_grasp = bool(
-                    hand in facts.get("hands", [])
-                    and self._held_closure_receipt_matches(
-                        hand=hand,
-                        attached_object=attached_objects.get(hand),
-                    )
-                )
-                grippers[hand] = (
-                    "closed" if physically_closed or stable_object_grasp else "open"
-                )
-                gripper_basis[hand] = (
-                    "physical_closure"
-                    if physically_closed
-                    else "stable_object_grasp"
-                    if stable_object_grasp
-                    else "physical_opening"
-                )
-            except Exception:
-                grippers[hand] = "unknown"
-                gripper_basis[hand] = "unavailable"
-        return {
-            "controller_state": self._controller_state,
-            "attachments": {
-                "available": bool(facts.get("available", False)),
-                "count": int(facts.get("attachment_count", 0)),
-                "conflict": bool(facts.get("identity_conflict", False)),
-                "by_hand": {
-                    hand: {"attached": hand in facts.get("hands", [])}
-                    for hand in ("left", "right")
-                },
-            },
-            "gripper_state": grippers,
-            "gripper_state_basis": gripper_basis,
-            "motion_in_flight": bool(self._motion_in_flight),
-            "official_success_latched": bool(self._official_success_latched),
-        }
 
     def _projection_receipt_is_fresh(self, receipt: Any) -> bool:
         if not isinstance(receipt, dict):
@@ -2562,26 +1844,14 @@ class BehaviorEnvFacade:
         self,
         target: str,
     ) -> dict[str, Any]:
-        """Switch controller ownership atomically when no action is in flight."""
+        """Switch between the BEHAVIOR VLA and planner controller configs."""
 
         if target not in {_CONTROLLER_VLA, _CONTROLLER_PLANNER}:
             raise ValueError("target controller must be vla or planner")
-        if self._motion_in_flight:
-            raise RuntimeError("controller switch rejected while motion is in flight")
         if self._official_success_latched:
             raise RuntimeError("controller switch rejected after official success")
         if self._controller_state == target:
             return {"from": target, "to": target, "changed": False}
-        facts = self._attachment_runtime_facts()
-        if facts.get("available") is not True:
-            raise RuntimeError(
-                "attachment identity conflict"
-                if facts.get("identity_conflict") is True
-                else "attachment feedback is unavailable"
-            )
-        before_attachments = self._attachment_fingerprint_snapshot(facts)
-        if not before_attachments["available"]:
-            raise RuntimeError("attachment feedback is unavailable")
         robot = self._robot()
         if robot is None:
             raise RuntimeError("R1Pro robot is unavailable")
@@ -2601,17 +1871,6 @@ class BehaviorEnvFacade:
                 self._base_controller_mode = "velocity"
                 report = {"from": "position", "to": "velocity"}
             self._require_planner().on_runtime_state_changed()
-            after = self._attachment_runtime_facts()
-            after_attachments = self._attachment_fingerprint_snapshot(after)
-            if (
-                not after_attachments["available"]
-                or after_attachments["hands"] != before_attachments["hands"]
-                or after_attachments["fingerprints"]
-                != before_attachments["fingerprints"]
-            ):
-                raise RuntimeError(
-                    "attachment identity changed during controller switch"
-                )
             self._controller_state = target
             self._action_source = "pi0_vla" if target == _CONTROLLER_VLA else "planner"
             self._vla_actions_enabled = target == _CONTROLLER_VLA
@@ -2930,33 +2189,10 @@ class BehaviorEnvFacade:
         assign("isaac_kp", 2_000_000.0)
         assign("isaac_kd", 100_000.0)
         reload_controllers(config)
-        expected_layout = (
-            ("base", 3),
-            ("trunk", 4),
-            ("arm_left", 7),
-            ("gripper_left", 1),
-            ("arm_right", 7),
-            ("gripper_right", 1),
-        )
-        actual_layout = tuple(
-            (str(name), int(controller.command_dim))
-            for name, controller in getattr(robot, "controllers", {}).items()
-        )
-        if actual_layout != expected_layout:
-            raise RuntimeError(
-                f"controller reload changed the 23D layout: {actual_layout!r}"
-            )
-        base_controller = getattr(robot, "controllers", {}).get("base")
-        motor_type = getattr(base_controller, "motor_type", None)
-        if motor_type is not None and not str(motor_type).lower().endswith("position"):
-            raise RuntimeError(
-                f"base controller reload did not enter position mode: {motor_type!r}"
-            )
         self._base_controller_mode = "position"
         return {
             "from": "velocity",
             "to": "position",
-            "controller_layout": [list(item) for item in actual_layout],
         }
 
     def _persist_pi0_nav_pick_views(
@@ -3472,55 +2708,109 @@ class BehaviorEnvFacade:
                     "canonical RGB-D capture group validation failed"
                 ) from exc
 
+    def _video_writer_loop(self) -> None:
+        """Resize and encode queued capture groups away from the Env thread."""
+
+        import imageio.v2 as imageio
+
+        while True:
+            item = self._video_queue.get()
+            try:
+                if item is self._video_queue_stop:
+                    break
+                observation = item
+                head = np.asarray(
+                    observation["main_images"], dtype=np.uint8
+                )
+                if head.ndim != 3 or head.shape[2] < 3:
+                    raise RuntimeError(
+                        f"planner head video must be HxWxC, got {head.shape}"
+                    )
+                wrists = np.asarray(
+                    observation["wrist_images"], dtype=np.uint8
+                )
+                if wrists.ndim != 4 or wrists.shape[0] != 2:
+                    raise RuntimeError(
+                        "planner video requires synchronized left/right wrist RGB"
+                    )
+                height, width = head.shape[:2]
+                left_wrist = _resize_video_tile(
+                    wrists[0], height=height, width=width
+                )
+                right_wrist = _resize_video_tile(
+                    wrists[1], height=height, width=width
+                )
+                frame = np.zeros(
+                    (height * 2, width * 2, 3), dtype=np.uint8
+                )
+                frame[:height, :width] = head[..., :3]
+                frame[:height, width:] = left_wrist
+                frame[height:, :width] = right_wrist
+                self._video_source_shapes.update(
+                    {
+                        "head": list(head.shape),
+                        "left_wrist": list(wrists[0].shape),
+                        "right_wrist": list(wrists[1].shape),
+                        "output": list(frame.shape),
+                    }
+                )
+                if self._video_writer is None:
+                    self._video_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._video_writer = imageio.get_writer(
+                        self._video_path, fps=15
+                    )
+                self._video_writer.append_data(frame)
+                self._video_frames += 1
+            except Exception as exc:
+                self._video_error = f"{type(exc).__name__}: {exc}"
+                logger.exception("failed to append BEHAVIOR video frame")
+            finally:
+                self._video_queue.task_done()
+        if self._video_writer is not None:
+            try:
+                self._video_writer.close()
+            except Exception as exc:
+                self._video_error = f"{type(exc).__name__}: {exc}"
+                logger.exception("failed to close BEHAVIOR video writer")
+            finally:
+                self._video_writer = None
+
     def _append_video(self, observation: dict[str, Any]) -> None:
         if self._video_error is not None or self._video_sealed:
             return
         try:
-            import imageio.v2 as imageio
-            import numpy as np
-
-            head = np.asarray(observation["main_images"], dtype=np.uint8)
-            if head.ndim != 3 or head.shape[2] < 3:
-                raise RuntimeError(
-                    f"planner head video must be HxWxC, got {head.shape}"
-                )
-            self._video_source_shapes["head"] = list(head.shape)
-            frame = head[..., :3]
-            wrists = np.asarray(observation["wrist_images"], dtype=np.uint8)
-            if wrists.ndim != 4 or wrists.shape[0] != 2:
-                raise RuntimeError(
-                    "planner video requires synchronized left/right wrist RGB"
-                )
-            height, width = head.shape[:2]
-            self._video_source_shapes["left_wrist"] = list(wrists[0].shape)
-            self._video_source_shapes["right_wrist"] = list(wrists[1].shape)
-            left_wrist = _resize_video_tile(wrists[0], height=height, width=width)
-            right_wrist = _resize_video_tile(wrists[1], height=height, width=width)
-            frame = np.zeros((height * 2, width * 2, 3), dtype=np.uint8)
-            frame[:height, :width] = head[..., :3]
-            frame[:height, width:] = left_wrist
-            frame[height:, :width] = right_wrist
-            self._video_source_shapes["output"] = list(frame.shape)
-            # Open the encoder only after a complete frame has validated.  A
-            # malformed first capture must not leave an empty MP4 handle.
-            if self._video_writer is None:
-                self._video_path.parent.mkdir(parents=True, exist_ok=True)
-                self._video_writer = imageio.get_writer(self._video_path, fps=15)
-            self._video_writer.append_data(frame)
-            self._video_frames += 1
+            if self._video_queue_closed:
+                return
+            queued = {
+                "main_images": np.asarray(
+                    observation["main_images"], dtype=np.uint8
+                ).copy(),
+                "wrist_images": np.asarray(
+                    observation["wrist_images"], dtype=np.uint8
+                ).copy(),
+            }
+            self._video_queue.put_nowait(queued)
+        except Full:
+            self._video_frames_dropped += 1
         except Exception as exc:
             self._video_error = f"{type(exc).__name__}: {exc}"
-            logger.exception("failed to append BEHAVIOR video frame")
+            logger.exception("failed to queue BEHAVIOR video frame")
 
     def _finalize_video_segment(self) -> None:
-        if self._video_writer is not None:
-            self._video_writer.close()
-            self._video_writer = None
+        if not self._video_queue_closed:
+            self._video_queue_closed = True
+            self._video_queue.put(self._video_queue_stop)
+        worker = getattr(self, "_video_worker", None)
+        if isinstance(worker, threading.Thread) and worker.is_alive():
+            worker.join(timeout=30.0)
+            if worker.is_alive() and self._video_error is None:
+                self._video_error = "video writer did not stop within 30 seconds"
         video_meta = {
             "path": str(self._video_path),
             "fps": 15,
             "sample_every_env_steps": self._planner_video_interval_steps,
             "frames": self._video_frames,
+            "dropped_frames": self._video_frames_dropped,
             "error": self._video_error,
             "source_shapes": dict(self._video_source_shapes),
             "layout": "2x2:head,left_wrist/right_wrist,blank",
@@ -3555,32 +2845,20 @@ class BehaviorEnvFacade:
         self._action_source = "pi0_vla"
         self._vla_actions_enabled = True
         self._controller_state = _CONTROLLER_VLA
-        self._pending_vla_visual_authorization = None
-        self._latest_successful_held_rotate_receipt = None
-        self._latest_successful_held_rotate_attachment = None
-        self._latest_successful_held_rotate_public_frame_ids = set()
-        self._held_rotate_target_surface_review = None
         self._public_capture_sequence = 0
         self._latest_unconsumed_public_capture_receipt = None
-        self._active_rotate_pi0_candidate = None
-        self._awaiting_opposite_surface_review = None
-        self._completed_opposite_surface_cycles = []
-        self._pi0_nav_pick_disable_receipt = None
         self._clear_active_vla_invocation_state()
-        self._next_pi0_chunk_index = 1
         self._motion_frozen = False
         self._dashboard_planning_admitted = False
         self._dashboard_execute_receipts = {}
         self._dashboard_env_step_latency = None
         self._projection_receipts.clear()
-        self._consumed_projection_receipts.clear()
         self._public_observed_frame_ids.clear()
         self._latest_public_head_frame_id = None
         self._latest_public_observation_lineage = None
         self._official_success_latched = False
         self._official_success_receipt = None
         self._terminal_failure_receipt = None
-        self._held_closure_receipts = {}
         restore_path_value = os.environ.get("RPENT_BEHAVIOR_RESTORE_STATE")
         if restore_path_value:
             raise RuntimeError(
@@ -3597,14 +2875,6 @@ class BehaviorEnvFacade:
                     "hybrid R1Pro cuRobo warmup did not complete successfully"
                 )
             self._planner_warmup_report = planner_warmup
-            capture_step = int(self._env_steps)
-            self._refresh_observation_without_step(
-                synchronize_hand_geometry=True
-            )
-            if int(self._env_steps) != capture_step:
-                raise RuntimeError(
-                    "post-warmup Dashboard camera refresh advanced the simulator"
-                )
         logger.info(
             "BEHAVIOR reset completed in %.1fs on thread %s",
             time.monotonic() - started_at,
@@ -3622,7 +2892,7 @@ class BehaviorEnvFacade:
         current_object_visual_check: dict[str, Any] | None = None,
         baseline_internal_authorization: bool = False,
     ) -> dict[str, Any]:
-        """Validate VLA use and confirm a repeatable controller re-arm."""
+        """Re-arm the VLA controller without external physical-state gates."""
 
         if not isinstance(invocation_id, str) or not invocation_id:
             raise ValueError("invocation_id must be a non-empty string")
@@ -3630,21 +2900,10 @@ class BehaviorEnvFacade:
             raise ValueError("call_index must be positive")
         if not isinstance(baseline_internal_authorization, bool):
             raise TypeError("baseline_internal_authorization must be boolean")
-        if (
-            baseline_internal_authorization
-            and self._controller_mode != "pi0_nav_pick_only"
-        ):
-            raise RuntimeError(
-                "baseline internal authorization is unavailable in hybrid mode"
-            )
-        if baseline_internal_authorization and current_object_visual_check is not None:
-            raise ValueError(
-                "baseline internal authorization cannot consume public visual evidence"
-            )
+        del current_object_visual_check
         if self._official_success_latched or _raw_success(self._last_info):
             receipt = self._latch_official_success(self._last_info)
             self._clear_active_vla_invocation_state()
-            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
             return {
                 "primitive_success": False,
                 "task_success": True,
@@ -3658,106 +2917,31 @@ class BehaviorEnvFacade:
                 "vla_actions_enabled": False,
             }
         if vla_status is None:
-            if (
-                not (self._official_success_latched or _raw_success(self._last_info))
-                and self._pi0_nav_pick_is_receipt_disabled()
-            ):
-                return self._pi0_nav_pick_disable_guard_result()
-            if self._awaiting_opposite_surface_review is not None:
-                self._invalidate_pi0_visual_regression_chain(reset_completed=True)
             if self._active_vla_invocation is not None:
                 self._clear_active_vla_invocation_state()
-                self._invalidate_pi0_visual_regression_chain(reset_completed=True)
-            facts = self.guard_tool_call(
-                name="pi0_nav_pick",
-                input_dict={"current_object_visual_check": current_object_visual_check},
-            )
-            # The public tool-envelope guard has the requested chunk count. This
-            # internal two-phase controller preflight does not; Pure VLA uses its
-            # own fixed exact-N baseline contract.
-            if baseline_internal_authorization:
-                failed = [
-                    item
-                    for item in facts["failed_preconditions"]
-                    if item != "fresh_object_visual_check_required"
-                ]
-                facts = {
-                    **facts,
-                    "primitive_success": not failed,
-                    "stop_reason": (
-                        "guard_passed" if not failed else "precondition_rejected"
-                    ),
-                    "failed_preconditions": failed,
-                }
-            failed = list(facts["failed_preconditions"])
-            if failed:
-                return facts
-            attachments = self._attachment_runtime_facts()
-            attachment_snapshot = self._attachment_fingerprint_snapshot(attachments)
-            if attachment_snapshot.get("available") is not True:
-                raise RuntimeError("attachment snapshot is unavailable")
-            visual_authorization = None
-            if int(attachments.get("attachment_count", 0)) > 0:
-                if baseline_internal_authorization:
-                    visual_authorization = self._baseline_internal_visual_authorization(
-                        invocation_id=invocation_id,
-                        attachment_snapshot=attachment_snapshot,
-                    )
-                else:
-                    visual_authorization = self._current_object_visual_authorization(
-                        current_object_visual_check,
-                        invocation_id=invocation_id,
-                    )
-                visual_authorization["attachment_count"] = int(
-                    attachment_snapshot["attachment_count"]
-                )
             controller = self._switch_controller(_CONTROLLER_VLA)
-            after_snapshot = self._attachment_fingerprint_snapshot()
-            if (
-                after_snapshot.get("available") is not True
-                or after_snapshot.get("hands") != attachment_snapshot.get("hands")
-                or after_snapshot.get("fingerprints")
-                != attachment_snapshot.get("fingerprints")
-            ):
-                raise RuntimeError(
-                    "attachment identity changed while arming the VLA controller"
-                )
-            self._bind_rotate_receipt_to_vla_invocation(
-                invocation_id=invocation_id,
-                call_index=int(call_index),
-            )
             self._active_vla_invocation = invocation_id
             self._active_vla_call_index = int(call_index)
-            self._pending_vla_visual_authorization = visual_authorization
-            self._pending_vla_attachment_snapshot = attachment_snapshot
             self._pending_vla_baseline_internal_authorization = bool(
                 baseline_internal_authorization
             )
-            self._next_pi0_chunk_index = 1
             return {
-                **facts,
+                "primitive_success": True,
+                "task_success": False,
+                "official_success_source": 'info["done"]["success"]',
+                "failed_preconditions": [],
+                "attempt_index": self._attempt_index,
+                "attempt_nonce": self._attempt_nonce,
+                "total_env_steps": int(self._env_steps),
                 "stop_reason": "vla_rearm_preflight_passed",
                 "invocation_id": invocation_id,
                 "call_index": int(call_index),
                 "vla_actions_enabled": bool(self._vla_actions_enabled),
                 "controller_transition": controller,
-                "attachment_count_at_invocation_start": int(
-                    attachments.get("attachment_count", 0)
-                ),
-                "attachments_present_at_invocation_start": bool(
-                    int(attachments.get("attachment_count", 0)) > 0
-                ),
-                "current_object_visual_authorization": visual_authorization,
                 "baseline_internal_authorization": bool(
                     baseline_internal_authorization
                 ),
             }
-        if (
-            not (self._official_success_latched or _raw_success(self._last_info))
-            and self._pi0_nav_pick_is_receipt_disabled()
-        ):
-            self._clear_active_vla_invocation_state()
-            return self._pi0_nav_pick_disable_guard_result()
         facts = {
             "primitive_success": True,
             "task_success": bool(self._official_success_latched),
@@ -3776,62 +2960,6 @@ class BehaviorEnvFacade:
         pending_is_baseline = bool(self._pending_vla_baseline_internal_authorization)
         if pending_is_baseline != baseline_internal_authorization:
             raise RuntimeError("VLA re-arm authorization mode changed after preflight")
-        attachments = self._attachment_runtime_facts()
-        if attachments.get("available") is not True:
-            raise RuntimeError("attachment state is unavailable during VLA re-arm")
-        attachment_snapshot = self._attachment_fingerprint_snapshot(attachments)
-        expected_attachment_snapshot = self._pending_vla_attachment_snapshot
-        if (
-            not isinstance(expected_attachment_snapshot, dict)
-            or expected_attachment_snapshot.get("hands")
-            != attachment_snapshot.get("hands")
-            or expected_attachment_snapshot.get("fingerprints")
-            != attachment_snapshot.get("fingerprints")
-        ):
-            raise RuntimeError("attachment identity changed during VLA re-arm")
-        candidate = getattr(self, "_active_rotate_pi0_candidate", None)
-        if isinstance(candidate, dict):
-            candidate_hand = str(candidate["rotate_receipt"].get("resolved_hand", ""))
-            current_attachment = attachments.get("attached_objects", {}).get(
-                candidate_hand
-            )
-            matches, _identity = _attachment_identity_status(
-                current_attachment,
-                candidate.get("expected_attachment"),
-                hand=candidate_hand,
-            )
-            if (
-                candidate.get("invocation_id") != invocation_id
-                or int(candidate.get("bound_env_step", -1)) != int(self._env_steps)
-                or not matches
-                or not self._attempt_receipt_is_current(
-                    candidate.get("target_surface_review_receipt")
-                )
-            ):
-                self._active_rotate_pi0_candidate = None
-                self._completed_opposite_surface_cycles = []
-        if int(attachments.get("attachment_count", 0)) > 0:
-            authorization = self._pending_vla_visual_authorization
-            if (
-                not isinstance(authorization, dict)
-                or authorization.get("invocation_id") != invocation_id
-                or authorization.get("run_nonce") != self._run_nonce
-                or authorization.get("attempt_nonce") != self._attempt_nonce
-                or int(authorization.get("env_step", -1)) != int(self._env_steps)
-                or int(authorization.get("attachment_count", -1))
-                != int(attachment_snapshot.get("attachment_count", -2))
-            ):
-                raise RuntimeError(
-                    "attached-state VLA re-arm lacks its fresh visual authorization"
-                )
-            self._frame_cache.get_current(
-                str(authorization["resolved_camera"]),
-                str(authorization["frame_id"]),
-            )
-        elif self._pending_vla_visual_authorization is not None:
-            raise RuntimeError(
-                "attachment changed after held-state visual authorization"
-            )
         if (
             not isinstance(vla_status, dict)
             or vla_status.get("actions_enabled") is not True
@@ -3846,12 +2974,6 @@ class BehaviorEnvFacade:
             "invocation_id": invocation_id,
             "call_index": int(call_index),
             "vla_actions_enabled": True,
-            "attachment_count_at_invocation_start": int(
-                attachments.get("attachment_count", 0)
-            ),
-            "attachments_present_at_invocation_start": bool(
-                int(attachments.get("attachment_count", 0)) > 0
-            ),
             "baseline_internal_authorization": bool(baseline_internal_authorization),
         }
 
@@ -3871,28 +2993,17 @@ class BehaviorEnvFacade:
             )
         if self._controller_state != _CONTROLLER_VLA or not self._vla_actions_enabled:
             raise RuntimeError("VLA controller is not active")
-        remaining = int(self._meta["max_episode_steps"]) - int(self._env_steps)
-        if remaining < 32:
-            raise RuntimeError(
-                "global env-step budget cannot admit one complete 32-step chunk"
-            )
         if (
             isinstance(chunk_index, bool)
-            or int(chunk_index) != chunk_index
-            or int(chunk_index) != self._next_pi0_chunk_index
+            or not isinstance(chunk_index, (int, np.integer))
+            or int(chunk_index) < 1
         ):
-            raise ValueError(
-                "chunk_index must be the next exact sequence value: "
-                f"expected={self._next_pi0_chunk_index} got={chunk_index!r}"
-            )
-        self._next_pi0_chunk_index += 1
+            raise ValueError("chunk_index must be positive")
         action_array = validate_action_chunk(actions, max_horizon=32)
         if action_array.shape != (32, 23):
             raise ValueError(
                 f"pi0_nav_pick requires one complete [32,23] chunk, got {action_array.shape}"
             )
-        if self._motion_in_flight:
-            raise RuntimeError("another physical action is already in flight")
         self._motion_in_flight = True
         try:
             ret = self._step_action_chunk(
@@ -3900,35 +3011,10 @@ class BehaviorEnvFacade:
                 observe_final=True,
                 pi0_nav_pick=True,
             )
-            observation, reward, terminated, truncated, info = ret
-            rpent = info.get("_rpent") if isinstance(info, dict) else None
-            monitor = (
-                rpent.get("pi0_nav_pick_monitor") if isinstance(rpent, dict) else None
-            )
-            if not isinstance(monitor, dict):
-                raise RuntimeError("pi0_nav_pick monitor was not produced")
-            executed_steps = int(monitor.get("executed_steps", 0))
-            if monitor.get("official_success_first_observed_this_chunk") is True:
-                monitor["visual_review"] = {
-                    "skipped": True,
-                    "reason": "official_task_success",
-                }
-            else:
-                self._record_full_pi0_chunk_for_rotate_candidate(
-                    executed_steps=executed_steps,
-                    terminated=bool(terminated),
-                    truncated=bool(truncated),
-                )
-                monitor["visual_review"] = self._persist_pi0_nav_pick_views(
-                    chunk_index=int(chunk_index), validator=monitor
-                )
-            result = (observation, reward, terminated, truncated, info)
-            pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
-            return result
+            pickle.dumps(ret, protocol=pickle.HIGHEST_PROTOCOL)
+            return ret
         except Exception:
             self._vla_actions_enabled = False
-            self._awaiting_opposite_surface_review = None
-            self._completed_opposite_surface_cycles = []
             self._clear_active_vla_invocation_state()
             if self._official_success_latched or _raw_success(self._last_info):
                 self._latch_official_success(self._last_info)
@@ -3967,7 +3053,7 @@ class BehaviorEnvFacade:
         observe_final: bool,
         pi0_nav_pick: bool = False,
     ) -> tuple[Any, Any, bool, bool, Any]:
-        """Execute a chunk and derive only sanitized live capabilities."""
+        """Send one 23D chunk and stop only on raw environment lifecycle facts."""
 
         import torch
 
@@ -3977,47 +3063,28 @@ class BehaviorEnvFacade:
         action_tensor = torch.as_tensor(action_array, dtype=torch.float32).reshape(
             1, action_array.shape[0], action_array.shape[1]
         )
-        pi0_admission_capability = (
-            self._sanitized_capability_summary() if pi0_nav_pick else None
-        )
         final_observation = self._last_observation
         final_reward: Any = None
         official_info: Any = {}
         terminated = False
         truncated = False
         executed_steps = 0
-        soft_success_observed = False
-        first_success_observed_this_chunk = False
-        terminal_classification: dict[str, Any] = {
-            "raw_terminated": False,
-            "raw_truncated": False,
-            "raw_success": False,
-            "info_done": False,
-            "soft_success_termination": False,
-            "hard_terminated": False,
-            "hard_truncated": False,
-            "terminal_envelope_malformed": False,
-            "terminal_classification_reason": "not_started",
-            "active_success_conditions": [],
-            "active_failure_conditions": [],
-            "active_timeout_conditions": [],
-        }
+        terminal_capture: dict[str, Any] | None = None
+        terminal_capture_error: str | None = None
         for step_index in range(action_tensor.shape[1]):
-            if self._env_steps >= int(self._meta["max_episode_steps"]):
-                truncated = True
-                terminal_classification = {
-                    **terminal_classification,
-                    "hard_truncated": True,
-                    "terminal_classification_reason": "global_episode_horizon",
-                }
-                break
             is_last = step_index == action_tensor.shape[1] - 1
-            interval = 1 if pi0_nav_pick else self._planner_video_interval_steps
-            need_observation = bool(
-                pi0_nav_pick
-                or (observe_final and is_last)
-                or (self._env_steps + 1) % interval == 0
+            interval = self._planner_video_interval_steps
+            record_observation = bool(
+                observe_final
+                and (
+                    is_last
+                    or (
+                        pi0_nav_pick
+                        and (self._env_steps + 1) % interval == 0
+                    )
+                )
             )
+            need_observation = record_observation
             step_action = action_tensor[:, step_index]
             step_latency = getattr(
                 self,
@@ -4070,55 +3137,51 @@ class BehaviorEnvFacade:
             official_info = step_infos[0]
             self._last_info = _numpy_tree(official_info)
             final_reward = step_reward[0]
-            if pi0_nav_pick:
-                terminal_classification = _classify_pi0_terminal_step(
-                    info=official_info,
-                    raw_terminated=step_term,
-                    raw_truncated=step_trunc,
-                )
-                terminated = bool(
-                    terminated or terminal_classification["hard_terminated"]
-                )
-                truncated = bool(truncated or terminal_classification["hard_truncated"])
-            else:
-                terminated = bool(
-                    terminated or _scalar_bool(step_term) or _raw_done(official_info)
-                )
-                truncated = bool(truncated or _scalar_bool(step_trunc))
             raw_success_this_step = _raw_success(official_info)
-            if pi0_nav_pick and raw_success_this_step:
-                receipt_before = self._official_success_receipt
-                self._capture_official_success(self._last_info)
-                first_success_observed_this_chunk = bool(
-                    first_success_observed_this_chunk
-                    or (
-                        receipt_before is None
-                        and isinstance(self._official_success_receipt, dict)
-                    )
-                )
-                soft_success_observed = bool(
-                    soft_success_observed
-                    or terminal_classification["soft_success_termination"]
-                )
+            terminated = bool(terminated or _scalar_bool(step_term))
+            truncated = bool(truncated or _scalar_bool(step_trunc))
             if need_observation:
                 if step_obs is None:
                     raise RuntimeError("requested observation was not returned")
                 final_observation = _single_observation(self._env._wrap_obs(step_obs))
                 self._last_observation = final_observation
-                if not (pi0_nav_pick and raw_success_this_step):
-                    self._record_rgbd_frames(step_obs, final_observation)
-                    self._append_video(final_observation)
+                self._record_rgbd_frames(step_obs, final_observation)
+                self._append_video(final_observation)
+            if (
+                (raw_success_this_step or terminated or truncated)
+                and not need_observation
+            ):
+                try:
+                    # This is an in-process render/get_obs on the same Env RPC,
+                    # not a second task RPC and never an additional env action.
+                    self._refresh_observation_without_step()
+                    final_observation = self._last_observation
+                    if final_observation is not None:
+                        self._append_video(final_observation)
+                except Exception as exc:
+                    terminal_capture_error = f"{type(exc).__name__}: {exc}"
+                    logger.exception("same-step terminal camera refresh failed")
+            if raw_success_this_step or terminated or truncated:
+                frame_cache = getattr(self, "_frame_cache", None)
+                if frame_cache is not None:
+                    try:
+                        terminal_capture = self._cached_capture_group()
+                    except Exception as exc:
+                        terminal_capture_error = f"{type(exc).__name__}: {exc}"
+                        # Raw success and raw lifecycle facts remain
+                        # authoritative even if terminal image packaging
+                        # fails. Never issue a post-terminal retry RPC.
+                        logger.exception(
+                            "same-step terminal capture packaging failed"
+                        )
             if raw_success_this_step:
-                if not pi0_nav_pick:
-                    self._latch_official_success(self._last_info)
+                self._latch_official_success(self._last_info)
                 break
             if terminated or truncated:
                 break
         if final_observation is None:
             raise RuntimeError("BEHAVIOR action chunk executed zero steps")
-        if pi0_nav_pick:
-            self._done = bool(self._official_success_latched or terminated or truncated)
-        elif not self._official_success_latched:
+        if not self._official_success_latched:
             self._done = bool(terminated or truncated)
         returned_info = _wire_safe(official_info)
         if not isinstance(returned_info, dict):
@@ -4129,44 +3192,27 @@ class BehaviorEnvFacade:
         envelope.update(
             {
                 "executed_steps": int(executed_steps),
-                "handoff_env_steps": 0,
                 "total_env_steps": int(self._env_steps),
             }
         )
+        if terminal_capture is not None:
+            envelope["terminal_capture"] = terminal_capture
+        if terminal_capture_error is not None:
+            envelope["terminal_capture_error"] = terminal_capture_error
         if pi0_nav_pick:
-            capability = (
-                pi0_admission_capability
-                if self._official_success_latched
-                else self._sanitized_capability_summary()
-            )
-            if not isinstance(capability, dict):
-                raise RuntimeError("Pi0 admission capability is unavailable")
-            attachment_state = capability.get("attachments", {})
-            local_grasp = bool(
-                not self._official_success_latched
-                and int(executed_steps) == 32
-                and isinstance(attachment_state, dict)
-                and attachment_state.get("available") is True
-                and int(attachment_state.get("count", 0)) > 0
-            )
             envelope["pi0_nav_pick_monitor"] = {
                 "executed_steps": int(executed_steps),
-                "handoff_env_steps": 0,
                 "total_env_steps": int(self._env_steps),
-                "local_grasp_success": bool(local_grasp),
-                "capability": capability,
-                "controller_state": self._controller_state,
-                "action_source": self._action_source,
-                "vla_actions_enabled": bool(self._vla_actions_enabled),
                 "official_success_receipt": _wire_safe(self._official_success_receipt),
-                "official_success_first_observed_this_chunk": bool(
-                    first_success_observed_this_chunk
-                ),
                 "stop_reason": (
-                    "official_task_success" if self._official_success_latched else None
+                    "official_task_success"
+                    if self._official_success_latched
+                    else "environment_terminated"
+                    if terminated
+                    else "environment_truncated"
+                    if truncated
+                    else "chunk_complete"
                 ),
-                "soft_success_observed": bool(soft_success_observed),
-                "terminal_classification": _wire_safe(terminal_classification),
             }
         result = _wire_safe(
             (
@@ -4179,62 +3225,6 @@ class BehaviorEnvFacade:
         )
         pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
         return result
-
-    def _physical_gripper_opening(self, hand: str) -> float:
-        """Return the physical two-finger joint opening without a sensor join."""
-
-        robot = self._robot()
-        if robot is None:
-            raise RuntimeError("R1Pro robot unavailable for Pi0 gripper monitoring")
-        control_indices = getattr(robot, "gripper_control_idx", None)
-        if not isinstance(control_indices, dict) or hand not in control_indices:
-            raise RuntimeError(f"R1Pro {hand} gripper control indices are unavailable")
-        indices = np.asarray(
-            _numpy_tree(control_indices[hand]), dtype=np.int64
-        ).reshape(-1)
-        if indices.size != 2 or np.any(indices < 0):
-            raise RuntimeError(
-                f"R1Pro {hand} gripper must contain exactly two joint indices"
-            )
-        qpos = np.asarray(
-            _numpy_tree(robot.get_joint_positions()), dtype=np.float64
-        ).reshape(-1)
-        if int(indices.max()) >= qpos.size:
-            raise RuntimeError(f"R1Pro {hand} gripper joint index is out of bounds")
-        actual_opening = float(qpos[indices].sum())
-        if not np.isfinite(actual_opening):
-            raise RuntimeError(f"R1Pro {hand} physical gripper opening is not finite")
-        return actual_opening
-
-    def _validated_selected_gripper_opening(
-        self,
-        *,
-        observation: dict[str, Any],
-        hand: str,
-    ) -> float:
-        """Return physical opening after matching same-step public proprio."""
-
-        actual_opening = self._physical_gripper_opening(hand)
-
-        compact = extract_policy_state(observation["states"])
-        public_values = compact[POLICY_STATE_SEGMENTS[f"{hand}_gripper"]]
-        if public_values.shape != (1,) or not np.isfinite(public_values[0]):
-            raise RuntimeError(
-                f"R1Pro {hand} public proprio gripper opening is invalid"
-            )
-        public_opening = float(public_values[0])
-        if not np.isclose(
-            actual_opening,
-            public_opening,
-            rtol=1e-5,
-            atol=1e-5,
-        ):
-            raise RuntimeError(
-                "same-step physical/public gripper opening mismatch: "
-                f"hand={hand!r}, physical={actual_opening:.9g}, "
-                f"public={public_opening:.9g}"
-            )
-        return actual_opening
 
     def get_env_meta(self) -> dict[str, Any]:
         """Return only public benchmark identity, never native simulator bindings."""
@@ -4362,7 +3352,6 @@ class BehaviorEnvFacade:
             and omni_env is not None
             and robot_is_r1pro
         )
-        no_motion_in_flight = not bool(getattr(self, "_motion_in_flight", False))
         position_control_ready = bool(
             controller_transfer_available
             and (
@@ -4378,16 +3367,12 @@ class BehaviorEnvFacade:
             and simulation_identity
             and hybrid_mode
             and planner_available
-            and controller_transfer_available
-            and position_control_ready
-            and no_motion_in_flight
             and not stopped
         )
         observe_available = bool(
             reset_completed
             and simulation_identity
             and planner is not None
-            and no_motion_in_flight
             and not stopped
         )
 
@@ -4423,7 +3408,6 @@ class BehaviorEnvFacade:
             isinstance(warmup_report, dict)
             and warmup_report.get("status") == "complete"
             and torso_warmup.get("ok") is True
-            and torso_warmup.get("collision_admitted") is True
             and int(torso_warmup.get("active_dof_count", -1)) == 3
             and int(torso_warmup.get("env_actions_sent", -1)) == 0
             and torso_warmup.get("simulator_advanced") is False
@@ -4464,6 +3448,20 @@ class BehaviorEnvFacade:
             or any(wrist_available.values())
             or any(gripper_available.values())
         )
+        threaded_ready = getattr(
+            planner,
+            "threaded_predicted_planning_ready",
+            None,
+        )
+        threaded_predicted_planning = bool(
+            getattr(
+                self,
+                "_threaded_predicted_planning_dispatcher_ready",
+                False,
+            )
+            and callable(threaded_ready)
+            and threaded_ready() is True
+        )
         unavailable_reason: str | None = None
         if stopped:
             unavailable_reason = "run_finished"
@@ -4475,10 +3473,6 @@ class BehaviorEnvFacade:
             unavailable_reason = "manual_motion_requires_hybrid_mode"
         elif not planner_available:
             unavailable_reason = "planner_unavailable"
-        elif not controller_transfer_available or not position_control_ready:
-            unavailable_reason = "position_controller_unavailable"
-        elif not no_motion_in_flight:
-            unavailable_reason = "controller_busy"
         elif not motion_available:
             unavailable_reason = "manual_motion_capabilities_unverified"
 
@@ -4501,6 +3495,7 @@ class BehaviorEnvFacade:
             "torso_warmup_verified": torso_warmup_verified,
             "wrist_rotation_available": wrist_available,
             "gripper_available": gripper_available,
+            "threaded_predicted_planning": threaded_predicted_planning,
             "steps": {
                 "base_translation_m": BASE_TRANSLATION_STEP_M,
                 "base_rotation_rad": BASE_ROTATION_STEP_RAD,
@@ -4511,21 +3506,9 @@ class BehaviorEnvFacade:
             "planner": planner_report,
         }
 
-    def _dashboard_capture_group(self) -> dict[str, Any]:
-        """Capture and serialize one fresh, atomic three-camera simulator view."""
+    def _cached_capture_group(self) -> dict[str, Any]:
+        """Serialize the already-published same-step three-camera capture."""
 
-        previous_group_ids: set[str] = set()
-        for camera in ("head", "left_wrist", "right_wrist"):
-            try:
-                prior = self._frame_cache.latest(camera)
-            except Exception:
-                continue
-            if isinstance(prior.capture_group_id, str):
-                previous_group_ids.add(prior.capture_group_id)
-
-        self._refresh_observation_without_step(
-            synchronize_hand_geometry=True
-        )
         frames_bytes: dict[str, bytes] = {}
         frame_ids: dict[str, str] = {}
         group_ids: set[str] = set()
@@ -4565,16 +3548,38 @@ class BehaviorEnvFacade:
             raise RuntimeError(
                 "dashboard capture is not from the current simulator step"
             )
-        if capture_group_id in previous_group_ids:
-            raise RuntimeError(
-                "dashboard capture refresh did not publish a fresh capture group"
-            )
         return {
             "_frames_bytes": frames_bytes,
             "frame_ids": frame_ids,
             "capture_group_id": capture_group_id,
             "simulator_step": simulator_step,
         }
+
+    def _dashboard_capture_group(self) -> dict[str, Any]:
+        """Capture and serialize one fresh, atomic three-camera simulator view."""
+
+        previous_group_ids: set[str] = set()
+        for camera in ("head", "left_wrist", "right_wrist"):
+            try:
+                prior = self._frame_cache.latest(camera)
+            except Exception:
+                continue
+            if isinstance(prior.capture_group_id, str):
+                previous_group_ids.add(prior.capture_group_id)
+
+        self._refresh_observation_without_step()
+        capture = self._cached_capture_group()
+        if capture["capture_group_id"] in previous_group_ids:
+            raise RuntimeError(
+                "dashboard capture refresh did not publish a fresh capture group"
+            )
+        observation = self._last_observation
+        if not isinstance(observation, dict):
+            raise RuntimeError(
+                "dashboard capture refresh produced no recordable observation"
+            )
+        self._append_video(observation)
+        return capture
 
     @staticmethod
     def _dashboard_requested_step(target: str, action: str) -> dict[str, Any]:
@@ -4677,6 +3682,8 @@ class BehaviorEnvFacade:
         target = request["target"]
         action = request["action"]
         planning_only_probe = request.get("planning_only_probe") is True
+        if self._official_success_latched or _raw_success(self._last_info):
+            raise RuntimeError("raw task success is terminal")
         if action in {"open", "close"}:
             raise ValueError(
                 "open and close are one-shot commands, not prepared motions"
@@ -4685,13 +3692,6 @@ class BehaviorEnvFacade:
             if not bool(getattr(self, "_dashboard_planning_admitted", False)):
                 raise RuntimeError(
                     "background planning requires a foreground-admitted predecessor"
-                )
-            if (
-                self._controller_state != _CONTROLLER_PLANNER
-                or self._base_controller_mode != "position"
-            ):
-                raise RuntimeError(
-                    "background planning requires verified planner position control"
                 )
         else:
             capabilities = self.dashboard_control_capabilities()
@@ -4744,17 +3744,18 @@ class BehaviorEnvFacade:
                 time.monotonic() - controller_switch_started,
             )
             controller_switch_changed = transition.get("changed") is True
-            if (
-                self._controller_state != _CONTROLLER_PLANNER
-                or self._base_controller_mode != "position"
-            ):
-                raise RuntimeError(
-                    "manual planning requires verified planner position control"
-                )
             self._dashboard_planning_admitted = True
 
         planner = self._require_planner()
-        prepare = getattr(planner, "prepare_dashboard_motion", None)
+        prepare = getattr(
+            planner,
+            (
+                "prepare_predicted_dashboard_motion"
+                if request["background"]
+                else "prepare_dashboard_motion"
+            ),
+            None,
+        )
         if not callable(prepare):
             raise RuntimeError("Dashboard prepared-motion planner is unavailable")
         prepare_started = time.monotonic()
@@ -4762,12 +3763,31 @@ class BehaviorEnvFacade:
             0.0,
             prepare_started - method_started - controller_switch_elapsed_s,
         )
-        result = prepare(
-            target,
-            action,
-            predecessor_plan_id=request["predecessor_plan_id"],
-            background=request["background"],
-        )
+        try:
+            if request["background"]:
+                result = prepare(
+                    target,
+                    action,
+                    predecessor_plan_id=request["predecessor_plan_id"],
+                )
+            else:
+                result = prepare(
+                    target,
+                    action,
+                    predecessor_plan_id=request["predecessor_plan_id"],
+                    background=False,
+                )
+        except CuroboPlanningError as exc:
+            result = {
+                "status": "failed",
+                "target": target,
+                "action": action,
+                "predecessor_plan_id": request["predecessor_plan_id"],
+                "background": request["background"],
+                "primitive_success": False,
+                "stop_reason": exc.stop_reason,
+                "error": exc.error or str(exc),
+            }
         prepare_finished = time.monotonic()
         planner_prepare_s = max(0.0, prepare_finished - prepare_started)
         if self._official_success_latched or _raw_success(self._last_info):
@@ -4783,6 +3803,41 @@ class BehaviorEnvFacade:
             raise RuntimeError(
                 "prepare_dashboard_motion returned a non-mapping result"
             )
+        if result.get("status") == "failed":
+            postcheck_finished = time.monotonic()
+            response = {
+                **_wire_safe(result),
+                "source": "dashboard_prepare",
+                "requested_step": self._dashboard_requested_step(target, action),
+                "elapsed_s": planner_prepare_s,
+                "planning_only_probe": planning_only_probe,
+                "env_step_delta": finish_env_step - start_env_step,
+                "zero_action_verified": finish_env_step == start_env_step,
+                "latency_metrics": {
+                    "schema_version": 1,
+                    "clock": "time.monotonic",
+                    "operation": "dashboard_prepare",
+                    "phases_s": {
+                        "prepare_preflight": prepare_preflight_s,
+                        "controller_switch": controller_switch_elapsed_s,
+                        "planner_prepare": planner_prepare_s,
+                        "prepare_postcheck": max(
+                            0.0, postcheck_finished - prepare_finished
+                        ),
+                    },
+                    "controller_switch": {
+                        "attempted": controller_switch_attempted,
+                        "changed": controller_switch_changed,
+                        "from_state": controller_state_before,
+                        "to_state": str(
+                            getattr(self, "_controller_state", "unavailable")
+                        ),
+                    },
+                    "total_s": max(0.0, postcheck_finished - method_started),
+                },
+            }
+            pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
+            return response
         plan_id = validate_dashboard_plan_id(result.get("plan_id"))
         for field, expected in (
             ("target", target),
@@ -4810,32 +3865,6 @@ class BehaviorEnvFacade:
                 planning_only_probe and finish_env_step == start_env_step
             ),
         }
-        if request["background"]:
-            deadline = response.get("planning_deadline_s")
-            if (
-                isinstance(deadline, bool)
-                or not isinstance(
-                    deadline,
-                    (int, float, np.integer, np.floating),
-                )
-                or not np.isfinite(float(deadline))
-                or float(deadline) <= 0.0
-            ):
-                raise RuntimeError(
-                    "background plan omitted a positive solver deadline"
-                )
-            enforcement = response.get("deadline_enforcement")
-            enforcement = (
-                dict(enforcement) if isinstance(enforcement, dict) else {}
-            )
-            enforcement.update(
-                {
-                    "hard_wall_clock_enforced": False,
-                    "soft_deadline_s": float(deadline),
-                    "background_deadline_kind": "soft_solver_deadline",
-                }
-            )
-            response["deadline_enforcement"] = enforcement
         postcheck_finished = time.monotonic()
         prepare_postcheck_s = max(
             0.0,
@@ -4873,28 +3902,13 @@ class BehaviorEnvFacade:
         plan_id: str,
         command_id: str,
     ) -> dict[str, Any]:
-        """Execute a prepared motion once per command id, without camera I/O."""
+        """Execute one prepared motion request."""
 
         method_started = time.monotonic()
         plan_id = validate_dashboard_plan_id(plan_id)
         command_id = validate_dashboard_command_id(command_id)
-        cached = self._dashboard_execute_receipts.get(command_id)
-        if cached is not None:
-            cached_plan_id, receipt = cached
-            if cached_plan_id != plan_id:
-                raise RuntimeError(
-                    "command_id is already bound to a different plan_id"
-                )
-            return deepcopy(receipt)
-        if (
-            self._controller_state != _CONTROLLER_PLANNER
-            or self._base_controller_mode != "position"
-        ):
-            raise RuntimeError(
-                "prepared execution requires verified planner position control"
-            )
-        if self._motion_in_flight:
-            raise RuntimeError("another physical action is already in flight")
+        if self._official_success_latched or _raw_success(self._last_info):
+            raise RuntimeError("raw task success is terminal")
         planner = self._require_planner()
         execute = getattr(planner, "execute_dashboard_motion", None)
         if not callable(execute):
@@ -4922,18 +3936,6 @@ class BehaviorEnvFacade:
                 "execute_dashboard_motion returned a non-mapping result"
             )
         result = self._planner_public_result(result)
-        if any(
-            key in result
-            for key in (
-                "_frames_bytes",
-                "frame_ids",
-                "capture_group_id",
-                "capture_error",
-            )
-        ):
-            raise RuntimeError(
-                "prepared motion result must not contain camera capture data"
-            )
         legacy_elapsed_s = max(0.0, time.monotonic() - execute_started)
         response = {
             **result,
@@ -4969,10 +3971,6 @@ class BehaviorEnvFacade:
             "total_s": execute_preflight_s + planner_execute_s + execute_postcheck_s,
         }
         pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
-        self._dashboard_execute_receipts[command_id] = (
-            plan_id,
-            deepcopy(response),
-        )
         return response
 
     def dashboard_discard_prepared_command(
@@ -5111,16 +4109,7 @@ class BehaviorEnvFacade:
                 )
 
             self._switch_controller(_CONTROLLER_PLANNER)
-            if (
-                self._controller_state != _CONTROLLER_PLANNER
-                or self._base_controller_mode != "position"
-            ):
-                raise RuntimeError(
-                    "manual motion requires verified planner position control"
-                )
             planner = self._require_planner()
-            if self._motion_in_flight:
-                raise RuntimeError("another physical action is already in flight")
             self._motion_in_flight = True
             try:
                 if target == "chassis" and action in {
@@ -5204,7 +4193,7 @@ class BehaviorEnvFacade:
             )
             response["control_capabilities"] = terminal_capabilities
         else:
-            response["control_capabilities"] = self.dashboard_control_capabilities()
+            response["control_capabilities"] = capabilities
         pickle.dumps(response, protocol=pickle.HIGHEST_PROTOCOL)
         return response
 
@@ -5311,6 +4300,14 @@ class BehaviorEnvFacade:
             for _ in range(_HAND_GEOMETRY_SYNC_RENDER_ITERATIONS):
                 self._render_only_for_hand_geometry()
                 render_sync_iterations += 1
+        else:
+            # ``get_obs()`` can return the previous render target after a
+            # controller-only Env step.  A render-only Kit update refreshes all
+            # three camera sensors without advancing physics or sending another
+            # Env action, so the terminal capture and MP4 reflect the state that
+            # just executed rather than a newly labelled copy of stale pixels.
+            self._render_only_for_hand_geometry()
+            render_sync_iterations = 1
         raw_observation, _sensor_info = omni_env.get_obs()
         observation = _single_observation(self._env._wrap_obs([raw_observation]))
         self._last_observation = observation
@@ -5367,7 +4364,6 @@ class BehaviorEnvFacade:
                 current_frame.camera_to_world, dtype=np.float64
             ).tolist(),
         }
-        payload["capability"] = self._sanitized_capability_summary()
         return payload
 
     def _review_public_observation(
@@ -5398,12 +4394,6 @@ class BehaviorEnvFacade:
         }:
             raise ValueError("frame_review.assessment is invalid")
         resolved_camera = self._resolve_camera_role(requested_camera)
-        if getattr(self, "_held_rotate_target_surface_review", None) is not None:
-            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
-            raise RuntimeError(
-                "another frame review invalidated the pending target-surface "
-                "authorization"
-            )
         capture_receipt = getattr(
             self, "_latest_unconsumed_public_capture_receipt", None
         )
@@ -5593,9 +4583,6 @@ class BehaviorEnvFacade:
             "distance_computation_frame": "world",
             "guidance_only": True,
             "semantic_target_verified": False,
-            "collision_authorization": False,
-            "close_authorization": False,
-            "open_authorization": False,
         }
         distance_report: dict[str, Any] | None = None
         if resolved_camera in {"left_wrist", "right_wrist"}:
@@ -5973,7 +4960,6 @@ class BehaviorEnvFacade:
 
     def _planner_public_result(self, result: dict[str, Any]) -> dict[str, Any]:
         public = self._planner_result_with_accounting(result)
-        public["capability"] = self._sanitized_capability_summary()
         public["task_success"] = bool(self._official_success_latched)
         public["official_success_source"] = 'info["done"]["success"]'
         if self._official_success_latched:
@@ -5991,12 +4977,6 @@ class BehaviorEnvFacade:
 
         if self._official_success_latched or _raw_success(self._last_info):
             receipt = self._latch_official_success(self._last_info)
-            self._latest_successful_held_rotate_receipt = None
-            self._latest_successful_held_rotate_attachment = None
-            self._latest_successful_held_rotate_public_frame_ids = set()
-            self._held_rotate_target_surface_review = None
-            self._awaiting_opposite_surface_review = None
-            self._completed_opposite_surface_cycles = []
             self._clear_active_vla_invocation_state()
             return {
                 "controller_state": self._controller_state,
@@ -6021,11 +5001,9 @@ class BehaviorEnvFacade:
             transition = self._switch_controller(_CONTROLLER_PLANNER)
         except Exception:
             self._clear_active_vla_invocation_state()
-            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
             raise
         self._vla_actions_enabled = False
-        finalized_candidate = self._finalize_rotate_pi0_candidate()
-        self._clear_active_vla_invocation_state(clear_candidate=False)
+        self._clear_active_vla_invocation_state()
         return {
             "controller_state": self._controller_state,
             "controller_transition": transition,
@@ -6036,220 +5014,7 @@ class BehaviorEnvFacade:
             "env_pid": os.getpid(),
             "vla_pid": health.get("pid"),
             "vla_endpoint": vla_status.get("endpoint"),
-            "capability": self._sanitized_capability_summary(),
-            "opposite_surface_review_pending": bool(
-                isinstance(finalized_candidate, dict)
-            ),
         }
-
-    def _revalidate_analytic_selection(
-        self,
-        *,
-        requested_hand: str,
-        expected_hand: str,
-        visual_hand_check: Any,
-    ) -> tuple[str, str, dict[str, Any]]:
-        """Repeat explicit hand authorization at the action boundary."""
-
-        resolved = self._authorize_analytic_hand(requested_hand, visual_hand_check)
-        hand, _source, _evidence = resolved
-        if hand != expected_hand:
-            raise RuntimeError("analytic hand selection changed before execution")
-        return resolved
-
-    def _assert_attachment_snapshot_unchanged(
-        self,
-        before: dict[str, Any],
-        *,
-        context: str,
-    ) -> dict[str, Any]:
-        """Reject before the first action if either attachment identity changed."""
-
-        after = self._attachment_fingerprint_snapshot()
-        if (
-            before.get("available") is not True
-            or after.get("available") is not True
-            or list(after.get("hands", [])) != list(before.get("hands", []))
-            or dict(after.get("fingerprints", {}))
-            != dict(before.get("fingerprints", {}))
-        ):
-            raise RuntimeError(f"attachment identity changed during {context}")
-        return after
-
-    def _attachment_postcondition_receipt(
-        self,
-        *,
-        primitive: str,
-        selected_hand: str,
-        before: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Verify task-neutral attachment isolation after one analytic primitive."""
-
-        after = self._attachment_fingerprint_snapshot()
-        other_hand = "right" if selected_hand == "left" else "left"
-        before_fingerprints = dict(before.get("fingerprints", {}))
-        after_fingerprints = dict(after.get("fingerprints", {}))
-        selected_before = before_fingerprints.get(selected_hand)
-        selected_after = after_fingerprints.get(selected_hand)
-        inactive_before = before_fingerprints.get(other_hand)
-        inactive_after = after_fingerprints.get(other_hand)
-        before_hands = set(before.get("hands", []))
-        after_hands = set(after.get("hands", []))
-        selected_present_before = selected_hand in before_hands
-        selected_present_after = selected_hand in after_hands
-        inactive_present_before = other_hand in before_hands
-        inactive_present_after = other_hand in after_hands
-        checks: dict[str, bool] = {
-            "feedback_available": bool(
-                before.get("available", False) and after.get("available", False)
-            ),
-            "inactive_attachment_unchanged": bool(
-                inactive_present_after == inactive_present_before
-                and inactive_after == inactive_before
-            ),
-        }
-        if primitive in {"move_to", "rotate_wrist"}:
-            checks["selected_attachment_unchanged"] = bool(
-                selected_present_after == selected_present_before
-                and selected_after == selected_before
-            )
-        elif primitive == "press":
-            checks["selected_hand_attachment_free_before"] = not selected_present_before
-            checks["selected_hand_attachment_free_after"] = not selected_present_after
-        elif primitive == "open":
-            checks["selected_hand_attachment_cleared"] = not selected_present_after
-        elif primitive == "close":
-            checks["selected_attachment_not_replaced"] = bool(
-                not selected_present_before
-                or (selected_present_after and selected_after == selected_before)
-            )
-        else:
-            raise ValueError(f"unsupported analytic primitive {primitive!r}")
-        passed = all(checks.values())
-        return self._seal_attempt_receipt(
-            {
-                "kind": "analytic_attachment_postcondition",
-                "primitive": primitive,
-                "selected_hand": selected_hand,
-                "inactive_hand": other_hand,
-                "started_env_step": int(before.get("env_step", self._env_steps)),
-                "completed_env_step": int(self._env_steps),
-                "checks": checks,
-                "passed": passed,
-                "before_fingerprints": before_fingerprints,
-                "after_fingerprints": after_fingerprints,
-            }
-        )
-
-    def _navigation_attachment_postcondition_receipt(
-        self,
-        *,
-        before: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Verify that base navigation preserved both attachment identities."""
-
-        after = self._attachment_fingerprint_snapshot()
-        before_fingerprints = dict(before.get("fingerprints", {}))
-        after_fingerprints = dict(after.get("fingerprints", {}))
-        checks = {
-            "feedback_available": bool(
-                before.get("available", False) and after.get("available", False)
-            ),
-            "attachment_hands_unchanged": list(after.get("hands", []))
-            == list(before.get("hands", [])),
-            "attachment_fingerprints_unchanged": after_fingerprints
-            == before_fingerprints,
-        }
-        return self._seal_attempt_receipt(
-            {
-                "kind": "navigation_attachment_postcondition",
-                "primitive": "navigate_to",
-                "started_env_step": int(before.get("env_step", self._env_steps)),
-                "completed_env_step": int(self._env_steps),
-                "checks": checks,
-                "passed": all(checks.values()),
-                "before_fingerprints": before_fingerprints,
-                "after_fingerprints": after_fingerprints,
-            }
-        )
-
-    @staticmethod
-    def _public_navigation_isolation(value: Any) -> dict[str, Any]:
-        """Whitelist base-isolation evidence without target or path geometry."""
-
-        if not isinstance(value, dict):
-            return {
-                "available": False,
-                "ok": False,
-                "stop_reason": "navigation_isolation_feedback_unavailable",
-            }
-        public: dict[str, Any] = {}
-        for field in ("available", "ok"):
-            if isinstance(value.get(field), bool):
-                public[field] = value[field]
-        if value.get("mode") == "base_only":
-            public["mode"] = "base_only"
-        if isinstance(value.get("checks_performed"), int) and not isinstance(
-            value.get("checks_performed"), bool
-        ):
-            public["checks_performed"] = int(value["checks_performed"])
-        if isinstance(value.get("reason"), str):
-            public["reason"] = value["reason"]
-
-        check_names = {
-            "base_z_locked",
-            "base_roll_pitch_locked",
-            "trunk_locked",
-            "left_arm_locked",
-            "right_arm_locked",
-            "left_gripper_command_locked",
-            "right_gripper_command_locked",
-            "left_attachment_identity_unchanged",
-            "right_attachment_identity_unchanged",
-        }
-        checks = value.get("checks")
-        if isinstance(checks, dict):
-            public["checks"] = {
-                key: checks[key]
-                for key in check_names
-                if isinstance(checks.get(key), bool)
-            }
-
-        scalar_groups = {
-            "max_observed": {
-                "base_z_drift_m",
-                "base_roll_pitch_drift_rad",
-                "trunk_drift_rad",
-                "left_arm_drift_rad",
-                "right_arm_drift_rad",
-                "left_gripper_command_drift",
-                "right_gripper_command_drift",
-            },
-            "thresholds": {
-                "base_z_m",
-                "base_roll_pitch_rad",
-                "articulation_rad",
-                "gripper_command",
-            },
-        }
-        for group_name, allowed_fields in scalar_groups.items():
-            group = value.get(group_name)
-            if not isinstance(group, dict):
-                continue
-            sanitized_group: dict[str, float] = {}
-            for field in allowed_fields:
-                item = group.get(field)
-                if isinstance(item, (int, float)) and not isinstance(item, bool):
-                    numeric = float(item)
-                    if np.isfinite(numeric):
-                        sanitized_group[field] = numeric
-            public[group_name] = sanitized_group
-
-        public.setdefault("available", False)
-        public.setdefault("ok", False)
-        if public["available"] is not True:
-            public.setdefault("reason", "navigation_isolation_feedback_unavailable")
-        return _wire_safe(public)
 
     def _analytic_public_result(
         self,
@@ -6260,68 +5025,10 @@ class BehaviorEnvFacade:
         resolved_hand: str,
         hand_selection_source: str,
         visual_hand_evidence: dict[str, Any],
-        attachment_before: dict[str, Any],
     ) -> dict[str, Any]:
-        """Attach common selection and isolation evidence to a planner result."""
+        """Attach only request-selection context to the CuRobo result."""
 
-        attachment_receipt = self._attachment_postcondition_receipt(
-            primitive=primitive,
-            selected_hand=resolved_hand,
-            before=attachment_before,
-        )
-        result = dict(result)
-        metrics = result.get("metrics")
-        metrics = dict(metrics) if isinstance(metrics, dict) else {}
-        single_arm_isolation = metrics.get("single_arm_isolation")
-        whole_body_execution = metrics.get("whole_body_execution")
-        uses_whole_body = (
-            primitive in {"move_to", "rotate_wrist", "press"}
-            and metrics.get("motion_scope") == "whole_body"
-        )
-        if not isinstance(single_arm_isolation, dict) and not uses_whole_body:
-            single_arm_isolation = {
-                "available": False,
-                "ok": False,
-                "selected_hand": resolved_hand,
-                "mode": (
-                    "gripper_only" if primitive in {"open", "close"} else "arm_motion"
-                ),
-                "stop_reason": "single_arm_isolation_feedback_unavailable",
-            }
-        if isinstance(single_arm_isolation, dict):
-            metrics["single_arm_isolation"] = single_arm_isolation
-        if uses_whole_body and isinstance(whole_body_execution, dict):
-            metrics["whole_body_execution"] = whole_body_execution
-        metrics["attachment_isolation"] = attachment_receipt
-        result["metrics"] = metrics
-        if uses_whole_body and result.get("primitive_success") is True:
-            if (
-                not isinstance(whole_body_execution, dict)
-                or whole_body_execution.get("available") is not True
-                or whole_body_execution.get("ok") is not True
-            ):
-                result["primitive_success"] = False
-                result["stop_reason"] = (
-                    "whole_body_execution_feedback_unavailable"
-                    if not isinstance(whole_body_execution, dict)
-                    or whole_body_execution.get("available") is not True
-                    else "whole_body_execution_violation"
-                )
-        elif (
-            not isinstance(single_arm_isolation, dict)
-            or single_arm_isolation.get("available") is not True
-            or single_arm_isolation.get("ok") is not True
-        ):
-            result["primitive_success"] = False
-            result["stop_reason"] = (
-                "single_arm_isolation_feedback_unavailable"
-                if not isinstance(single_arm_isolation, dict)
-                or single_arm_isolation.get("available") is not True
-                else "single_arm_isolation_violation"
-            )
-        if attachment_receipt.get("passed") is not True:
-            result["primitive_success"] = False
-            result["stop_reason"] = "attachment_isolation_violation"
+        del primitive
         public = self._planner_public_result(result)
         public.update(
             {
@@ -6329,16 +5036,6 @@ class BehaviorEnvFacade:
                 "resolved_hand": resolved_hand,
                 "hand_selection_source": hand_selection_source,
                 "visual_hand_evidence": visual_hand_evidence,
-                "single_arm_isolation": (
-                    single_arm_isolation
-                    if isinstance(single_arm_isolation, dict)
-                    else None
-                ),
-                "whole_body_execution": (
-                    whole_body_execution
-                    if uses_whole_body and isinstance(whole_body_execution, dict)
-                    else None
-                ),
             }
         )
         return public
@@ -6348,7 +5045,6 @@ class BehaviorEnvFacade:
         *,
         hand: str,
         target: dict[str, Any],
-        max_travel_m: float,
     ) -> tuple[np.ndarray, str | None]:
         if not isinstance(target, dict):
             raise ValueError("target must be an object")
@@ -6363,9 +5059,6 @@ class BehaviorEnvFacade:
             raise ValueError(
                 "target requires exactly one of projection_id or delta_xyz"
             )
-        max_travel = float(max_travel_m)
-        if not np.isfinite(max_travel) or max_travel <= 0.0:
-            raise ValueError("max_travel_m must be finite and positive")
         current = self._require_planner().backend.get_eef_pose(hand)
         if current is None:
             raise RuntimeError("current EEF pose is unavailable")
@@ -6378,8 +5071,6 @@ class BehaviorEnvFacade:
             receipt = self._projection_receipts.get(str(projection_id))
             if not self._projection_receipt_is_fresh(receipt):
                 raise RuntimeError("fresh projection receipt is required")
-            if str(projection_id) in self._consumed_projection_receipts:
-                raise RuntimeError("projection receipt has already been consumed")
             point = np.asarray(receipt["world_point"], dtype=np.float64).reshape(3)
             normal = np.asarray(
                 receipt["camera_facing_normal"], dtype=np.float64
@@ -6404,12 +5095,6 @@ class BehaviorEnvFacade:
                 delta = _quat_rotate_vector_xyzw(current[1], delta)
             resolved = current_position + delta
             receipt_id = None
-        travel = float(np.linalg.norm(resolved - current_position))
-        if not np.isfinite(travel) or travel > max_travel + 1e-9:
-            raise RuntimeError(
-                f"resolved motion travel {travel:.6f} exceeds max_travel_m "
-                f"{max_travel:.6f}"
-            )
         return resolved, receipt_id
 
     def navigate_to(
@@ -6419,10 +5104,8 @@ class BehaviorEnvFacade:
         navigation_visual_check: Any = None,
         relative_motion: Any = None,
         standoff_m: float | None = None,
-        max_travel_m: float | None = None,
-        timeout_s: float = 300.0,
     ) -> dict[str, Any]:
-        """Navigate toward a projection or execute one explicit relative motion."""
+        """Resolve one base goal and delegate its execution to CuRobo."""
 
         projection_mode = relative_motion is None
         navigation_visual_evidence: dict[str, Any] | None = None
@@ -6432,16 +5115,12 @@ class BehaviorEnvFacade:
             if not isinstance(projection_id, str) or not projection_id.strip():
                 raise ValueError("projection_id must be a non-empty string")
             projection_id = projection_id.strip()
-            standoff, max_travel, timeout = self._validated_navigation_parameters(
-                standoff_m=0.85 if standoff_m is None else standoff_m,
-                max_travel_m=1.0 if max_travel_m is None else max_travel_m,
-                timeout_s=timeout_s,
-            )
+            standoff = float(0.85 if standoff_m is None else standoff_m)
+            if not np.isfinite(standoff) or not 0.45 <= standoff <= 1.50:
+                raise ValueError("standoff_m must be finite and within [0.45,1.50]")
             projection_receipt = self._projection_receipts.get(projection_id)
             if not self._projection_receipt_is_fresh(projection_receipt):
                 raise RuntimeError("fresh projection receipt is required")
-            if projection_id in self._consumed_projection_receipts:
-                raise RuntimeError("projection receipt has already been consumed")
             navigation_visual_evidence = self._navigation_visual_authorization(
                 projection_receipt=projection_receipt,
                 navigation_visual_check=navigation_visual_check,
@@ -6458,7 +5137,6 @@ class BehaviorEnvFacade:
                     projection_id,
                     navigation_visual_check,
                     standoff_m,
-                    max_travel_m,
                 )
             ):
                 raise ValueError(
@@ -6466,121 +5144,17 @@ class BehaviorEnvFacade:
                     "navigation arguments"
                 )
             normalized_motion = validate_relative_navigation_motion(relative_motion)
-            timeout = self._validated_navigation_timeout(timeout_s)
-        attachment_before = self._attachment_fingerprint_snapshot()
-        if attachment_before.get("available") is not True:
-            raise RuntimeError(
-                "attachment identity conflict"
-                if attachment_before.get("identity_conflict") is True
-                else "attachment feedback is unavailable"
-            )
 
-        self._invalidate_pi0_visual_regression_chain(reset_completed=True)
         self._switch_controller(_CONTROLLER_PLANNER)
-
+        planner = self._require_planner()
         if projection_mode:
-            projection_receipt = self._projection_receipts.get(projection_id)
-            if not self._projection_receipt_is_fresh(projection_receipt):
-                raise RuntimeError(
-                    "navigation projection changed during controller transfer"
-                )
-            if projection_id in self._consumed_projection_receipts:
-                raise RuntimeError(
-                    "navigation projection was consumed during controller transfer"
-                )
-            revalidated_target_xyz = np.asarray(
-                projection_receipt.get("world_point"), dtype=np.float64
-            ).reshape(-1)
-            if (
-                revalidated_target_xyz.shape != (3,)
-                or not np.isfinite(revalidated_target_xyz).all()
-                or target_xyz is None
-                or not np.array_equal(revalidated_target_xyz, target_xyz)
-            ):
-                raise RuntimeError(
-                    "navigation projection point changed during controller transfer"
-                )
-            target_xyz = revalidated_target_xyz
-            navigation_visual_evidence = self._navigation_visual_authorization(
-                projection_receipt=projection_receipt,
-                navigation_visual_check=navigation_visual_check,
+            result = planner.navigate_to(
+                target_xyz=target_xyz,
+                standoff_m=standoff,
             )
-        self._assert_attachment_snapshot_unchanged(
-            attachment_before,
-            context="navigate_to controller transfer",
-        )
-
-        before_env_steps = int(self._env_steps)
-        try:
-            planner = self._require_planner()
-            if projection_mode:
-                result = planner.navigate_to(
-                    target_xyz=target_xyz,
-                    standoff_m=standoff,
-                    max_travel_m=max_travel,
-                    timeout_s=timeout,
-                )
-            else:
-                result = planner.navigate_to(
-                    relative_motion=normalized_motion,
-                    timeout_s=timeout,
-                )
-        finally:
-            if projection_mode and int(self._env_steps) > before_env_steps:
-                assert isinstance(projection_id, str)
-                self._consumed_projection_receipts.add(projection_id)
-
-        attachment_isolation = self._navigation_attachment_postcondition_receipt(
-            before=attachment_before,
-        )
-        planner_result = dict(result)
-        planner_metrics = planner_result.get("metrics")
-        planner_metrics = (
-            dict(planner_metrics) if isinstance(planner_metrics, dict) else {}
-        )
-        navigation_isolation = self._public_navigation_isolation(
-            planner_metrics.get("navigation_isolation")
-        )
-        action_executed = int(self._env_steps) > before_env_steps
-        public_metrics: dict[str, Any] = {
-            "navigation_isolation": navigation_isolation,
-            "attachment_isolation": attachment_isolation,
-        }
-        for field in (
-            "final_position_error_m",
-            "final_yaw_error_rad",
-            "elapsed_s",
-        ):
-            value = planner_metrics.get(field)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                value = float(value)
-                if np.isfinite(value):
-                    public_metrics[field] = value
-        result = {
-            "primitive_success": bool(planner_result.get("primitive_success", False)),
-            "stop_reason": str(planner_result.get("stop_reason", "error")),
-            "recoverable": bool(planner_result.get("recoverable", False)),
-            "metrics": public_metrics,
-        }
-        official_success = bool(self._official_success_latched)
-        if not official_success and navigation_isolation.get("available") is not True:
-            if action_executed or result["primitive_success"]:
-                result["primitive_success"] = False
-                result["stop_reason"] = "navigation_isolation_feedback_unavailable"
-        elif not official_success and navigation_isolation.get("ok") is not True:
-            result["primitive_success"] = False
-            result["stop_reason"] = "navigation_isolation_violation"
-        if not official_success and attachment_isolation.get("passed") is not True:
-            result["primitive_success"] = False
-            result["stop_reason"] = "attachment_isolation_violation"
-
+        else:
+            result = planner.navigate_to(relative_motion=normalized_motion)
         public = self._planner_public_result(result)
-        public.update(
-            {
-                "navigation_isolation": navigation_isolation,
-                "attachment_isolation": attachment_isolation,
-            }
-        )
         if projection_mode:
             public.update(
                 {
@@ -6601,48 +5175,21 @@ class BehaviorEnvFacade:
         hand: str,
         target: dict[str, Any],
         visual_hand_check: Any,
-        position_tolerance_m: float = 0.02,
-        max_travel_m: float = 0.25,
-        timeout_s: float = 240.0,
     ) -> dict[str, Any]:
         requested_hand = str(hand)
         hand, selection_source, visual_hand_evidence = self._authorize_analytic_hand(
             requested_hand, visual_hand_check
         )
-        attachment_before = self._attachment_fingerprint_snapshot()
-        tolerance = float(position_tolerance_m)
-        if not np.isfinite(tolerance) or tolerance <= 0.0:
-            raise ValueError("position_tolerance_m must be finite and positive")
         target, receipt_id = self._motion_target(
             hand=hand,
             target=target,
-            max_travel_m=max_travel_m,
         )
-        timeout = float(timeout_s)
-        if not np.isfinite(timeout) or timeout <= 0.0:
-            raise ValueError("timeout_s must be finite and positive")
-        self._invalidate_pi0_visual_regression_chain(reset_completed=True)
         self._switch_controller(_CONTROLLER_PLANNER)
-        hand, selection_source, visual_hand_evidence = (
-            self._revalidate_analytic_selection(
-                requested_hand=requested_hand,
-                expected_hand=hand,
-                visual_hand_check=visual_hand_check,
-            )
-        )
-        self._assert_attachment_snapshot_unchanged(
-            attachment_before,
-            context="move_to controller transfer",
-        )
-        before_env_steps = int(self._env_steps)
         result = self._require_planner().move_to(
             hand=hand,
             target_xyz=target,
-            position_tolerance_m=tolerance,
-            timeout_s=timeout,
         )
-        if receipt_id is not None and int(self._env_steps) > before_env_steps:
-            self._consumed_projection_receipts.add(receipt_id)
+        del receipt_id
         return self._analytic_public_result(
             result,
             primitive="move_to",
@@ -6650,7 +5197,6 @@ class BehaviorEnvFacade:
             resolved_hand=hand,
             hand_selection_source=selection_source,
             visual_hand_evidence=visual_hand_evidence,
-            attachment_before=attachment_before,
         )
 
     def rotate_wrist(
@@ -6675,140 +5221,27 @@ class BehaviorEnvFacade:
             and float(np.linalg.norm(orientation[:3])) <= 1e-12
         ):
             raise ValueError("relative axis must be nonzero for a nonzero angle")
-        rotate_start_env_step = int(self._env_steps)
-        before_facts = self._attachment_runtime_facts()
-        attachment_before = self._attachment_fingerprint_snapshot(before_facts)
-        before_attachment = before_facts.get("attached_objects", {}).get(hand)
-        before_attachment_fingerprint = self._attachment_lineage_fingerprint(
-            before_attachment,
+        self._switch_controller(_CONTROLLER_PLANNER)
+        result = self._require_planner().rotate_wrist(
             hand=hand,
+            target_quat_xyzw=None,
+            relative_axis_angle=orientation.tolist(),
+            frame=frame,
         )
-        surface_review_enabled = (
-            self._active_task_spec().surface_review_policy is not None
-        )
-        selected_attachment_present = bool(
-            before_facts.get("available") is True and before_attachment is not None
-        )
-        if selected_attachment_present and surface_review_enabled:
-            completed = list(getattr(self, "_completed_opposite_surface_cycles", []))
-            has_unfinished_chain = any(
-                (
-                    getattr(self, "_latest_successful_held_rotate_receipt", None)
-                    is not None,
-                    getattr(self, "_held_rotate_target_surface_review", None)
-                    is not None,
-                    getattr(self, "_active_rotate_pi0_candidate", None) is not None,
-                    getattr(self, "_awaiting_opposite_surface_review", None)
-                    is not None,
-                )
-            )
-            preserve_completed = bool(
-                completed
-                and not has_unfinished_chain
-                and int(completed[-1].get("env_step", -1)) == rotate_start_env_step
-                and completed[-1].get("resolved_hand") == hand
-                and completed[-1].get("attachment_fingerprint")
-                == before_attachment_fingerprint
-            )
-            self._invalidate_pi0_visual_regression_chain(
-                reset_completed=not preserve_completed
-            )
-        elif surface_review_enabled:
-            self._invalidate_pi0_visual_regression_chain(reset_completed=True)
-        try:
-            self._switch_controller(_CONTROLLER_PLANNER)
-            hand, selection_source, visual_hand_evidence = (
-                self._revalidate_analytic_selection(
-                    requested_hand=requested_hand,
-                    expected_hand=hand,
-                    visual_hand_check=visual_hand_check,
-                )
-            )
-            self._assert_attachment_snapshot_unchanged(
-                attachment_before,
-                context="rotate_wrist controller transfer",
-            )
-            result = self._require_planner().rotate_wrist(
-                hand=hand,
-                target_quat_xyzw=None,
-                relative_axis_angle=orientation.tolist(),
-                frame=frame,
-                timeout_s=ROTATE_WRIST_RUNTIME_TIMEOUT_S,
-            )
-        except Exception:
-            if surface_review_enabled:
-                self._invalidate_pi0_visual_regression_chain(reset_completed=True)
-            raise
-        public = self._analytic_public_result(
+        return self._analytic_public_result(
             result,
             primitive="rotate_wrist",
             requested_hand=requested_hand,
             resolved_hand=hand,
             hand_selection_source=selection_source,
             visual_hand_evidence=visual_hand_evidence,
-            attachment_before=attachment_before,
         )
-        metrics = public.get("metrics")
-        public["metrics"] = dict(metrics) if isinstance(metrics, dict) else {}
-        public["metrics"]["runtime_timeout_s"] = ROTATE_WRIST_RUNTIME_TIMEOUT_S
-        if (
-            surface_review_enabled
-            and selected_attachment_present
-            and public.get("primitive_success") is True
-            and not (self._official_success_latched or _raw_success(self._last_info))
-        ):
-            after_facts = self._attachment_runtime_facts()
-            after_attachment = after_facts.get("attached_objects", {}).get(hand)
-            matches, identity = _attachment_identity_status(
-                after_attachment,
-                before_attachment,
-                hand=hand,
-            )
-            after_attachment_fingerprint = self._attachment_lineage_fingerprint(
-                after_attachment,
-                hand=hand,
-            )
-            if (
-                before_facts.get("available") is True
-                and hand in before_facts.get("hands", [])
-                and after_facts.get("available") is True
-                and hand in after_facts.get("hands", [])
-                and matches
-                and before_attachment_fingerprint is not None
-                and after_attachment_fingerprint == before_attachment_fingerprint
-            ):
-                receipt = self._seal_attempt_receipt(
-                    {
-                        "kind": "successful_attached_hand_rotate",
-                        "rotation_start_env_step": rotate_start_env_step,
-                        "started_env_step": rotate_start_env_step,
-                        "completed_env_step": int(self._env_steps),
-                        "env_step": int(self._env_steps),
-                        "requested_hand": requested_hand,
-                        "resolved_hand": hand,
-                        "hand_selection_source": selection_source,
-                        "attachment_identity": _wire_safe(identity),
-                        "attachment_fingerprint": after_attachment_fingerprint,
-                    }
-                )
-                self._latest_successful_held_rotate_receipt = receipt
-                self._latest_successful_held_rotate_attachment = after_attachment
-                self._latest_successful_held_rotate_public_frame_ids = set(
-                    getattr(self, "_public_observed_frame_ids", set())
-                )
-                public["attached_rotate_receipt"] = receipt
-            else:
-                self._completed_opposite_surface_cycles = []
-        elif selected_attachment_present and surface_review_enabled:
-            self._completed_opposite_surface_cycles = []
-        return public
 
     def _set_gripper(
         self,
         *,
         hand: str,
         opening: float,
-        timeout_s: float,
         visual_hand_check: Any,
         release_visual_check: Any = None,
     ) -> dict[str, Any]:
@@ -6816,103 +5249,30 @@ class BehaviorEnvFacade:
         hand, selection_source, visual_hand_evidence = self._authorize_analytic_hand(
             requested_hand, visual_hand_check
         )
-        facts = self._attachment_runtime_facts()
-        attachment_before = self._attachment_fingerprint_snapshot(facts)
-        timeout = float(timeout_s)
-        if not np.isfinite(timeout) or timeout <= 0.0:
-            raise ValueError("timeout_s must be finite and positive")
-        expected_attachment = facts.get("attached_objects", {}).get(hand)
-        selected_attachment_present = expected_attachment is not None
-        closing_attached = bool(selected_attachment_present and float(opening) < 0.5)
-        release_visual_evidence = None
-        selected_attachment_fingerprint = dict(
-            attachment_before.get("fingerprints", {})
-        ).get(hand)
-        if (
-            float(opening) >= 0.5
-            and selected_attachment_present
-            and self._active_task_spec().release_visual_policy is not None
-        ):
-            release_visual_evidence = self._release_visual_authorization(
-                selected_hand=hand,
-                expected_attachment_fingerprint=selected_attachment_fingerprint,
-                release_visual_check=release_visual_check,
-            )
-        self._invalidate_pi0_visual_regression_chain(reset_completed=True)
+        del release_visual_check
         self._switch_controller(_CONTROLLER_PLANNER)
-        hand, selection_source, visual_hand_evidence = (
-            self._revalidate_analytic_selection(
-                requested_hand=requested_hand,
-                expected_hand=hand,
-                visual_hand_check=visual_hand_check,
-            )
-        )
-        self._assert_attachment_snapshot_unchanged(
-            attachment_before,
-            context="gripper controller transfer",
-        )
         result = self._require_planner()._gripper_command(
             hand,
             opening=float(opening),
-            timeout_s=timeout,
-            hold_steps_required=(
-                _HELD_ATTACHMENT_CONFIRMATION_STEPS if closing_attached else 1
-            ),
-            expected_attachment=expected_attachment if closing_attached else None,
-            require_attachment=closing_attached,
         )
-        receipts = getattr(self, "_held_closure_receipts", None)
-        if not isinstance(receipts, dict):
-            receipts = {}
-            self._held_closure_receipts = receipts
-        if bool(result.get("primitive_success", False)):
-            if closing_attached:
-                metrics = result.get("metrics", {})
-                endpoint_steps = int(metrics.get("attachment_endpoint_held_steps", 0))
-                close_latch = float(self._gripper_latch.get(hand, 1.0))
-                if (
-                    endpoint_steps >= _HELD_ATTACHMENT_CONFIRMATION_STEPS
-                    and close_latch <= _HELD_CLOSE_LATCH_MAX
-                ):
-                    receipts[hand] = {
-                        "schema_version": 1,
-                        "run_nonce": self._run_nonce,
-                        "attempt_nonce": self._attempt_nonce,
-                        "attempt_index": int(self._attempt_index),
-                        "hand": hand,
-                        "expected_attachment": expected_attachment,
-                        "confirmed_env_step": int(self._env_steps),
-                        "close_latch": close_latch,
-                        "attachment_endpoint_held_steps": endpoint_steps,
-                    }
-                else:
-                    receipts.pop(hand, None)
-            elif float(opening) >= 0.5:
-                receipts.pop(hand, None)
-        public = self._analytic_public_result(
+        return self._analytic_public_result(
             result,
             primitive="close" if float(opening) < 0.5 else "open",
             requested_hand=requested_hand,
             resolved_hand=hand,
             hand_selection_source=selection_source,
             visual_hand_evidence=visual_hand_evidence,
-            attachment_before=attachment_before,
         )
-        if release_visual_evidence is not None:
-            public["release_visual_evidence"] = release_visual_evidence
-        return public
 
     def close(
         self,
         *,
         hand: str,
         visual_hand_check: Any,
-        timeout_s: float = 30.0,
     ) -> dict[str, Any]:
         return self._set_gripper(
             hand=hand,
             opening=0.0,
-            timeout_s=timeout_s,
             visual_hand_check=visual_hand_check,
         )
 
@@ -6922,12 +5282,10 @@ class BehaviorEnvFacade:
         hand: str,
         visual_hand_check: Any,
         release_visual_check: Any = None,
-        timeout_s: float = 30.0,
     ) -> dict[str, Any]:
         return self._set_gripper(
             hand=hand,
             opening=1.0,
-            timeout_s=timeout_s,
             visual_hand_check=visual_hand_check,
             release_visual_check=release_visual_check,
         )
@@ -6939,65 +5297,29 @@ class BehaviorEnvFacade:
         projection_id: str,
         travel_m: float,
         visual_hand_check: Any,
-        timeout_s: float = 300.0,
     ) -> dict[str, Any]:
         requested_hand = str(hand)
         hand, selection_source, visual_hand_evidence = self._authorize_analytic_hand(
             requested_hand, visual_hand_check
         )
-        attachment_before = self._attachment_fingerprint_snapshot()
-        if hand in attachment_before["hands"]:
-            raise RuntimeError("press requires an attachment-free selected hand")
         if not isinstance(projection_id, str) or not projection_id.strip():
             raise ValueError("projection_id must be a non-empty string")
         travel = float(travel_m)
         if not np.isfinite(travel) or travel <= 0.0:
             raise ValueError("travel_m must be finite and positive")
-        timeout = float(timeout_s)
-        if not np.isfinite(timeout) or timeout <= 0.0:
-            raise ValueError("timeout_s must be finite and positive")
         receipt = self._projection_receipts.get(str(projection_id))
         if not self._projection_receipt_is_fresh(receipt):
             raise RuntimeError("fresh projection receipt is required")
-        if str(projection_id) in self._consumed_projection_receipts:
-            raise RuntimeError("projection receipt has already been consumed")
-        if not self._press_gripper_is_strictly_closed(hand):
-            raise RuntimeError(
-                "press requires physical opening <= 0.003 m and actual close "
-                "latch <= -0.99 on the selected gripper"
-            )
-        self._invalidate_pi0_visual_regression_chain(reset_completed=True)
         self._switch_controller(_CONTROLLER_PLANNER)
-        hand, selection_source, visual_hand_evidence = (
-            self._revalidate_analytic_selection(
-                requested_hand=requested_hand,
-                expected_hand=hand,
-                visual_hand_check=visual_hand_check,
-            )
-        )
-        switched_facts = self._assert_attachment_snapshot_unchanged(
-            attachment_before,
-            context="press controller transfer",
-        )
-        if hand in switched_facts["hands"]:
-            raise RuntimeError(
-                "press selected hand gained an attachment before execution"
-            )
-        if not self._press_gripper_is_strictly_closed(hand):
-            raise RuntimeError(
-                "press selected gripper closure changed before execution"
-            )
         point = np.asarray(receipt["world_point"], dtype=np.float64).reshape(3)
         outward = np.asarray(receipt["camera_facing_normal"], dtype=np.float64).reshape(
             3
         )
-        self._consumed_projection_receipts.add(str(projection_id))
         result = self._require_planner().press(
             hand=hand,
             target_xyz=point,
             press_direction=-outward,
             travel_m=travel,
-            timeout_s=timeout,
         )
         return self._analytic_public_result(
             result,
@@ -7006,7 +5328,6 @@ class BehaviorEnvFacade:
             resolved_hand=hand,
             hand_selection_source=selection_source,
             visual_hand_evidence=visual_hand_evidence,
-            attachment_before=attachment_before,
         )
 
     def shutdown(self) -> None:
@@ -7063,8 +5384,23 @@ class _MainThreadDispatcher:
         self._env = env
         self._shutdown_event = shutdown_event
         self._calls: Queue[tuple[str, tuple, dict, Future]] = Queue()
+        self._predicted_planner = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="rpent-curobo-predicted",
+        )
+        ready = getattr(
+            getattr(env, "_planner", None),
+            "threaded_predicted_planning_ready",
+            None,
+        )
+        env._threaded_predicted_planning_dispatcher_ready = callable(ready)
 
     def submit(self, method: str, args: tuple, kwargs: dict) -> Any:
+        if (
+            method == "env.dashboard_prepare_manual_command"
+            and kwargs.get("background") is True
+        ):
+            return self.submit_dashboard_prepare(method, args, kwargs)
         future: Future = Future()
         self._calls.put((method, args, kwargs, future))
         return future.result()
@@ -7075,17 +5411,45 @@ class _MainThreadDispatcher:
         args: tuple,
         kwargs: dict,
     ) -> Any:
-        """Fail closed if prepare is ever wired around the simulator FIFO."""
+        """Run only pure predicted-start CuRobo planning off the env FIFO."""
 
         if method != "env.dashboard_prepare_manual_command":
             raise ValueError(
                 f"unknown concurrent BEHAVIOR env RPC method: {method!r}"
             )
-        if kwargs.get("background") is True:
-            raise RuntimeError(
-                "background Dashboard prepare cannot bypass the simulator FIFO"
+        if kwargs.get("background") is not True:
+            return self.submit(method, args, kwargs)
+        ready = getattr(
+            getattr(self._env, "_planner", None),
+            "threaded_predicted_planning_ready",
+            None,
+        )
+        if (
+            not bool(
+                getattr(
+                    self._env,
+                    "_threaded_predicted_planning_dispatcher_ready",
+                    False,
+                )
             )
-        return self.submit(method, args, kwargs)
+            or not callable(ready)
+            or ready() is not True
+        ):
+            raise RuntimeError(
+                "pure predicted CuRobo planning worker is not ready"
+            )
+
+        def plan() -> Any:
+            self._env._assert_rpc_lifecycle(
+                "dashboard_prepare_manual_command"
+            )
+            if ready() is not True:
+                raise RuntimeError(
+                    "pure predicted CuRobo planning readiness changed"
+                )
+            return self._env.dashboard_prepare_manual_command(*args, **kwargs)
+
+        return self._predicted_planner.submit(plan).result()
 
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method.startswith("env."):
@@ -7115,6 +5479,10 @@ class _MainThreadDispatcher:
     def run(self) -> None:
         while not self._shutdown_event.is_set():
             self.process_next()
+
+    def close(self) -> None:
+        self._env._threaded_predicted_planning_dispatcher_ready = False
+        self._predicted_planner.shutdown(wait=True, cancel_futures=True)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -7230,10 +5598,13 @@ def main() -> None:
         dispatcher.run()
     finally:
         try:
-            env.shutdown()
+            dispatcher.close()
         finally:
-            server.shutdown()
-            server.server_close()
+            try:
+                env.shutdown()
+            finally:
+                server.shutdown()
+                server.server_close()
     _flush_shutdown_artifacts(output_dir)
 
 

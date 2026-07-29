@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# This is the closed acceptance matrix for the BEHAVIOR
+# joint-limits-and-goal-only execution mode.
+# Do not add new collision, contact, attachment, tracking,
+# pose-error, isolation, settling, or safety-gate tests
+# without explicit user authorization.
 import json
 from types import SimpleNamespace
 
@@ -193,7 +198,7 @@ def test_execute_aggregates_completed_direct_env_step_latency(monkeypatch):
     json.dumps(metrics, allow_nan=False)
 
 
-def test_raw_success_stops_remaining_steps_and_replay_adds_no_action():
+def test_raw_success_stops_remaining_steps_and_rejects_later_execution():
     facade, planner, direct_step_calls = _execute_facade(
         raw_success=True,
         action_count=3,
@@ -203,13 +208,12 @@ def test_raw_success_stops_remaining_steps_and_replay_adds_no_action():
         plan_id="plan-1",
         command_id="command-1",
     )
-    replay = facade.dashboard_execute_prepared_command(
-        plan_id="plan-1",
-        command_id="command-1",
-    )
+    with pytest.raises(RuntimeError, match="terminal"):
+        facade.dashboard_execute_prepared_command(
+            plan_id="plan-1",
+            command_id="command-1",
+        )
 
-    assert first == replay
-    assert first is not replay
     assert first["task_success"] is True
     assert planner.calls == 1
     assert direct_step_calls == [False]
