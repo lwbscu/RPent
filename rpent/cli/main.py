@@ -43,6 +43,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from rpent.cli.tui import (
     start_first_prompt_resolver,
@@ -92,6 +93,78 @@ def _serialize_messages(messages: list[dict]) -> list[dict]:
         }
         for m in messages
     ]
+
+
+def _record_finish_result(record: Any) -> dict[str, Any] | None:
+    command = getattr(record, "command", None)
+    result = getattr(record, "result", None)
+    if isinstance(command, dict) and command.get("action") == "finish":
+        return dict(result) if isinstance(result, dict) else None
+    return None
+
+
+def _latest_toolkit_finish_result(toolkit: Any) -> dict[str, Any] | None:
+    try:
+        state = toolkit.state
+    except Exception:
+        return None
+
+    records = getattr(state, "records", None)
+    if callable(records):
+        try:
+            for record in reversed(records()):
+                result = _record_finish_result(record)
+                if result is not None:
+                    return result
+        except Exception:
+            pass
+
+    latest_record = getattr(state, "latest_record", None)
+    if callable(latest_record):
+        try:
+            return _record_finish_result(latest_record())
+        except Exception:
+            return None
+    return None
+
+
+def _normalise_yam_finish_result(
+    finish_result: dict[str, Any] | None,
+    *,
+    solved: bool,
+) -> dict[str, Any] | None:
+    if finish_result is None:
+        if not solved:
+            return None
+        finish_result = {"summary": "YAM environment reported success."}
+
+    result = dict(finish_result)
+    requested_status = result.get("requested_status")
+    if requested_status is None and "status" in result:
+        requested_status = result["status"]
+        result["requested_status"] = requested_status
+
+    result["_finish"] = True
+    result["verified_success"] = bool(solved)
+    if solved:
+        result["status"] = "success"
+    elif str(requested_status).lower() == "success":
+        result["status"] = "failure"
+    else:
+        result.setdefault("status", "failure")
+    return result
+
+
+def _yam_authoritative_finish_result(
+    toolkit: Any,
+    planner_finish_result: dict[str, Any] | None,
+    *,
+    solved: bool,
+) -> dict[str, Any] | None:
+    return _normalise_yam_finish_result(
+        _latest_toolkit_finish_result(toolkit) or planner_finish_result,
+        solved=solved,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -321,13 +394,15 @@ def main() -> int:
     args.robot_name = early.robot_name
     if args.dashboard and args.interactive:
         parser.error("--dashboard and --interactive cannot be used together")
-    if args.explore and args.robot_name != "libero":
-        parser.error("--explore is currently supported only for LIBERO")
+    if args.explore and args.robot_name not in ("libero", "yam"):
+        parser.error("--explore is currently supported only for LIBERO and YAM")
     if args.explore and args.memory_profile == "hf":
         parser.error("--explore cannot be used with --memory-profile hf")
     if args.explore and getattr(args, "explore_sessions", 1) <= 0:
         parser.error("--explore-sessions must be greater than 0")
-    args.memory_profile = args.memory_profile or ("local" if args.explore else "hf")
+    args.memory_profile = args.memory_profile or (
+        "local" if args.explore or args.robot_name == "yam" else "hf"
+    )
     if args.memory_profile == "hf" and args.memory_dir is not None:
         parser.error("--memory-dir requires --memory-profile local or --explore")
     if args.dashboard:
@@ -446,7 +521,7 @@ def main() -> int:
                 state_output_dir = (
                     output_dir / "sessions" / f"session_{session_number:03d}"
                 )
-            if robot_name == "libero":
+            if robot_name in ("libero", "yam"):
                 toolkit = get_toolkit(
                     robot_name,
                     primitives_kwargs=primitives_kwargs,
@@ -478,8 +553,15 @@ def main() -> int:
                 messages += result.messages
                 stats = result.stats
                 agent_error = result.error
-                if robot_name == "libero":
+                if robot_name in ("libero", "yam"):
                     solved = toolkit.solved()
+                    if robot_name == "yam":
+                        finish_result = _yam_authoritative_finish_result(
+                            toolkit,
+                            finish_result,
+                            solved=solved,
+                        )
+                        result.finish_result = finish_result
                     if solved:
                         recipe_path = toolkit.write_recipe(recipe_tag)
             finally:
@@ -539,6 +621,7 @@ def main() -> int:
         and getattr(args, "auto_merge_memory", False)
         and not agent_error
         and memory_manager is not None
+        and (robot_name != "yam" or solved)
     ):
         try:
             merge_result = memory_manager.merge_memory(

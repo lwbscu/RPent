@@ -1,0 +1,1447 @@
+# Copyright 2026 The RPent Authors.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy at https://www.apache.org/licenses/LICENSE-2.0
+
+from __future__ import annotations
+
+import socket
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import numpy as np
+import pytest
+
+from robots.yam.contracts import (
+    MODEL_SPEC,
+    env_runtime_contract,
+    validate_actions,
+    vla_runtime_contract,
+)
+from robots.yam.env_client import YamEnvClient
+from robots.yam.env_server import YamEnvFacade
+from robots.yam.operator_control import write_receipt
+from robots.yam.rlinf_env import YamAgentEnv
+from robots.yam.toolkit import YamToolkit
+from robots.yam.vla_client import YamVLAClient, policy_observation
+from robots.yam.vla_server import YamVLAFacade, build_model_cfg
+from rpent.dashboard.events import NullDashboardEventSink
+from rpent.memory import MemoryManager
+from rpent.utils.rpc.http_rpc import HttpRpcClient
+from rpent.utils.rpc.rpc_client import RpcError
+from rpent.utils.rpc.socket_rpc import SocketRpcClient
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@contextmanager
+def _served_facade(facade: Any, transport: str) -> Iterator[Any]:
+    port = _free_port()
+    errors: list[BaseException] = []
+
+    def serve() -> None:
+        try:
+            facade.serve(transport=transport, host="127.0.0.1", port=port)
+        except BaseException as exc:  # pragma: no cover - surfaced by caller.
+            errors.append(exc)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    if transport == "http":
+        client = HttpRpcClient(f"http://127.0.0.1:{port}")
+    else:
+        client = SocketRpcClient("127.0.0.1", port)
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if errors:
+            raise errors[0]
+        try:
+            assert client.call("healthz", timeout_s=0.2) == {"status": "ok"}
+            break
+        except Exception:
+            time.sleep(0.02)
+    else:
+        raise TimeoutError(f"{transport} facade did not become ready")
+
+    try:
+        yield client
+    finally:
+        try:
+            client.call("shutdown", timeout_s=1.0)
+        except Exception:
+            pass
+        thread.join(timeout=3.0)
+        assert not thread.is_alive()
+        if errors:
+            raise errors[0]
+
+
+class FakeYamEnv:
+    def __init__(self, *, block_chunk: bool = False) -> None:
+        self.block_chunk = block_chunk
+        self.reset_calls = 0
+        self.step_actions: list[np.ndarray] = []
+        self.chunk_actions: list[np.ndarray] = []
+        self.stop_calls = 0
+        self.close_calls = 0
+        self.chunk_entered = threading.Event()
+        self.stop_requested = threading.Event()
+
+    def get_task_language(self) -> str:
+        return "place the cube"
+
+    def observe(self) -> dict[str, Any]:
+        return self._observation(), self._info()
+
+    def _observation(self) -> dict[str, Any]:
+        return {
+            "frames": {
+                "top": np.full((3, 4, 3), 11, dtype=np.uint8),
+                "left": np.full((3, 4, 3), 22, dtype=np.uint8),
+                "right": np.full((3, 4, 3), 33, dtype=np.uint8),
+            },
+            "state": {"joint_position": np.arange(14, dtype=np.float32)},
+        }
+
+    def _info(self) -> dict[str, Any]:
+        return {
+            "episode_status": {
+                "eval_success": False,
+                "take_action_cnt": len(self.step_actions)
+                + sum(len(actions) for actions in self.chunk_actions),
+                "step_lim": 40,
+                "actual_seed": 12,
+                "episode_id": "fake-yam-episode",
+            },
+            "robot_state": {"qpos": np.arange(14, dtype=np.float64)},
+        }
+
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
+        self.reset_calls += 1
+        obs = self._observation()
+        obs["seed"] = seed
+        obs["options"] = options or {}
+        obs["reset_calls"] = self.reset_calls
+        return obs, self._info()
+
+    def step(self, action: np.ndarray, *, expected_episode_id: str | None = None):
+        assert expected_episode_id in {None, "fake-yam-episode"}
+        self.step_actions.append(np.asarray(action).copy())
+        return (
+            self._observation(),
+            0.0,
+            False,
+            False,
+            {**self._info(), "executed_actions": 1, "action_type": "qpos"},
+        )
+
+    def chunk_step(
+        self,
+        actions: np.ndarray,
+        *,
+        action_type: str = "qpos",
+        return_all_frames: bool = False,
+        expected_episode_id: str | None = None,
+    ):
+        assert expected_episode_id in {None, "fake-yam-episode"}
+        self.chunk_actions.append(np.asarray(actions).copy())
+        if self.block_chunk:
+            self.chunk_entered.set()
+            if not self.stop_requested.wait(timeout=2.0):
+                raise TimeoutError("chunk_step was not stopped")
+        frames = [self._observation() | {"frame": i} for i in range(len(actions))]
+        obs = frames if return_all_frames else frames[-1]
+        return (
+            obs,
+            np.zeros(len(actions), dtype=np.float32),
+            False,
+            False,
+            {
+                **self._info(),
+                "action_type": action_type,
+                "executed_actions": int(len(actions)),
+                "stop_calls": self.stop_calls,
+            },
+        )
+
+    def render_camera(self, camera_name: str, *, depth: bool = False):
+        value = {"top": 11, "left": 22, "right": 33}[camera_name]
+        rgb = np.full((3, 4, 3), value, dtype=np.uint8)
+        if not depth:
+            return rgb
+        return rgb, np.full((3, 4), value / 100.0, dtype=np.float32)
+
+    def get_camera_meta(self, camera_name: str) -> dict[str, Any]:
+        return {"name": camera_name, "intrinsic_K": np.eye(3, dtype=np.float32)}
+
+    def plan_arm_path(self, arm: str, target_pose: list[float]) -> dict[str, Any]:
+        return {"arm": arm, "target_pose": np.asarray(target_pose, dtype=np.float32)}
+
+    def request_stop(self) -> None:
+        self.stop_calls += 1
+        self.stop_requested.set()
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class FakeYamModel:
+    def __init__(self, actions: np.ndarray | None = None) -> None:
+        if actions is None:
+            actions = np.zeros((1, MODEL_SPEC.use_length, 14), dtype=np.float32)
+            actions[..., 6] = 0.25
+            actions[..., 13] = 0.75
+        self.actions = actions
+        self.calls: list[tuple[dict[str, Any], str]] = []
+
+    def predict_action_batch(self, env_obs: dict[str, Any], *, mode: str):
+        self.calls.append((env_obs, mode))
+        return self.actions.copy(), {"source": "fake"}
+
+
+class FakeToolkitModel:
+    def __init__(self, on_predict: Any = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.on_predict = on_predict
+
+    def predict(self, obs: dict[str, Any]) -> np.ndarray:
+        self.calls.append(obs)
+        if self.on_predict is not None:
+            self.on_predict()
+        return _valid_action_chunk(MODEL_SPEC.use_length)
+
+
+class FakeRpc:
+    def __init__(self, responses: dict[str, Any]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, tuple, dict]] = []
+
+    def call(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        *,
+        timeout_s: float | None = None,
+    ) -> Any:
+        del timeout_s
+        self.calls.append((method, args, kwargs or {}))
+        result = self.responses[method]
+        return result() if callable(result) else result
+
+
+class FakeRobotState:
+    def __init__(self, qpos: np.ndarray) -> None:
+        self.qpos = qpos
+        self.left = SimpleNamespace(timestamp_s=10.0)
+        self.right = SimpleNamespace(timestamp_s=11.0)
+
+    def as_vector(self) -> np.ndarray:
+        return self.qpos.copy()
+
+
+class FakeRuntime:
+    def __init__(
+        self,
+        qpos: np.ndarray | None = None,
+        *,
+        accepted_updates_measured_state: bool = False,
+        on_command: Any = None,
+    ) -> None:
+        if qpos is None:
+            qpos = np.zeros(14, dtype=np.float64)
+            qpos[[6, 13]] = 0.5
+        self.qpos = qpos
+        self.accepted_updates_measured_state = accepted_updates_measured_state
+        self.on_command = on_command
+        self.connect_calls = 0
+        self.hold_calls = 0
+        self.close_calls = 0
+        self.commands: list[np.ndarray] = []
+
+    def connect_followers(self) -> None:
+        self.connect_calls += 1
+
+    def hold(self) -> None:
+        self.hold_calls += 1
+
+    def read_state(self) -> FakeRobotState:
+        return FakeRobotState(self.qpos)
+
+    def command(self, action: np.ndarray):
+        accepted = np.asarray(action, dtype=np.float64).copy()
+        self.commands.append(accepted)
+        if self.accepted_updates_measured_state:
+            self.qpos = accepted.copy()
+        if self.on_command is not None:
+            self.on_command()
+        return SimpleNamespace(
+            accepted=accepted,
+            clipped=False,
+            rejection_reason=None,
+        )
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class FakeCameraRig:
+    def __init__(self) -> None:
+        self.open_calls = 0
+        self.close_calls = 0
+        self.snapshot_count = 0
+
+    def open(self) -> None:
+        self.open_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        self.snapshot_count += 1
+        views = {}
+        for index, name in enumerate(("top", "left", "right"), start=1):
+            views[name] = SimpleNamespace(
+                rgb=np.full((2, 3, 3), index, dtype=np.uint8),
+                depth=np.full((2, 3), float(index), dtype=np.float32),
+                camera_meta={
+                    "name": name,
+                    "intrinsic_K": np.eye(3, dtype=np.float64),
+                    "cam2world_cv": np.eye(4, dtype=np.float64),
+                },
+            )
+        return {"snapshot_id": f"s{self.snapshot_count}", "views": views}
+
+    def render_camera(self, camera_name: str, *, depth: bool = False):
+        frame = self.snapshot()["views"][camera_name]
+        return (frame.rgb, frame.depth) if depth else frame.rgb
+
+    def get_camera_meta(self, camera_name: str) -> dict[str, Any]:
+        return self.snapshot()["views"][camera_name].camera_meta
+
+
+class FreshSnapshotCameraRig:
+    def __init__(
+        self,
+        *,
+        bracketed: bool = True,
+        include_timestamps: bool = True,
+    ) -> None:
+        self.bracketed = bracketed
+        self.include_timestamps = include_timestamps
+        self.open_calls = 0
+        self.close_calls = 0
+        self.snapshot_not_before_calls: list[float | None] = []
+
+    def open(self) -> None:
+        self.open_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    def snapshot(
+        self, *, not_before_monotonic_s: float | None = None
+    ) -> dict[str, Any]:
+        self.snapshot_not_before_calls.append(not_before_monotonic_s)
+        before = time.monotonic()
+        after = time.monotonic()
+        if not self.bracketed and not_before_monotonic_s is not None:
+            before = max(0.0, float(not_before_monotonic_s) - 1e-6)
+            after = time.monotonic()
+        views = {}
+        for index, name in enumerate(("top", "left", "right"), start=1):
+            camera_meta = {
+                "name": name,
+                "width": 3,
+                "height": 2,
+                "intrinsic_K": np.eye(3, dtype=np.float64),
+                "cam2world_cv": np.eye(4, dtype=np.float64),
+            }
+            if self.include_timestamps:
+                camera_meta["timestamps"] = {
+                    "host_before_monotonic_s": before,
+                    "host_after_monotonic_s": after,
+                }
+            views[name] = SimpleNamespace(
+                rgb=np.full((2, 3, 3), index, dtype=np.uint8),
+                depth=np.full((2, 3), float(index), dtype=np.float32),
+                camera_meta=camera_meta,
+            )
+        return {
+            "snapshot_id": "fresh-fake",
+            "views": views,
+            "capture_host_interval_s": (before, after),
+            "sync_mode": "fresh_fake",
+        }
+
+    def render_camera(self, camera_name: str, *, depth: bool = False):
+        frame = self.snapshot()["views"][camera_name]
+        return (frame.rgb, frame.depth) if depth else frame.rgb
+
+    def get_camera_meta(self, camera_name: str) -> dict[str, Any]:
+        return self.snapshot()["views"][camera_name].camera_meta
+
+
+class MovingReadRuntime(FakeRuntime):
+    def __init__(self, before: np.ndarray, after: np.ndarray) -> None:
+        super().__init__(before)
+        self._states = [before.copy(), before.copy(), after.copy()]
+        self.read_count = 0
+
+    def read_state(self) -> FakeRobotState:
+        index = min(self.read_count, len(self._states) - 1)
+        self.read_count += 1
+        return FakeRobotState(self._states[index])
+
+
+class FakeKinematics:
+    def fk(self, joints: np.ndarray, gripper: float) -> np.ndarray:
+        del gripper
+        transform = np.eye(4, dtype=np.float64)
+        transform[0, 3] = float(joints[0])
+        return transform
+
+
+class FakeToolkitEnv:
+    def __init__(
+        self,
+        *,
+        success_after_chunk: bool = False,
+        require_expected_episode_id: bool = False,
+    ) -> None:
+        self.server_meta = {"task_name": "place_cube"}
+        self.execution_capabilities = {"chunk_step_all_frames": True}
+        self.success_after_chunk = success_after_chunk
+        self.require_expected_episode_id = require_expected_episode_id
+        self.eval_success = False
+        self.take_action_cnt = 0
+        self.step_lim = 20
+        self.actual_seed = 12
+        self.episode_id = "tk-episode-0"
+        self.stop_requests: list[str] = []
+        self.hold_calls = 0
+        self.reset_calls = 0
+        self.chunk_step_calls: list[dict[str, Any]] = []
+        self.last_obs: dict[str, Any] | None = None
+        self.last_info: dict[str, Any] | None = None
+        self.observe()
+
+    def force_new_episode_id(self) -> None:
+        self.episode_id = (
+            f"tk-episode-{self.reset_calls + len(self.chunk_step_calls) + 1}"
+        )
+        self.observe()
+
+    def _status(self) -> dict[str, Any]:
+        return {
+            "eval_success": self.eval_success,
+            "take_action_cnt": self.take_action_cnt,
+            "step_lim": self.step_lim,
+            "actual_seed": self.actual_seed,
+            "episode_id": self.episode_id,
+        }
+
+    def _observation(self) -> dict[str, Any]:
+        views = {}
+        for value, name in enumerate(("top", "left", "right"), start=1):
+            rgb = np.full((3, 4, 3), value * 20, dtype=np.uint8)
+            depth = np.full((3, 4), 1.0 + value, dtype=np.float32)
+            views[name] = {
+                "rgb": rgb,
+                "depth": depth,
+                "camera_meta": {
+                    "name": name,
+                    "width": 4,
+                    "height": 3,
+                    "intrinsic_K": np.eye(3, dtype=np.float64),
+                    "cam2world_cv": np.eye(4, dtype=np.float64),
+                },
+            }
+        qpos = np.zeros(14, dtype=np.float64)
+        qpos[[6, 13]] = 0.5
+        return {
+            "frames": {name: view["rgb"] for name, view in views.items()},
+            "state": {"joint_position": qpos},
+            "views": views,
+            "snapshot_id": f"tk-{self.take_action_cnt}",
+        }
+
+    def _info(self) -> dict[str, Any]:
+        qpos = np.zeros(14, dtype=np.float64)
+        qpos[[6, 13]] = 0.5
+        return {
+            "episode_status": self._status(),
+            "robot_state": {
+                "qpos": qpos,
+                "left_eef_pose": np.array([0, 0, 0, 1, 0, 0, 0], dtype=np.float64),
+                "right_eef_pose": np.array([0, 0, 0, 1, 0, 0, 0], dtype=np.float64),
+                "world_frame": "left_base",
+            },
+        }
+
+    def observe(self):
+        self.last_obs = self._observation()
+        self.last_info = self._info()
+        return self.last_obs, self.last_info
+
+    def reset(self, *, reason: str = ""):
+        del reason
+        self.reset_calls += 1
+        self.eval_success = False
+        self.take_action_cnt = 0
+        self.episode_id = f"tk-reset-{self.reset_calls}"
+        return self.observe()
+
+    def chunk_step(
+        self,
+        actions: np.ndarray,
+        *,
+        action_type: str = "qpos",
+        return_all_frames: bool = False,
+        expected_episode_id: str | None = None,
+    ):
+        del action_type
+        actions = validate_actions(actions)
+        self.chunk_step_calls.append({"expected_episode_id": expected_episode_id})
+        if self.require_expected_episode_id and expected_episode_id is None:
+            raise AssertionError("pi05_act did not bind expected_episode_id")
+        if expected_episode_id is not None and expected_episode_id != self.episode_id:
+            self.hold_calls += 1
+            raise RuntimeError("stale episode_id refused before command")
+        self.take_action_cnt += len(actions)
+        if self.success_after_chunk:
+            self.eval_success = True
+        obs, info = self.observe()
+        payload = [obs for _ in range(len(actions))] if return_all_frames else obs
+        return (
+            payload,
+            1.0 if self.eval_success else 0.0,
+            self.eval_success,
+            False,
+            {**info, "executed_actions": len(actions)},
+        )
+
+    def step(
+        self,
+        action: np.ndarray,
+        *,
+        action_type: str = "qpos",
+        expected_episode_id: str | None = None,
+    ):
+        return self.chunk_step(
+            validate_actions(action),
+            action_type=action_type,
+            return_all_frames=False,
+            expected_episode_id=expected_episode_id,
+        )
+
+    def plan_arm_path(self, arm: str, target_pose: Any) -> dict[str, Any]:
+        del target_pose
+        return {"status": "Success", "position": np.zeros((2, 6)), "arm": arm}
+
+    def get_task_language(self) -> str:
+        return "place the cube"
+
+    def request_stop(self, reason: str = "") -> dict[str, Any]:
+        self.stop_requests.append(reason)
+        return {"stop_requested": True}
+
+
+def _yam_agent_config(
+    *,
+    step_lim: int = 40,
+    operator_receipt_path: Path | None = None,
+    include_wrist_handeye: bool = True,
+) -> dict[str, Any]:
+    identity = np.eye(4, dtype=np.float64).tolist()
+    intrinsic = np.eye(3, dtype=np.float64).tolist()
+    cameras = {
+        "top": {"cam2world_cv": identity, "intrinsic_K": intrinsic},
+        "left": {"cam2world_cv": identity, "intrinsic_K": intrinsic},
+        "right": {"cam2world_cv": identity, "intrinsic_K": intrinsic},
+    }
+    if include_wrist_handeye:
+        cameras["left"]["T_grasp_from_camera"] = identity
+        cameras["right"]["T_grasp_from_camera"] = identity
+
+    return {
+        "task_name": "place_cube",
+        "task_language": "place the cube",
+        "seed": 12,
+        "max_episode_steps": step_lim,
+        "control_hz": MODEL_SPEC.control_hz,
+        "max_joint_delta_per_step": None,
+        "operator_receipt_path": (
+            None if operator_receipt_path is None else str(operator_receipt_path)
+        ),
+        "table_z": -1.0,
+        "table_clearance_m": 0.01,
+        "calibration": {
+            "world_frame": "left_base",
+            "T_left_base_from_right_base": identity,
+            "cameras": cameras,
+        },
+    }
+
+
+def _write_operator_receipt(env: Any, path: Path, *, event: str) -> dict[str, Any]:
+    request = env.operator_receipt_requests()
+    return write_receipt(
+        path,
+        episode_id=request["episode_id"],
+        event=event,
+        note=f"test operator {event}",
+    )
+
+
+def _observe_write_ready_reset(env: Any, path: Path):
+    _, pending_info = env.observe()
+    pending_id = pending_info["episode_status"]["episode_id"]
+    receipt = _write_operator_receipt(env, path, event="ready")
+    assert receipt["episode_id"] == pending_id
+    obs, info = env.reset()
+    ready = info["episode_status"]["operator_ready_receipt"]
+    assert info["episode_status"]["episode_id"] != pending_id
+    assert ready["reset_request_episode_id"] == pending_id
+    assert ready["ready_for_episode_id"] == info["episode_status"]["episode_id"]
+    return obs, info
+
+
+def _valid_action_chunk(length: int = 2) -> np.ndarray:
+    actions = np.zeros((length, 14), dtype=np.float64)
+    actions[:, 6] = 0.5
+    actions[:, 13] = 1.0
+    return actions
+
+
+def _valid_policy_observation() -> dict[str, Any]:
+    top = np.full((1, 3, 4, 3), 10, dtype=np.uint8)
+    left = np.full((3, 4, 3), 20, dtype=np.uint8)
+    right = np.full((3, 4, 3), 30, dtype=np.uint8)
+    side = np.stack([left, right])[None]
+    states = np.arange(14, dtype=np.float32)[None]
+    return {
+        "main_images": top,
+        "extra_view_images": side,
+        "states": states,
+        "task_descriptions": ["place the cube"],
+    }
+
+
+def test_yam_env_facade_constructor_does_not_reset_or_move_robot() -> None:
+    env = FakeYamEnv()
+
+    facade = YamEnvFacade(env)
+
+    assert facade.get_env_meta()["runtime"] == "yam_real_env"
+    obs, _ = facade.observe()
+    assert obs["state"]["joint_position"].shape == (14,)
+    assert env.reset_calls == 0
+    assert env.step_actions == []
+    assert env.chunk_actions == []
+    assert env.stop_calls == 0
+
+
+def test_yam_env_client_constructor_observes_without_resetting() -> None:
+    env = FakeYamEnv()
+    expected_meta = env_runtime_contract(
+        task_name="place_cube",
+        seed=12,
+        max_episode_steps=40,
+    )
+    rpc = FakeRpc(
+        {
+            "env.get_env_meta": expected_meta,
+            "env.observe": env.observe,
+            "env.reset": env.reset,
+        }
+    )
+
+    client = YamEnvClient(rpc, expected_meta=expected_meta)
+
+    assert client.last_obs["state"]["joint_position"].shape == (14,)
+    assert env.reset_calls == 0
+    assert [call[0] for call in rpc.calls] == ["env.get_env_meta", "env.observe"]
+
+
+@pytest.mark.parametrize("transport", ["http", "socket"])
+def test_yam_env_facade_localhost_rpc_round_trip_and_cleanup(transport: str) -> None:
+    env = FakeYamEnv()
+    facade = YamEnvFacade(
+        env,
+        metadata=env_runtime_contract(
+            task_name="place_cube",
+            seed=12,
+            max_episode_steps=40,
+        ),
+    )
+    actions = _valid_action_chunk(3)
+
+    with _served_facade(facade, transport) as client:
+        assert client.call("env.get_env_meta")["seed"] == 12
+        reset_obs, reset_info = client.call(
+            "env.reset",
+            kwargs={"seed": 99, "options": {"operator_ready": True}},
+        )
+        assert reset_obs["seed"] == 99
+        assert reset_info["episode_status"]["actual_seed"] == 12
+        step = client.call("env.step", args=(actions[0],))
+        chunk = client.call(
+            "env.chunk_step",
+            args=(actions,),
+            kwargs={"return_all_frames": True},
+        )
+        rgb, depth = client.call(
+            "env.render_camera",
+            kwargs={"camera_name": "left", "depth": True},
+        )
+        meta = client.call("env.get_camera_meta", args=("right",))
+
+    assert step[4]["executed_actions"] == 1
+    assert chunk[4]["executed_actions"] == 3
+    assert len(chunk[0]) == 3
+    assert np.array_equal(env.step_actions[0], actions[0])
+    assert np.array_equal(env.chunk_actions[0], actions)
+    assert rgb.shape == (3, 4, 3)
+    assert depth.shape == (3, 4)
+    assert meta["name"] == "right"
+    assert env.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("actions", "action_type"),
+    [
+        (np.zeros((0, 14), dtype=np.float64), "qpos"),
+        (np.zeros((1, 13), dtype=np.float64), "qpos"),
+        (np.zeros((1, 15), dtype=np.float64), "qpos"),
+        (np.full((1, 14), np.nan, dtype=np.float64), "qpos"),
+        (np.array([[0, 0, 0, 0, 0, 0, -0.1, 0, 0, 0, 0, 0, 0, 0.5]]), "qpos"),
+        (np.array([[0, 0, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, 0, 1.1]]), "qpos"),
+        (_valid_action_chunk(), "delta"),
+    ],
+)
+def test_yam_action_contract_rejects_invalid_shape_nan_grip_and_delta(
+    actions: np.ndarray,
+    action_type: str,
+) -> None:
+    with pytest.raises(ValueError):
+        validate_actions(actions, action_type=action_type)
+
+
+def test_yam_env_facade_rejects_bad_actions_before_calling_runtime() -> None:
+    env = FakeYamEnv()
+    facade = YamEnvFacade(env)
+
+    with pytest.raises(ValueError):
+        facade.step(np.zeros((2, 14), dtype=np.float64))
+    with pytest.raises(ValueError):
+        facade.chunk_step(np.zeros((1, 13), dtype=np.float64))
+
+    assert env.step_actions == []
+    assert env.chunk_actions == []
+
+
+def test_yam_env_client_reset_round_trips_without_constructor_auto_reset() -> None:
+    env = FakeYamEnv()
+    expected_meta = env_runtime_contract(
+        task_name="place_cube",
+        seed=12,
+        max_episode_steps=40,
+    )
+    facade = YamEnvFacade(env, metadata=expected_meta)
+
+    with _served_facade(facade, "http") as rpc:
+        client = YamEnvClient(rpc, expected_meta=expected_meta)
+        assert env.reset_calls == 0
+        obs, info = client.reset(reason="operator approved")
+
+    assert obs["state"]["joint_position"].shape == (14,)
+    assert info["episode_status"]["actual_seed"] == 12
+    assert env.reset_calls == 1
+
+
+def test_request_stop_bypasses_writer_lock_during_active_chunk() -> None:
+    env = FakeYamEnv(block_chunk=True)
+    facade = YamEnvFacade(env)
+    chunk_errors: list[BaseException] = []
+    chunk_result: list[Any] = []
+
+    with _served_facade(facade, "http") as client:
+
+        def run_chunk() -> None:
+            try:
+                chunk_result.append(
+                    client.call(
+                        "env.chunk_step",
+                        args=(_valid_action_chunk(4),),
+                        timeout_s=5.0,
+                    )
+                )
+            except BaseException as exc:
+                chunk_errors.append(exc)
+
+        thread = threading.Thread(target=run_chunk)
+        thread.start()
+        assert env.chunk_entered.wait(timeout=1.0)
+
+        started = time.monotonic()
+        assert client.call("env.request_stop", timeout_s=1.0) == {
+            "stop_requested": True,
+            "hold_confirmed": False,
+        }
+        elapsed = time.monotonic() - started
+        thread.join(timeout=2.0)
+
+    assert elapsed < 0.5
+    assert not thread.is_alive()
+    assert chunk_errors == []
+    assert chunk_result[0][4]["executed_actions"] == 4
+    assert env.stop_calls == 1
+
+
+def test_yam_agent_env_missing_handeye_still_returns_rgb_and_status(tmp_path) -> None:
+    env = YamAgentEnv(
+        _yam_agent_config(
+            operator_receipt_path=tmp_path / "operator-receipt.json",
+            include_wrist_handeye=False,
+        ),
+        runtime=FakeRuntime(),
+        cameras=FreshSnapshotCameraRig(bracketed=True),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        obs, info = env.observe()
+    finally:
+        env.close()
+
+    assert set(obs["frames"]) == {"top", "left", "right"}
+    assert info["episode_status"]["episode_id"]
+    for name in ("left", "right"):
+        meta = obs["views"][name]["camera_meta"]
+        assert meta["projection_valid"] is False
+        assert "missing_or_invalid_wrist_handeye" in meta["projection_limitation"]
+
+
+def test_yam_agent_env_unbracketed_cached_snapshot_invalidates_wrist_projection(
+    tmp_path,
+) -> None:
+    config = _yam_agent_config(operator_receipt_path=tmp_path / "operator-receipt.json")
+    config["projection_observe_timeout_s"] = 0.0
+    env = YamAgentEnv(
+        config,
+        runtime=FakeRuntime(),
+        cameras=FreshSnapshotCameraRig(bracketed=False),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        obs, _ = env.observe()
+    finally:
+        env.close()
+
+    for name in ("left", "right"):
+        meta = obs["views"][name]["camera_meta"]
+        assert meta["projection_valid"] is False
+        assert meta["frame_bracketed_by_qpos_samples"] is False
+        assert "not bracketed" in meta["projection_limitation"]
+
+
+def test_yam_agent_env_top_projection_does_not_depend_on_stationary_qpos(
+    tmp_path,
+) -> None:
+    before = np.zeros(14, dtype=np.float64)
+    before[[6, 13]] = 0.5
+    after = before.copy()
+    after[0] += 0.02
+    config = _yam_agent_config(operator_receipt_path=tmp_path / "operator-receipt.json")
+    config["qpos_static_tolerance_rad"] = 1e-4
+    config["projection_observe_timeout_s"] = 0.0
+    env = YamAgentEnv(
+        config,
+        runtime=MovingReadRuntime(before, after),
+        cameras=FreshSnapshotCameraRig(bracketed=True),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        obs, _ = env.observe()
+    finally:
+        env.close()
+
+    assert obs["views"]["top"]["camera_meta"]["projection_valid"] is True
+    for name in ("left", "right"):
+        meta = obs["views"][name]["camera_meta"]
+        assert meta["projection_valid"] is False
+        assert "joints moved" in meta["projection_limitation"]
+
+
+def test_yam_agent_env_observe_waits_fresh_but_step_uses_cached_snapshot(
+    tmp_path,
+) -> None:
+    receipt_path = tmp_path / "operator-receipt.json"
+    cameras = FreshSnapshotCameraRig(bracketed=True)
+    env = YamAgentEnv(
+        _yam_agent_config(operator_receipt_path=receipt_path),
+        runtime=FakeRuntime(accepted_updates_measured_state=True),
+        cameras=cameras,
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        env.observe()
+        assert any(call is not None for call in cameras.snapshot_not_before_calls)
+        _write_operator_receipt(env, receipt_path, event="ready")
+        env.reset()
+        cameras.snapshot_not_before_calls.clear()
+        env.step(_valid_action_chunk(1)[0])
+    finally:
+        env.close()
+
+    assert cameras.snapshot_not_before_calls
+    assert cameras.snapshot_not_before_calls == [None, None]
+
+
+def test_yam_agent_env_stop_during_pace_holds_without_commanding(tmp_path) -> None:
+    receipt_path = tmp_path / "operator-receipt.json"
+    runtime = FakeRuntime(accepted_updates_measured_state=True)
+    config = _yam_agent_config(operator_receipt_path=receipt_path)
+    config["projection_observe_timeout_s"] = 0.0
+    env = YamAgentEnv(
+        config,
+        runtime=runtime,
+        cameras=FreshSnapshotCameraRig(bracketed=True),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    errors: list[BaseException] = []
+    result: list[Any] = []
+    try:
+        _observe_write_ready_reset(env, receipt_path)
+        startup_holds = runtime.hold_calls
+        env._next_tick_s = time.perf_counter() + 0.25
+
+        def run_chunk() -> None:
+            try:
+                result.append(env.chunk_step(_valid_action_chunk(1)))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_chunk)
+        thread.start()
+        time.sleep(0.05)
+        env.request_stop()
+        thread.join(timeout=1.0)
+    finally:
+        env.close()
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert runtime.commands == []
+    assert runtime.hold_calls > startup_holds
+    assert result[0][4]["executed_actions"] == 0
+
+
+def test_yam_agent_env_observe_does_not_fabricate_operator_ready_receipt(
+    tmp_path,
+) -> None:
+    receipt_path = tmp_path / "operator-receipt.json"
+    env = YamAgentEnv(
+        _yam_agent_config(operator_receipt_path=receipt_path),
+        runtime=FakeRuntime(),
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        _, info = env.observe()
+    finally:
+        env.close()
+
+    assert info["episode_status"]["ready_for_motion"] is False
+    assert info["episode_status"]["operator_ready_receipt"] is None
+
+
+def test_yam_agent_env_reset_without_ready_holds_and_keeps_episode_id(tmp_path) -> None:
+    runtime = FakeRuntime()
+    env = YamAgentEnv(
+        _yam_agent_config(operator_receipt_path=tmp_path / "operator-receipt.json"),
+        runtime=runtime,
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        _, info = env.observe()
+        pending_id = info["episode_status"]["episode_id"]
+        startup_holds = runtime.hold_calls
+        with pytest.raises(
+            RuntimeError, match="requires a local operator ready receipt"
+        ):
+            env.reset()
+        _, after = env.observe()
+    finally:
+        env.close()
+
+    assert after["episode_status"]["episode_id"] == pending_id
+    assert after["episode_status"]["ready_for_motion"] is False
+    assert runtime.hold_calls > startup_holds
+
+
+def test_yam_agent_env_ready_reset_starts_new_episode_id(tmp_path) -> None:
+    receipt_path = tmp_path / "operator-receipt.json"
+    env = YamAgentEnv(
+        _yam_agent_config(operator_receipt_path=receipt_path),
+        runtime=FakeRuntime(),
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        _, pending_info = env.observe()
+        pending_id = pending_info["episode_status"]["episode_id"]
+        _write_operator_receipt(env, receipt_path, event="ready")
+        _, reset_info = env.reset()
+    finally:
+        env.close()
+
+    new_id = reset_info["episode_status"]["episode_id"]
+    ready = reset_info["episode_status"]["operator_ready_receipt"]
+    assert new_id != pending_id
+    assert reset_info["episode_status"]["ready_for_motion"] is True
+    assert ready["reset_request_episode_id"] == pending_id
+    assert ready["ready_for_episode_id"] == new_id
+
+
+def test_yam_agent_env_stale_success_receipt_is_not_reused_after_reset(
+    tmp_path,
+) -> None:
+    receipt_path = tmp_path / "operator-receipt.json"
+    env = YamAgentEnv(
+        _yam_agent_config(operator_receipt_path=receipt_path),
+        runtime=FakeRuntime(),
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        _, pending_info = env.observe()
+        stale_id = pending_info["episode_status"]["episode_id"]
+        _write_operator_receipt(env, receipt_path, event="ready")
+        _, reset_info = env.reset()
+        current_id = reset_info["episode_status"]["episode_id"]
+        write_receipt(
+            receipt_path,
+            episode_id=stale_id,
+            event="success",
+            note="old success must not apply to new episode",
+        )
+        _, after = env.observe()
+    finally:
+        env.close()
+
+    assert current_id != stale_id
+    assert after["episode_status"]["episode_id"] == current_id
+    assert after["episode_status"]["eval_success"] is False
+    assert after["episode_status"]["terminal_event"] is None
+    assert after["episode_status"]["operator_success_receipt"] is None
+
+
+def test_yam_agent_env_rejects_stale_expected_episode_without_commanding(
+    tmp_path,
+) -> None:
+    receipt_path = tmp_path / "operator-receipt.json"
+    runtime = FakeRuntime(accepted_updates_measured_state=True)
+    env = YamAgentEnv(
+        _yam_agent_config(operator_receipt_path=receipt_path),
+        runtime=runtime,
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        _, pending_info = env.observe()
+        stale_id = pending_info["episode_status"]["episode_id"]
+        _write_operator_receipt(env, receipt_path, event="ready")
+        _, reset_info = env.reset()
+        assert reset_info["episode_status"]["episode_id"] != stale_id
+        startup_holds = runtime.hold_calls
+        with pytest.raises(RuntimeError, match="episode"):
+            env.chunk_step(_valid_action_chunk(1), expected_episode_id=stale_id)
+    finally:
+        env.close()
+
+    assert runtime.commands == []
+    assert runtime.hold_calls > startup_holds
+
+
+def test_yam_agent_env_requires_operator_ready_before_motion(tmp_path) -> None:
+    runtime = FakeRuntime()
+    env = YamAgentEnv(
+        _yam_agent_config(operator_receipt_path=tmp_path / "operator-receipt.json"),
+        runtime=runtime,
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        env.observe()
+        startup_holds = runtime.hold_calls
+        with pytest.raises(RuntimeError, match="operator ready receipt"):
+            env.chunk_step(_valid_action_chunk(1))
+    finally:
+        env.close()
+
+    assert runtime.hold_calls > startup_holds
+    assert runtime.commands == []
+
+
+def test_yam_agent_env_rejects_agent_supplied_operator_receipt_options(
+    tmp_path,
+) -> None:
+    env = YamAgentEnv(
+        _yam_agent_config(operator_receipt_path=tmp_path / "operator-receipt.json"),
+        runtime=FakeRuntime(),
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    try:
+        with pytest.raises(ValueError, match="must not carry operator receipts"):
+            env.reset(options={"operator_ready_receipt": {"event": "ready"}})
+    finally:
+        env.close()
+
+
+def test_yam_agent_env_per_step_robot_state_uses_measured_state_not_accepted_target(
+    tmp_path,
+) -> None:
+    receipt_path = tmp_path / "operator-receipt.json"
+    measured = np.zeros(14, dtype=np.float64)
+    measured[[6, 13]] = 0.5
+    runtime = FakeRuntime(measured, accepted_updates_measured_state=False)
+    env = YamAgentEnv(
+        _yam_agent_config(operator_receipt_path=receipt_path),
+        runtime=runtime,
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    action = measured.copy()
+    action[0] = 0.4
+    try:
+        _observe_write_ready_reset(env, receipt_path)
+        obs, _, _, _, info = env.chunk_step(action)
+    finally:
+        env.close()
+
+    assert np.array_equal(obs["state"]["joint_position"], measured)
+    assert np.array_equal(info["per_step"][0]["robot_state"]["qpos"], measured)
+    assert np.array_equal(info["accepted_action"], action)
+
+
+def test_yam_agent_env_return_all_frames_uses_standard_obs_list_contract(
+    tmp_path,
+) -> None:
+    receipt_path = tmp_path / "operator-receipt.json"
+    runtime = FakeRuntime(accepted_updates_measured_state=True)
+    env = YamAgentEnv(
+        _yam_agent_config(operator_receipt_path=receipt_path),
+        runtime=runtime,
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    actions = _valid_action_chunk(3)
+    try:
+        _observe_write_ready_reset(env, receipt_path)
+        obs, _, _, _, info = env.chunk_step(actions, return_all_frames=True)
+    finally:
+        env.close()
+
+    assert isinstance(obs, list)
+    assert len(obs) == info["executed_actions"] == 3
+    assert all("frames" in frame for frame in obs)
+
+
+@pytest.mark.parametrize("terminal_kind", ["success", "limit"])
+def test_yam_agent_env_holds_when_success_or_step_limit_stops_chunk(
+    terminal_kind: str,
+    tmp_path,
+) -> None:
+    receipt_path = tmp_path / "operator-receipt.json"
+    env_holder: dict[str, YamAgentEnv] = {}
+
+    def mark_success() -> None:
+        if terminal_kind == "success":
+            _write_operator_receipt(env_holder["env"], receipt_path, event="success")
+
+    runtime = FakeRuntime(accepted_updates_measured_state=True, on_command=mark_success)
+    step_lim = 10 if terminal_kind == "success" else 1
+    env = YamAgentEnv(
+        _yam_agent_config(step_lim=step_lim, operator_receipt_path=receipt_path),
+        runtime=runtime,
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    env_holder["env"] = env
+    try:
+        _observe_write_ready_reset(env, receipt_path)
+        startup_holds = runtime.hold_calls
+        env.chunk_step(_valid_action_chunk(2))
+    finally:
+        env.close()
+
+    assert runtime.hold_calls > startup_holds
+
+
+def test_policy_observation_keeps_pi05_three_view_batch_order() -> None:
+    top = np.full((3, 4, 3), 10, dtype=np.uint8)
+    left = np.full((3, 4, 3), 20, dtype=np.uint8)
+    right = np.full((3, 4, 3), 30, dtype=np.uint8)
+    snapshot = {
+        "frames": {"top": top, "left": left, "right": right},
+        "state": {"joint_position": np.arange(14, dtype=np.float32)},
+    }
+
+    obs = policy_observation(snapshot, "place the cube")
+
+    assert obs["main_images"].shape == (1, 3, 4, 3)
+    assert obs["extra_view_images"].shape == (1, 2, 3, 4, 3)
+    assert np.array_equal(obs["main_images"][0], top)
+    assert np.array_equal(obs["extra_view_images"][0, 0], left)
+    assert np.array_equal(obs["extra_view_images"][0, 1], right)
+    assert obs["wrist_images"] is None
+    assert obs["states"].shape == (1, 14)
+    assert obs["task_descriptions"] == ["place the cube"]
+
+
+@pytest.mark.parametrize("transport", ["http", "socket"])
+def test_yam_vla_localhost_rpc_round_trip_meta_and_actions(transport: str) -> None:
+    model = FakeYamModel()
+    facade = YamVLAFacade(model=model)
+
+    with _served_facade(facade, transport) as rpc:
+        client = YamVLAClient(rpc)
+        actions = client.predict(_valid_policy_observation(), options={"mode": "eval"})
+
+    assert actions.shape == (MODEL_SPEC.use_length, 14)
+    assert np.all(actions[:, 6] == pytest.approx(0.25))
+    assert np.all(actions[:, 13] == pytest.approx(0.75))
+    assert len(model.calls) == 1
+    env_obs, mode = model.calls[0]
+    assert mode == "eval"
+    assert env_obs["main_images"].shape == (1, 3, 4, 3)
+    assert env_obs["extra_view_images"].shape == (1, 2, 3, 4, 3)
+    assert np.all(env_obs["extra_view_images"][0, 0] == 20)
+    assert np.all(env_obs["extra_view_images"][0, 1] == 30)
+    assert env_obs["wrist_images"] is None
+    assert env_obs["states"].shape == (1, 14)
+
+
+def test_yam_vla_contract_and_build_cfg_use_horizon30_use5_qpos14() -> None:
+    meta = vla_runtime_contract()
+    cfg = build_model_cfg("/tmp/fake-yam-model", "/tmp/fake-norm-stats")
+
+    assert meta["runtime"] == "pi05_yam"
+    assert meta["camera_order"] == ["top", "left", "right"]
+    assert meta["state_layout"] == "qpos14"
+    assert meta["action_layout"] == "qpos14"
+    assert meta["action_horizon"] == 30
+    assert meta["use_length"] == 5
+    assert meta["gripper"] == "0_closed_1_open"
+    assert cfg.num_action_chunks == 5
+    assert cfg.action_dim == 14
+    assert cfg.openpi.num_images_in_input == 3
+    assert cfg.openpi.action_horizon == 30
+    assert cfg.openpi.action_chunk == 5
+    assert cfg.openpi.action_env_dim == 14
+
+
+@pytest.mark.parametrize(
+    "bad_obs",
+    [
+        {
+            **_valid_policy_observation(),
+            "main_images": np.zeros((3, 4, 3), dtype=np.uint8),
+        },
+        {
+            **_valid_policy_observation(),
+            "extra_view_images": np.zeros((1, 1, 3, 4, 3), dtype=np.uint8),
+        },
+        {
+            **_valid_policy_observation(),
+            "states": np.full((1, 14), np.nan, dtype=np.float32),
+        },
+        {
+            **_valid_policy_observation(),
+            "task_descriptions": [""],
+        },
+    ],
+)
+def test_yam_vla_facade_rejects_bad_observations_before_model_call(
+    bad_obs: dict[str, Any],
+) -> None:
+    model = FakeYamModel()
+    facade = YamVLAFacade(model=model)
+
+    with pytest.raises((TypeError, ValueError)):
+        facade.predict(bad_obs)
+
+    assert model.calls == []
+
+
+@pytest.mark.parametrize(
+    "bad_actions",
+    [
+        np.zeros((1, MODEL_SPEC.use_length, 13), dtype=np.float32),
+        np.zeros((1, MODEL_SPEC.use_length + 1, 14), dtype=np.float32),
+        np.full((1, MODEL_SPEC.use_length, 14), np.nan, dtype=np.float32),
+        np.array([[[0, 0, 0, 0, 0, 0, -0.1, 0, 0, 0, 0, 0, 0, 0.5]]]),
+        np.array([[[0, 0, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, 0, 1.1]]]),
+    ],
+)
+def test_yam_vla_facade_rejects_bad_policy_outputs(bad_actions: np.ndarray) -> None:
+    model = FakeYamModel(actions=bad_actions)
+    facade = YamVLAFacade(model=model)
+
+    with pytest.raises(ValueError):
+        facade.predict(_valid_policy_observation())
+
+
+def test_yam_vla_rpc_returns_errors_for_bad_observation() -> None:
+    facade = YamVLAFacade(model=FakeYamModel())
+    bad_obs = {
+        **_valid_policy_observation(),
+        "extra_view_images": np.zeros((1, 2, 3, 4, 1), dtype=np.uint8),
+    }
+
+    with _served_facade(facade, "http") as rpc:
+        with pytest.raises(RpcError, match="extra_view_images"):
+            rpc.call("vla.predict", args=(bad_obs, {"mode": "eval"}), timeout_s=2.0)
+
+
+def _make_yam_toolkit(
+    tmp_path: Path,
+    *,
+    success_after_chunk: bool = False,
+    mode: str = "evaluation",
+    attempts_per_session: int = 0,
+) -> tuple[Any, FakeToolkitEnv, FakeToolkitModel, MemoryManager]:
+    env = FakeToolkitEnv(success_after_chunk=success_after_chunk)
+    model = FakeToolkitModel()
+    memory = MemoryManager(
+        tmp_path / "memory",
+        memory_access="inbox_write" if mode == "exploration" else "read_only",
+        inbox_cell_tag="yam_place_cube_s12" if mode == "exploration" else None,
+    )
+    toolkit = YamToolkit(
+        primitives_kwargs={"env": env, "model": model, "seed": 12},
+        dashboard_events=NullDashboardEventSink(),
+        memory=memory,
+        mode=mode,
+        attempts_per_session=attempts_per_session,
+        state_output_dir=tmp_path / "state",
+        run_output_dir=tmp_path / "run",
+    )
+    return toolkit, env, model, memory
+
+
+def test_yam_toolkit_finish_claim_cannot_create_verified_success(tmp_path) -> None:
+    toolkit, env, _, _ = _make_yam_toolkit(tmp_path, success_after_chunk=False)
+    try:
+        result = toolkit.execute_tool(
+            "finish",
+            {"status": "success", "summary": "agent claimed success"},
+        )
+    finally:
+        toolkit.close()
+
+    assert env.eval_success is False
+    assert result.is_finish is True
+    assert result.result["verified_success"] is False
+    assert result.result["status"] == "failure"
+
+
+def test_yam_toolkit_pi05_act_rejects_model_side_episode_reset(tmp_path) -> None:
+    env = FakeToolkitEnv(require_expected_episode_id=True)
+    model = FakeToolkitModel(on_predict=env.force_new_episode_id)
+    memory = MemoryManager(tmp_path / "memory", memory_access="read_only")
+    toolkit = YamToolkit(
+        primitives_kwargs={"env": env, "model": model, "seed": 12},
+        dashboard_events=NullDashboardEventSink(),
+        memory=memory,
+        mode="evaluation",
+        state_output_dir=tmp_path / "state",
+        run_output_dir=tmp_path / "run",
+    )
+    try:
+        result = toolkit.execute_tool("pi05_act", {"chunks": 1})
+    finally:
+        toolkit.close()
+
+    assert len(model.calls) == 1
+    assert env.take_action_cnt == 0
+    assert env.hold_calls == 1
+    assert result.result["error"] == "stale episode_id refused before command"
+
+
+def test_yam_toolkit_success_writes_recipe_and_memory_task_artifacts(tmp_path) -> None:
+    toolkit, env, model, memory = _make_yam_toolkit(
+        tmp_path,
+        success_after_chunk=True,
+        mode="exploration",
+        attempts_per_session=2,
+    )
+    recipe_tag = "yam_place_cube_s12"
+    try:
+        assert toolkit.write_recipe(recipe_tag) == ""
+        action_result = toolkit.execute_tool("pi05_act", {"chunks": 1})
+        assert action_result.result["state"]["episode_status"]["eval_success"] is True
+        assert toolkit.solved() is True
+        recipe_path = Path(toolkit.write_recipe(recipe_tag))
+    finally:
+        toolkit.close()
+
+    assert len(model.calls) == 1
+    assert env.take_action_cnt == MODEL_SPEC.use_length
+    assert recipe_path.exists()
+    assert recipe_path.read_text(encoding="utf-8").count('"action": "pi05_act"') == 1
+    audit_path = tmp_path / "run" / f"{recipe_tag}.json"
+    assert audit_path.exists()
+
+    merge = memory.merge_memory(
+        cell_tag=recipe_tag,
+        run_state_dir=tmp_path / "run",
+        solved=True,
+    )
+
+    assert merge["task"] == 1
+    assert (tmp_path / "memory" / "task" / f"recipe_{recipe_tag}.jsonl").exists()
+    assert (tmp_path / "memory" / "task" / f"{recipe_tag}.json").exists()
+
+
+def test_yam_toolkit_failure_does_not_write_recipe_or_merge_task_artifacts(
+    tmp_path,
+) -> None:
+    toolkit, env, _, memory = _make_yam_toolkit(
+        tmp_path,
+        success_after_chunk=False,
+        mode="exploration",
+        attempts_per_session=1,
+    )
+    recipe_tag = "yam_place_cube_s12"
+    try:
+        action_result = toolkit.execute_tool("pi05_act", {"chunks": 1})
+        assert action_result.result["state"]["episode_status"]["eval_success"] is False
+        assert toolkit.solved() is False
+        assert toolkit.write_recipe(recipe_tag) == ""
+    finally:
+        toolkit.close()
+
+    merge = memory.merge_memory(
+        cell_tag=recipe_tag,
+        run_state_dir=tmp_path / "run",
+        solved=False,
+    )
+
+    assert env.take_action_cnt == MODEL_SPEC.use_length
+    assert merge["task"] == 0
+    assert not (tmp_path / "memory" / "task" / f"recipe_{recipe_tag}.jsonl").exists()
+    assert not (tmp_path / "memory" / "task" / f"{recipe_tag}.json").exists()

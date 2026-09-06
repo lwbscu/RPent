@@ -1,0 +1,7 @@
+[
+  {
+    "task_name": "yam_smoke",
+    "seed": 0,
+    "instruction": "dual-arm YAM manipulation smoke task"
+  }
+]
