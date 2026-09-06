@@ -9,7 +9,7 @@
 # limitations under the License.
 """Hardware-independent YAM wire and policy contracts."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -27,7 +27,6 @@ YAM_STATUS_KEYS = (
 class YamModelSpec:
     policy_name: str = "pi05_yam_joint"
     camera_order: tuple[str, ...] = YAM_CAMERA_NAMES
-    state_layout: str = "qpos14"
     action_layout: str = "qpos14"
     action_horizon: int = 30
     use_length: int = 5
@@ -35,12 +34,6 @@ class YamModelSpec:
 
 
 MODEL_SPEC = YamModelSpec()
-
-
-def vla_runtime_contract() -> dict:
-    result = asdict(MODEL_SPEC)
-    result["camera_order"] = list(MODEL_SPEC.camera_order)
-    return {"runtime": "pi05_yam", **result, "gripper": "0_closed_1_open"}
 
 
 def env_runtime_contract(

@@ -14,22 +14,8 @@ from __future__ import annotations
 import argparse
 import json
 
-import numpy as np
-
-from robots.yam.contracts import env_runtime_contract, validate_actions
+from robots.yam.contracts import env_runtime_contract
 from rpent.robots.components.env_facade_base import BaseEnvFacade
-
-
-def _to_numpy_tree(value):
-    if hasattr(value, "detach") and hasattr(value, "cpu"):
-        return value.detach().cpu().numpy()
-    if isinstance(value, dict):
-        return {key: _to_numpy_tree(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return type(value)(_to_numpy_tree(item) for item in value)
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
 
 
 class YamEnvFacade(BaseEnvFacade):
@@ -72,17 +58,16 @@ class YamEnvFacade(BaseEnvFacade):
         return dict(self._metadata)
 
     def observe(self):
-        return _to_numpy_tree(self._env.observe())
+        return self._env.observe()
 
     def reset(self, *, seed=None, options=None):
-        return _to_numpy_tree(self._env.reset(seed=seed, options=options))
+        return self._env.reset(seed=seed, options=options)
 
     def step(self, action, *, action_type="qpos", expected_episode_id=None):
-        array = validate_actions(action, action_type=action_type)
-        if len(array) != 1:
-            raise ValueError("step requires a single qpos14 action")
-        return _to_numpy_tree(
-            self._env.step(array[0], expected_episode_id=expected_episode_id)
+        return self._env.step(
+            action,
+            action_type=action_type,
+            expected_episode_id=expected_episode_id,
         )
 
     def chunk_step(
@@ -93,27 +78,24 @@ class YamEnvFacade(BaseEnvFacade):
         return_all_frames=False,
         expected_episode_id=None,
     ):
-        array = validate_actions(actions, action_type=action_type)
-        return _to_numpy_tree(
-            self._env.chunk_step(
-                array,
-                action_type=action_type,
-                return_all_frames=return_all_frames,
-                expected_episode_id=expected_episode_id,
-            )
+        return self._env.chunk_step(
+            actions,
+            action_type=action_type,
+            return_all_frames=return_all_frames,
+            expected_episode_id=expected_episode_id,
         )
 
     def render_camera(self, camera_name, *, depth=False):
-        return _to_numpy_tree(self._env.render_camera(camera_name, depth=depth))
+        return self._env.render_camera(camera_name, depth=depth)
 
     def get_camera_meta(self, camera_name):
-        return _to_numpy_tree(self._env.get_camera_meta(camera_name))
+        return self._env.get_camera_meta(camera_name)
 
     def get_task_language(self):
         return self._env.get_task_language()
 
     def plan_arm_path(self, arm, target_pose):
-        return _to_numpy_tree(self._env.plan_arm_path(arm, target_pose))
+        return self._env.plan_arm_path(arm, target_pose)
 
     def request_stop(self):
         self._env.request_stop()

@@ -23,41 +23,28 @@ class YamEnvClient(BaseEnvClient):
     """Client for one operator-supervised YAM env endpoint.
 
     Unlike the common base constructor, this client does not reset on connect.
-    Reset changes the operator-approved episode, so construction performs only
-    metadata validation and an explicit ``env.observe`` snapshot unless the
-    caller opted into ``reset_on_connect``. Observe may initialize hardware.
+    Reset changes the operator-approved episode, so construction performs
+    metadata validation through the common base and then takes an explicit
+    ``env.observe`` snapshot. Observe may initialize hardware.
     """
-
-    _TIMEOUT_S = {**BaseEnvClient._TIMEOUT_S, "default": 120.0}
 
     def __init__(
         self,
         client: RpcClient,
         *,
         expected_meta: dict[str, Any],
-        reset_on_connect: bool = False,
     ) -> None:
-        self._client = client
-        self.server_meta = dict(expected_meta)
-        self.terminated = False
-        self.truncated = False
-        actual = self._client.call(
-            "env.get_env_meta", timeout_s=self._TIMEOUT_S["default"]
+        super().__init__(
+            client,
+            expected_meta=expected_meta,
+            reset_on_connect=False,
         )
-        if actual != expected_meta:
-            raise RuntimeError(
-                "YAM env_meta mismatch: "
-                f"expected={expected_meta!r} actual={actual!r}. "
-                "Start the yambox env_server with the same task/seed/budget."
-            )
+        self.server_meta = dict(expected_meta)
         execution = self.server_meta.get("execution", {})
         self.execution_capabilities = (
             dict(execution) if isinstance(execution, dict) else {}
         )
-        if reset_on_connect:
-            self.reset()
-        else:
-            self.observe()
+        self.observe()
 
     @staticmethod
     def _require_result_tuple(result: Any, size: int, method: str) -> tuple:
@@ -104,19 +91,10 @@ class YamEnvClient(BaseEnvClient):
         observation, info = self._require_result_tuple(result, 2, "env.observe")
         self.last_obs = self._require_observation(observation)
         self.last_info = info
-        status = self._require_episode_status(info)
-        self.terminated = status.get("eval_success") is True
-        self.truncated = (
-            status.get("terminal_event") in {"failure", "abort"}
-            or status.get("stop_requested") is True
-            or int(status["take_action_cnt"]) >= int(status["step_lim"])
-        )
+        self._require_episode_status(info)
         return self.last_obs, info
 
-    def reset(
-        self, *, reason: str | None = None
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        del reason
+    def reset(self) -> tuple[dict[str, Any], dict[str, Any]]:
         result = self._client.call(
             "env.reset",
             timeout_s=self._TIMEOUT_S["env.reset"],
@@ -125,8 +103,6 @@ class YamEnvClient(BaseEnvClient):
         self.last_obs = self._require_observation(observation)
         self.last_info = info
         self._require_episode_status(info)
-        self.terminated = False
-        self.truncated = False
         return self.last_obs, info
 
     def step(
@@ -147,15 +123,13 @@ class YamEnvClient(BaseEnvClient):
                 "expected_episode_id": expected_episode_id
                 or self.last_info["episode_status"]["episode_id"],
             },
-            timeout_s=600.0,
+            timeout_s=self._TIMEOUT_S["env.step"],
         )
         result = self._require_result_tuple(result, 5, "env.step")
-        obs, _, terminated, truncated, info = result
+        obs, _, _, _, info = result
         self.last_obs = self._require_observation(obs)
         self.last_info = info
         self._require_episode_status(info)
-        self.terminated |= bool(np.asarray(terminated).any())
-        self.truncated |= bool(np.asarray(truncated).any())
         return result
 
     def chunk_step(
@@ -176,29 +150,22 @@ class YamEnvClient(BaseEnvClient):
                 "expected_episode_id": expected_episode_id
                 or self.last_info["episode_status"]["episode_id"],
             },
-            timeout_s=600.0,
+            timeout_s=self._TIMEOUT_S["env.chunk_step"],
         )
         result = self._require_result_tuple(result, 5, "env.chunk_step")
-        obs_field, _, terminated, truncated, info = result
-        if return_all_frames:
-            if isinstance(obs_field, list):
-                if not obs_field:
-                    raise TypeError(
-                        "YAM chunk_step return_all_frames=True returned no observations"
-                    )
-                self.last_obs = self._require_observation(obs_field[-1])
-            elif isinstance(obs_field, dict) and "final" in obs_field:
-                self.last_obs = self._require_observation(obs_field["final"])
-            else:
-                raise TypeError(
-                    "YAM chunk_step return_all_frames=True must return an observation list or {'frames','final'}"
-                )
-        else:
+        obs_field, _, _, _, info = result
+        if isinstance(obs_field, list):
+            if not obs_field:
+                raise TypeError("YAM chunk_step returned no observations")
+            self.last_obs = self._require_observation(obs_field[-1])
+        elif isinstance(obs_field, dict):
             self.last_obs = self._require_observation(obs_field)
+        else:
+            raise TypeError(
+                "YAM chunk_step must return an observation dict or a list of observations"
+            )
         self.last_info = info
         self._require_episode_status(info)
-        self.terminated |= bool(np.asarray(terminated).any())
-        self.truncated |= bool(np.asarray(truncated).any())
         return result
 
     def render_camera(self, camera_name: str, *, depth: bool = False) -> Any:
@@ -228,9 +195,8 @@ class YamEnvClient(BaseEnvClient):
             timeout_s=120.0,
         )
 
-    def request_stop(self, reason: str = "") -> dict[str, Any]:
+    def request_stop(self) -> dict[str, Any]:
         return self._client.call(
             "env.request_stop",
-            kwargs={"reason": reason},
             timeout_s=5.0,
         )

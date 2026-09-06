@@ -24,10 +24,8 @@ from typing import Any
 
 import numpy as np
 
-from robots.yam import contracts as _contracts
+from robots.yam.contracts import YAM_CAMERA_NAMES
 from robots.yam.geometry import YamCalibration, load_calibration
-
-CAMERA_NAMES = tuple(getattr(_contracts, "CAMERA_NAMES", _contracts.YAM_CAMERA_NAMES))
 
 
 @dataclass
@@ -81,9 +79,9 @@ class YamRgbdCameraRig:
         else:
             items = ((entry.get("name"), entry) for entry in raw)
         for name, spec in items:
-            if name not in CAMERA_NAMES:
+            if name not in YAM_CAMERA_NAMES:
                 raise ValueError(
-                    f"unknown YAM camera {name!r}; expected {list(CAMERA_NAMES)}"
+                    f"unknown YAM camera {name!r}; expected {list(YAM_CAMERA_NAMES)}"
                 )
             values = dict(spec)
             serial = str(values.get("serial", values.get("serial_number", ""))).strip()
@@ -107,7 +105,7 @@ class YamRgbdCameraRig:
                 "fps": fps,
             })
             specs[str(name)] = values
-        missing = sorted(set(CAMERA_NAMES) - set(specs))
+        missing = sorted(set(YAM_CAMERA_NAMES) - set(specs))
         if missing:
             raise ValueError(f"YAM camera config is missing {missing}")
         return specs
@@ -124,7 +122,7 @@ class YamRgbdCameraRig:
             ) from error
         self._rs = rs
         try:
-            for name in CAMERA_NAMES:
+            for name in YAM_CAMERA_NAMES:
                 spec = self._camera_specs[name]
                 pipeline = rs.pipeline()
                 cfg = rs.config()
@@ -150,14 +148,14 @@ class YamRgbdCameraRig:
                 depth_sensor = profile.get_device().first_depth_sensor()
                 self._depth_scales[name] = float(depth_sensor.get_depth_scale())
             for _ in range(self.warmup_frames):
-                for name in CAMERA_NAMES:
+                for name in YAM_CAMERA_NAMES:
                     frame = self._capture_one_direct(name)
                     with self._frame_lock:
                         self._last_frames[name] = frame
             with self._frame_lock:
                 self._thread_errors.clear()
             self._opened = True
-            for name in CAMERA_NAMES:
+            for name in YAM_CAMERA_NAMES:
                 thread = threading.Thread(
                     target=self._capture_loop,
                     args=(name,),
@@ -214,17 +212,17 @@ class YamRgbdCameraRig:
                         for name, error in sorted(self._thread_errors.items())
                     )
                     raise RuntimeError(f"YAM camera capture thread error: {details}")
-                if set(CAMERA_NAMES).issubset(self._last_frames):
+                if set(YAM_CAMERA_NAMES).issubset(self._last_frames):
                     stale = self._stale_camera_names_locked(now)
                     old = self._old_camera_names_locked(not_before_monotonic_s)
                     if not stale and not old:
                         views = {
                             name: self._copy_frame(self._last_frames[name])
-                            for name in CAMERA_NAMES
+                            for name in YAM_CAMERA_NAMES
                         }
                         break
             if now >= deadline:
-                missing = sorted(set(CAMERA_NAMES) - set(self._last_frames))
+                missing = sorted(set(YAM_CAMERA_NAMES) - set(self._last_frames))
                 if missing:
                     raise RuntimeError(
                         f"YAM cameras have no cached frames yet: {missing}"
@@ -363,8 +361,6 @@ class YamRgbdCameraRig:
             distortion_model = str(getattr(intr, "model", ""))
             distortion_coeffs = [float(value) for value in getattr(intr, "coeffs", [])]
         if intrinsic_k is None:
-            intrinsic_k = self.calibration.intrinsic_K.get(name)
-        if intrinsic_k is None:
             intrinsic_k = np.full((3, 3), np.nan, dtype=np.float64)
         timestamps = {
             "host_before_time_s": host_before_s,
@@ -394,7 +390,7 @@ class YamRgbdCameraRig:
 
     def _stale_camera_names_locked(self, now_monotonic_s: float) -> list[str]:
         stale: list[str] = []
-        for name in CAMERA_NAMES:
+        for name in YAM_CAMERA_NAMES:
             frame = self._last_frames.get(name)
             if frame is None:
                 continue
@@ -415,7 +411,7 @@ class YamRgbdCameraRig:
         if not_before_monotonic_s is None:
             return []
         old: list[str] = []
-        for name in CAMERA_NAMES:
+        for name in YAM_CAMERA_NAMES:
             frame = self._last_frames.get(name)
             if frame is None:
                 continue
@@ -452,9 +448,9 @@ class YamRgbdCameraRig:
     @staticmethod
     def _normalize_name(camera_name: str) -> str:
         name = str(camera_name)
-        if name not in CAMERA_NAMES:
+        if name not in YAM_CAMERA_NAMES:
             raise ValueError(
-                f"unknown YAM camera {camera_name!r}; expected {list(CAMERA_NAMES)}"
+                f"unknown YAM camera {camera_name!r}; expected {list(YAM_CAMERA_NAMES)}"
             )
         return name
 

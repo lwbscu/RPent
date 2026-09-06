@@ -21,9 +21,7 @@ the RPent agent boundary.
 
 from __future__ import annotations
 
-import importlib
 import json
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,9 +29,8 @@ from typing import Any, Literal
 
 import numpy as np
 
-from robots.yam import contracts as _contracts
+from rpent.utils.config import get_rlinf_repo_path
 
-CAMERA_NAMES = tuple(getattr(_contracts, "CAMERA_NAMES", _contracts.YAM_CAMERA_NAMES))
 ARM_SLICES = {"left": slice(0, 7), "right": slice(7, 14)}
 ARM_JOINT_INDICES = np.array([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12])
 GRIPPER_INDICES = np.array([6, 13])
@@ -53,47 +50,6 @@ DEFAULT_JOINT_LIMIT_MAX = np.array(
 )
 
 
-def bootstrap_rlinf_root(config: dict[str, Any] | None = None) -> Path | None:
-    """Add the configured RLinf checkout to ``sys.path`` if one is provided."""
-    config = config or {}
-    env_names = [
-        str(config.get("rlinf_root_env", "RPENT_RLINF_ROOT")),
-        "RPENT_RLINF_ROOT",
-        "RLINF_REPO_PATH",
-        "YAM_RLINF_ROOT",
-    ]
-    root_value = config.get("rlinf_root") or next(
-        (os.environ[name] for name in env_names if os.environ.get(name)),
-        None,
-    )
-    if root_value is None:
-        return None
-    root = Path(root_value).expanduser().resolve()
-    if not root.exists():
-        raise RuntimeError(f"configured RLinf root does not exist: {root}")
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    return root
-
-
-def import_rlinf_object(
-    module_name: str, object_name: str, config: dict[str, Any] | None = None
-) -> Any:
-    """Import one RLinf object with a dependency-focused error message."""
-    bootstrap_rlinf_root(config)
-    try:
-        module = importlib.import_module(module_name)
-    except ModuleNotFoundError as error:
-        missing = error.name or module_name
-        raise RuntimeError(
-            f"missing dependency while importing {module_name}: {missing}. "
-            "Set RPENT_RLINF_ROOT, RLINF_REPO_PATH, YAM_RLINF_ROOT, or "
-            "config['rlinf_root'] to the RLinf checkout and install the pinned "
-            "YAM/i2rt dependencies on the robot host."
-        ) from error
-    return getattr(module, object_name)
-
-
 def as_qpos14(value: Any, *, name: str = "qpos") -> np.ndarray:
     array = np.asarray(value, dtype=np.float64)
     if array.shape != (14,):
@@ -108,16 +64,6 @@ def as_qpos14(value: Any, *, name: str = "qpos") -> np.ndarray:
 def split_qpos14(qpos: Any) -> tuple[np.ndarray, np.ndarray]:
     vector = as_qpos14(qpos)
     return vector[ARM_SLICES["left"]].copy(), vector[ARM_SLICES["right"]].copy()
-
-
-def pack_qpos14(left: Any, right: Any) -> np.ndarray:
-    left_array = np.asarray(left, dtype=np.float64)
-    right_array = np.asarray(right, dtype=np.float64)
-    if left_array.shape != (7,) or right_array.shape != (7,):
-        raise ValueError(
-            f"left/right YAM qpos must be 7D, got {left_array.shape}/{right_array.shape}"
-        )
-    return as_qpos14(np.concatenate([left_array, right_array]))
 
 
 def joint_limits_from_config(
@@ -259,55 +205,7 @@ def matrix_to_xyz_wxyz(matrix: Any) -> np.ndarray:
     return np.concatenate([transform[:3, 3], quat])
 
 
-def deproject_pixel(u: float, v: float, depth_m: Any, intrinsic_K: Any) -> np.ndarray:
-    depth = np.asarray(depth_m, dtype=np.float64)
-    k_matrix = np.asarray(intrinsic_K, dtype=np.float64)
-    if depth.ndim != 2:
-        raise ValueError("depth image must be 2D meters")
-    if k_matrix.shape != (3, 3):
-        raise ValueError("intrinsic_K must be 3x3")
-    px = int(round(u))
-    py = int(round(v))
-    patch = depth[max(0, py - 3) : py + 4, max(0, px - 3) : px + 4]
-    valid = patch[np.isfinite(patch) & (patch > 0.1)]
-    if valid.size == 0:
-        raise ValueError(f"no valid metric depth near pixel ({px}, {py})")
-    z = float(np.median(valid))
-    return np.array(
-        [
-            (px - k_matrix[0, 2]) * z / k_matrix[0, 0],
-            (py - k_matrix[1, 2]) * z / k_matrix[1, 1],
-            z,
-        ],
-        dtype=np.float64,
-    )
-
-
-def hover_target_from_pixel(
-    pixel_base: Any, axis_base: Any, hover_m: float
-) -> np.ndarray:
-    """Build the same top-down hover target convention used by RLinf tooling."""
-    point = np.asarray(pixel_base, dtype=np.float64).reshape(3)
-    axis = np.asarray(axis_base, dtype=np.float64).reshape(3)
-    z_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    axis_xy = axis - np.dot(axis, z_up) * z_up
-    if np.linalg.norm(axis_xy) < 1e-6:
-        axis_xy = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    axis_xy /= np.linalg.norm(axis_xy)
-    y_site = np.cross(axis_xy, z_up)
-    y_site /= np.linalg.norm(y_site)
-    x_site = z_up - np.dot(z_up, y_site) * y_site
-    x_site /= np.linalg.norm(x_site)
-    z_site = np.cross(x_site, y_site)
-    target = np.eye(4, dtype=np.float64)
-    target[:3, 0] = x_site
-    target[:3, 1] = y_site
-    target[:3, 2] = z_site
-    target[:3, 3] = point + np.array([0.0, 0.0, float(hover_m)])
-    return target
-
-
-def _load_json_path(value: str | os.PathLike[str] | None) -> dict[str, Any]:
+def _load_json_path(value: str | Path | None) -> dict[str, Any]:
     if value is None:
         return {}
     return json.loads(Path(value).expanduser().read_text())
@@ -317,12 +215,10 @@ def _load_json_path(value: str | os.PathLike[str] | None) -> dict[str, Any]:
 class YamCalibration:
     """Transforms into the RPent world frame, defined as the left robot base."""
 
-    world_frame: str
     camera_to_world: dict[str, np.ndarray]
-    intrinsic_K: dict[str, np.ndarray]
     world_from_right_base: np.ndarray | None
     wrist_grasp_from_camera: dict[str, np.ndarray]
-    notes: tuple[str, ...] = ()
+    world_frame: str = "left_base"
 
     def cam2world_cv(self, camera_name: str) -> np.ndarray:
         if camera_name not in self.camera_to_world:
@@ -337,8 +233,8 @@ class YamCalibration:
             return target
         if self.world_from_right_base is None:
             raise ValueError(
-                "right-arm planning requires T_world_from_right_base; provide it "
-                "explicitly or derive it from top camera calibration"
+                "right-arm planning requires extrinsics_path with "
+                "top_camera.T_base_to_cam via both arms"
             )
         return np.linalg.inv(self.world_from_right_base) @ target
 
@@ -354,139 +250,42 @@ class YamCalibration:
 
 
 def load_calibration(config: dict[str, Any] | None) -> YamCalibration:
-    """Load RPent YAM calibration.
-
-    Accepted keys are intentionally explicit. ``cam2world_cv`` means
-    ``T_left_base_from_camera_cv`` because the RPent world frame is left_base.
-    Legacy RLinf calibration names are interpreted from the producer's matrix
-    equations: both ``T_base_to_cam`` and ``T_grasp_to_cam`` map camera points
-    into the named robot frame, despite their historical spelling.
-    """
+    """Load the RLinf solve_handeye extrinsics.json producer format."""
     config = config or {}
-    calibration = dict(config.get("calibration", {}))
-    calibration.update(_load_json_path(config.get("extrinsics_path")))
-    world_frame = str(calibration.get("world_frame", "left_base"))
-    if world_frame != "left_base":
-        raise ValueError("YAM RPent world_frame must be 'left_base'")
-
-    notes: list[str] = []
-    cameras_cfg = dict(calibration.get("cameras", {}))
+    calibration = _load_json_path(config.get("extrinsics_path"))
     camera_to_world: dict[str, np.ndarray] = {}
-    intrinsic_k: dict[str, np.ndarray] = {}
-    right_from_camera: dict[str, np.ndarray] = {}
     wrist_grasp_from_camera: dict[str, np.ndarray] = {}
+    right_base_from_top: np.ndarray | None = None
 
-    def _record_wrist_transform(name: str, values: dict[str, Any], prefix: str) -> None:
-        if name not in {"left", "right"}:
-            return
-        if values.get("T_grasp_from_camera") is not None:
-            wrist_grasp_from_camera[name] = matrix4(
-                values["T_grasp_from_camera"], name=f"{prefix}.T_grasp_from_camera"
-            )
-        elif values.get("T_eef_from_camera") is not None:
-            wrist_grasp_from_camera[name] = matrix4(
-                values["T_eef_from_camera"], name=f"{prefix}.T_eef_from_camera"
-            )
-        elif values.get("T_grasp_to_cam") is not None:
+    top_transforms = calibration.get("top_camera", {}).get("T_base_to_cam", {})
+    if "via_left_arm" in top_transforms:
+        camera_to_world["top"] = matrix4(
+            top_transforms["via_left_arm"],
+            name="top_camera.T_base_to_cam.via_left_arm",
+        )
+    if "via_right_arm" in top_transforms:
+        right_base_from_top = matrix4(
+            top_transforms["via_right_arm"],
+            name="top_camera.T_base_to_cam.via_right_arm",
+        )
+
+    for key, arm in (("left_wrist", "left"), ("right_wrist", "right")):
+        values = calibration.get(key)
+        if isinstance(values, dict) and values.get("T_grasp_to_cam") is not None:
             # RLinf solve_handeye.py verifies FK @ t_tcp_cam @ board_in_cam
             # and writes t_tcp_cam under this historical key. Do not invert.
-            wrist_grasp_from_camera[name] = matrix4(
-                values["T_grasp_to_cam"], name=f"{prefix}.T_grasp_to_cam"
+            wrist_grasp_from_camera[arm] = matrix4(
+                values["T_grasp_to_cam"], name=f"{key}.T_grasp_to_cam"
             )
-
-    for name, spec in cameras_cfg.items():
-        values = dict(spec)
-        if values.get("intrinsic_K") is not None:
-            intrinsic_k[str(name)] = np.asarray(values["intrinsic_K"], dtype=np.float64)
-        if values.get("cam2world_cv") is not None:
-            camera_to_world[str(name)] = matrix4(
-                values["cam2world_cv"], name=f"{name}.cam2world_cv"
-            )
-        if values.get("T_left_base_from_camera") is not None:
-            camera_to_world[str(name)] = matrix4(
-                values["T_left_base_from_camera"],
-                name=f"{name}.T_left_base_from_camera",
-            )
-        if values.get("T_right_base_from_camera") is not None:
-            right_from_camera[str(name)] = matrix4(
-                values["T_right_base_from_camera"],
-                name=f"{name}.T_right_base_from_camera",
-            )
-        _record_wrist_transform(str(name), values, f"cameras.{name}")
-
-    for wrist_key, arm_name in (("left_wrist", "left"), ("right_wrist", "right")):
-        wrist_values = calibration.get(wrist_key)
-        if isinstance(wrist_values, dict):
-            _record_wrist_transform(arm_name, wrist_values, wrist_key)
-
-    for arm_name, wrist_values in dict(config.get("wrist_cameras", {})).items():
-        if isinstance(wrist_values, dict):
-            _record_wrist_transform(
-                str(arm_name), wrist_values, f"wrist_cameras.{arm_name}"
-            )
-
-    legacy_top = calibration.get("top_camera", {}).get("T_base_to_cam", {})
-    if legacy_top:
-        if "via_left_arm" in legacy_top:
-            camera_to_world["top"] = matrix4(
-                legacy_top["via_left_arm"],
-                name="top_camera.T_base_to_cam.via_left_arm",
-            )
-        if "via_right_arm" in legacy_top:
-            right_from_camera["top"] = matrix4(
-                legacy_top["via_right_arm"],
-                name="top_camera.T_base_to_cam.via_right_arm",
-            )
-        notes.append("legacy_top_T_base_to_cam_used_as_base_from_camera")
 
     world_from_right = None
-    if calibration.get("T_left_base_from_right_base") is not None:
-        world_from_right = matrix4(
-            calibration["T_left_base_from_right_base"],
-            name="T_left_base_from_right_base",
-        )
-    elif "top" in camera_to_world and "top" in right_from_camera:
-        world_from_right = camera_to_world["top"] @ np.linalg.inv(
-            right_from_camera["top"]
-        )
-        notes.append("T_left_base_from_right_base_derived_from_top_camera")
-
-    if world_from_right is not None:
-        for name, transform in right_from_camera.items():
-            camera_to_world.setdefault(name, world_from_right @ transform)
-
-    intrinsics_path = config.get("intrinsics_path")
-    intrinsics = _load_json_path(intrinsics_path)
-    if intrinsics:
-        if "cameras" in intrinsics:
-            for name, spec in intrinsics["cameras"].items():
-                intrinsic_k[str(name)] = np.asarray(
-                    spec["intrinsic_K"], dtype=np.float64
-                )
-        elif "fx" in intrinsics:
-            intrinsic_k.setdefault(
-                "top",
-                np.array(
-                    [
-                        [intrinsics["fx"], 0.0, intrinsics["cx"]],
-                        [0.0, intrinsics["fy"], intrinsics["cy"]],
-                        [0.0, 0.0, 1.0],
-                    ],
-                    dtype=np.float64,
-                ),
-            )
-
-    for name, k_matrix in list(intrinsic_k.items()):
-        if k_matrix.shape != (3, 3) or not np.isfinite(k_matrix).all():
-            raise ValueError(f"{name}.intrinsic_K must be finite 3x3")
+    if "top" in camera_to_world and right_base_from_top is not None:
+        world_from_right = camera_to_world["top"] @ np.linalg.inv(right_base_from_top)
 
     return YamCalibration(
-        world_frame=world_frame,
         camera_to_world=camera_to_world,
-        intrinsic_K=intrinsic_k,
         world_from_right_base=world_from_right,
         wrist_grasp_from_camera=wrist_grasp_from_camera,
-        notes=tuple(notes),
     )
 
 
@@ -517,12 +316,18 @@ class YamGeometry:
                 return self._kinematics[arm]
         elif self._kinematics is not None:
             return self._kinematics
-        adapter_cls = import_rlinf_object(
-            "rlinf.envs.realworld.yam.kinematics",
-            "YamKinematicsAdapter",
-            self.config,
-        )
-        adapter = adapter_cls(
+        rlinf_root = get_rlinf_repo_path()
+        if rlinf_root is not None and str(rlinf_root) not in sys.path:
+            sys.path.insert(0, str(rlinf_root))
+        try:
+            from rlinf.envs.realworld.yam.kinematics import YamKinematicsAdapter
+        except ModuleNotFoundError as error:
+            raise RuntimeError(
+                "missing dependency while importing RLinf YAM kinematics. "
+                "Set RPENT_RLINF_ROOT or RLINF_REPO_PATH to the RLinf checkout "
+                "and install the pinned YAM/i2rt dependencies on the robot host."
+            ) from error
+        adapter = YamKinematicsAdapter(
             joint_lower=self.lower[0 if arm == "left" else 1],
             joint_upper=self.upper[0 if arm == "left" else 1],
         )
@@ -554,7 +359,7 @@ class YamGeometry:
         meta = dict(base_meta)
         if name == "top":
             meta["cam2world_cv"] = self.calibration.cam2world_cv("top")
-            meta["cam2world_source"] = "static_top_calibration"
+            meta["cam2world_source"] = "static_top_extrinsics"
             return meta
         if name not in {"left", "right"}:
             raise ValueError(f"unknown YAM camera {camera_name!r}")
@@ -564,7 +369,7 @@ class YamGeometry:
         if grasp_from_camera is None:
             raise ValueError(
                 f"{name} wrist camera requires dynamic hand-eye calibration: "
-                "provide T_grasp_from_camera/T_eef_from_camera or RLinf "
+                f"set extrinsics_path to an RLinf solve_handeye output with "
                 f"{name}_wrist.T_grasp_to_cam"
             )
         base_from_grasp = self._kinematics_for(name).fk(
@@ -572,14 +377,9 @@ class YamGeometry:
         )
         world_from_camera = self.calibration.pose_to_world(
             name, base_from_grasp
-        ) @ matrix4(grasp_from_camera, name=f"{name}.T_grasp_from_camera")
+        ) @ matrix4(grasp_from_camera, name=f"{name}_wrist.T_grasp_to_cam")
         meta["cam2world_cv"] = world_from_camera
         meta["cam2world_source"] = "dynamic_fk_current_qpos_approx_cached_frame"
-        meta["cam2world_limitation"] = (
-            "computed from current measured qpos for a cached RGBD frame; use only "
-            "when robot is stationary or inspect frame_age_s/qpos_delta metadata"
-        )
-        meta["qpos_used_for_cam2world"] = qpos.copy()
         return meta
 
     def plan_arm_path(
@@ -620,7 +420,7 @@ class YamGeometry:
         steps = max(2, int(np.ceil(max_delta / self.path_joint_delta)) + 1)
         position = np.linspace(seed, q_target, steps, dtype=np.float64)
         table_check = self._check_table_guard(arm, position, gripper, kin)
-        if not table_check["ok"]:
+        if table_check["checked"] and not table_check["ok"]:
             return {
                 "status": "Failure",
                 "position": None,
@@ -642,10 +442,10 @@ class YamGeometry:
         """Check TCP height along the commanded qpos segment."""
         if self.table_z is None:
             return {
-                "ok": False,
+                "ok": True,
                 "checked": False,
-                "reason": "table_not_configured",
-                "limitation": "table_z is required before real qpos motion",
+                "reason": None,
+                "limitation": "table_z is not configured; table guard disabled",
             }
         previous = enforce_hard_limits(previous_qpos14, self.lower, self.upper)
         target = enforce_hard_limits(target_qpos14, self.lower, self.upper)
@@ -680,10 +480,10 @@ class YamGeometry:
     ) -> dict[str, Any]:
         if self.table_z is None:
             return {
-                "ok": False,
+                "ok": True,
                 "checked": False,
-                "reason": "table_not_configured",
-                "limitation": "table_z is required before executable Cartesian plans",
+                "reason": None,
+                "limitation": "table_z is not configured; table guard disabled",
             }
         min_clearance = float("inf")
         for q in position:

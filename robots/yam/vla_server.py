@@ -13,14 +13,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import os
 import sys
-from pathlib import Path
 
 import numpy as np
 
-from robots.yam.contracts import MODEL_SPEC, validate_actions, vla_runtime_contract
+from robots.yam.contracts import MODEL_SPEC, validate_actions
 from rpent.robots.components.vla_facade_base import BaseVLAFacade
+from rpent.utils.config import get_rlinf_repo_path
 
 
 def build_model_cfg(model_path: str, norm_stats_path: str | None = None):
@@ -28,32 +27,19 @@ def build_model_cfg(model_path: str, norm_stats_path: str | None = None):
 
     data = {"norm_stats_path": norm_stats_path} if norm_stats_path else {}
     return OmegaConf.create({
-        "model_type": "openpi",
         "model_path": model_path,
-        "precision": None,
-        "num_action_chunks": MODEL_SPEC.use_length,
-        "action_dim": 14,
-        "is_lora": False,
-        "lora_rank": 32,
-        "use_proprio": True,
+        "precision": "bf16",
         "num_steps": 5,
-        "add_value_head": False,
+        "num_action_chunks": MODEL_SPEC.action_horizon,
+        "action_dim": 14,
         "openpi_data": data,
         "openpi": {
+            "task": "eval",
             "config_name": MODEL_SPEC.policy_name,
-            "num_images_in_input": 3,
-            "action_horizon": MODEL_SPEC.action_horizon,
-            "action_chunk": MODEL_SPEC.use_length,
-            "action_env_dim": 14,
-            "num_steps": 5,
-            "noise_level": 0.5,
-            "noise_method": "flow_sde",
-            "train_expert_only": True,
-            "add_value_head": False,
-            "value_after_vlm": False,
-            "value_vlm_mode": "mean_token",
-            "detach_critic_input": None,
-            "use_dsrl": False,
+            "model_action_dim": 32,
+            "paligemma_variant": "gemma_2b",
+            "action_expert_variant": "gemma_300m",
+            "discrete_state_input": True,
         },
     })
 
@@ -68,14 +54,11 @@ class YamVLAFacade(BaseVLAFacade):
                 raise ValueError(
                     "provide a trained YAM model_path, including YAM norm_stats"
                 )
-            root = os.environ.get("RPENT_RLINF_ROOT") or os.environ.get(
-                "RLINF_REPO_PATH"
-            )
-            if root:
-                root = str(Path(root).expanduser().resolve())
-                sys.path.insert(0, root)
+            rlinf_root = get_rlinf_repo_path()
+            if rlinf_root is not None:
+                sys.path.insert(0, str(rlinf_root))
             import torch
-            from rlinf.models.embodiment.openpi import get_model
+            from rlinf.models.embodiment.openpi_rlinf import get_model
 
             model = get_model(
                 build_model_cfg(model_path, norm_stats_path), torch_dtype=None
@@ -84,8 +67,6 @@ class YamVLAFacade(BaseVLAFacade):
             self._inference_context = torch.inference_mode
         self._model = model
         super().__init__()
-        self._rpc["vla.get_meta"] = vla_runtime_contract
-        self._readonly_methods.add("vla.get_meta")
 
     def predict(self, observation, options=None):
         options = options or {}
@@ -133,11 +114,12 @@ class YamVLAFacade(BaseVLAFacade):
         actions = np.asarray(actions)
         if actions.ndim != 3 or actions.shape[0] != 1:
             raise ValueError(f"policy output must be [1,T,14]; got {actions.shape}")
-        result = validate_actions(actions[0])
-        if len(result) > MODEL_SPEC.use_length:
+        if actions.shape[1] < MODEL_SPEC.use_length:
             raise ValueError(
-                f"policy output exceeds configured use_length={MODEL_SPEC.use_length}"
+                f"policy output has {actions.shape[1]} actions; "
+                f"use_length={MODEL_SPEC.use_length}"
             )
+        result = validate_actions(actions[0, : MODEL_SPEC.use_length])
         return result[None].astype(np.float32)
 
 

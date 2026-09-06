@@ -8,7 +8,7 @@
 
 基线锁定 `codex/pr133-final-plan` 的 `0cf9d002b317db13a250ccceacc1eac519e9a1e2`；独立工作区 `/home/lwb/Projects/thusigs/yam/RPent`，分支 `yam`，fork `https://github.com/lwbscu/RPent`。原 RPent/其他工作树原状保留。2026-09-06 `git ls-remote upstream main` 为 `d4e9b3a6a7342ab08d3b80a05e558f34170a529b`，不能称指定基线已包含今日最新 main；本轮不混入这些后续变更。
 
-RLinf 来源为 `/home/lwb/Projects/thusigs/yam/RLinf`，标示分支 `fix/yam-review-findings`。该本地副本的 Git pack 损坏，不能以 `git status/log` 可靠证明其版本；实施依赖实际文件内容并记录 SHA256。未修改该副本或远程源码。现场版本需之后核对。
+RLinf 来源为 `/home/lwb/Projects/thusigs/yam/RLinf`，标示分支 `fix/yam-review-findings`。该本地副本的 Git pack 损坏，不能以 `git status/log` 可靠证明其版本；实施以实际文件内容为准。未修改该副本或远程源码。现场版本需之后核对。
 
 ## 2. 原方案必须修正之处
 
@@ -45,13 +45,13 @@ RLinf 来源为 `/home/lwb/Projects/thusigs/yam/RLinf`，标示分支 `fix/yam-r
 | 推理输入 | `main_images[:,…]` | `extra_view_images[:,0,…]` | `extra_view_images[:,1,…]` |
 | OpenPI | `base_0_rgb` | `left_wrist_0_rgb` | `right_wrist_0_rgb` |
 
-推理输入为 RGB uint8 HWC：主图 `[1,H,W,3]`，左右腕 `[1,2,H,W,3]`，`wrist_images=None`，`states=[1,14]`，一条任务语言。RLinf `YamInputs/YamOutputs` 负责现有映射。
+推理输入为 RGB uint8 HWC：主图 `[1,H,W,3]`，左右腕 `[1,2,H,W,3]`，`wrist_images=None`，`states=[1,14]`，一条任务语言。复用 RLinf `openpi_rlinf` eval wrapper 及其 `YamInputs/YamOutputs` 变换；工厂选择与现有 YAM eval YAML 一致，不另建 backend 选择器。
 
 YAM dataconfig 对 12 个关节应用 DeltaActions，对夹爪不做 delta；这是**训练内部变换**。推理先反归一化再 AbsoluteActions，控制机得到绝对关节目标；RPent 不再加第二次当前 qpos。norm_stats 必须来自相同处理管线及 YAM 数据。OpenPI 上游的预训练夹爪约定与本地 YAM 不完全相同，不能只看 14D 就替换 ALOHA stats。[OpenPI 官方归一化说明](https://github.com/Physical-Intelligence/openpi/blob/main/docs/norm_stats.md)
 
 ### 3.2 坐标与像素反投影
 
-统一 `T_A_from_B` 表示把 B 中的列向量变换到 A。world 定义为 left_base。标定 JSON 的历史字段 `T_base_to_cam` 实际是 base-from-camera；`T_grasp_to_cam` 同样实际是 grasp-from-camera，须直接使用，不能取逆。依据是 `solve_handeye.py` 的生成方程 `FK @ t_tcp_cam @ board_in_camera`。进入适配层后按明确语义命名：
+统一 `T_A_from_B` 表示把 B 中的列向量变换到 A。world 定义为 left_base。直接读取 RLinf `solve_handeye.py` 产出的 `extrinsics.json`，不另设内联标定结构。文件中的历史字段 `T_base_to_cam` 实际是 base-from-camera；`T_grasp_to_cam` 同样实际是 grasp-from-camera，须直接使用，不能取逆。依据是 `solve_handeye.py` 的生成方程 `FK @ t_tcp_cam @ board_in_camera`。进入适配层后按明确语义命名：
 
 ```
 T_world_from_top = T_leftbase_from_top
@@ -69,7 +69,7 @@ T_world_from_rightcam = T_world_from_rightbase @ FK_right(q_right)
 
 ### 3.3 运动语义
 
-所有 Cartesian xyz/quat 使用 world=left_base，quat 为 wxyz。`move_to(arm,xyz,quat,gripper,substeps)` 保留接口，但不能通过下采样丢掉经过检查的路径；`substeps` 不是越大越安全的保证。一般 move_to 的显式姿态不能被 IK 扫描悄悄修改；视觉 hover 可另外请求候选姿态，并把实际采用姿态返回。垂直顶抓不可达是用户报告的工作空间限制，GUIDE 需注明前下逼近、Y_site 捏合、-Z_site 逼近的现场约定。
+所有 Cartesian xyz/quat 使用 world=left_base，quat 为 wxyz。`move_to(arm,xyz,quat,gripper)` 执行完整规划路径；删除初版中没有执行语义的 `substeps` 参数。一般 move_to 的显式姿态不能被 IK 扫描悄悄修改；视觉 hover 可另外请求候选姿态，并把实际采用姿态返回。垂直顶抓不可达是用户报告的工作空间限制，GUIDE 需注明前下逼近、Y_site 捏合、-Z_site 逼近的现场约定。
 
 RPC 服务端拥有 30 Hz 执行节拍，网络延时不能决定 CAN 控制周期。LLM 不逐帧控制。默认短 VLA 块；不以“推理机能跑”推断稳定 30 Hz 闭环。5 帧=0.167 s 的下发窗口，周期还包含图像、网络和推理时延。无 RTC 时块间保持，延迟实测后再决定长度。
 
@@ -79,7 +79,7 @@ RPC 服务端拥有 30 Hz 执行节拍，网络延时不能决定 CAN 控制周�
 
 保留现场已发生的问题对应措施：相机先启动保活，再连 CAN；640×480@30；位置控制不用 measured-error 摆率裁剪；零重力关闭摩擦补偿。清错/重新使能必须是现场启动操作，运行中不能自动反复 0xFB/0xFC 掩盖故障。不同 CAN 程序不能同时拥有 follower；采集/Pico/hover 与 env_server 互斥运行。
 
-桌面 TCP 检查只声明为桌面净空检查，**不等价于碰撞规划**；全连杆、自碰、双臂互撞、夹持物碰撞没有现成证据。首阶段优先单臂，另一臂在已确认的停驻区；双臂交叉工作空间要另行标定和分区或引入完整碰撞模型。配置值应来自现场标定和实际 i2rt 限位，示例值不能代替现场认证。
+桌面 TCP 检查在配置 `table_z` 后生效；未配置时不执行该检查。它只声明为桌面净空检查，**不等价于碰撞规划**；全连杆、自碰、双臂互撞、夹持物碰撞没有现成证据。首阶段优先单臂，另一臂在已确认的停驻区；双臂交叉工作空间要另行标定和分区或引入完整碰撞模型。配置值应来自现场标定和实际 i2rt 限位，示例值不能代替现场认证。
 
 人工流程采用 episode ID 绑定：操作员布置并确认 ready → 显式开始 episode → Agent 执行 → 操作员裁决 success/failure/abort。重连不清零、重试不复用旧成功。自动回 home 与 fold/断电后置，因持物、重力掉落、途中障碍均依赖现场条件。
 
@@ -92,9 +92,9 @@ RPC 服务端拥有 30 Hz 执行节拍，网络延时不能决定 CAN 控制周�
 | `env_client.py` / `env_server.py` | Base 客户端/Facade 的兼容适配，显式 observe/reset，CPU numpy 边界 |
 | `rlinf_env.py` | lazy import RLinf，唯一 runtime writer、执行预算/取消/episode、快照 |
 | `cameras.py` / `geometry.py` | 常驻三路 RGBD、明确 CV/world 变换、FK/IK 适配与桌面检查 |
-| `primitives.py` | act/pi05_act、move_to、rotate_wrist、set_gripper、release、status、finish |
+| `primitives.py` | pi05_act、move_to、rotate_wrist、set_gripper、release |
 | `toolkit.py` / `tools.py` | 与 RoboTwin 对齐的工具及状态、图片、世界点、动作记录 |
-| `vla_client.py` / `vla_server.py` | 复用 YAM OpenPI config/transforms，3 图 + qpos14 输入输出 |
+| `vla_server.py` + 公共 `BaseVLAClient` | 复用 YAM OpenPI config/transforms，3 图 + qpos14 输入输出 |
 | `prompts/` / `guides/` | 真机限制、工具使用与 explore/eval 区别 |
 | `tests/yam/` | 无硬件 fake runtime、RPC、VLA、几何、取消/人工终态测试 |
 
@@ -129,22 +129,7 @@ Explore 沿用 LIBERO 的组织思路：独立 planner sessions、每 session �
 
 工期按依赖估算，不承诺固定 1 周：本地适配取决于接口缺口；控制机验证取决于现场可用性；SFT 取决于数据/GPU/首轮学习曲线。阶段 1 数据训练与本地适配可并行，真机 Agent 验收依赖两者。
 
-## 8. Execution Orchestration
-
-计划至少 5 个单点角色，受 4 并发槽（含 Leader）限制分批执行。探索与独立审查先并行，随后探索者转限定文件的实现角色；测试/交叉验证后续接替空闲槽。所有角色结束需确认退出，所有本轮后台服务关闭并 join。
-
-| 角色 | ownership / 边界 | 等待/整合点 |
-|---|---|---|
-| RPent 探索/实现 | YAM spec/client/primitives/toolkit/tools/prompts/guide | 等真机 API 摘要后实现；Leader 接 CLI 与 facade |
-| YAM 探索/实现 | `rlinf_env.py/cameras.py/geometry.py/config.example.json` | 只 import 现有 RLinf runtime/IK，禁止修改 RLinf |
-| 独立审查 | 全部只读；真实接口风险 | Leader 根据源码证据决策，避免新增无意义门 |
-| 测试/日志 | `tests/yam/` | fake 控制/模型、loopback RPC、回归；失败反馈实现所有者 |
-| 交叉验证 | 最终代码与方案只读；最后限定修复 CLI 中 YAM finish 记录 | 查文档/源码不一致和遗漏；Leader 最终验收 |
-| Leader | `contracts.py/env_server.py/vla_*.py`、CLI必要接线、方案/结果文档 | 冻结契约、整合、提交 fork、决定是否满足同步条件 |
-
-本地测试与真机验收分别记录，不将 mock 结果写成真机通过。最终当前完成项和命令见 [ACCEPTANCE.zh-CN.md](ACCEPTANCE.zh-CN.md)。
-
-## 9. 联网一手来源
+## 8. 联网一手来源
 
 - [RPent 官方仓库](https://github.com/RLinf/RPent)：当前 README 标注 LIBERO、RoboTwin 与 Explore；真机条目不能作为已有 YAM 实现证据。
 - [RoboTwin 官方接入文档](https://rpent.readthedocs.io/en/latest/rst_source/usage/robotwin.html)：双臂 agent 参考，具体字段以锁定提交为准。

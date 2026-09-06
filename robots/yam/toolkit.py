@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 
 
 _RECIPE_ACTIONS = {
-    "act",
     "pi05_act",
     "move_to",
     "rotate_wrist",
@@ -65,7 +64,6 @@ class YamToolkit(Toolkit):
         state = EnvState(self._state_output_dir)
         super().__init__(dashboard_events=dashboard_events, state=state, memory=memory)
         self._mode = mode
-        self._solved = False
         self._attempt = 1
         self._attempts_per_session = max(0, int(attempts_per_session))
         self._session_attempt = 1
@@ -77,8 +75,6 @@ class YamToolkit(Toolkit):
             check_cancelled=self.raise_if_cancelled,
             **primitives_kwargs,
         )
-        self._primitives.start_recording()
-        self._action_frame_cursor = self._primitives.recorded_frame_count()
         self._register_yam_tools()
         initial = self.get_env_state(
             command={"action": "observe"},
@@ -113,7 +109,6 @@ class YamToolkit(Toolkit):
         )
         for name in (
             "render",
-            "act",
             "pi05_act",
             "move_to",
             "rotate_wrist",
@@ -126,20 +121,19 @@ class YamToolkit(Toolkit):
         self.add_tool("finish", self._SPECS["finish"], self._finish)
 
     def _finish(self, *, status: str, summary: str) -> dict[str, Any]:
-        return self._primitives.finish(status=status, summary=summary)
+        return {"_finish": True, "status": status, "summary": summary}
 
-    def _reset_episode(self, reason: str = "") -> dict[str, Any]:
+    def _reset_episode(self) -> dict[str, Any]:
         budget = self._attempts_per_session
         if budget and self._session_attempt >= budget:
             return {
                 "error": "reset refused",
                 "reason": f"This session's attempt budget is spent ({budget} attempts).",
             }
-        result = self._primitives.reset(reason=reason)
+        result = self._primitives.reset()
         self._attempt += 1
         self._session_attempt += 1
         self._latest_status = result.get("episode_status", {})
-        self._solved = False
         result["attempt"] = self._attempt
         result["notice"] = (
             "YAM episode reset completed; re-run perception before acting."
@@ -192,33 +186,24 @@ class YamToolkit(Toolkit):
         result: dict[str, Any],
         elapsed_s: float,
     ) -> dict[str, Any]:
-        frame_start = self._action_frame_cursor
-        self._action_frame_cursor = self._primitives.recorded_frame_count()
         observation, status = self._capture_full_observation()
         self._latest_status = status
-        self._solved = status.get("eval_success") is True
         record = tools.dump_observation(
             observation,
             env_state=self._state,
             status=status,
             log={"command": command, "result": result, "elapsed_s": elapsed_s},
         )
-        if self._dashboard_events.enabled:
-            frames = self._primitives.frame_slice(frame_start)
-            if frames:
-                self._state.save(
-                    f"action_{command['action']}.mp4",
-                    frames,
-                    step=record.step_idx,
-                    fps=20,
-                )
         captured = tools.view_env_state(record.step_idx, state=self._state)
         if result.get("_finish"):
             # Toolkit.execute_tool replaces stateful handler output with this
             # capture. Keep the planner termination signal at the top level.
             verified = status.get("eval_success") is True
+            requested_status = str(result.get("status", "failure"))
             captured.update({
                 **result,
+                "requested_status": requested_status,
+                "requested_success": requested_status.lower() == "success",
                 "verified_success": verified,
                 "episode_status": status,
                 "status": "success" if verified else "failure",
@@ -231,20 +216,19 @@ class YamToolkit(Toolkit):
             if operation is None:
                 return
             operation.cancel_event.set()
-        self._primitives.env.request_stop("active tool cancelled")
+        self._primitives.env.request_stop()
         operation.done_event.wait()
 
     def _step(self, name: str, **kwargs) -> dict[str, Any]:
         self.raise_if_cancelled()
         if name == "render":
-            self._primitives.observe()
             return {"success": True}
         return getattr(self._primitives, name)(**kwargs)
 
     def close(self) -> None:
         stop_error = None
         try:
-            self._primitives.env.request_stop("RPent YamToolkit.close")
+            self._primitives.env.request_stop()
         except Exception as error:
             stop_error = error
         frames = self._primitives.stop_recording()

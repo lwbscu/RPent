@@ -43,9 +43,6 @@ class FakeState:
     def records(self) -> list[SimpleNamespace]:
         return list(self._records)
 
-    def latest_record(self):
-        return self._records[-1] if self._records else None
-
 
 class FakeMemory:
     def __init__(self) -> None:
@@ -103,7 +100,6 @@ def _fake_robot_spec(name: str, tmp_path: Path) -> RobotSpec:
             parser.add_argument("--max-episode-steps", type=int, default=1000)
             parser.add_argument("--env-endpoint")
             parser.add_argument("--without-vla", action="store_true")
-            parser.add_argument("--yam-reset-on-connect", action="store_true")
         else:
             parser.add_argument("--suite", required=True)
             parser.add_argument("--task", type=int, required=True)

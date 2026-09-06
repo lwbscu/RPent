@@ -17,7 +17,7 @@ import numpy as np
 
 from robots.yam.contracts import MODEL_SPEC, validate_actions
 from robots.yam.env_client import YamEnvClient
-from robots.yam.vla_client import YamVLAClient, policy_observation
+from rpent.robots.components.vla_client_base import BaseVLAClient
 
 
 def _qmult(left: np.ndarray, right: np.ndarray) -> np.ndarray:
@@ -48,37 +48,19 @@ class YamPrimitives:
         self,
         *,
         env: YamEnvClient,
-        model: YamVLAClient | None = None,
-        seed: int = 0,
+        model: BaseVLAClient | None = None,
         check_cancelled: Callable[[], None],
-        seed_mode: str = "label_only",
     ) -> None:
-        del seed_mode
         self.env = env
         self.model = model
-        self.seed = int(seed)
         self._check_cancelled = check_cancelled
-        self.policy_actions = 0
-        self.native_actions = 0
-        self._recording = False
         self._frames: list[np.ndarray] = []
 
-    def start_recording(self) -> None:
-        self._recording = True
-        self._frames = []
-
-    def record_frame(self, rgb: Any) -> None:
+    def _record_frame(self, rgb: Any) -> None:
         self._frames.append(np.ascontiguousarray(np.asarray(rgb)))
-
-    def recorded_frame_count(self) -> int:
-        return len(self._frames)
-
-    def frame_slice(self, start: int) -> list[np.ndarray]:
-        return list(self._frames[int(start) :])
 
     def stop_recording(self) -> list[np.ndarray]:
         frames = list(self._frames)
-        self._recording = False
         self._frames = []
         return frames
 
@@ -105,33 +87,31 @@ class YamPrimitives:
             "stop_reason": stop_reason,
         }
 
-    def reset(
-        self, *, instruction: str | None = None, reason: str = ""
-    ) -> dict[str, Any]:
-        del instruction
-        _, info = self.env.reset(reason=reason)
-        return {**info, "success": True}
-
-    def observe(self) -> dict[str, Any]:
-        _, info = self.env.observe()
+    def reset(self) -> dict[str, Any]:
+        _, info = self.env.reset()
         return {**info, "success": True}
 
     def _build_policy_observation(self, *, prompt: str | None = None) -> dict[str, Any]:
         self.env.observe()
-        return policy_observation(
-            self.env.last_obs,
-            self.env.get_task_language(),
-            prompt=prompt,
+        frames = self.env.last_obs["frames"]
+        instruction = self.env.get_task_language()
+        policy_instruction = (
+            prompt if prompt is not None and prompt.strip() else instruction
         )
+        return {
+            "main_images": np.asarray(frames["top"])[None],
+            "wrist_images": None,
+            "extra_view_images": np.stack([frames["left"], frames["right"]])[None],
+            "states": np.asarray(
+                self.env.last_obs["state"]["joint_position"], dtype=np.float32
+            )[None],
+            "task_descriptions": [policy_instruction],
+        }
 
     def _record_chunk_payload(self, payload: Any) -> None:
-        if not self._recording:
-            return
         observations: list[Any]
         if isinstance(payload, list):
             observations = payload
-        elif isinstance(payload, dict) and "frames" in payload and "final" in payload:
-            observations = payload.get("frames", [])
         elif isinstance(payload, dict):
             observations = [payload]
         else:
@@ -140,7 +120,7 @@ class YamPrimitives:
             if isinstance(obs, dict):
                 frame = obs.get("frames", {}).get("top")
                 if frame is not None:
-                    self.record_frame(frame)
+                    self._record_frame(frame)
 
     def pi05_act(
         self,
@@ -174,20 +154,21 @@ class YamPrimitives:
             )
             observation = self._build_policy_observation(prompt=prompt)
             episode_id = self.env.last_info["episode_status"]["episode_id"]
-            actions = self.model.predict(observation)[: MODEL_SPEC.use_length]
+            actions = validate_actions(np.asarray(self.model.predict(observation))[0])[
+                : MODEL_SPEC.use_length
+            ]
             payload, _, _, _, info = self.env.chunk_step(
                 actions,
                 action_type="qpos",
                 expected_episode_id=episode_id,
-                return_all_frames=self._recording
-                and self.env.execution_capabilities.get("chunk_step_all_frames")
+                return_all_frames=self.env.execution_capabilities.get(
+                    "chunk_step_all_frames"
+                )
                 is True,
             )
             self._record_chunk_payload(payload)
             count = int(info.get("executed_actions", 0))
             executed += count
-            self.policy_actions += count
-            self.native_actions += count
         status = self.env.last_info["episode_status"]
         return {
             **self._completion(requested=requested, executed=executed, status=status),
@@ -195,9 +176,6 @@ class YamPrimitives:
             "prompt": native_prompt,
             "episode_status": status,
         }
-
-    def act(self, **kwargs) -> dict[str, Any]:
-        return self.pi05_act(**kwargs)
 
     @staticmethod
     def _validate_qpos_updates_request(updates: Any) -> list[dict[str, Any]]:
@@ -249,8 +227,10 @@ class YamPrimitives:
             action_type="qpos",
             expected_episode_id=expected_episode_id
             or self.env.last_info["episode_status"]["episode_id"],
-            return_all_frames=self._recording
-            and self.env.execution_capabilities.get("chunk_step_all_frames") is True,
+            return_all_frames=self.env.execution_capabilities.get(
+                "chunk_step_all_frames"
+            )
+            is True,
         )
         self._record_chunk_payload(payload)
         episode_status = info["episode_status"]
@@ -269,10 +249,7 @@ class YamPrimitives:
         xyz: list[float],
         quat: list[float] | None = None,
         gripper: float | None = None,
-        substeps: int = 0,
-        _primitive_name: str = "move_to",
     ) -> dict[str, Any]:
-        del substeps, _primitive_name
         if arm not in ("left", "right"):
             raise ValueError("arm must be 'left' or 'right'")
         robot_state = self.env.last_info["robot_state"]
@@ -304,7 +281,6 @@ class YamPrimitives:
         ]
         execution = self.apply_qpos_updates(updates, expected_episode_id=episode_id)
         executed = int(execution.get("executed_actions", 0))
-        self.native_actions += executed
         status = execution["episode_status"]
         key = "left_eef_pose" if arm == "left" else "right_eef_pose"
         measured_pose = np.asarray(
@@ -344,7 +320,6 @@ class YamPrimitives:
         arm: str,
         delta_yaw_deg: float,
         gripper: float | None = None,
-        substeps: int = 0,
     ) -> dict[str, Any]:
         state = self.env.last_info["robot_state"]
         key = "left_eef_pose" if arm == "left" else "right_eef_pose"
@@ -356,8 +331,6 @@ class YamPrimitives:
             xyz=pose[:3].tolist(),
             quat=_qmult(world_z, pose[3:]).tolist(),
             gripper=gripper,
-            substeps=substeps,
-            _primitive_name="rotate_wrist",
         )
         result["requested_delta_yaw_deg"] = float(delta_yaw_deg)
         return result
@@ -368,9 +341,7 @@ class YamPrimitives:
         arm: str,
         val: float,
         steps: int = 10,
-        _primitive_name: str = "set_gripper",
     ) -> dict[str, Any]:
-        del _primitive_name
         if arm not in ("left", "right"):
             raise ValueError("arm must be 'left' or 'right'")
         if int(steps) < 1:
@@ -390,7 +361,6 @@ class YamPrimitives:
             {"arm": arm, "gripper": value} for value in values
         ])
         executed = int(execution.get("executed_actions", 0))
-        self.native_actions += executed
         return {
             **execution,
             **self._completion(
@@ -403,30 +373,4 @@ class YamPrimitives:
         }
 
     def release(self, *, arm: str, val: float = 1.0, steps: int = 10) -> dict[str, Any]:
-        return self.set_gripper(
-            arm=arm, val=val, steps=steps, _primitive_name="release"
-        )
-
-    def status(self) -> dict[str, Any]:
-        self.env.observe()
-        return {
-            **self.env.last_info["episode_status"],
-            "policy_actions": self.policy_actions,
-            "native_actions": self.native_actions,
-        }
-
-    def finish(self, *, status: str, summary: str) -> dict[str, Any]:
-        native = self.status()
-        verified_success = native.get("eval_success") is True
-        requested_success = str(status).lower() == "success"
-        return {
-            "_finish": True,
-            "status": "success"
-            if verified_success
-            else ("failure" if requested_success else status),
-            "summary": summary,
-            "requested_status": status,
-            "requested_success": requested_success,
-            "verified_success": verified_success,
-            "episode_status": native,
-        }
+        return self.set_gripper(arm=arm, val=val, steps=steps)

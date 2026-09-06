@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 
 from robots.yam.geometry import YamGeometry
@@ -25,23 +27,29 @@ def _translation(x: float, y: float, z: float) -> np.ndarray:
     return transform
 
 
-def test_geometry_uses_legacy_t_grasp_to_cam_in_forward_direction() -> None:
+def test_geometry_uses_solve_handeye_t_grasp_to_cam_in_forward_direction(
+    tmp_path,
+) -> None:
     base_from_grasp = _translation(0.20, -0.10, 0.30)
     grasp_from_camera = _translation(0.04, 0.05, -0.06)
-    config = {
-        "calibration": {
+    extrinsics_path = tmp_path / "solve_handeye-extrinsics.json"
+    extrinsics_path.write_text(
+        json.dumps({
             "world_frame": "left_base",
-            "cameras": {
-                "top": {
-                    "cam2world_cv": np.eye(4, dtype=np.float64).tolist(),
-                    "intrinsic_K": np.eye(3, dtype=np.float64).tolist(),
-                },
+            "top_camera": {
+                "T_base_to_cam": {
+                    "via_left_arm": np.eye(4, dtype=np.float64).tolist(),
+                    "via_right_arm": np.eye(4, dtype=np.float64).tolist(),
+                }
             },
             "left_wrist": {
                 "T_grasp_to_cam": grasp_from_camera.tolist(),
             },
-            "T_left_base_from_right_base": np.eye(4, dtype=np.float64).tolist(),
-        }
+        }),
+        encoding="utf-8",
+    )
+    config = {
+        "extrinsics_path": str(extrinsics_path),
     }
     geometry = YamGeometry(
         config,

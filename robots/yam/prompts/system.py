@@ -29,11 +29,11 @@ confirmation. Pair RGB, depth, and world_xyz from the same step and view.
 world_xyz is [row,col] -> [x,y,z] in metres in the YAM left-base frame; visible
 surface points are not automatically object centers."""
 
-CONTROL = """Use pi05_act for trained local qpos14 behavior. Use move_to,
-rotate_wrist, set_gripper, and release only after binding the current target
-from fresh perception. move_to executes all server-planned safety waypoints.
-Do not queue several low approaches without observing between them. Never claim
-primitive success as task success."""
+CONTROL = """Use pi05_act for trained qpos14 behavior through the configured
+VLA endpoint. Use move_to, rotate_wrist, set_gripper, and release only after
+binding the current target from fresh perception. move_to executes all
+server-planned safety waypoints. Do not queue several low approaches without
+observing between them. Never claim primitive success as task success."""
 
 SUCCESS = """Only fresh env eval_success=true confirms success. On the real YAM
 rig this may be an operator-confirmed flag until a perception success checker is

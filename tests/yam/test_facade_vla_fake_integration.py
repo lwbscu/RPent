@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
@@ -21,17 +22,18 @@ from robots.yam.contracts import (
     MODEL_SPEC,
     env_runtime_contract,
     validate_actions,
-    vla_runtime_contract,
 )
 from robots.yam.env_client import YamEnvClient
 from robots.yam.env_server import YamEnvFacade
 from robots.yam.operator_control import write_receipt
+from robots.yam.primitives import YamPrimitives
 from robots.yam.rlinf_env import YamAgentEnv
 from robots.yam.toolkit import YamToolkit
-from robots.yam.vla_client import YamVLAClient, policy_observation
 from robots.yam.vla_server import YamVLAFacade, build_model_cfg
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.memory import MemoryManager
+from rpent.robots.components.env_client_base import BaseEnvClient
+from rpent.robots.components.vla_client_base import BaseVLAClient
 from rpent.utils.rpc.http_rpc import HttpRpcClient
 from rpent.utils.rpc.rpc_client import RpcError
 from rpent.utils.rpc.socket_rpc import SocketRpcClient
@@ -134,9 +136,18 @@ class FakeYamEnv:
         obs["reset_calls"] = self.reset_calls
         return obs, self._info()
 
-    def step(self, action: np.ndarray, *, expected_episode_id: str | None = None):
+    def step(
+        self,
+        action: np.ndarray,
+        *,
+        action_type: str = "qpos",
+        expected_episode_id: str | None = None,
+    ):
         assert expected_episode_id in {None, "fake-yam-episode"}
-        self.step_actions.append(np.asarray(action).copy())
+        flat = validate_actions(action, action_type=action_type)
+        if flat.shape[0] != 1:
+            raise ValueError("YAM step requires one qpos14 action")
+        self.step_actions.append(flat[0].copy())
         return (
             self._observation(),
             0.0,
@@ -154,7 +165,8 @@ class FakeYamEnv:
         expected_episode_id: str | None = None,
     ):
         assert expected_episode_id in {None, "fake-yam-episode"}
-        self.chunk_actions.append(np.asarray(actions).copy())
+        actions = validate_actions(actions, action_type=action_type)
+        self.chunk_actions.append(actions.copy())
         if self.block_chunk:
             self.chunk_entered.set()
             if not self.stop_requested.wait(timeout=2.0):
@@ -198,7 +210,7 @@ class FakeYamEnv:
 class FakeYamModel:
     def __init__(self, actions: np.ndarray | None = None) -> None:
         if actions is None:
-            actions = np.zeros((1, MODEL_SPEC.use_length, 14), dtype=np.float32)
+            actions = np.zeros((1, MODEL_SPEC.action_horizon, 14), dtype=np.float32)
             actions[..., 6] = 0.25
             actions[..., 13] = 0.75
         self.actions = actions
@@ -218,7 +230,7 @@ class FakeToolkitModel:
         self.calls.append(obs)
         if self.on_predict is not None:
             self.on_predict()
-        return _valid_action_chunk(MODEL_SPEC.use_length)
+        return _valid_action_chunk(MODEL_SPEC.use_length)[None]
 
 
 class FakeRpc:
@@ -307,8 +319,13 @@ class FakeCameraRig:
     def close(self) -> None:
         self.close_calls += 1
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(
+        self, *, not_before_monotonic_s: float | None = None
+    ) -> dict[str, Any]:
+        del not_before_monotonic_s
         self.snapshot_count += 1
+        before = time.monotonic()
+        after = time.monotonic()
         views = {}
         for index, name in enumerate(("top", "left", "right"), start=1):
             views[name] = SimpleNamespace(
@@ -318,6 +335,10 @@ class FakeCameraRig:
                     "name": name,
                     "intrinsic_K": np.eye(3, dtype=np.float64),
                     "cam2world_cv": np.eye(4, dtype=np.float64),
+                    "timestamps": {
+                        "host_before_monotonic_s": before,
+                        "host_after_monotonic_s": after,
+                    },
                 },
             )
         return {"snapshot_id": f"s{self.snapshot_count}", "views": views}
@@ -559,46 +580,50 @@ class FakeToolkitEnv:
 
 def _yam_agent_config(
     *,
+    tmp_path: Path,
     step_lim: int = 40,
     operator_receipt_path: Path | None = None,
     include_wrist_handeye: bool = True,
 ) -> dict[str, Any]:
     identity = np.eye(4, dtype=np.float64).tolist()
-    intrinsic = np.eye(3, dtype=np.float64).tolist()
-    cameras = {
-        "top": {"cam2world_cv": identity, "intrinsic_K": intrinsic},
-        "left": {"cam2world_cv": identity, "intrinsic_K": intrinsic},
-        "right": {"cam2world_cv": identity, "intrinsic_K": intrinsic},
+    extrinsics: dict[str, Any] = {
+        "world_frame": "left_base",
+        "top_camera": {
+            "T_base_to_cam": {
+                "via_left_arm": identity,
+                "via_right_arm": identity,
+            }
+        },
     }
     if include_wrist_handeye:
-        cameras["left"]["T_grasp_from_camera"] = identity
-        cameras["right"]["T_grasp_from_camera"] = identity
+        extrinsics["left_wrist"] = {"T_grasp_to_cam": identity}
+        extrinsics["right_wrist"] = {"T_grasp_to_cam": identity}
+    extrinsics_path = tmp_path / "solve_handeye-extrinsics.json"
+    extrinsics_path.write_text(json.dumps(extrinsics), encoding="utf-8")
 
     return {
         "task_name": "place_cube",
         "task_language": "place the cube",
         "seed": 12,
         "max_episode_steps": step_lim,
-        "control_hz": MODEL_SPEC.control_hz,
         "max_joint_delta_per_step": None,
         "operator_receipt_path": (
             None if operator_receipt_path is None else str(operator_receipt_path)
         ),
         "table_z": -1.0,
         "table_clearance_m": 0.01,
-        "calibration": {
-            "world_frame": "left_base",
-            "T_left_base_from_right_base": identity,
-            "cameras": cameras,
-        },
+        "extrinsics_path": str(extrinsics_path),
     }
 
 
 def _write_operator_receipt(env: Any, path: Path, *, event: str) -> dict[str, Any]:
-    request = env.operator_receipt_requests()
+    info = getattr(env, "last_info", None)
+    if not isinstance(info, dict):
+        _, info = env.observe()
+    status = info["episode_status"]
     return write_receipt(
         path,
-        episode_id=request["episode_id"],
+        episode_id=status["episode_id"],
         event=event,
         note=f"test operator {event}",
     )
@@ -624,7 +649,7 @@ def _valid_action_chunk(length: int = 2) -> np.ndarray:
     return actions
 
 
-def _valid_policy_observation() -> dict[str, Any]:
+def _valid_vla_observation() -> dict[str, Any]:
     top = np.full((1, 3, 4, 3), 10, dtype=np.uint8)
     left = np.full((3, 4, 3), 20, dtype=np.uint8)
     right = np.full((3, 4, 3), 30, dtype=np.uint8)
@@ -659,19 +684,32 @@ def test_yam_env_client_constructor_observes_without_resetting() -> None:
         seed=12,
         max_episode_steps=40,
     )
-    rpc = FakeRpc(
-        {
-            "env.get_env_meta": expected_meta,
-            "env.observe": env.observe,
-            "env.reset": env.reset,
-        }
-    )
+    rpc = FakeRpc({
+        "env.get_env_meta": expected_meta,
+        "env.observe": env.observe,
+        "env.reset": env.reset,
+    })
 
     client = YamEnvClient(rpc, expected_meta=expected_meta)
 
     assert client.last_obs["state"]["joint_position"].shape == (14,)
     assert env.reset_calls == 0
     assert [call[0] for call in rpc.calls] == ["env.get_env_meta", "env.observe"]
+
+
+def test_common_env_client_default_still_resets_on_connect() -> None:
+    env = FakeYamEnv()
+    expected_meta = {"runtime": "generic"}
+    rpc = FakeRpc({
+        "env.get_env_meta": expected_meta,
+        "env.reset": env.reset,
+    })
+
+    client = BaseEnvClient(rpc, expected_meta=expected_meta)
+
+    assert client.last_obs[0]["reset_calls"] == 1
+    assert env.reset_calls == 1
+    assert [call[0] for call in rpc.calls] == ["env.get_env_meta", "env.reset"]
 
 
 @pytest.mark.parametrize("transport", ["http", "socket"])
@@ -763,7 +801,7 @@ def test_yam_env_client_reset_round_trips_without_constructor_auto_reset() -> No
     with _served_facade(facade, "http") as rpc:
         client = YamEnvClient(rpc, expected_meta=expected_meta)
         assert env.reset_calls == 0
-        obs, info = client.reset(reason="operator approved")
+        obs, info = client.reset()
 
     assert obs["state"]["joint_position"].shape == (14,)
     assert info["episode_status"]["actual_seed"] == 12
@@ -812,6 +850,7 @@ def test_request_stop_bypasses_writer_lock_during_active_chunk() -> None:
 def test_yam_agent_env_missing_handeye_still_returns_rgb_and_status(tmp_path) -> None:
     env = YamAgentEnv(
         _yam_agent_config(
+            tmp_path=tmp_path,
             operator_receipt_path=tmp_path / "operator-receipt.json",
             include_wrist_handeye=False,
         ),
@@ -835,7 +874,10 @@ def test_yam_agent_env_missing_handeye_still_returns_rgb_and_status(tmp_path) ->
 def test_yam_agent_env_unbracketed_cached_snapshot_invalidates_wrist_projection(
     tmp_path,
 ) -> None:
-    config = _yam_agent_config(operator_receipt_path=tmp_path / "operator-receipt.json")
+    config = _yam_agent_config(
+        tmp_path=tmp_path,
+        operator_receipt_path=tmp_path / "operator-receipt.json",
+    )
     config["projection_observe_timeout_s"] = 0.0
     env = YamAgentEnv(
         config,
@@ -851,7 +893,6 @@ def test_yam_agent_env_unbracketed_cached_snapshot_invalidates_wrist_projection(
     for name in ("left", "right"):
         meta = obs["views"][name]["camera_meta"]
         assert meta["projection_valid"] is False
-        assert meta["frame_bracketed_by_qpos_samples"] is False
         assert "not bracketed" in meta["projection_limitation"]
 
 
@@ -862,7 +903,10 @@ def test_yam_agent_env_top_projection_does_not_depend_on_stationary_qpos(
     before[[6, 13]] = 0.5
     after = before.copy()
     after[0] += 0.02
-    config = _yam_agent_config(operator_receipt_path=tmp_path / "operator-receipt.json")
+    config = _yam_agent_config(
+        tmp_path=tmp_path,
+        operator_receipt_path=tmp_path / "operator-receipt.json",
+    )
     config["qpos_static_tolerance_rad"] = 1e-4
     config["projection_observe_timeout_s"] = 0.0
     env = YamAgentEnv(
@@ -889,7 +933,7 @@ def test_yam_agent_env_observe_waits_fresh_but_step_uses_cached_snapshot(
     receipt_path = tmp_path / "operator-receipt.json"
     cameras = FreshSnapshotCameraRig(bracketed=True)
     env = YamAgentEnv(
-        _yam_agent_config(operator_receipt_path=receipt_path),
+        _yam_agent_config(tmp_path=tmp_path, operator_receipt_path=receipt_path),
         runtime=FakeRuntime(accepted_updates_measured_state=True),
         cameras=cameras,
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -911,7 +955,7 @@ def test_yam_agent_env_observe_waits_fresh_but_step_uses_cached_snapshot(
 def test_yam_agent_env_stop_during_pace_holds_without_commanding(tmp_path) -> None:
     receipt_path = tmp_path / "operator-receipt.json"
     runtime = FakeRuntime(accepted_updates_measured_state=True)
-    config = _yam_agent_config(operator_receipt_path=receipt_path)
+    config = _yam_agent_config(tmp_path=tmp_path, operator_receipt_path=receipt_path)
     config["projection_observe_timeout_s"] = 0.0
     env = YamAgentEnv(
         config,
@@ -945,6 +989,8 @@ def test_yam_agent_env_stop_during_pace_holds_without_commanding(tmp_path) -> No
     assert runtime.commands == []
     assert runtime.hold_calls > startup_holds
     assert result[0][4]["executed_actions"] == 0
+    assert result[0][3] is True
+    assert result[0][4]["episode_status"]["stop_requested"] is True
 
 
 def test_yam_agent_env_observe_does_not_fabricate_operator_ready_receipt(
@@ -952,7 +998,7 @@ def test_yam_agent_env_observe_does_not_fabricate_operator_ready_receipt(
 ) -> None:
     receipt_path = tmp_path / "operator-receipt.json"
     env = YamAgentEnv(
-        _yam_agent_config(operator_receipt_path=receipt_path),
+        _yam_agent_config(tmp_path=tmp_path, operator_receipt_path=receipt_path),
         runtime=FakeRuntime(),
         cameras=FakeCameraRig(),
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -969,7 +1015,10 @@ def test_yam_agent_env_observe_does_not_fabricate_operator_ready_receipt(
 def test_yam_agent_env_reset_without_ready_holds_and_keeps_episode_id(tmp_path) -> None:
     runtime = FakeRuntime()
     env = YamAgentEnv(
-        _yam_agent_config(operator_receipt_path=tmp_path / "operator-receipt.json"),
+        _yam_agent_config(
+            tmp_path=tmp_path,
+            operator_receipt_path=tmp_path / "operator-receipt.json",
+        ),
         runtime=runtime,
         cameras=FakeCameraRig(),
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -994,7 +1043,7 @@ def test_yam_agent_env_reset_without_ready_holds_and_keeps_episode_id(tmp_path) 
 def test_yam_agent_env_ready_reset_starts_new_episode_id(tmp_path) -> None:
     receipt_path = tmp_path / "operator-receipt.json"
     env = YamAgentEnv(
-        _yam_agent_config(operator_receipt_path=receipt_path),
+        _yam_agent_config(tmp_path=tmp_path, operator_receipt_path=receipt_path),
         runtime=FakeRuntime(),
         cameras=FakeCameraRig(),
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -1020,7 +1069,7 @@ def test_yam_agent_env_stale_success_receipt_is_not_reused_after_reset(
 ) -> None:
     receipt_path = tmp_path / "operator-receipt.json"
     env = YamAgentEnv(
-        _yam_agent_config(operator_receipt_path=receipt_path),
+        _yam_agent_config(tmp_path=tmp_path, operator_receipt_path=receipt_path),
         runtime=FakeRuntime(),
         cameras=FakeCameraRig(),
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -1054,7 +1103,7 @@ def test_yam_agent_env_rejects_stale_expected_episode_without_commanding(
     receipt_path = tmp_path / "operator-receipt.json"
     runtime = FakeRuntime(accepted_updates_measured_state=True)
     env = YamAgentEnv(
-        _yam_agent_config(operator_receipt_path=receipt_path),
+        _yam_agent_config(tmp_path=tmp_path, operator_receipt_path=receipt_path),
         runtime=runtime,
         cameras=FakeCameraRig(),
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -1078,7 +1127,10 @@ def test_yam_agent_env_rejects_stale_expected_episode_without_commanding(
 def test_yam_agent_env_requires_operator_ready_before_motion(tmp_path) -> None:
     runtime = FakeRuntime()
     env = YamAgentEnv(
-        _yam_agent_config(operator_receipt_path=tmp_path / "operator-receipt.json"),
+        _yam_agent_config(
+            tmp_path=tmp_path,
+            operator_receipt_path=tmp_path / "operator-receipt.json",
+        ),
         runtime=runtime,
         cameras=FakeCameraRig(),
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -1099,7 +1151,10 @@ def test_yam_agent_env_rejects_agent_supplied_operator_receipt_options(
     tmp_path,
 ) -> None:
     env = YamAgentEnv(
-        _yam_agent_config(operator_receipt_path=tmp_path / "operator-receipt.json"),
+        _yam_agent_config(
+            tmp_path=tmp_path,
+            operator_receipt_path=tmp_path / "operator-receipt.json",
+        ),
         runtime=FakeRuntime(),
         cameras=FakeCameraRig(),
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -1119,7 +1174,7 @@ def test_yam_agent_env_per_step_robot_state_uses_measured_state_not_accepted_tar
     measured[[6, 13]] = 0.5
     runtime = FakeRuntime(measured, accepted_updates_measured_state=False)
     env = YamAgentEnv(
-        _yam_agent_config(operator_receipt_path=receipt_path),
+        _yam_agent_config(tmp_path=tmp_path, operator_receipt_path=receipt_path),
         runtime=runtime,
         cameras=FakeCameraRig(),
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -1143,7 +1198,7 @@ def test_yam_agent_env_return_all_frames_uses_standard_obs_list_contract(
     receipt_path = tmp_path / "operator-receipt.json"
     runtime = FakeRuntime(accepted_updates_measured_state=True)
     env = YamAgentEnv(
-        _yam_agent_config(operator_receipt_path=receipt_path),
+        _yam_agent_config(tmp_path=tmp_path, operator_receipt_path=receipt_path),
         runtime=runtime,
         cameras=FakeCameraRig(),
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -1175,7 +1230,11 @@ def test_yam_agent_env_holds_when_success_or_step_limit_stops_chunk(
     runtime = FakeRuntime(accepted_updates_measured_state=True, on_command=mark_success)
     step_lim = 10 if terminal_kind == "success" else 1
     env = YamAgentEnv(
-        _yam_agent_config(step_lim=step_lim, operator_receipt_path=receipt_path),
+        _yam_agent_config(
+            tmp_path=tmp_path,
+            step_lim=step_lim,
+            operator_receipt_path=receipt_path,
+        ),
         runtime=runtime,
         cameras=FakeCameraRig(),
         kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
@@ -1184,29 +1243,34 @@ def test_yam_agent_env_holds_when_success_or_step_limit_stops_chunk(
     try:
         _observe_write_ready_reset(env, receipt_path)
         startup_holds = runtime.hold_calls
-        env.chunk_step(_valid_action_chunk(2))
+        _, _, terminated, truncated, _ = env.chunk_step(_valid_action_chunk(2))
     finally:
         env.close()
 
     assert runtime.hold_calls > startup_holds
 
+    assert terminated is (terminal_kind == "success")
+    assert truncated is (terminal_kind == "limit")
 
-def test_policy_observation_keeps_pi05_three_view_batch_order() -> None:
-    top = np.full((3, 4, 3), 10, dtype=np.uint8)
-    left = np.full((3, 4, 3), 20, dtype=np.uint8)
-    right = np.full((3, 4, 3), 30, dtype=np.uint8)
-    snapshot = {
-        "frames": {"top": top, "left": left, "right": right},
-        "state": {"joint_position": np.arange(14, dtype=np.float32)},
-    }
 
-    obs = policy_observation(snapshot, "place the cube")
+def test_yam_primitive_builds_pi05_three_view_batch_order() -> None:
+    env = FakeToolkitEnv()
+    model = FakeToolkitModel()
+    primitive = YamPrimitives(env=env, model=model, check_cancelled=lambda: None)
 
+    result = primitive.pi05_act(chunks=1)
+
+    assert result["executed_steps"] == MODEL_SPEC.use_length
+    obs = model.calls[0]
     assert obs["main_images"].shape == (1, 3, 4, 3)
     assert obs["extra_view_images"].shape == (1, 2, 3, 4, 3)
-    assert np.array_equal(obs["main_images"][0], top)
-    assert np.array_equal(obs["extra_view_images"][0, 0], left)
-    assert np.array_equal(obs["extra_view_images"][0, 1], right)
+    assert np.array_equal(obs["main_images"][0], env.last_obs["frames"]["top"])
+    assert np.array_equal(
+        obs["extra_view_images"][0, 0], env.last_obs["frames"]["left"]
+    )
+    assert np.array_equal(
+        obs["extra_view_images"][0, 1], env.last_obs["frames"]["right"]
+    )
     assert obs["wrist_images"] is None
     assert obs["states"].shape == (1, 14)
     assert obs["task_descriptions"] == ["place the cube"]
@@ -1218,12 +1282,12 @@ def test_yam_vla_localhost_rpc_round_trip_meta_and_actions(transport: str) -> No
     facade = YamVLAFacade(model=model)
 
     with _served_facade(facade, transport) as rpc:
-        client = YamVLAClient(rpc)
-        actions = client.predict(_valid_policy_observation(), options={"mode": "eval"})
+        client = BaseVLAClient(rpc)
+        actions = client.predict(_valid_vla_observation(), options={"mode": "eval"})
 
-    assert actions.shape == (MODEL_SPEC.use_length, 14)
-    assert np.all(actions[:, 6] == pytest.approx(0.25))
-    assert np.all(actions[:, 13] == pytest.approx(0.75))
+    assert actions.shape == (1, MODEL_SPEC.use_length, 14)
+    assert np.all(actions[0, :, 6] == pytest.approx(0.25))
+    assert np.all(actions[0, :, 13] == pytest.approx(0.75))
     assert len(model.calls) == 1
     env_obs, mode = model.calls[0]
     assert mode == "eval"
@@ -1236,41 +1300,42 @@ def test_yam_vla_localhost_rpc_round_trip_meta_and_actions(transport: str) -> No
 
 
 def test_yam_vla_contract_and_build_cfg_use_horizon30_use5_qpos14() -> None:
-    meta = vla_runtime_contract()
     cfg = build_model_cfg("/tmp/fake-yam-model", "/tmp/fake-norm-stats")
 
-    assert meta["runtime"] == "pi05_yam"
-    assert meta["camera_order"] == ["top", "left", "right"]
-    assert meta["state_layout"] == "qpos14"
-    assert meta["action_layout"] == "qpos14"
-    assert meta["action_horizon"] == 30
-    assert meta["use_length"] == 5
-    assert meta["gripper"] == "0_closed_1_open"
-    assert cfg.num_action_chunks == 5
+    assert MODEL_SPEC.camera_order == ("top", "left", "right")
+    assert MODEL_SPEC.action_layout == "qpos14"
+    assert MODEL_SPEC.action_horizon == 30
+    assert MODEL_SPEC.use_length == 5
+    assert cfg.model_path == "/tmp/fake-yam-model"
+    assert cfg.precision == "bf16"
+    assert cfg.num_action_chunks == MODEL_SPEC.action_horizon
     assert cfg.action_dim == 14
-    assert cfg.openpi.num_images_in_input == 3
-    assert cfg.openpi.action_horizon == 30
-    assert cfg.openpi.action_chunk == 5
-    assert cfg.openpi.action_env_dim == 14
+    assert cfg.openpi.task == "eval"
+    assert cfg.openpi.model_action_dim == 32
+    assert cfg.openpi.discrete_state_input is True
+    assert "num_images_in_input" not in cfg.openpi
+    assert "action_horizon" not in cfg.openpi
+    assert "action_chunk" not in cfg.openpi
+    assert "action_env_dim" not in cfg.openpi
 
 
 @pytest.mark.parametrize(
     "bad_obs",
     [
         {
-            **_valid_policy_observation(),
+            **_valid_vla_observation(),
             "main_images": np.zeros((3, 4, 3), dtype=np.uint8),
         },
         {
-            **_valid_policy_observation(),
+            **_valid_vla_observation(),
             "extra_view_images": np.zeros((1, 1, 3, 4, 3), dtype=np.uint8),
         },
         {
-            **_valid_policy_observation(),
+            **_valid_vla_observation(),
             "states": np.full((1, 14), np.nan, dtype=np.float32),
         },
         {
-            **_valid_policy_observation(),
+            **_valid_vla_observation(),
             "task_descriptions": [""],
         },
     ],
@@ -1291,10 +1356,17 @@ def test_yam_vla_facade_rejects_bad_observations_before_model_call(
     "bad_actions",
     [
         np.zeros((1, MODEL_SPEC.use_length, 13), dtype=np.float32),
-        np.zeros((1, MODEL_SPEC.use_length + 1, 14), dtype=np.float32),
         np.full((1, MODEL_SPEC.use_length, 14), np.nan, dtype=np.float32),
-        np.array([[[0, 0, 0, 0, 0, 0, -0.1, 0, 0, 0, 0, 0, 0, 0.5]]]),
-        np.array([[[0, 0, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, 0, 1.1]]]),
+        np.repeat(
+            np.array([[[0, 0, 0, 0, 0, 0, -0.1, 0, 0, 0, 0, 0, 0, 0.5]]]),
+            MODEL_SPEC.use_length,
+            axis=1,
+        ),
+        np.repeat(
+            np.array([[[0, 0, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, 0, 1.1]]]),
+            MODEL_SPEC.use_length,
+            axis=1,
+        ),
     ],
 )
 def test_yam_vla_facade_rejects_bad_policy_outputs(bad_actions: np.ndarray) -> None:
@@ -1302,13 +1374,13 @@ def test_yam_vla_facade_rejects_bad_policy_outputs(bad_actions: np.ndarray) -> N
     facade = YamVLAFacade(model=model)
 
     with pytest.raises(ValueError):
-        facade.predict(_valid_policy_observation())
+        facade.predict(_valid_vla_observation())
 
 
 def test_yam_vla_rpc_returns_errors_for_bad_observation() -> None:
     facade = YamVLAFacade(model=FakeYamModel())
     bad_obs = {
-        **_valid_policy_observation(),
+        **_valid_vla_observation(),
         "extra_view_images": np.zeros((1, 2, 3, 4, 1), dtype=np.uint8),
     }
 
@@ -1332,7 +1404,7 @@ def _make_yam_toolkit(
         inbox_cell_tag="yam_place_cube_s12" if mode == "exploration" else None,
     )
     toolkit = YamToolkit(
-        primitives_kwargs={"env": env, "model": model, "seed": 12},
+        primitives_kwargs={"env": env, "model": model},
         dashboard_events=NullDashboardEventSink(),
         memory=memory,
         mode=mode,
@@ -1364,7 +1436,7 @@ def test_yam_toolkit_pi05_act_rejects_model_side_episode_reset(tmp_path) -> None
     model = FakeToolkitModel(on_predict=env.force_new_episode_id)
     memory = MemoryManager(tmp_path / "memory", memory_access="read_only")
     toolkit = YamToolkit(
-        primitives_kwargs={"env": env, "model": model, "seed": 12},
+        primitives_kwargs={"env": env, "model": model},
         dashboard_events=NullDashboardEventSink(),
         memory=memory,
         mode="evaluation",
@@ -1445,3 +1517,20 @@ def test_yam_toolkit_failure_does_not_write_recipe_or_merge_task_artifacts(
     assert merge["task"] == 0
     assert not (tmp_path / "memory" / "task" / f"recipe_{recipe_tag}.jsonl").exists()
     assert not (tmp_path / "memory" / "task" / f"{recipe_tag}.json").exists()
+
+
+def test_env_step_rpc_rejects_multiple_actions_before_command(tmp_path) -> None:
+    runtime = FakeRuntime()
+    env = YamAgentEnv(
+        _yam_agent_config(tmp_path=tmp_path),
+        runtime=runtime,
+        cameras=FakeCameraRig(),
+        kinematics={"left": FakeKinematics(), "right": FakeKinematics()},
+    )
+    facade = YamEnvFacade(env)
+    try:
+        with pytest.raises(ValueError, match="single qpos14"):
+            facade._dispatch("env.step", (_valid_action_chunk(2),), {})
+        assert runtime.commands == []
+    finally:
+        facade.close()

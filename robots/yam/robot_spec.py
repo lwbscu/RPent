@@ -11,48 +11,25 @@
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from robots.yam.contracts import (
     MODEL_SPEC,
-    YAM_CAMERA_NAMES,
     env_runtime_contract,
 )
 from robots.yam.prompt_bundle import system_prompt, user_prompt
-from rpent.dashboard.events import DashboardEventSink, RuntimeStatusEvent
+from rpent.dashboard.events import DashboardEventSink
 from rpent.memory import MemoryManager
 from rpent.robots.prompt_bundle import PromptBundle
 from rpent.robots.robot_spec import RobotSpec, RunConfig
-from rpent.robots.runtime import stop_owned_daemons, try_spawn_server, try_wait_server
+from rpent.robots.runtime import try_wait_server
 from rpent.utils.config import get_memory_dir, get_repo_root
+from rpent.utils.rpc import make_rpc_client
 
 if TYPE_CHECKING:
     from rpent.utils.daemon import ProcessDaemon
-
-
-YAM_DASHBOARD_SPEC = {
-    "task": {
-        "command": "/rpent-task",
-        "usage": "/rpent-task <task_name> <seed>",
-        "fields": (
-            {"name": "task_name"},
-            {"name": "seed", "kind": "integer", "minimum": 0},
-        ),
-        "display": "{task_name} / seed {seed}",
-        "output_slug": "{task_name}_s{seed}",
-    },
-    "runtime_components": (
-        {"name": "env", "label": "ENV", "scope": "unique"},
-        {"name": "vla", "label": "VLA", "scope": "shared"},
-    ),
-    "frame_channels": tuple(
-        {"name": name, "label": f"{name} camera"} for name in YAM_CAMERA_NAMES
-    ),
-}
 
 
 def get_robot_spec() -> RobotSpec:
@@ -62,7 +39,6 @@ def get_robot_spec() -> RobotSpec:
         add_cli_args=_add_cli_args,
         parse_config=_parse_config,
         init_runtime=_init_runtime,
-        dashboard=YAM_DASHBOARD_SPEC,
     )
 
 
@@ -109,36 +85,18 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     )
     parser.add_argument(
         "--env-endpoint",
-        required=required and os.environ.get("YAM_ENV_ENDPOINT") is None,
-        default=os.environ.get("YAM_ENV_ENDPOINT"),
+        required=required,
         help="YAM env_server endpoint. Use socket://host:port for pickle TCP.",
     )
     parser.add_argument(
         "--vla-endpoint",
-        default=os.environ.get("YAM_VLA_ENDPOINT"),
         help="Existing Pi0.5 YAM VLA endpoint.",
-    )
-    parser.add_argument(
-        "--vla-model-path",
-        default=os.environ.get("YAM_PI05_CHECKPOINT_PATH"),
-        help="Local YAM Pi0.5 checkpoint used only when no --vla-endpoint is given.",
     )
     parser.add_argument(
         "--without-vla",
         action="store_true",
         help="Run primitives-only wiring without starting or connecting a VLA server.",
     )
-    parser.add_argument(
-        "--yam-reset-on-connect",
-        action="store_true",
-        help="Explicitly reset the real robot when the client connects. Default is observe-only.",
-    )
-    parser.add_argument(
-        "--yam-rlinf-root",
-        default=os.environ.get("RPENT_RLINF_ROOT") or os.environ.get("RLINF_REPO_PATH"),
-    )
-    parser.add_argument("--cuda-device", default=None)
-    parser.add_argument("--vla-cuda-device", default=None)
 
 
 def _parse_config(args: argparse.Namespace) -> RunConfig:
@@ -196,6 +154,7 @@ def _init_runtime(
     dashboard_events: DashboardEventSink,
     components: set[str] | None,
 ) -> tuple[list["ProcessDaemon"], dict[str, Any]]:
+    del output_dir
     available = {"env", "vla"}
     selected = available if components is None else components
     if getattr(args, "without_vla", False):
@@ -203,111 +162,42 @@ def _init_runtime(
     unknown = selected.difference(available)
     if unknown:
         raise ValueError(f"unknown YAM runtime components: {sorted(unknown)}")
+    if "env" in selected and not args.env_endpoint:
+        raise ValueError(
+            "--env-endpoint is required for YAM; start env_server on yambox first"
+        )
+    if "vla" in selected and not args.vla_endpoint:
+        raise ValueError("--vla-endpoint or --without-vla is required for YAM")
 
     owned_daemons: dict[str, ProcessDaemon] = {}
-    env_pending = None
-    vla_pending = None
-    if "env" in selected:
-        env_pending = try_spawn_server(
-            owned_daemons,
-            dashboard_events,
-            "env",
-            lambda: _connect_external_env(args),
-        )
-    if "vla" in selected:
-        vla_pending = try_spawn_server(
-            owned_daemons,
-            dashboard_events,
-            "vla",
-            lambda: _spawn_or_connect_vla(args, output_dir),
-        )
-
     primitives_kwargs: dict[str, Any] = {}
-    if env_pending is not None:
-        env_daemon, env_rpc = env_pending
+    if "env" in selected:
+        env_rpc = make_rpc_client(args.env_endpoint)
         primitives_kwargs.update(
             try_wait_server(
                 owned_daemons,
                 dashboard_events,
                 "env",
                 env_rpc,
-                env_daemon,
+                None,
                 300.0,
                 post_fn=lambda: _build_env_runtime_kwargs(args, env_rpc),
             )
         )
-    if vla_pending is not None:
-        vla_daemon, vla_rpc = vla_pending
-        try:
-            from rpent.utils.rpc import wait_for_ready
-
-            wait_for_ready(
-                vla_rpc, daemon=vla_daemon, timeout_s=900.0 if vla_daemon else 300.0
+    if "vla" in selected:
+        vla_rpc = make_rpc_client(args.vla_endpoint)
+        primitives_kwargs.update(
+            try_wait_server(
+                owned_daemons,
+                dashboard_events,
+                "vla",
+                vla_rpc,
+                None,
+                300.0,
+                post_fn=lambda: _build_vla_runtime_kwargs(vla_rpc),
             )
-            primitives_kwargs.update(_build_vla_runtime_kwargs(vla_rpc))
-        except Exception as exc:
-            stop_owned_daemons(owned_daemons, dashboard_events)
-            dashboard_events.emit(RuntimeStatusEvent("vla", "failed", error=exc))
-            raise RuntimeError(f"[vla] wait / client connect failed: {exc}") from exc
-        dashboard_events.emit(RuntimeStatusEvent("vla", "ready"))
+        )
     return list(owned_daemons.values()), primitives_kwargs
-
-
-def _connect_external_env(args: argparse.Namespace):
-    if not args.env_endpoint:
-        raise ValueError(
-            "--env-endpoint is required for YAM; start env_server on yambox first"
-        )
-    from rpent.utils.rpc import make_rpc_client
-
-    return None, make_rpc_client(args.env_endpoint)
-
-
-def _spawn_or_connect_vla(args: argparse.Namespace, output_dir: Path):
-    from rpent.utils.rpc import make_rpc_client
-
-    if args.vla_endpoint:
-        return None, make_rpc_client(args.vla_endpoint)
-    if not args.vla_model_path:
-        raise ValueError(
-            "--vla-endpoint, --vla-model-path, or --without-vla is required"
-        )
-    from rpent.utils.daemon import ProcessDaemon, pick_free_port
-
-    host, port = "127.0.0.1", pick_free_port()
-    cmd = [
-        sys.executable,
-        "-m",
-        "robots.yam.vla_server",
-        "--model-path",
-        str(Path(args.vla_model_path).expanduser()),
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--transport",
-        "http",
-        "--parent-watch",
-    ]
-    env_overrides = {}
-    if args.yam_rlinf_root:
-        env_overrides["RPENT_RLINF_ROOT"] = str(
-            Path(args.yam_rlinf_root).expanduser().resolve()
-        )
-    device = (
-        args.vla_cuda_device if args.vla_cuda_device is not None else args.cuda_device
-    )
-    if device is not None:
-        env_overrides["CUDA_VISIBLE_DEVICES"] = str(device)
-    daemon = ProcessDaemon(
-        "yam_pi05_vla_server",
-        cmd,
-        env_overrides=env_overrides,
-        log_path=str(output_dir / "yam_pi05_vla_server.log"),
-        cwd=str(get_repo_root()),
-    )
-    daemon.start()
-    return daemon, make_rpc_client(f"http://{host}:{port}")
 
 
 def _build_env_runtime_kwargs(args: argparse.Namespace, env_rpc: Any) -> dict[str, Any]:
@@ -321,14 +211,11 @@ def _build_env_runtime_kwargs(args: argparse.Namespace, env_rpc: Any) -> dict[st
                 seed=int(args.seed),
                 max_episode_steps=int(args.max_episode_steps),
             ),
-            reset_on_connect=bool(args.yam_reset_on_connect),
         ),
-        "seed": int(args.seed),
-        "seed_mode": "label_only",
     }
 
 
 def _build_vla_runtime_kwargs(vla_rpc: Any) -> dict[str, Any]:
-    from robots.yam.vla_client import YamVLAClient
+    from rpent.robots.components.vla_client_base import BaseVLAClient
 
-    return {"model": YamVLAClient(vla_rpc)}
+    return {"model": BaseVLAClient(vla_rpc)}

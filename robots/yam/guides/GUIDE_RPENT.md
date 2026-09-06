@@ -11,11 +11,10 @@ to a look-alike visible in a wrist camera. `sample_world_xyz` and
 `query_world_map` read persisted same-frame depth projections in the YAM
 left-base frame.
 
-`pi05_act` runs the trained Pi0.5 YAM qpos14 policy when a checkpoint is
-available. Keep chunks short on the real robot. `move_to` delegates reachability,
+`pi05_act` runs the trained Pi0.5 YAM qpos14 policy through the configured VLA
+endpoint. Keep chunks short on the real robot. `move_to` delegates reachability,
 IK, table protection, and waypoint generation to the env server, then executes
-the full returned waypoint list. Do not use the `substeps` argument to thin out
-server safety waypoints.
+the full returned waypoint list.
 
 All xyz targets use `left_base` as the shared world frame, in metres. Pose
 quaternions are **wxyz**. Each arm's native FK has its own base; the server

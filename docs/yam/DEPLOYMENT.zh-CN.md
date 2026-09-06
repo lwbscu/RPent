@@ -56,7 +56,7 @@ python -m robots.yam.operator_control --config /path/to/yam-site.json \
 
 ## 3. 推理机
 
-先准备 **YAM SFT 权重**与其 `yam` norm_stats；LIBERO/RobotWin 权重不能只改 action_dim 就替用。当前接入假设 `pi05_yam_joint`、三图、训练 horizon 30、执行 chunk 5、绝对 qpos14。若训练更改 horizon/频率/变换，更新明确 contract 并重新核对，不静默兼容。
+先准备 **YAM SFT 权重**与其 `yam` norm_stats；LIBERO/RobotWin 权重不能只改 action_dim 就替用。加载路径与 RLinf 的 `evaluations/realworld/realworld_dual_yam_openpi_rlinf_eval.yaml` 一致，使用 `openpi_rlinf.get_model` 的 eval wrapper；`pi05_yam_joint`、三图、预测 horizon 30，RPent 每次执行前 5 帧绝对 qpos14。若训练更改 horizon/频率/变换，更新明确 contract 并重新核对，不静默兼容。
 
 ```bash
 export RPENT_RLINF_ROOT=/path/to/the/same-yam-rlinf-source
@@ -66,7 +66,7 @@ python -m robots.yam.vla_server \
   --device cuda --transport http --host 127.0.0.1 --port 8220
 ```
 
-`norm-stats-path` 可省略，此时 RLinf 从 checkpoint 对应的 YAM assets 加载。`vla.get_meta` 返回 policy、camera_order、state/action layout、horizon/use_length、控制频率及夹爪约定。输出仅通过 CPU numpy 跨 RPC；实际输出值和 checkpoint 行为仍需真实观测推理验证。
+`norm-stats-path` 可省略，此时 RLinf 从 checkpoint 对应的 YAM assets 加载。使用公共 `vla.predict` RPC；YAM 输入与动作形状在实际预测调用中检查。输出仅通过 CPU numpy 跨 RPC；实际输出值和 checkpoint 行为仍需真实观测推理验证。
 
 ## 4. Agent 机
 
@@ -94,7 +94,7 @@ python -m rpent.cli.main --robot yam \
 
 示例未含 planner 凭据，需要使用已有 planner 配置。`--no-auto-merge-memory` 可先保留探索草稿人工复查；它不是机械运动前置门。评测保持 memory read_only。更换 task_name/step_limit 时，ENV 配置与 Agent 启动参数须相同。真实 seed 是布局/试次标签，不承诺仿真式可重复生成场景。
 
-首版以 CLI 外部服务模式验收。Dashboard 的设备启停、人工回执按钮和远程部署权限不属于本轮已验证能力。
+使用 CLI 连接两个外部服务；YAM 不注册 Dashboard，也不从 Agent 进程启动本地 VLA。
 
 ## 5. 每阶段留存最小证据
 

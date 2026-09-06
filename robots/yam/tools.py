@@ -289,7 +289,11 @@ def dump_observation(
     with env_state.record_step(
         state=state,
         terminated=status.get("eval_success") is True,
-        truncated=False,
+        truncated=bool(
+            status.get("terminal_event") in {"failure", "abort"}
+            or status.get("stop_requested")
+            or int(status["take_action_cnt"]) >= int(status["step_lim"])
+        ),
         command=(log or {}).get("command"),
         result=(log or {}).get("result"),
         elapsed_s=(log or {}).get("elapsed_s"),
@@ -356,10 +360,7 @@ TOOLS_SPEC = [
     {
         "name": "reset",
         "description": "Operator-approved reset for exploration or a fresh task attempt.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"reason": {"type": "string", "default": ""}},
-        },
+        "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "sample_world_xyz",
@@ -415,18 +416,6 @@ TOOLS_SPEC = [
         },
     },
     {
-        "name": "act",
-        "description": "Run the YAM Pi0.5 qpos14 policy for one or more short chunks.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "chunks": {"type": "integer", "minimum": 1, "default": 1},
-                "use_length": {"type": "integer", "const": 5, "default": 5},
-                "prompt": {"type": ["string", "null"]},
-            },
-        },
-    },
-    {
         "name": "pi05_act",
         "description": "Run the YAM Pi0.5 qpos14 policy for one or more short chunks.",
         "input_schema": {
@@ -458,7 +447,6 @@ TOOLS_SPEC = [
                     "maxItems": 4,
                 },
                 "gripper": {"type": ["number", "null"]},
-                "substeps": {"type": "integer", "minimum": 0, "default": 0},
             },
             "required": ["arm", "xyz"],
         },
@@ -472,7 +460,6 @@ TOOLS_SPEC = [
                 "arm": {"type": "string", "enum": ["left", "right"]},
                 "delta_yaw_deg": {"type": "number"},
                 "gripper": {"type": ["number", "null"]},
-                "substeps": {"type": "integer", "minimum": 0, "default": 0},
             },
             "required": ["arm", "delta_yaw_deg"],
         },
