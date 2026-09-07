@@ -18,6 +18,11 @@ from rpent.prompt.utils import PromptNode
 
 
 def system_prompt(variables: Mapping[str, object] | None = None) -> PromptNode:
+    policy = (
+        system_parts.VLA
+        if (variables or {}).get("vla_enabled", False)
+        else system_parts.PRIMITIVES_ONLY
+    )
     if (variables or {}).get("mode", "eval") == "explore":
         return {
             "ROLE": system_parts.ROLE,
@@ -26,6 +31,7 @@ def system_prompt(variables: Mapping[str, object] | None = None) -> PromptNode:
             "RUNTIME": system_parts.RUNTIME,
             "PERCEPTION": system_parts.PERCEPTION,
             "CONTROL": system_parts.CONTROL,
+            "POLICY AVAILABILITY": policy,
             "SUCCESS": system_parts.SUCCESS,
         }
     return {
@@ -34,6 +40,7 @@ def system_prompt(variables: Mapping[str, object] | None = None) -> PromptNode:
         "RUNTIME": system_parts.RUNTIME,
         "PERCEPTION": system_parts.PERCEPTION,
         "CONTROL": system_parts.CONTROL,
+        "POLICY AVAILABILITY": policy,
         "SUCCESS": system_parts.SUCCESS,
     }
 

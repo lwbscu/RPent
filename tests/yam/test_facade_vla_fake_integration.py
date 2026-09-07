@@ -449,6 +449,8 @@ class FakeToolkitEnv:
         self.step_lim = 20
         self.actual_seed = 12
         self.episode_id = "tk-episode-0"
+        self.qpos = np.zeros(14, dtype=np.float64)
+        self.qpos[[6, 13]] = 0.5
         self.stop_requests: list[str] = []
         self.hold_calls = 0
         self.reset_calls = 0
@@ -461,6 +463,8 @@ class FakeToolkitEnv:
         self.episode_id = (
             f"tk-episode-{self.reset_calls + len(self.chunk_step_calls) + 1}"
         )
+        self.eval_success = False
+        self.take_action_cnt = 0
         self.observe()
 
     def _status(self) -> dict[str, Any]:
@@ -488,22 +492,18 @@ class FakeToolkitEnv:
                     "cam2world_cv": np.eye(4, dtype=np.float64),
                 },
             }
-        qpos = np.zeros(14, dtype=np.float64)
-        qpos[[6, 13]] = 0.5
         return {
             "frames": {name: view["rgb"] for name, view in views.items()},
-            "state": {"joint_position": qpos},
+            "state": {"joint_position": self.qpos.copy()},
             "views": views,
             "snapshot_id": f"tk-{self.take_action_cnt}",
         }
 
     def _info(self) -> dict[str, Any]:
-        qpos = np.zeros(14, dtype=np.float64)
-        qpos[[6, 13]] = 0.5
         return {
             "episode_status": self._status(),
             "robot_state": {
-                "qpos": qpos,
+                "qpos": self.qpos.copy(),
                 "left_eef_pose": np.array([0, 0, 0, 1, 0, 0, 0], dtype=np.float64),
                 "right_eef_pose": np.array([0, 0, 0, 1, 0, 0, 0], dtype=np.float64),
                 "world_frame": "left_base",
@@ -540,6 +540,8 @@ class FakeToolkitEnv:
             self.hold_calls += 1
             raise RuntimeError("stale episode_id refused before command")
         self.take_action_cnt += len(actions)
+        if len(actions):
+            self.qpos = actions[-1].astype(np.float64, copy=True)
         if self.success_after_chunk:
             self.eval_success = True
         obs, info = self.observe()
@@ -661,6 +663,9 @@ def _valid_vla_observation() -> dict[str, Any]:
         "states": states,
         "task_descriptions": ["place the cube"],
     }
+
+
+_DEFAULT_TOOLKIT_MODEL = object()
 
 
 def test_yam_env_facade_constructor_does_not_reset_or_move_robot() -> None:
@@ -1395,9 +1400,12 @@ def _make_yam_toolkit(
     success_after_chunk: bool = False,
     mode: str = "evaluation",
     attempts_per_session: int = 0,
-) -> tuple[Any, FakeToolkitEnv, FakeToolkitModel, MemoryManager]:
+    model: FakeToolkitModel | None | object = _DEFAULT_TOOLKIT_MODEL,
+) -> tuple[Any, FakeToolkitEnv, FakeToolkitModel | None, MemoryManager]:
     env = FakeToolkitEnv(success_after_chunk=success_after_chunk)
-    model = FakeToolkitModel()
+    if model is _DEFAULT_TOOLKIT_MODEL:
+        model = FakeToolkitModel()
+    assert model is None or isinstance(model, FakeToolkitModel)
     memory = MemoryManager(
         tmp_path / "memory",
         memory_access="inbox_write" if mode == "exploration" else "read_only",
@@ -1415,6 +1423,25 @@ def _make_yam_toolkit(
     return toolkit, env, model, memory
 
 
+def test_yam_toolkit_without_model_hides_pi05_but_keeps_primitives_and_reset(
+    tmp_path,
+) -> None:
+    toolkit, _, _, _ = _make_yam_toolkit(
+        tmp_path,
+        mode="exploration",
+        model=None,
+    )
+    try:
+        tool_names = set(toolkit._tools)
+    finally:
+        toolkit.close()
+
+    assert "pi05_act" not in tool_names
+    assert {"move_to", "rotate_wrist", "set_gripper", "release", "reset"}.issubset(
+        tool_names
+    )
+
+
 def test_yam_toolkit_finish_claim_cannot_create_verified_success(tmp_path) -> None:
     toolkit, env, _, _ = _make_yam_toolkit(tmp_path, success_after_chunk=False)
     try:
@@ -1429,6 +1456,32 @@ def test_yam_toolkit_finish_claim_cannot_create_verified_success(tmp_path) -> No
     assert result.is_finish is True
     assert result.result["verified_success"] is False
     assert result.result["status"] == "failure"
+
+
+@pytest.mark.parametrize(
+    ("arm", "target", "other_index"),
+    [
+        ("left", 0.2, 13),
+        ("right", 0.8, 6),
+    ],
+)
+def test_yam_primitives_set_gripper_reports_actual_value_and_preserves_other_arm(
+    arm: str,
+    target: float,
+    other_index: int,
+) -> None:
+    env = FakeToolkitEnv()
+    primitive = YamPrimitives(env=env, model=None, check_cancelled=lambda: None)
+    before_other = float(env.last_obs["state"]["joint_position"][other_index])
+
+    result = primitive.set_gripper(arm=arm, val=target, steps=2)
+
+    gripper_index = 6 if arm == "left" else 13
+    qpos = env.last_obs["state"]["joint_position"]
+    assert result["success"] is True
+    assert result["gripper_val"] == pytest.approx(target)
+    assert qpos[gripper_index] == pytest.approx(target)
+    assert qpos[other_index] == pytest.approx(before_other)
 
 
 def test_yam_toolkit_pi05_act_rejects_model_side_episode_reset(tmp_path) -> None:
@@ -1452,6 +1505,106 @@ def test_yam_toolkit_pi05_act_rejects_model_side_episode_reset(tmp_path) -> None
     assert env.take_action_cnt == 0
     assert env.hold_calls == 1
     assert result.result["error"] == "stale episode_id refused before command"
+
+
+def test_yam_toolkit_no_vla_primitives_recipe_and_memory_merge(tmp_path) -> None:
+    toolkit, env, _, memory = _make_yam_toolkit(
+        tmp_path,
+        success_after_chunk=False,
+        mode="exploration",
+        attempts_per_session=1,
+        model=None,
+    )
+    recipe_tag = "yam_place_cube_s12"
+    technique_path = tmp_path / "memory" / "_inbox" / recipe_tag / "suite_technique.md"
+    technique = """---
+scope: suite
+suite: yam
+regime: real
+task_id: place_cube
+task_language: place the cube
+confidence: single-shot
+evidence:
+  cells:
+    - yam_place_cube_s12
+---
+Use the left gripper to stabilize the object before opening the right gripper.
+"""
+    try:
+        set_result = toolkit.execute_tool(
+            "set_gripper", {"arm": "left", "val": 0.25, "steps": 2}
+        )
+        env.success_after_chunk = True
+        release_result = toolkit.execute_tool(
+            "release", {"arm": "right", "val": 1.0, "steps": 2}
+        )
+        write_result = toolkit.execute_tool(
+            "write_text_file",
+            {"path": str(technique_path), "content": technique},
+        )
+        recipe_path = Path(toolkit.write_recipe(recipe_tag))
+    finally:
+        toolkit.close()
+
+    assert "pi05_act" not in set(toolkit._tools)
+    assert set_result.result["state"]["episode_status"]["eval_success"] is False
+    assert release_result.result["state"]["episode_status"]["eval_success"] is True
+    assert set_result.result["log"]["result"]["gripper_val"] == pytest.approx(0.25)
+    assert release_result.result["log"]["result"]["gripper_val"] == pytest.approx(1.0)
+    assert write_result.result["bytes_written"] == len(technique.encode("utf-8"))
+    assert env.take_action_cnt == 4
+    assert recipe_path.exists()
+    recipe_text = recipe_path.read_text(encoding="utf-8")
+    assert recipe_text.count('"action": "set_gripper"') == 1
+    assert recipe_text.count('"action": "release"') == 1
+
+    merge = memory.merge_memory(
+        cell_tag=recipe_tag,
+        run_state_dir=tmp_path / "run",
+        solved=True,
+    )
+
+    assert merge["suite"] == 1
+    assert merge["task"] == 1
+    assert (tmp_path / "memory" / "MEMORY.md").exists()
+    assert (tmp_path / "memory" / "suite" / "suite_yam_real_tplace_cube.md").exists()
+    assert (tmp_path / "memory" / "task" / f"recipe_{recipe_tag}.jsonl").exists()
+    assert (tmp_path / "memory" / "task" / f"{recipe_tag}.json").exists()
+
+
+def test_yam_toolkit_recipe_uses_only_current_episode_after_external_reset(
+    tmp_path,
+) -> None:
+    toolkit, env, _, _ = _make_yam_toolkit(
+        tmp_path,
+        success_after_chunk=False,
+        mode="exploration",
+        model=None,
+    )
+    recipe_tag = "yam_place_cube_s12"
+    try:
+        old_result = toolkit.execute_tool(
+            "set_gripper", {"arm": "left", "val": 0.25, "steps": 1}
+        )
+        old_episode = old_result.result["state"]["episode_status"]["episode_id"]
+        env.force_new_episode_id()
+        env.success_after_chunk = True
+        new_result = toolkit.execute_tool(
+            "release", {"arm": "right", "val": 1.0, "steps": 1}
+        )
+        new_episode = new_result.result["state"]["episode_status"]["episode_id"]
+        recipe_path = Path(toolkit.write_recipe(recipe_tag))
+    finally:
+        toolkit.close()
+
+    assert old_episode != new_episode
+    assert recipe_path.exists()
+    recipe_text = recipe_path.read_text(encoding="utf-8")
+    assert '"action": "set_gripper"' not in recipe_text
+    assert recipe_text.count('"action": "release"') == 1
+    audit = json.loads((tmp_path / "run" / f"{recipe_tag}.json").read_text())
+    assert audit["episode_status"]["episode_id"] == new_episode
+    assert audit["recipe_actions"] == 1
 
 
 def test_yam_toolkit_success_writes_recipe_and_memory_task_artifacts(tmp_path) -> None:

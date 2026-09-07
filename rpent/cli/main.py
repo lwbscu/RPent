@@ -288,7 +288,22 @@ def _start_continuation_session(
             "session_max": session_max,
         },
     )
-    session_message = _handoff_message(output_dir, session_number, session_max)
+    if args.robot_name == "yam":
+        previous_session = (
+            Path(output_dir) / "sessions" / f"session_{session_number - 1:03d}"
+        )
+        session_message = (
+            f"You are agent {session_number} of up to {session_max} on this cell. "
+            f"Read the recorded steps and artifacts in {previous_session}/ and "
+            f"working notes under {prompt_vars['memory_inbox']}/wip/. "
+            "The physical scene has NOT been reset. The previous session requested "
+            "stop; this toolkit only observes. Inspect the current state and previous "
+            "failures, ask the operator to prepare the next attempt and write a ready "
+            "receipt, then use the reset tool before motion. Do not repeat failed "
+            "approaches or claim that a new planner context restored the scene."
+        )
+    else:
+        session_message = _handoff_message(output_dir, session_number, session_max)
     return planner, system_prompt, session_message
 
 

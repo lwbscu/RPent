@@ -131,7 +131,7 @@ class YamPrimitives:
     ) -> dict[str, Any]:
         if self.model is None:
             raise RuntimeError(
-                "YAM VLA is not connected; run without pi05_act or omit --without-vla"
+                "YAM VLA is not connected; pi05_act requires a trained --vla-endpoint"
             )
         if int(chunks) < 1:
             raise ValueError("chunks must be at least 1")
@@ -361,6 +361,7 @@ class YamPrimitives:
             {"arm": arm, "gripper": value} for value in values
         ])
         executed = int(execution.get("executed_actions", 0))
+        now = np.asarray(self.env.last_obs["state"]["joint_position"], dtype=np.float64)
         return {
             **execution,
             **self._completion(
@@ -369,7 +370,7 @@ class YamPrimitives:
                 status=execution["episode_status"],
             ),
             "success": executed == len(values),
-            "gripper_val": float(val),
+            "gripper_val": float(now[6 if arm == "left" else 13]),
         }
 
     def release(self, *, arm: str, val: float = 1.0, steps: int = 10) -> dict[str, Any]:

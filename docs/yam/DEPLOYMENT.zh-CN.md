@@ -42,10 +42,19 @@ python -m robots.yam.env_server \
 ```bash
 python -m robots.yam.operator_control --config /path/to/yam-site.json --event status
 python -m robots.yam.operator_control --config /path/to/yam-site.json \
-  --event ready --episode-id CURRENT_ID --note '已人工布置场景，确认工作区与停驻臂'
+  --event start --episode-id CURRENT_ID --note '已人工布置首回合，确认工作区与停驻臂'
 ```
 
-ready 是一次性的场景确认回执；成功开始后输出新的 episode ID。Agent 客户端连接不 reset，evaluation 模式不提供 reset 工具。Explore 的 reset 也只有在控制机存在匹配的新 ready 回执时才能消耗一次尝试。人工 success/failure/abort 绑定实际执行的 episode：
+`start` 用于 Agent 开始记录前的首回合：写 ready 回执并调用 env.reset，输出新的 episode ID。Agent 客户端连接不 reset，evaluation 模式不提供 reset 工具。
+
+Explore 重试时，操作者恢复场景后改用 `--event ready`；它只写一次性回执，随后由 **Agent 的 reset 工具**消费回执、开始新 episode 并记录尝试。不要在 Agent 的尝试之间使用 start。ready 不是动作，也不自动开始新 episode：
+
+```bash
+python -m robots.yam.operator_control --config /path/to/yam-site.json \
+  --event ready --episode-id ACTIVE_ID --note '已恢复场景，供 Agent 重试'
+```
+
+人工 success/failure/abort 绑定实际执行的 episode：
 
 ```bash
 python -m robots.yam.operator_control --config /path/to/yam-site.json \
@@ -55,6 +64,8 @@ python -m robots.yam.operator_control --config /path/to/yam-site.json \
 现场中止使用硬件急停；软件 `abort` 是补充。软件返回 `stop_requested` 只证明已发出请求，不证明物理已停。记录测量状态与最终 hold 结果。
 
 ## 3. 推理机
+
+**当前 VLA 未训练完成，本阶段后置；原语与 Explore 不依赖该服务。**
 
 先准备 **YAM SFT 权重**与其 `yam` norm_stats；LIBERO/RobotWin 权重不能只改 action_dim 就替用。加载路径与 RLinf 的 `evaluations/realworld/realworld_dual_yam_openpi_rlinf_eval.yaml` 一致，使用 `openpi_rlinf.get_model` 的 eval wrapper；`pi05_yam_joint`、三图、预测 horizon 30，RPent 每次执行前 5 帧绝对 qpos14。若训练更改 horizon/频率/变换，更新明确 contract 并重新核对，不静默兼容。
 
@@ -70,7 +81,7 @@ python -m robots.yam.vla_server \
 
 ## 4. Agent 机
 
-将服务通过可信连接暴露到 Agent 机后，用实际 endpoint 替换下例。先原语，再 VLA，再 Explore：
+将服务通过可信连接暴露到 Agent 机后，用实际 endpoint 替换下例。当前先原语，再无 VLA Explore；不传 `--vla-endpoint` 时默认只连接 ENV，工具列表不含 `pi05_act`。`--without-vla` 仍可显式覆盖已配置的 endpoint：
 
 ```bash
 python -m rpent.cli.main --robot yam \
@@ -81,20 +92,13 @@ python -m rpent.cli.main --robot yam \
 python -m rpent.cli.main --robot yam \
   --task-name pick_place --seed 0 \
   --env-endpoint http://127.0.0.1:8110 \
-  --vla-endpoint http://127.0.0.1:8220 \
-  --memory-profile local --memory-dir /path/to/yam-memory
-
-python -m rpent.cli.main --robot yam \
-  --task-name pick_place --seed 0 \
-  --env-endpoint http://127.0.0.1:8110 \
-  --vla-endpoint http://127.0.0.1:8220 \
   --explore --explore-sessions 1 --explore-attempts-per-session 5 \
-  --memory-dir /path/to/yam-memory --no-auto-merge-memory
+  --memory-dir /path/to/yam-memory
 ```
 
-示例未含 planner 凭据，需要使用已有 planner 配置。`--no-auto-merge-memory` 可先保留探索草稿人工复查；它不是机械运动前置门。评测保持 memory read_only。更换 task_name/step_limit 时，ENV 配置与 Agent 启动参数须相同。真实 seed 是布局/试次标签，不承诺仿真式可重复生成场景。
+示例未含 planner 凭据，需要使用已有 planner 配置；无 VLA 仍需要负责观察和决策的 LLM/VLM planner。Explore 默认在人工确认成功后自动将有效草稿、当前 episode 的 recipe/audit 归入本地 memory，并重建索引。失败笔记留在 inbox，冲突草稿进入 `_conflicts`，不会自动覆盖已有正文。`--no-auto-merge-memory` 可显式关闭归档。评测保持 memory read_only。更换 task_name/step_limit 时，ENV 配置与 Agent 启动参数须相同。真实 seed 是布局/试次标签，不承诺仿真式可重复生成场景；独立试验使用不同标签，同一 cell 重跑不会被当作新的独立记忆证据。
 
-使用 CLI 连接两个外部服务；YAM 不注册 Dashboard，也不从 Agent 进程启动本地 VLA。
+训练完成后，增加 `--vla-endpoint http://127.0.0.1:8220` 才会连接 VLA 并注册 `pi05_act`。YAM 不注册 Dashboard，也不从 Agent 进程启动本地 VLA。
 
 ## 5. 每阶段留存最小证据
 

@@ -109,13 +109,16 @@ class YamToolkit(Toolkit):
         )
         for name in (
             "render",
-            "pi05_act",
             "move_to",
             "rotate_wrist",
             "set_gripper",
             "release",
         ):
             self.add_tool(name, self._SPECS[name], partial(self._step, name))
+        if self._primitives.model is not None:
+            self.add_tool(
+                "pi05_act", self._SPECS["pi05_act"], partial(self._step, "pi05_act")
+            )
         if self._mode == "exploration":
             self.add_tool("reset", self._SPECS["reset"], self._reset_episode)
         self.add_tool("finish", self._SPECS["finish"], self._finish)
@@ -245,27 +248,11 @@ class YamToolkit(Toolkit):
     def write_recipe(self, recipe_tag: str) -> str:
         if not self.solved():
             return ""
-        records = self._state.records()
-        last_reset = max(
-            (
-                record.step_idx
-                for record in records
-                if (
-                    isinstance(record.command, dict)
-                    and record.command.get("action") == "reset"
-                    and not (
-                        isinstance(record.result, dict)
-                        and (
-                            record.result.get("error")
-                            or record.result.get("success") is False
-                        )
-                    )
-                )
-            ),
-            default=-1,
-        )
+        episode_id = self._latest_status["episode_id"]
         successful_records = [
-            record for record in records if record.step_idx > last_reset
+            record
+            for record in self._state.records()
+            if record.state["episode_status"]["episode_id"] == episode_id
         ]
         if not any(record.terminated for record in successful_records):
             return ""
@@ -305,7 +292,6 @@ class YamToolkit(Toolkit):
             "solved": True,
             "source": "operator_backed_eval_success",
             "episode_status": dict(self._latest_status),
-            "last_reset_step": last_reset,
             "terminal_step": successful_records[-1].step_idx
             if successful_records
             else None,

@@ -100,9 +100,9 @@ RPC 服务端拥有 30 Hz 执行节拍，网络延时不能决定 CAN 控制周�
 
 不执行 `cp -r` 整包后仅字符串替换：robotwin 的 assets、LingBot eef16、GL 相机、sim reset、原生成功判定均不适用。复用公共 `Toolkit/MemoryManager/EnvState/RpcFacade`，通过 YAM 包承接不同实现。
 
-## 6. Explore 与 Memory 完整闭环
+## 6. Explore 与 Memory：软件流程和现场边界
 
-Explore 沿用 LIBERO 的组织思路：独立 planner sessions、每 session 尝试预算、观测/动作轨迹、失败归因、成功 recipe、最终归纳。真机版本的 reset 为有操作员证据的场景重建，每个尝试更换 episode ID；无权限自动摆物、清错、解除故障或扩展动作范围。
+Explore 沿用 LIBERO 的组织思路：独立 planner sessions、每 session 尝试预算、观测/动作轨迹、失败归因、成功 recipe、最终归纳。当前不传 VLA endpoint 即使用原语探索，不注册 pi05_act。真机 reset 消费操作员 ready 回执并更新 episode ID，本身不重建物理场景；操作者负责摆物和裁决。首回合由 operator start 开始，重试由 operator ready + Agent reset 开始。跨 session 读取实际 session 记录与 inbox 笔记，不能宣称新 planner 自动复原了场景。
 
 本地 memory 使用一个官方 MemoryManager corpus，scope 为 global/suite；task 保存 audit/recipe。工具的局部 `success=True` 只表示原语完成，不能发布成功任务记忆。只有 fresh 当前 episode 的人工成功证据可生成成功 recipe/audit；当前 audit 记录 task、episode、动作与人工裁决来源；现场验收还须单独附布局标签、标定/权重/norm 指纹和失败尝试数，尚未自动采集这些外部资产指纹。失败笔记暂存 inbox，不冒充已验证技能。
 
@@ -121,13 +121,13 @@ Explore 沿用 LIBERO 的组织思路：独立 planner sessions、每 session �
 1. **本地契约**：fork yam 分支；mock 的 env/client/toolkit/recipe/VLA 通路、CPU serialization、取消/错误/预算、几何合成测试。无需 checkpoint，也不运行硬件。
 2. **控制机观测**：本地验收后同步；核对进程归属、CAN/USB、源码/标定指纹；相机常驻、三视角图、深度单位/变换、静止反投影；此阶段不下动作。
 3. **原语真机**：操作员现场确认后，先小幅单关节/夹爪，再抬高净空的 move_to；录像、requested/accepted/measured 轨迹、失败/stop。不从任意姿态自动折叠。
-4. **VLA**：独立完成 SFT/统计量/权重；先离线真实观测推理看 qpos14、关节范围和块内连续性，再短块现场 rollout。短块反复感知是闭环，“开环一次”需明确仅一块且不能等同任务完成。
-5. **Agent 与 Explore**：先单次 Agent 工具闭环，再人工 reset 的 ≤5 次尝试流程；发布成功 recipe 与 corpus 格式验证。
+4. **无 VLA Agent 与 Explore**：先单次双臂原语工具闭环，再人工 reset 的 ≤5 次尝试流程；发布当前成功 episode 的 recipe，并验证下次读取 memory。双臂几何动作按指定 arm 交替执行，尚无同时双臂 Cartesian 规划。
+5. **VLA（后置）**：独立完成 SFT/统计量/权重；先离线真实观测推理看 qpos14、关节范围和块内连续性，再短块现场 rollout。短块反复感知是闭环，“开环一次”需明确仅一块且不能等同任务完成。
 6. **比较实验**：冻结 VLA；VLA only / Agent primitives+VLA / Agent+validated memory。任务和初始布局成对、不同 trial 顺序随机化，报告逐任务成功率、原始次数、置信区间、人工介入/安全中止/用时/模型调用数。5–10 任务×5 rollout 只够试点，不能当高精度总体结论；正式样本量据效果差与区间宽度确定。
 
 阶段 0 的标定 std 1.7–2.8 mm、hover 往返和流式数据为**用户提供的现场证据**，当前窗口尚未独立复测。重复性 std 也不等于绝对精度：之后需要未参与求解的点/姿态验证，并覆盖左右工作空间。
 
-工期按依赖估算，不承诺固定 1 周：本地适配取决于接口缺口；控制机验证取决于现场可用性；SFT 取决于数据/GPU/首轮学习曲线。阶段 1 数据训练与本地适配可并行，真机 Agent 验收依赖两者。
+工期按依赖估算，不承诺固定 1 周：本地适配取决于接口缺口；控制机验证取决于现场可用性；SFT 取决于数据/GPU/首轮学习曲线。数据训练与原语探索可并行；仅 VLA 驱动的 Agent 验收依赖训练权重。
 
 ## 8. 联网一手来源
 

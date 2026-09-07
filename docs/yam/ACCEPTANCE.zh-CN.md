@@ -16,9 +16,13 @@
 | BaseEnvClient / BaseVLAClient / Base Facade / RPC | ENV 连接仅 observe；VLA 使用公共 predict；支持 HTTP/socket |
 | RLinf YAM runtime / FK / IK | 单一控制路径；保留已有 PD 问题对应的 previous-command slew 和硬限位，`enforce_runtime_joint_limits=False` |
 | RealSense RGBD + 标定 | 仅加载真实 solve_handeye JSON；内参来自 SDK；静止近似支持腕相机投影，有效性与限制随帧返回 |
-| 人工 ready / verdict / episode ID / stop | 回合确认与动作归属；拒绝旧回合动作，取消后 hold；ACK 不等于物理急停 |
+| 人工 start / ready / verdict / episode ID / stop | start 启动首回合；重试 ready 仅写回执，由 Agent reset 消费；recipe 只取当前 episode 动作；ACK 不等于物理急停 |
 | step 图片 / episode.mp4 / 成功 recipe | 现场复核和记忆导出；不保留 Dashboard 专用视频支线 |
 | openpi_rlinf eval factory | 对齐现有 YAM eval YAML；预测 horizon 30，仅执行前 5 帧 qpos14 |
+
+当前 VLA 未训好，默认不连接：无 endpoint 时只注册几何原语，提示词明确不可调用 pi05_act。双臂原语沿用 RoboTwin 的 `move_to/set_gripper/release + arm=left/right`；单次几何动作保持另一臂，不提供同时双臂 Cartesian 规划。夹爪返回实测开度。
+
+无 VLA Explore 可使用公共文件工具写 technique，并在当前 episode 成功后自动调用 MemoryManager 合并本地 corpus、保留冲突和重建索引。跨 session 读取实际 session 记录，不再假设仿真式自动复位。物理场景恢复与成功裁决仍由操作者完成，尚非无人值守探索。
 
 已删除专用 VLA client/元数据握手、无调用 helper、act 别名、无效参数、状态重复缓存、Dashboard 配置、本地 VLA 自动启动、额外 root 环境变量、另一套标定 schema、未接线 smoke JSON 和开发过程文件。
 
@@ -30,11 +34,13 @@
 
 | 检查 | 结果 |
 |---|---|
-| `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv311/bin/python -m pytest tests/yam tests/robotwin tests/robocasa -q` | **74 passed, 1 skipped** |
+| `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv311/bin/python -m pytest tests/yam tests/robotwin tests/robocasa -q` | **86 passed, 1 skipped** |
 | ruff check / format、compileall、YAM CLI help、git diff --check | 通过 |
 | 子 Agent / fake RPC 服务与测试线程 | 已结束并确认无任务进程残留 |
 
 跳过项是需显式启用的 RoboCasa GPU 集成测试。回归覆盖公共 BaseEnvClient 默认 reset、YAM 连接不 reset、单步 RPC 拒绝多步输入、三图 batch、人工成功与预算中止的区分、手眼方向、静止投影、旧回合拒绝、stop、finish 和记忆导出。
+
+本轮新增回归覆盖无 VLA 默认/显式关闭、工具与 prompt 可用性、左右夹爪互不修改、实测夹爪返回、ready/start 分工、外部 reset 后 recipe 隔离，以及无 VLA 原语 → 公共写文件工具 → 真实 MemoryManager → suite/task/index 的完整本地流程。成功标记与硬件仍为 fake，不代表真实任务成功。
 
 ## 未完成
 

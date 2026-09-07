@@ -90,7 +90,7 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     )
     parser.add_argument(
         "--vla-endpoint",
-        help="Existing Pi0.5 YAM VLA endpoint.",
+        help="Optional trained Pi0.5 YAM endpoint; omit for primitives-only control.",
     )
     parser.add_argument(
         "--without-vla",
@@ -130,6 +130,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
             "seed": args.seed,
             "instruction": instruction,
             "mode": "explore" if explore else "eval",
+            "vla_enabled": bool(args.vla_endpoint and not args.without_vla),
             "memory_profile": memory_profile,
             "memory_dir": str(memory_dir),
             "memory_inbox": str(memory_dir / "_inbox" / recipe_tag),
@@ -156,7 +157,11 @@ def _init_runtime(
 ) -> tuple[list["ProcessDaemon"], dict[str, Any]]:
     del output_dir
     available = {"env", "vla"}
-    selected = available if components is None else components
+    selected = (
+        ({"env", "vla"} if args.vla_endpoint else {"env"})
+        if components is None
+        else set(components)
+    )
     if getattr(args, "without_vla", False):
         selected = set(selected) - {"vla"}
     unknown = selected.difference(available)

@@ -11,7 +11,7 @@
 
 Run on the control machine as the owner of the local operator receipt file.
 The endpoint is used only to read the episode ID and to consume a ready
-receipt via reset (bookkeeping, no home motion). Verdicts remain local files.
+receipt via start (bookkeeping, no home motion). Verdicts remain local files.
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ def main():
     parser.add_argument(
         "--event",
         default="status",
-        choices=("status", "ready", "success", "failure", "abort"),
+        choices=("status", "ready", "start", "success", "failure", "abort"),
     )
     parser.add_argument("--note", default="")
     args = parser.parse_args()
@@ -99,10 +99,11 @@ def main():
     path = config.get("operator_receipt_path")
     if not path:
         parser.error("config.operator_receipt_path is required")
+    receipt_event = "ready" if args.event == "start" else args.event
     receipt = write_receipt(
-        path, episode_id=args.episode_id, event=args.event, note=args.note
+        path, episode_id=args.episode_id, event=receipt_event, note=args.note
     )
-    if args.event == "ready":
+    if args.event == "start":
         result = client.call("env.reset", timeout_s=120)
         print(json.dumps(result[1]["episode_status"], default=str, ensure_ascii=False))
     else:

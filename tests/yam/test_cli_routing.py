@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from rpent.robots.robot_spec import RobotSpec, RunConfig
 
 
@@ -119,6 +121,11 @@ def _fake_robot_spec(name: str, tmp_path: Path) -> RobotSpec:
                 "mode": "explore" if args.explore else "eval",
                 "memory_profile": args.memory_profile,
                 "memory_dir": args.memory_dir or str(tmp_path / name / "memory"),
+                "memory_inbox": str(
+                    Path(args.memory_dir or tmp_path / name / "memory")
+                    / "_inbox"
+                    / f"{name}_{task_name}_s{args.seed}"
+                ),
             },
             task_desc={"env": name, "task_name": task_name, "seed": args.seed},
         )
@@ -429,3 +436,204 @@ def test_cli_keeps_libero_eval_on_hf_resource_path(monkeypatch, tmp_path) -> Non
     assert get_toolkit_calls[0]["name"] == "libero"
     assert get_toolkit_calls[0]["mode"] == "evaluation"
     assert get_toolkit_calls[0]["config"].prompt_vars["memory_profile"] == "hf"
+
+
+@pytest.mark.parametrize(
+    "vla_endpoint, without_vla", [(None, False), ("http://vla", True)]
+)
+def test_yam_spec_primitives_only_runtime_does_not_connect_vla(
+    monkeypatch,
+    tmp_path,
+    vla_endpoint: str | None,
+    without_vla: bool,
+) -> None:
+    import robots.yam.robot_spec as yam_robot_spec
+
+    spec = yam_robot_spec.get_robot_spec()
+    args = SimpleNamespace(
+        task_name="place_cube",
+        task_language=None,
+        seed=7,
+        max_episode_steps=1000,
+        explore=False,
+        explore_sessions=1,
+        memory_profile=None,
+        memory_dir=str(tmp_path / "memory"),
+        output_dir=tmp_path / "run",
+        env_endpoint="http://env",
+        vla_endpoint=vla_endpoint,
+        without_vla=without_vla,
+    )
+
+    endpoints: list[str] = []
+    waited: list[str] = []
+    monkeypatch.setattr(
+        yam_robot_spec,
+        "make_rpc_client",
+        lambda endpoint: endpoints.append(endpoint) or f"rpc:{endpoint}",
+    )
+
+    def fake_wait_server(
+        owned_daemons,
+        dashboard_events,
+        component,
+        rpc,
+        *args,
+        **kwargs,
+    ):
+        del owned_daemons, dashboard_events, args, kwargs
+        waited.append(component)
+        return {component: rpc}
+
+    monkeypatch.setattr(yam_robot_spec, "try_wait_server", fake_wait_server)
+
+    config = spec.parse_config(args)
+    daemons, runtime_kwargs = spec.init_runtime(
+        args,
+        tmp_path / "run",
+        dashboard_events=SimpleNamespace(),
+        components=None,
+    )
+
+    assert config.prompt_vars["vla_enabled"] is False
+    assert endpoints == ["http://env"]
+    assert waited == ["env"]
+    assert daemons == []
+    assert runtime_kwargs == {"env": "rpc:http://env"}
+
+
+@pytest.mark.parametrize(
+    ("vla_enabled", "expected", "unexpected"),
+    [
+        (True, "pi05_act is available", "pi05_act is not available"),
+        (False, "pi05_act is not available", "pi05_act is available"),
+    ],
+)
+def test_yam_prompt_policy_text_follows_vla_enabled(
+    vla_enabled: bool,
+    expected: str,
+    unexpected: str,
+) -> None:
+    from robots.yam.prompt_bundle import system_prompt
+
+    rendered = json.dumps(
+        system_prompt({"mode": "eval", "vla_enabled": vla_enabled}),
+        ensure_ascii=False,
+    )
+
+    assert expected in rendered
+    assert unexpected not in rendered
+
+
+def test_yam_continuation_handoff_points_to_prior_session_and_memory_inbox(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import rpent.cli.main as cli_main
+
+    output_dir = tmp_path / "yam-out"
+    prior_session = output_dir / "sessions" / "session_001"
+    prior_session.mkdir(parents=True)
+    memory_inbox = tmp_path / "memory" / "_inbox" / "yam_place_cube_s7"
+    args = SimpleNamespace(
+        planner="codex",
+        robot_name="yam",
+        base_url=None,
+        model=None,
+        max_tokens=None,
+        planner_timeout_s=None,
+        reasoning_effort=None,
+        claude_code_max_budget_usd=None,
+        no_images=False,
+    )
+    monkeypatch.setattr(
+        cli_main, "build_planner", lambda *args, **kwargs: FakePlanner()
+    )
+
+    _, system_prompt, message = cli_main._start_continuation_session(
+        args,
+        output_dir=output_dir,
+        recipe_tag="yam_place_cube_s7",
+        dashboard_events=SimpleNamespace(),
+        prompt_bundle=FakePromptBundle(),
+        prompt_vars={
+            "mode": "explore",
+            "memory_profile": "local",
+            "memory_inbox": str(memory_inbox),
+        },
+        session_number=2,
+        session_max=3,
+    )
+
+    assert system_prompt == "system:explore:local"
+    assert str(prior_session) in message
+    assert f"{memory_inbox}/wip/" in message
+    assert "physical scene has NOT been reset" in message
+    assert "clean scene" not in message
+
+
+@pytest.mark.parametrize(
+    ("event", "expected_calls"),
+    [
+        ("ready", []),
+        ("start", ["env.reset"]),
+    ],
+)
+def test_operator_control_ready_writes_receipt_and_start_resets(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    event: str,
+    expected_calls: list[str],
+) -> None:
+    import rpent.utils.rpc as rpc_module
+    from robots.yam import operator_control
+
+    receipt_path = tmp_path / "operator-receipt.json"
+    config_path = tmp_path / "yam-config.json"
+    config_path.write_text(
+        json.dumps({"operator_receipt_path": str(receipt_path)}),
+        encoding="utf-8",
+    )
+
+    class FakeOperatorRpc:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def call(self, method: str, *args, **kwargs):
+            del args, kwargs
+            self.calls.append(method)
+            if method == "env.reset":
+                return None, {"episode_status": {"episode_id": "started"}}
+            raise AssertionError(method)
+
+    fake_rpc = FakeOperatorRpc()
+    monkeypatch.setattr(rpc_module, "make_rpc_client", lambda endpoint: fake_rpc)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "operator_control",
+            "--config",
+            str(config_path),
+            "--endpoint",
+            "http://env",
+            "--episode-id",
+            "pending-episode",
+            "--event",
+            event,
+            "--note",
+            "operator approved",
+        ],
+    )
+
+    operator_control.main()
+
+    output = json.loads(capsys.readouterr().out)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["episode_id"] == "pending-episode"
+    assert receipt["event"] == "ready"
+    assert fake_rpc.calls == expected_calls
+    if event == "start":
+        assert output["episode_id"] == "started"
+    else:
+        assert output["episode_id"] == "pending-episode"
