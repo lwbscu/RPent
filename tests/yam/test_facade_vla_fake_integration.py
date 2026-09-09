@@ -1876,7 +1876,7 @@ def test_site_requires_verified_table_before_any_motion(tmp_path, table_z):
         return
     env = YamAgentEnv(config, runtime=runtime)
     env._operator_ready_receipt = {"event": "ready"}
-    with pytest.raises(RuntimeError, match="verified finite table_z"):
+    with pytest.raises(RuntimeError, match="verified table geometry"):
         env._require_ready_for_motion()
     assert runtime.commands == []
     env.close()

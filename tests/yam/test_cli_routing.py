@@ -379,7 +379,7 @@ def test_cli_yam_finalization_uses_environment_over_planner_success(
     assert transcript["finish"]["status"] == "success"
     assert transcript["environment_success"] is False
     final = json.loads((output_dir / "result.json").read_text())
-    assert final["status"] == "failure"
+    assert final["status"] == "not_successful"
     assert final["environment_success"] is False
     assert final["planner_finish_request"]["status"] == "success"
     assert toolkits[0].recipe_tags == []
@@ -535,7 +535,7 @@ def test_yam_prompt_policy_text_follows_vla_enabled(
 
 @pytest.mark.parametrize(
     ("environment_success", "expected"),
-    [(True, "success"), (False, "failure"), (None, "unknown")],
+    [(True, "success"), (False, "not_successful"), (None, "unknown")],
 )
 def test_finalization_retains_actual_outcome_and_agent_error(
     tmp_path, environment_success, expected

@@ -23,12 +23,21 @@ RLinf `collect_tabletop_cleanup_1.sh` 与 `_2.sh`。三瓶全部入袋、同色�
 
 设备字段继承当前数采配置，包括 gravity 和摩擦开关；RPent 不自动清故障，
 `enable_auto_recovery=false`。当前原语每步指令限制 0.02 rad，规划间隔 0.01 rad，
-指令领先实测不得超过 0.1 rad；它们不修改 VR/主臂遥操参数。运行时硬关节限位开启。
+指令领先实测不得超过 0.1 rad；它们不修改 VR/主臂遥操参数。RPent 在下发前拒绝越过硬关节限位的目标。
+RPent 构造 runtime 时关闭其重复逐关节限幅，避免实际发送目标偏离已检查路径；
+RPent 的硬限位、步幅、最新实测路径与跟踪误差检查保留，SDK 硬限位仍生效。
 `reset.tolerance=0.04` 是数采回位容差，不用于此处笛卡尔成功判断。
 
 `collision_guard.enabled=true`，模型间距设为 0.01 m；缺模型资产/基座外参时拒绝。
-`require_table_guard=true`：`table_z` 必须在首次新鲜观察后核实并填写；当前未填写，所有原语运动均被拒绝，只允许观察。
-桌面检查假设左基座世界坐标下的水平平面。采样模型检查不包含相机、线缆、主臂、
+`require_table_guard=true`：桌面几何必须在新鲜观察后核实并填写；当前未填写，所有原语运动均被拒绝，只允许观察。
+水平桌面可用 `table_z`。有限倾斜桌面使用 `table_surface`，两者不能同时配置：
+`plane_z_equals_ax_by_c` 为左基座世界坐标下的 `[a,b,c]`，
+`footprint_xy` 为沿边界顺序排列的严格凸多边形，`depth_m` 为沿世界 Z 向下的禁入深度，
+`uncertainty_m` 为定位不确定性余量。参数需现场验证，不能直接将单帧拟合当作验收。
+可选 `collision_guard.base_link2_clearance_m` 仅调整同臂基座与 link2 的正距离余量；
+默认仍等于全局余量，不排除该几何对或放宽跨臂检查。实际模型在常用姿态约有 9.4 mm
+间距，接近关节极限时会缩小甚至穿透，因此不能简单忽略。
+采样模型检查不包含相机、线缆、主臂、
 夹持物、纸袋、碗和其他场景障碍，也不是连续碰撞或实际跟踪保证。
 
 ## 首次接管与服务
@@ -80,6 +89,7 @@ status 可能调用 observe，须在接管确认后使用。start 消费 ready �
 cd /home/yambox/cynws/RPent
 export RPENT_RLINF_ROOT=/home/yambox/cynws/RLinf
 SITE_CONFIG=logs/yambox_deployment/site/task_a.json
+export CODEX_BIN=/home/yambox/.vscode-server/extensions/openai.chatgpt-26.903.61454-linux-x64/bin/linux-x86_64/codex
 TASK_LANGUAGE="$(.venv/bin/python -c 'import json,sys; print(json.load(open(sys.argv[1]))["task_language"])' "$SITE_CONFIG")"
 .venv/bin/python -m rpent.cli.main --robot yam --planner codex \
   --task-name tabletop_cleanup --task-language "$TASK_LANGUAGE" --seed 0 \
@@ -93,6 +103,9 @@ Explore 使用同一命令追加：
 ```bash
 --explore --explore-sessions 1 --explore-attempts-per-session 3
 ```
+
+本机 SDK 随附的 Codex 0.147.0 启动默认模型时返回版本过旧；上述 `CODEX_BIN`
+使用已安装的 0.153.4，已实际完成 Agent 调用。扩展升级后需核对该路径。
 
 先验收 A，再由现场恢复布局并换 B 服务配置与 `--seed 1`、B 语言；保持其他控制代码
 相同。每次抓、提、放后必须重新观察，执行成功不能替代物体状态验证。

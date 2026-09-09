@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
@@ -27,7 +29,7 @@ from rpent.dashboard.events import DashboardEventSink
 from rpent.memory.manager import MemoryManager
 from rpent.planner.utils.http_mcp_server import HttpMcpServer
 from rpent.session import EnvState
-from rpent.tools.toolkit import Toolkit, readonly
+from rpent.tools.toolkit import Toolkit, ToolResult, readonly
 from rpent.utils.logging import init_output_dir
 
 CONCURRENT_CALLS = [
@@ -152,15 +154,86 @@ def test_http_mcp_server_serializes_concurrent_tool_calls(tmp_path: Path) -> Non
 
 async def _fire_concurrent(url: str) -> int:
     rejected = 0
-    async with streamable_http_client(url) as (read, write, _get_session_id):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            results = await asyncio.gather(
-                *(session.call_tool(name, args) for name, args in CONCURRENT_CALLS)
-            )
-            for result in results:
-                if "another tool operation is still active" in json.dumps(
-                    result.content, default=str
-                ):
-                    rejected += 1
+    async with httpx.AsyncClient(trust_env=False) as client:
+        async with streamable_http_client(url, http_client=client) as (
+            read,
+            write,
+            _get_session_id,
+        ):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                results = await asyncio.gather(
+                    *(session.call_tool(name, args) for name, args in CONCURRENT_CALLS)
+                )
+                for result in results:
+                    if "another tool operation is still active" in json.dumps(
+                        result.content, default=str
+                    ):
+                        rejected += 1
     return rejected
+
+
+def test_http_mcp_transports_images_as_top_level_content_and_preserves_errors(
+    tmp_path: Path,
+) -> None:
+    """Exercise the actual protocol, not only our block conversion helper."""
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
+        "/x8AAwMCAO+jR5kAAAAASUVORK5CYII="
+    )
+
+    class VisualToolkit:
+        def get_tools_spec(self):
+            return [
+                {
+                    "name": name,
+                    "description": "Synthetic transport test; no hardware.",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+                for name in ("view_env_state", "rejected_action")
+            ]
+
+        def execute_tool(self, name, arguments):
+            if name == "rejected_action":
+                return ToolResult(name, {"error": "motion is disabled"})
+            return ToolResult(
+                name,
+                {
+                    "view_order": ["top", "left", "right"],
+                    "_image_bytes": png,
+                    "_image_cam_bytes": png,
+                    "_image_wrist_bytes": png,
+                },
+            )
+
+    async def read_results(url):
+        # Local test traffic must not use the host's external HTTP proxy.
+        async with httpx.AsyncClient(trust_env=False) as client:
+            async with streamable_http_client(url, http_client=client) as (r, w, _):
+                async with ClientSession(r, w) as session:
+                    await session.initialize()
+                    return (
+                        await session.call_tool("view_env_state", {}),
+                        await session.call_tool("rejected_action", {}),
+                    )
+
+    init_output_dir(tmp_path / "log")
+    server = HttpMcpServer(VisualToolkit())
+    try:
+        observation, rejected = asyncio.run(read_results(server.start()))
+    finally:
+        server.stop()
+
+    assert [block.type for block in observation.content] == [
+        "text",
+        "image",
+        "image",
+        "image",
+    ]
+    assert observation.isError is False
+    assert json.loads(observation.content[0].text) == {
+        "view_order": ["top", "left", "right"]
+    }
+    assert all(base64.b64decode(block.data) == png for block in observation.content[1:])
+    assert rejected.isError is True
+    assert json.loads(rejected.content[0].text) == {"error": "motion is disabled"}

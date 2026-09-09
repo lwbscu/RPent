@@ -19,7 +19,7 @@ def finalize_run(context: RunFinalizationContext) -> Path:
         if context.environment_success is None
         else "success"
         if context.environment_success
-        else "failure"
+        else "not_successful"
     )
     return write_json_atomic(
         context.output_dir / "result.json",
@@ -28,7 +28,11 @@ def finalize_run(context: RunFinalizationContext) -> Path:
             "task": dict(context.task_desc),
             "environment_success": context.environment_success,
             "status": status,
-            "success_source": "operator_backed_eval_success",
+            "success_source": "environment_eval_success",
+            "status_meaning": (
+                "False means success is not established; it does not by itself "
+                "mean the operator judged a physical attempt to have failed."
+            ),
             "planner_finish_request": dict(context.finish_result or {}),
             "agent_error": context.agent_error,
             "elapsed_s": context.elapsed_s,

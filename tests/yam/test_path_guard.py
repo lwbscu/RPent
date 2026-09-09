@@ -206,3 +206,171 @@ def test_incomplete_or_unsupported_model_fails_closed(
     ):
         geometry.check_qpos_transition(np.zeros(14), np.zeros(14))
     assert geometry._collision_guard is None
+
+
+def surface_config(**overrides):
+    surface = {
+        "plane_z_equals_ax_by_c": [0.1, -0.05, 0.1],
+        "footprint_xy": [[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
+        "depth_m": 0.3,
+    }
+    surface.update(overrides)
+    return {
+        "collision_guard": {"enabled": True, "clearance_m": 0.003},
+        "table_surface": surface,
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"plane_z_equals_ax_by_c": [0, float("nan"), 0]},
+        {"footprint_xy": [[0, 0], [1, 0]]},
+        {"footprint_xy": [[0, 0], [1, 1], [0, 1], [1, 0]]},
+        {"footprint_xy": [[0, 0], [1, 0], [0.5, 0.1], [1, 1], [0, 1]]},
+        {"footprint_xy": [[0, 0], [1, 0], [1, 0], [0, 1]]},
+        {"depth_m": 0},
+        {"depth_m": float("inf")},
+        {"uncertainty_m": -0.01},
+        {"typo_footprint": []},
+    ],
+)
+def test_invalid_table_surface_rejected(overrides):
+    with pytest.raises(ValueError, match="table_surface"):
+        YamGeometry(surface_config(**overrides))
+
+
+def test_ambiguous_or_unprotected_table_surface_rejected():
+    with pytest.raises(ValueError, match="only one"):
+        YamGeometry({**surface_config(), "table_z": 0.1})
+    config = surface_config()
+    config["collision_guard"]["enabled"] = False
+    with pytest.raises(ValueError, match="requires collision_guard.enabled"):
+        YamGeometry(config)
+
+
+def test_surface_vertices_and_tcp_distance_use_tilt_and_finite_footprint():
+    geometry = YamGeometry(surface_config(uncertainty_m=0.007))
+    surface = geometry.table_surface
+    assert geometry.table_guard_configured
+    vertices = surface.vertices()
+    np.testing.assert_allclose(
+        vertices[:4, 2], 0.1 * vertices[:4, 0] - 0.05 * vertices[:4, 1] + 0.1
+    )
+    np.testing.assert_allclose(
+        vertices[:4] - vertices[4:], np.tile([0, 0, 0.3], (4, 1))
+    )
+    point = np.array([0.02, 0.04, 0.2])
+    expected = (0.2 - 0.1 * 0.02 + 0.05 * 0.04 - 0.1) / np.sqrt(
+        1 + 0.1**2 + 0.05**2
+    ) - 0.007
+    assert geometry._tcp_table_clearance(point) == pytest.approx(expected)
+    assert np.isinf(geometry._tcp_table_clearance(np.array([2, 0, -1])))
+    assert geometry._tcp_table_clearance(np.array([0.104, 0, -0.1])) < 0
+    clockwise = surface_config(footprint_xy=surface.footprint[::-1].tolist())
+    assert YamGeometry(clockwise).table_guard_configured
+
+
+def test_actual_finite_tilted_surface_rejects_link_when_tcp_outside(actual_kinematics):
+    geometry = YamGeometry(surface_config(), kinematics=actual_kinematics)
+    transform = np.eye(4)
+    transform[1, 3] = 1.2
+    geometry.calibration = YamCalibration({}, transform, {})
+    qpos = np.zeros(14)
+    assert np.isinf(geometry._tcp_table_clearance(geometry.eef_pose("left", qpos)[:3]))
+    result = geometry.check_qpos_transition(qpos, qpos)
+    assert not result["ok"]
+    assert result["reason"] == "link_table_guard"
+    assert "left_link1" in result["bodies"]
+    target = actual_kinematics.fk(qpos[:6], 0.0)
+    plan = geometry.plan_arm_path("left", target, current_qpos14=qpos)
+    assert plan["status"] == "Failure"
+    assert plan["reason"] == "link_table_guard"
+
+
+def test_actual_finite_surface_does_not_block_space_beyond_footprint(actual_kinematics):
+    config = surface_config(
+        footprint_xy=[[1.9, -0.1], [2.1, -0.1], [2.1, 0.1], [1.9, 0.1]]
+    )
+    geometry = YamGeometry(config, kinematics=actual_kinematics)
+    transform = np.eye(4)
+    transform[1, 3] = 1.2
+    geometry.calibration = YamCalibration({}, transform, {})
+    result = geometry.check_qpos_transition(np.zeros(14), np.zeros(14))
+    assert result["ok"]
+    assert result["collision_guard"]["table_mesh_checked"]
+
+
+@pytest.mark.parametrize("margin", [0, -0.001, float("nan"), float("inf"), 0.011])
+def test_invalid_base_link2_margin_rejected(margin):
+    with pytest.raises(ValueError, match="base_link2_clearance_m"):
+        YamGeometry(
+            {"collision_guard": {"clearance_m": 0.01, "base_link2_clearance_m": margin}}
+        )
+
+
+def test_scoped_base_link2_margin_still_rejects_limit_collision(actual_kinematics):
+    geometry = YamGeometry(
+        {
+            "collision_guard": {
+                "enabled": True,
+                "clearance_m": 0.01,
+                "base_link2_clearance_m": 0.008,
+            }
+        },
+        kinematics=actual_kinematics,
+    )
+    transform = np.eye(4)
+    transform[1, 3] = 1.2
+    geometry.calibration = YamCalibration({}, transform, {})
+    qpos = np.zeros(14)
+    assert geometry.check_qpos_transition(qpos, qpos)["ok"]
+    qpos[1] = geometry.upper[0, 1]
+    result = geometry.check_qpos_transition(qpos, qpos)
+    assert not result["ok"]
+    assert result["bodies"] == ["left_base", "left_link2"]
+    assert result["required_clearance_m"] == 0.008
+    assert result["distance_m"] < 0.008
+    qpos[0] = 1.8456845
+    result = geometry.check_qpos_transition(qpos, qpos)
+    assert not result["ok"]
+    assert result["distance_m"] < 0
+
+
+def test_scoped_base_link2_margin_does_not_relax_cross_arm_pairs(actual_kinematics):
+    geometry = YamGeometry(
+        {
+            "collision_guard": {
+                "enabled": True,
+                "clearance_m": 0.01,
+                "base_link2_clearance_m": 0.008,
+            }
+        },
+        kinematics=actual_kinematics,
+    )
+    transform = np.eye(4)
+    transform[1, 3] = 0.209
+    geometry.calibration = YamCalibration({}, transform, {})
+    result = geometry.check_qpos_transition(np.zeros(14), np.zeros(14))
+    assert not result["ok"]
+    assert result["bodies"] == ["left_base", "right_base"]
+    assert 0.008 < result["distance_m"] < 0.01
+    assert result["required_clearance_m"] == 0.01
+
+
+def test_table_uncertainty_increases_mesh_margin(actual_kinematics):
+    config = surface_config(plane_z_equals_ax_by_c=[0, 0, 0.04])
+    transform = np.eye(4)
+    transform[1, 3] = 1.2
+    geometry = YamGeometry(config, kinematics=actual_kinematics)
+    geometry.calibration = YamCalibration({}, transform, {})
+    qpos = np.zeros(14)
+    assert geometry.check_qpos_transition(qpos, qpos)["ok"]
+    config = surface_config(plane_z_equals_ax_by_c=[0, 0, 0.04], uncertainty_m=0.03)
+    geometry = YamGeometry(config, kinematics=actual_kinematics)
+    geometry.calibration = YamCalibration({}, transform, {})
+    result = geometry.check_qpos_transition(qpos, qpos)
+    assert not result["ok"]
+    assert result["reason"] == "link_table_guard"
+    assert result["required_clearance_m"] == pytest.approx(0.033)
+    assert 0 < result["distance_m"] < 0.033

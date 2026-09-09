@@ -437,7 +437,10 @@ class YamAgentEnv:
             task_description=self.task_language,
             step_frequency=self.control_hz,
             max_joint_delta=max(float(self.max_joint_delta_per_step or 0.05), 1e-6),
-            enforce_runtime_joint_limits=True,
+            # RPent validates hard limits, command slew and the measured-to-target
+            # path. A second per-joint measured-position clip would reshape that
+            # checked path when joints have different tracking errors.
+            enforce_runtime_joint_limits=False,
             joint_limit_min=self.lower.tolist(),
             joint_limit_max=self.upper.tolist(),
             feedback_timeout_s=float(self.config.get("feedback_timeout_s", 0.25)),
@@ -741,10 +744,12 @@ class YamAgentEnv:
         )
 
     def _require_ready_for_motion(self) -> None:
-        if self.config.get("require_table_guard", False) and (
-            self.geometry.table_z is None or not np.isfinite(self.geometry.table_z)
+        if self.config.get("require_table_guard", False) and not (
+            self.geometry.table_guard_configured
         ):
-            raise RuntimeError("YAM motion requires a verified finite table_z in the site config")
+            raise RuntimeError(
+                "YAM motion requires verified table geometry in the site config"
+            )
         if self._operator_ready_receipt is None:
             self._runtime.hold()
             self._last_stop_hold_s = time.time()

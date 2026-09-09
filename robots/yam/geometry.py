@@ -290,6 +290,97 @@ def load_calibration(config: dict[str, Any] | None) -> YamCalibration:
     )
 
 
+@dataclass(frozen=True)
+class _TableSurface:
+    """Site-supplied convex tabletop, extruded downward in world Z.
+
+    This is a keep-out volume, not a certification of the physical tabletop.
+    The caller must verify the footprint, plane, depth and uncertainty on site.
+    """
+
+    plane: np.ndarray
+    footprint: np.ndarray
+    depth_m: float
+    uncertainty_m: float
+
+    @classmethod
+    def from_config(cls, config: Any) -> _TableSurface:
+        required = {"plane_z_equals_ax_by_c", "footprint_xy", "depth_m"}
+        if (
+            not isinstance(config, dict)
+            or not required.issubset(config)
+            or set(config) - required - {"uncertainty_m"}
+        ):
+            raise ValueError(
+                "table_surface requires plane_z_equals_ax_by_c, footprint_xy, depth_m; optional uncertainty_m"
+            )
+        plane = np.asarray(config["plane_z_equals_ax_by_c"], dtype=np.float64)
+        points = np.asarray(config["footprint_xy"], dtype=np.float64)
+        depth = float(config["depth_m"])
+        uncertainty = float(config.get("uncertainty_m", 0.0))
+        if plane.shape != (3,) or not np.isfinite(plane).all():
+            raise ValueError(
+                "table_surface plane must contain three finite coefficients"
+            )
+        if (
+            points.ndim != 2
+            or points.shape[1] != 2
+            or len(points) < 3
+            or not np.isfinite(points).all()
+        ):
+            raise ValueError(
+                "table_surface footprint_xy must contain at least three finite XY vertices"
+            )
+        if (
+            not np.isfinite(depth)
+            or depth <= 0
+            or not np.isfinite(uncertainty)
+            or uncertainty < 0
+        ):
+            raise ValueError(
+                "table_surface depth_m must be positive and uncertainty_m non-negative, both finite"
+            )
+        # Require cyclic convex vertices: never silently take a convex hull or
+        # reorder an invalid footprint and change the site's approved region.
+        edges = np.roll(points, -1, axis=0) - points
+        next_edges = np.roll(edges, -1, axis=0)
+        turns = edges[:, 0] * next_edges[:, 1] - edges[:, 1] * next_edges[:, 0]
+        if np.all(turns < -1e-10):
+            points = points[::-1].copy()
+            edges = np.roll(points, -1, axis=0) - points
+        elif not np.all(turns > 1e-10):
+            raise ValueError(
+                "table_surface footprint must be strictly convex and cyclic"
+            )
+        offsets = points[None, :, :] - points[:, None, :]
+        sides = (
+            edges[:, None, 0] * offsets[:, :, 1] - edges[:, None, 1] * offsets[:, :, 0]
+        )
+        if np.any(sides < -1e-10):
+            raise ValueError("table_surface footprint must not self-intersect")
+        return cls(plane.copy(), points.copy(), depth, uncertainty)
+
+    def vertices(self) -> np.ndarray:
+        z = self.footprint @ self.plane[:2] + self.plane[2]
+        top = np.column_stack((self.footprint, z))
+        bottom = top - [0, 0, self.depth_m]
+        return np.concatenate((top, bottom))
+
+    def tcp_clearance(self, point: np.ndarray) -> float:
+        edges = np.roll(self.footprint, -1, axis=0) - self.footprint
+        offsets = point[:2] - self.footprint
+        sides = edges[:, 0] * offsets[:, 1] - edges[:, 1] * offsets[:, 0]
+        # Expanded footprint keeps the TCP check conservative near uncertain
+        # table edges. Mesh distance separately covers the entire robot shape.
+        if np.any(sides < -self.uncertainty_m * np.linalg.norm(edges, axis=1) - 1e-10):
+            return float("inf")
+        a, b, c = self.plane
+        return float(
+            (point[2] - a * point[0] - b * point[1] - c) / np.sqrt(1 + a * a + b * b)
+            - self.uncertainty_m
+        )
+
+
 class _ModelCollisionGuard:
     """Check convex MuJoCo meshes from the same models used for FK/IK.
 
@@ -305,6 +396,7 @@ class _ModelCollisionGuard:
 
         self._mj = mujoco
         self.clearance_m = clearance_m
+        self.base_link2_clearance_m = geometry.base_link2_clearance_m
         right_base = geometry.calibration.world_from_right_base
         if right_base is None:
             raise ValueError("collision_guard requires calibrated right base transform")
@@ -332,7 +424,19 @@ class _ModelCollisionGuard:
                 frame = spec.worldbody.add_frame(pos=pose[:3], quat=pose[3:])
                 spec.attach(child, prefix=f"{arm}_", frame=frame)
         self.table_z = geometry.table_z
-        if self.table_z is not None:
+        self.table_surface = geometry.table_surface
+        self.table_mesh_configured = geometry.table_guard_configured
+        if self.table_surface is not None:
+            spec.add_mesh(
+                name="guard_table_mesh",
+                uservert=self.table_surface.vertices().reshape(-1),
+            )
+            spec.worldbody.add_geom(
+                name="guard_table",
+                type=mujoco.mjtGeom.mjGEOM_MESH,
+                meshname="guard_table_mesh",
+            )
+        elif self.table_z is not None:
             spec.worldbody.add_geom(
                 name="guard_table",
                 type=mujoco.mjtGeom.mjGEOM_PLANE,
@@ -354,7 +458,7 @@ class _ModelCollisionGuard:
         self._pairs = []
         excluded = {int(value) for value in self.model.exclude_signature}
         table_id = (
-            self.model.geom("guard_table").id if self.table_z is not None else None
+            self.model.geom("guard_table").id if self.table_mesh_configured else None
         )
         self._table_pairs = []
         for first in range(self.model.ngeom):
@@ -488,6 +592,20 @@ class _ModelCollisionGuard:
         self._mj.mj_kinematics(self.model, self.data)
         for first, second in self._pairs + self._table_pairs:
             table_pair = (first, second) in self._table_pairs
+            margin = self.clearance_m + (
+                self.table_surface.uncertainty_m
+                if table_pair and self.table_surface is not None
+                else 0.0
+            )
+            if not table_pair:
+                names = [
+                    self.model.body(int(self.model.geom_bodyid[i])).name
+                    for i in (first, second)
+                ]
+                arm_a, body_a = names[0].split("_", 1)
+                arm_b, body_b = names[1].split("_", 1)
+                if arm_a == arm_b and {body_a, body_b} == {"base", "link2"}:
+                    margin = self.base_link2_clearance_m
             # Bounding spheres only reject distant pairs; near pairs always
             # use mesh distance rather than an invented link radius.
             separation = np.linalg.norm(
@@ -502,9 +620,9 @@ class _ModelCollisionGuard:
             ):
                 continue
             distance = self._mj.mj_geomDistance(
-                self.model, self.data, first, second, self.clearance_m + 1e-6, None
+                self.model, self.data, first, second, margin + 1e-6, None
             )
-            if distance <= self.clearance_m:
+            if distance <= margin:
                 return {
                     "ok": False,
                     "checked": True,
@@ -514,15 +632,15 @@ class _ModelCollisionGuard:
                         for i in (first, second)
                     ],
                     "distance_m": float(distance),
-                    "required_clearance_m": self.clearance_m,
+                    "required_clearance_m": margin,
                 }
         return {
             "ok": True,
             "checked": True,
             "reason": None,
             "required_clearance_m": self.clearance_m,
-            "table_mesh_checked": self.table_z is not None,
-            "limitation": "sampled arm mesh convex hulls only; excludes adjacent/model-excluded pairs, cameras, cables, held objects, leader arms and fixtures; table plane checked only when table_z is configured",
+            "table_mesh_checked": self.table_mesh_configured,
+            "limitation": "sampled arm mesh convex hulls only; excludes adjacent/model-excluded pairs, cameras, cables, held objects, leader arms and fixtures; table geometry checked only when table_z or table_surface is configured",
         }
 
 
@@ -543,6 +661,13 @@ class YamGeometry:
             if self.config.get("table_z") is None
             else float(self.config["table_z"])
         )
+        self.table_surface = (
+            None
+            if self.config.get("table_surface") is None
+            else _TableSurface.from_config(self.config["table_surface"])
+        )
+        if self.table_z is not None and self.table_surface is not None:
+            raise ValueError("configure only one of table_z and table_surface")
         self.table_clearance_m = float(self.config.get("table_clearance_m", 0.03))
         if self.table_z is not None and not np.isfinite(self.table_z):
             raise ValueError("table_z must be finite")
@@ -564,7 +689,31 @@ class YamGeometry:
             or self.collision_clearance_m <= 0
         ):
             raise ValueError("collision_guard.clearance_m must be finite and positive")
+        self.base_link2_clearance_m = float(
+            guard.get("base_link2_clearance_m", self.collision_clearance_m)
+        )
+        if (
+            not np.isfinite(self.base_link2_clearance_m)
+            or not 0 < self.base_link2_clearance_m <= self.collision_clearance_m
+        ):
+            raise ValueError(
+                "collision_guard.base_link2_clearance_m must be finite, positive and <= clearance_m"
+            )
+        if self.table_surface is not None and not self.collision_guard_enabled:
+            raise ValueError(
+                "table_surface requires collision_guard.enabled for mesh protection"
+            )
         self._collision_guard: _ModelCollisionGuard | None = None
+
+    @property
+    def table_guard_configured(self) -> bool:
+        """Whether a validated table representation is configured, not certified."""
+        return self.table_z is not None or self.table_surface is not None
+
+    def _tcp_table_clearance(self, point: np.ndarray) -> float:
+        if self.table_surface is not None:
+            return self.table_surface.tcp_clearance(point)
+        return float(point[2] - self.table_z)
 
     def _kinematics_for(self, arm: Literal["left", "right"]) -> Any:
         if isinstance(self._kinematics, dict):
@@ -720,14 +869,14 @@ class YamGeometry:
         collision_check = self._check_collision_path(path)
         if not collision_check["ok"]:
             return collision_check
-        if self.table_z is None:
+        if not self.table_guard_configured:
             if collision_check["checked"]:
                 return collision_check
             return {
                 "ok": True,
                 "checked": False,
                 "reason": None,
-                "limitation": "table_z is not configured; table guard disabled",
+                "limitation": "no table_z or table_surface configured; table guard disabled",
             }
         min_clearance = float("inf")
         for qpos in path:
@@ -737,7 +886,7 @@ class YamGeometry:
                     arm,
                     self._kinematics_for(arm).fk(arm_qpos[:6], float(arm_qpos[6])),
                 )
-                clearance = float(pose_world[2, 3] - self.table_z)
+                clearance = self._tcp_table_clearance(pose_world[:3, 3])
                 min_clearance = min(min_clearance, clearance)
         return {
             "ok": min_clearance >= self.table_clearance_m,
@@ -748,7 +897,7 @@ class YamGeometry:
             "min_tcp_clearance_m": min_clearance,
             "required_clearance_m": self.table_clearance_m,
             "collision_guard": collision_check,
-            "limitation": "TCP table height only; additional arm mesh checks are reported separately",
+            "limitation": "TCP table surface clearance within footprint only; additional arm mesh checks are reported separately",
         }
 
     def _check_collision_path(self, path: Any) -> dict[str, Any]:
@@ -777,17 +926,17 @@ class YamGeometry:
         gripper: float,
         kin: Any,
     ) -> dict[str, Any]:
-        if self.table_z is None:
+        if not self.table_guard_configured:
             return {
                 "ok": True,
                 "checked": False,
                 "reason": None,
-                "limitation": "table_z is not configured; table guard disabled",
+                "limitation": "no table_z or table_surface configured; table guard disabled",
             }
         min_clearance = float("inf")
         for q in position:
             pose_world = self.calibration.pose_to_world(arm, kin.fk(q, gripper))
-            clearance = float(pose_world[2, 3] - self.table_z)
+            clearance = self._tcp_table_clearance(pose_world[:3, 3])
             min_clearance = min(min_clearance, clearance)
         return {
             "ok": min_clearance >= self.table_clearance_m,
