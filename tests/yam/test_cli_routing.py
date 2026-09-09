@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from robots.yam.evaluation import finalize_run
 from rpent.robots.robot_spec import RobotSpec, RunConfig
 
 
@@ -123,7 +124,8 @@ def _fake_robot_spec(name: str, tmp_path: Path) -> RobotSpec:
                 "memory_dir": args.memory_dir or str(tmp_path / name / "memory"),
                 "memory_inbox": str(
                     Path(args.memory_dir or tmp_path / name / "memory")
-                    / "_inbox"
+                    / "_internal"
+                    / "inbox"
                     / f"{name}_{task_name}_s{args.seed}"
                 ),
             },
@@ -136,6 +138,9 @@ def _fake_robot_spec(name: str, tmp_path: Path) -> RobotSpec:
 
     return RobotSpec(
         name=name,
+        supports_exploration=True,
+        default_memory_profile="local" if name == "yam" else "hf",
+        finalize_run=finalize_run if name == "yam" else None,
         prompts=prompts,
         add_cli_args=add_cli_args,
         parse_config=parse_config,
@@ -162,9 +167,9 @@ def test_cli_routes_yam_explore_to_local_memory_and_sessions(
         _init_output_dir,
     )
     monkeypatch.setattr(
-        cli_main,
-        "ensure_resources",
-        lambda robot_spec: (_ for _ in ()).throw(AssertionError(robot_spec.name)),
+        cli_main.MemoryManager,
+        "sync",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("remote sync")),
     )
 
     def build_planner(*args, **kwargs):
@@ -221,7 +226,8 @@ def test_cli_routes_yam_explore_to_local_memory_and_sessions(
         "session_002",
     ]
     assert get_toolkit_calls[0]["config"].prompt_vars["memory_profile"] == "local"
-    assert [toolkit.memory.merge_calls for toolkit in toolkits] == [[], []]
+    assert toolkits[0].memory.merge_calls == []
+    assert toolkits[1].memory.merge_calls[0]["solved"] is False
     assert [toolkit.recipe_tags for toolkit in toolkits] == [[], []]
 
 
@@ -235,9 +241,9 @@ def test_cli_merges_yam_explore_memory_after_solved(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(cli_main, "get_robot_spec", lambda name: spec)
     monkeypatch.setattr(cli_main, "init_output_dir", _init_output_dir)
     monkeypatch.setattr(
-        cli_main,
-        "ensure_resources",
-        lambda robot_spec: (_ for _ in ()).throw(AssertionError(robot_spec.name)),
+        cli_main.MemoryManager,
+        "sync",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("remote sync")),
     )
     monkeypatch.setattr(
         cli_main, "build_planner", lambda *args, **kwargs: FakePlanner()
@@ -286,7 +292,7 @@ def test_cli_merges_yam_explore_memory_after_solved(monkeypatch, tmp_path) -> No
     ]
 
 
-def test_cli_yam_transcript_uses_toolkit_finish_failure_over_planner_success(
+def test_cli_yam_finalization_uses_environment_over_planner_success(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -323,9 +329,9 @@ def test_cli_yam_transcript_uses_toolkit_finish_failure_over_planner_success(
     monkeypatch.setattr(cli_main, "get_robot_spec", lambda name: spec)
     monkeypatch.setattr(cli_main, "init_output_dir", _init_output_dir)
     monkeypatch.setattr(
-        cli_main,
-        "ensure_resources",
-        lambda robot_spec: (_ for _ in ()).throw(AssertionError(robot_spec.name)),
+        cli_main.MemoryManager,
+        "sync",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("remote sync")),
     )
 
     def build_planner(*args, **kwargs):
@@ -370,14 +376,12 @@ def test_cli_yam_transcript_uses_toolkit_finish_failure_over_planner_success(
     assert planner_calls[0]["toolkit"] is toolkits[0]
     transcript_path = output_dir / "transcript_yam_place_cube_s7.json"
     transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
-    assert transcript["finish"]["status"] == "failure"
-    assert transcript["finish"]["requested_status"] == "success"
-    assert transcript["finish"]["verified_success"] is False
-    assert transcript["finish"]["reason"] == "eval_success remained false"
-    assert (
-        transcript["finish"]["summary"]
-        == "agent claimed success but final env check failed"
-    )
+    assert transcript["finish"]["status"] == "success"
+    assert transcript["environment_success"] is False
+    final = json.loads((output_dir / "result.json").read_text())
+    assert final["status"] == "failure"
+    assert final["environment_success"] is False
+    assert final["planner_finish_request"]["status"] == "success"
     assert toolkits[0].recipe_tags == []
     assert toolkits[0].memory.merge_calls == []
 
@@ -397,9 +401,9 @@ def test_cli_keeps_libero_eval_on_hf_resource_path(monkeypatch, tmp_path) -> Non
         _init_output_dir,
     )
     monkeypatch.setattr(
-        cli_main,
-        "ensure_resources",
-        lambda robot_spec: ensured.append(robot_spec.name),
+        cli_main.MemoryManager,
+        "sync",
+        lambda *args, **kwargs: ensured.append(kwargs["remote_repo"]),
     )
     monkeypatch.setattr(
         cli_main, "build_planner", lambda *args, **kwargs: FakePlanner()
@@ -432,7 +436,7 @@ def test_cli_keeps_libero_eval_on_hf_resource_path(monkeypatch, tmp_path) -> Non
 
     assert cli_main.main() == 0
 
-    assert ensured == ["libero"]
+    assert ensured == [spec.memory_repo_id]
     assert get_toolkit_calls[0]["name"] == "libero"
     assert get_toolkit_calls[0]["mode"] == "evaluation"
     assert get_toolkit_calls[0]["config"].prompt_vars["memory_profile"] == "hf"
@@ -496,6 +500,10 @@ def test_yam_spec_primitives_only_runtime_does_not_connect_vla(
     )
 
     assert config.prompt_vars["vla_enabled"] is False
+    assert config.prompt_vars["memory_profile"] == "local"
+    assert Path(config.prompt_vars["memory_inbox"]) == (
+        tmp_path / "memory" / "_internal" / "inbox" / "yam_place_cube_s7"
+    )
     assert endpoints == ["http://env"]
     assert waited == ["env"]
     assert daemons == []
@@ -525,6 +533,39 @@ def test_yam_prompt_policy_text_follows_vla_enabled(
     assert unexpected not in rendered
 
 
+@pytest.mark.parametrize(
+    ("environment_success", "expected"),
+    [(True, "success"), (False, "failure"), (None, "unknown")],
+)
+def test_finalization_retains_actual_outcome_and_agent_error(
+    tmp_path, environment_success, expected
+) -> None:
+    from rpent.evaluation import RunFinalizationContext
+
+    path = finalize_run(
+        RunFinalizationContext(
+            output_dir=tmp_path,
+            robot_name="yam",
+            task_desc={"instruction": "Pepsi goes in the left bag"},
+            environment_success=environment_success,
+            agent_error="planner disconnected",
+            elapsed_s=1.2,
+            planner="api",
+            model="test-planner",
+            reasoning_effort="high",
+            max_turns=10,
+            planner_timeout_s=20,
+            finish_result={"status": "success"},
+            stats={},
+        )
+    )
+    record = json.loads(path.read_text())
+    assert record["status"] == expected
+    assert record["environment_success"] is environment_success
+    assert record["agent_error"] == "planner disconnected"
+    assert record["planner_finish_request"]["status"] == "success"
+
+
 def test_yam_continuation_handoff_points_to_prior_session_and_memory_inbox(
     monkeypatch,
     tmp_path,
@@ -534,7 +575,7 @@ def test_yam_continuation_handoff_points_to_prior_session_and_memory_inbox(
     output_dir = tmp_path / "yam-out"
     prior_session = output_dir / "sessions" / "session_001"
     prior_session.mkdir(parents=True)
-    memory_inbox = tmp_path / "memory" / "_inbox" / "yam_place_cube_s7"
+    memory_inbox = tmp_path / "memory" / "_internal" / "inbox" / "yam_place_cube_s7"
     args = SimpleNamespace(
         planner="codex",
         robot_name="yam",
@@ -568,7 +609,7 @@ def test_yam_continuation_handoff_points_to_prior_session_and_memory_inbox(
     assert system_prompt == "system:explore:local"
     assert str(prior_session) in message
     assert f"{memory_inbox}/wip/" in message
-    assert "physical scene has NOT been reset" in message
+    assert "does not prove that the scene was reset" in message
     assert "clean scene" not in message
 
 

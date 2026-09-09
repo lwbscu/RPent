@@ -32,10 +32,11 @@ from rpent.cli.main import (
     _serialize_messages,
 )
 from rpent.dashboard.events import RunStartedEvent
+from rpent.memory import MemoryManager
 from rpent.planner.base import build_planner
 from rpent.robots import get_toolkit
+from rpent.utils.config import get_memory_dir
 from rpent.utils.logging import get_logger, init_output_dir
-from rpent.utils.resources import ensure_resources
 
 if TYPE_CHECKING:
     from rpent.dashboard.state import ClaimedTask, DashboardState
@@ -52,7 +53,6 @@ def run_dashboard_session(
     parser: argparse.ArgumentParser,
 ) -> int:
     """Run one long-lived Dashboard Session with sequential fresh TaskRuns."""
-    from rpent.dashboard.launcher import apply_to_args, defaults_from_args
     from rpent.dashboard.server import DashboardServer
     from rpent.dashboard.session import DashboardSessionController
     from rpent.dashboard.state import DashboardState
@@ -61,7 +61,12 @@ def run_dashboard_session(
     dashboard_spec = robot_spec.dashboard
     if dashboard_spec is None:
         parser.error(f"robot {robot_spec.name!r} does not support Dashboard control")
-    runtime_components = dashboard_spec["runtime_components"]
+    runtime_components = tuple(
+        component
+        for component in dashboard_spec["runtime_components"]
+        if not component.get("planners") or args.planner in component["planners"]
+    )
+    dashboard_spec = {**dashboard_spec, "runtime_components": runtime_components}
     shared_components = {
         component["name"]
         for component in runtime_components
@@ -73,26 +78,13 @@ def run_dashboard_session(
         if component["scope"] == "unique"
     }
 
-    dashboard_server = DashboardServer(
-        host=args.dashboard_host,
-        port=args.dashboard_port,
-        language=args.dashboard_language,
-        dashboard_spec=dashboard_spec,
-    )
-    dashboard_url = dashboard_server.start()
-    print(
-        f"Dashboard: {dashboard_url}. Open it, adjust the Session config, "
-        "and click Start Session.",
-        flush=True,
-    )
-    launch_config = dashboard_server.wait_for_launch(defaults=defaults_from_args(args))
-    apply_to_args(args, launch_config)
-
-    if args.env_endpoint is not None:
+    if getattr(args, "env_endpoint", None) is not None:
         parser.error(
             "Dashboard task control cannot use --env-endpoint because each "
             "TaskRun requires a fresh owned env_server"
         )
+    if args.planner == "api" and not args.model:
+        parser.error("--model is required when --planner=api")
 
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S")
@@ -100,21 +92,32 @@ def run_dashboard_session(
     else:
         session_root = Path(args.output_dir)
     session_root = init_output_dir(session_root, verbose=args.verbose)
-    logger.info("Dashboard: %s", dashboard_url)
-    logger.info("launcher Session config applied: %s", launch_config)
     logger.info("physical agent cmd: %s", shlex.join([sys.executable, *sys.argv]))
+
+    state = DashboardState(
+        output_dir=session_root,
+        dashboard_spec=dashboard_spec,
+    )
+    dashboard_server = DashboardServer(
+        host=args.dashboard_host,
+        port=args.dashboard_port,
+        language=args.dashboard_language,
+        state=state,
+        planner=args.planner,
+        model=args.model,
+    )
+    dashboard_url = dashboard_server.start()
+    print(f"Dashboard: {dashboard_url}", flush=True)
+    logger.info("Dashboard: %s", dashboard_url)
 
     if (
         not getattr(args, "explore", False)
         and getattr(args, "memory_profile", "hf") == "hf"
+        and args.planner != "task_card"
     ):
-        ensure_resources(robot_spec)
-    state = DashboardState(
-        run_id=f"dashboard-session/{session_root.name}",
-        output_dir=session_root,
-        dashboard_spec=dashboard_spec,
-    )
-    dashboard_server.register(state)
+        MemoryManager(get_memory_dir(robot_spec.name)).sync(
+            remote_repo=robot_spec.memory_repo_id,
+        )
 
     controller = DashboardSessionController(
         state=state,
@@ -247,6 +250,8 @@ def _run_dashboard_task(
                         dashboard_events=state,
                         config=run_config,
                     )
+                solved = False
+                state.bind_toolkit(toolkit)
                 memory_manager = toolkit.memory
                 try:
                     planner = build_planner(
@@ -279,6 +284,7 @@ def _run_dashboard_task(
                         if solved:
                             recipe_path = toolkit.write_recipe(recipe_tag)
                 finally:
+                    state.unbind_toolkit(toolkit)
                     toolkit.close()
                 if solved or state.task_replacement_requested:
                     break

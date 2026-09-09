@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -289,6 +290,242 @@ def load_calibration(config: dict[str, Any] | None) -> YamCalibration:
     )
 
 
+class _ModelCollisionGuard:
+    """Check convex MuJoCo meshes from the same models used for FK/IK.
+
+    Adjacent/welded bodies and the model's explicit exclusions are mechanical
+    contacts, not tested self-collision pairs. All cross-arm pairs are tested,
+    including static bases. Camera mounts, cables, held objects, leader arms,
+    and fixtures absent from these models are not covered. Path sampling is
+    not a continuous collision or tracking-error guarantee.
+    """
+
+    def __init__(self, geometry: YamGeometry, clearance_m: float) -> None:
+        import mujoco
+
+        self._mj = mujoco
+        self.clearance_m = clearance_m
+        right_base = geometry.calibration.world_from_right_base
+        if right_base is None:
+            raise ValueError("collision_guard requires calibrated right base transform")
+        if not np.allclose(
+            right_base[:3, :3].T @ right_base[:3, :3], np.eye(3)
+        ) or not np.isclose(np.linalg.det(right_base[:3, :3]), 1.0):
+            raise ValueError("collision_guard requires a rigid right base transform")
+        spec = mujoco.MjSpec()
+        for arm, transform in (("left", np.eye(4)), ("right", right_base)):
+            kin = geometry._kinematics_for(arm)
+            if not hasattr(kin, "model"):
+                raise ValueError(
+                    "collision_guard requires the actual MuJoCo kinematics model"
+                )
+            self._validate_model(kin.model)
+            # Serialize each already-loaded model instead of reconstructing a
+            # different gripper/arm model or modifying RLinf's mutable IK data.
+            with tempfile.TemporaryDirectory(
+                prefix="rpent-yam-collision-"
+            ) as directory:
+                xml_path = str(Path(directory) / "arm.xml")
+                mujoco.mj_saveLastXML(xml_path, kin.model)
+                child = mujoco.MjSpec.from_file(xml_path)
+                pose = matrix_to_xyz_wxyz(transform)
+                frame = spec.worldbody.add_frame(pos=pose[:3], quat=pose[3:])
+                spec.attach(child, prefix=f"{arm}_", frame=frame)
+        self.table_z = geometry.table_z
+        if self.table_z is not None:
+            spec.worldbody.add_geom(
+                name="guard_table",
+                type=mujoco.mjtGeom.mjGEOM_PLANE,
+                pos=[0, 0, self.table_z],
+                size=[0, 0, 0.01],
+            )
+        self.model = spec.compile()
+        self.data = mujoco.MjData(self.model)
+        self._q_addresses = {
+            arm: np.array(
+                [self.model.joint(f"{arm}_joint{i}").qposadr[0] for i in range(1, 9)]
+            )
+            for arm in ("left", "right")
+        }
+        self._finger_ranges = {
+            arm: np.array([self.model.joint(f"{arm}_joint{i}").range for i in (7, 8)])
+            for arm in ("left", "right")
+        }
+        self._pairs = []
+        excluded = {int(value) for value in self.model.exclude_signature}
+        table_id = (
+            self.model.geom("guard_table").id if self.table_z is not None else None
+        )
+        self._table_pairs = []
+        for first in range(self.model.ngeom):
+            for second in range(first + 1, self.model.ngeom):
+                a = int(self.model.geom_bodyid[first])
+                b = int(self.model.geom_bodyid[second])
+                if table_id in (first, second):
+                    other = second if first == table_id else first
+                    # Only fixed installation geometry may touch its support.
+                    if self.model.body_weldid[self.model.geom_bodyid[other]] != 0:
+                        self._table_pairs.append((first, second))
+                    continue
+                same_arm = (
+                    self.model.body(a).name.split("_", 1)[0]
+                    == self.model.body(b).name.split("_", 1)[0]
+                )
+                if same_arm:
+                    wa, wb = self.model.body_weldid[[a, b]]
+                    adjacent = (
+                        self.model.body_weldid[self.model.body_parentid[wa]] == wb
+                        or self.model.body_weldid[self.model.body_parentid[wb]] == wa
+                    )
+                    if (
+                        wa == wb
+                        or adjacent
+                        or (min(a, b) << 16 | max(a, b)) in excluded
+                    ):
+                        continue
+                self._pairs.append((first, second))
+        if not any(
+            self.model.body(int(self.model.geom_bodyid[a])).name.startswith("left_")
+            and self.model.body(int(self.model.geom_bodyid[b])).name.startswith(
+                "right_"
+            )
+            for a, b in self._pairs
+        ):
+            raise ValueError("collision_guard requires cross-arm collision pairs")
+
+    def _validate_model(self, model: Any) -> None:
+        """Reject incomplete/unsupported models instead of reporting a safe path.
+
+        These names and mesh counts are the installed YAM + flexible_4310
+        model contract, also used by RLinf's kinematics adapter. They are not
+        tunable safety parameters or a substitute for physical model validation.
+        """
+        bodies = [
+            "base",
+            "link1",
+            "link2",
+            "link3",
+            "link4",
+            "link5",
+            "gripper",
+            "linear_module",
+            "linear_module_2",
+        ]
+        if (
+            model.njnt != 8
+            or model.nq != 8
+            or model.nv != 8
+            or {model.joint(i).name for i in range(model.njnt)}
+            != {f"joint{i}" for i in range(1, 9)}
+        ):
+            raise ValueError(
+                "collision_guard requires the supported eight-joint YAM model"
+            )
+        if model.nbody != 10 or {
+            model.body(i).name for i in range(1, model.nbody)
+        } != set(bodies):
+            raise ValueError("collision_guard requires the supported YAM body layout")
+        for index, name in enumerate(bodies):
+            body = model.body(name)
+            expected_parent = (
+                "world" if index == 0 else bodies[index - 1] if index < 8 else "gripper"
+            )
+            if model.body(int(body.parentid[0])).name != expected_parent:
+                raise ValueError(f"collision_guard unsupported parent for {name}")
+            count = 2 if name in ("linear_module", "linear_module_2") else 1
+            geoms = np.flatnonzero(model.geom_bodyid == body.id)
+            if len(geoms) != count or np.any(
+                model.geom_type[geoms] != self._mj.mjtGeom.mjGEOM_MESH
+            ):
+                raise ValueError(
+                    f"collision_guard missing or unsupported mesh geometry for {name}"
+                )
+            if not np.isfinite(model.geom_rbound[geoms]).all() or np.any(
+                model.geom_rbound[geoms] <= 0
+            ):
+                raise ValueError(f"collision_guard invalid mesh bounds for {name}")
+        expected_exclusions = {
+            frozenset(("gripper", "linear_module")),
+            frozenset(("gripper", "linear_module_2")),
+            frozenset(("linear_module", "linear_module_2")),
+        }
+        exclusions = {
+            frozenset(
+                (model.body(int(value) >> 16).name, model.body(int(value) & 65535).name)
+            )
+            for value in model.exclude_signature
+        }
+        if exclusions != expected_exclusions:
+            raise ValueError("collision_guard unsupported model collision exclusions")
+        for index in range(1, 9):
+            joint = model.joint(f"joint{index}")
+            expected_type = (
+                self._mj.mjtJoint.mjJNT_HINGE
+                if index <= 6
+                else self._mj.mjtJoint.mjJNT_SLIDE
+            )
+            if (
+                joint.type[0] != expected_type
+                or model.body(int(joint.bodyid[0])).name != bodies[index]
+            ):
+                raise ValueError(
+                    f"collision_guard unsupported joint{index} type or body"
+                )
+            if (
+                not joint.limited[0]
+                or not np.isfinite(joint.range).all()
+                or joint.range[0] >= joint.range[1]
+            ):
+                raise ValueError(f"collision_guard invalid joint{index} range")
+
+    def check(self, qpos: np.ndarray) -> dict[str, Any]:
+        for arm in ("left", "right"):
+            values = qpos[ARM_SLICES[arm]]
+            ranges = self._finger_ranges[arm]
+            self.data.qpos[self._q_addresses[arm]] = np.concatenate(
+                [values[:6], ranges[:, 0] + values[6] * (ranges[:, 1] - ranges[:, 0])]
+            )
+        self._mj.mj_kinematics(self.model, self.data)
+        for first, second in self._pairs + self._table_pairs:
+            table_pair = (first, second) in self._table_pairs
+            # Bounding spheres only reject distant pairs; near pairs always
+            # use mesh distance rather than an invented link radius.
+            separation = np.linalg.norm(
+                self.data.geom_xpos[first] - self.data.geom_xpos[second]
+            )
+            if (
+                not table_pair
+                and separation
+                > self.model.geom_rbound[first]
+                + self.model.geom_rbound[second]
+                + self.clearance_m
+            ):
+                continue
+            distance = self._mj.mj_geomDistance(
+                self.model, self.data, first, second, self.clearance_m + 1e-6, None
+            )
+            if distance <= self.clearance_m:
+                return {
+                    "ok": False,
+                    "checked": True,
+                    "reason": "link_table_guard" if table_pair else "collision_guard",
+                    "bodies": [
+                        self.model.body(int(self.model.geom_bodyid[i])).name
+                        for i in (first, second)
+                    ],
+                    "distance_m": float(distance),
+                    "required_clearance_m": self.clearance_m,
+                }
+        return {
+            "ok": True,
+            "checked": True,
+            "reason": None,
+            "required_clearance_m": self.clearance_m,
+            "table_mesh_checked": self.table_z is not None,
+            "limitation": "sampled arm mesh convex hulls only; excludes adjacent/model-excluded pairs, cameras, cables, held objects, leader arms and fixtures; table plane checked only when table_z is configured",
+        }
+
+
 class YamGeometry:
     """Planner and pose adapter backed by RLinf's YAM kinematics."""
 
@@ -307,8 +544,27 @@ class YamGeometry:
             else float(self.config["table_z"])
         )
         self.table_clearance_m = float(self.config.get("table_clearance_m", 0.03))
+        if self.table_z is not None and not np.isfinite(self.table_z):
+            raise ValueError("table_z must be finite")
+        if not np.isfinite(self.table_clearance_m) or self.table_clearance_m < 0:
+            raise ValueError("table_clearance_m must be finite and non-negative")
         self.path_joint_delta = float(self.config.get("path_joint_delta", 0.02))
+        if not np.isfinite(self.path_joint_delta) or self.path_joint_delta <= 0:
+            raise ValueError("path_joint_delta must be finite and positive")
         self._kinematics = kinematics
+        guard = self.config.get("collision_guard", {})
+        if not isinstance(guard, dict) or not isinstance(
+            guard.get("enabled", False), bool
+        ):
+            raise ValueError("collision_guard must be a mapping with boolean enabled")
+        self.collision_guard_enabled = guard.get("enabled", False)
+        self.collision_clearance_m = float(guard.get("clearance_m", 0.01))
+        if (
+            not np.isfinite(self.collision_clearance_m)
+            or self.collision_clearance_m <= 0
+        ):
+            raise ValueError("collision_guard.clearance_m must be finite and positive")
+        self._collision_guard: _ModelCollisionGuard | None = None
 
     def _kinematics_for(self, arm: Literal["left", "right"]) -> Any:
         if isinstance(self._kinematics, dict):
@@ -408,8 +664,10 @@ class YamGeometry:
             }
 
         q_target = np.asarray(result.q_target, dtype=np.float64).reshape(6)
-        if np.any(q_target < self.lower[arm_index]) or np.any(
-            q_target > self.upper[arm_index]
+        if (
+            not np.isfinite(q_target).all()
+            or np.any(q_target < self.lower[arm_index])
+            or np.any(q_target > self.upper[arm_index])
         ):
             return {
                 "status": "Failure",
@@ -427,9 +685,20 @@ class YamGeometry:
                 "reason": "table_guard",
                 **table_check,
             }
+        collision_check = self._check_collision_path(
+            [
+                np.concatenate([q, qpos[6:]])
+                if arm == "left"
+                else np.concatenate([qpos[:7], q, qpos[13:]])
+                for q in position
+            ]
+        )
+        if not collision_check["ok"]:
+            return {"status": "Failure", "position": None, **collision_check}
         return {
             "status": "Success",
             "position": position,
+            "collision_guard": collision_check,
             "reason": None,
             "position_error": float(result.position_error),
             "rotation_error": float(result.rotation_error),
@@ -439,19 +708,29 @@ class YamGeometry:
     def check_qpos_transition(
         self, previous_qpos14: Any, target_qpos14: Any, *, samples: int = 8
     ) -> dict[str, Any]:
-        """Check TCP height along the commanded qpos segment."""
+        """Check sampled TCP height and optional two-arm model clearance."""
+        previous = enforce_hard_limits(previous_qpos14, self.lower, self.upper)
+        target = enforce_hard_limits(target_qpos14, self.lower, self.upper)
+        steps = max(
+            2,
+            int(samples),
+            int(np.ceil(np.max(np.abs(target - previous)) / self.path_joint_delta)) + 1,
+        )
+        path = np.linspace(previous, target, steps)
+        collision_check = self._check_collision_path(path)
+        if not collision_check["ok"]:
+            return collision_check
         if self.table_z is None:
+            if collision_check["checked"]:
+                return collision_check
             return {
                 "ok": True,
                 "checked": False,
                 "reason": None,
                 "limitation": "table_z is not configured; table guard disabled",
             }
-        previous = enforce_hard_limits(previous_qpos14, self.lower, self.upper)
-        target = enforce_hard_limits(target_qpos14, self.lower, self.upper)
         min_clearance = float("inf")
-        for alpha in np.linspace(0.0, 1.0, max(2, int(samples))):
-            qpos = previous + alpha * (target - previous)
+        for qpos in path:
             for arm in ("left", "right"):
                 arm_qpos = qpos[ARM_SLICES[arm]]
                 pose_world = self.calibration.pose_to_world(
@@ -468,8 +747,28 @@ class YamGeometry:
             else "table_guard",
             "min_tcp_clearance_m": min_clearance,
             "required_clearance_m": self.table_clearance_m,
-            "limitation": "checks TCP height only; no self, object, or fixture collision guarantee",
+            "collision_guard": collision_check,
+            "limitation": "TCP table height only; additional arm mesh checks are reported separately",
         }
+
+    def _check_collision_path(self, path: Any) -> dict[str, Any]:
+        if not self.collision_guard_enabled:
+            return {
+                "ok": True,
+                "checked": False,
+                "reason": None,
+                "limitation": "collision_guard.enabled is false; no arm collision check",
+            }
+        if self._collision_guard is None:
+            self._collision_guard = _ModelCollisionGuard(
+                self, self.collision_clearance_m
+            )
+        result = {}
+        for index, qpos in enumerate(path):
+            result = self._collision_guard.check(qpos)
+            if not result["ok"]:
+                return {**result, "path_sample": index}
+        return result
 
     def _check_table_guard(
         self,

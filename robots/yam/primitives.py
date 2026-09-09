@@ -212,7 +212,9 @@ class YamPrimitives:
         state = np.asarray(
             self.env.last_obs["state"]["joint_position"], dtype=np.float64
         )
-        action = state.copy()
+        action = np.asarray(
+            self.env.last_info.get("commanded_qpos", state), dtype=np.float64
+        ).copy()
         actions = []
         for update in updates:
             offset = 0 if update["arm"] == "left" else 7
@@ -357,9 +359,9 @@ class YamPrimitives:
             current + (target - current) * i / int(steps)
             for i in range(1, int(steps) + 1)
         ]
-        execution = self.apply_qpos_updates([
-            {"arm": arm, "gripper": value} for value in values
-        ])
+        execution = self.apply_qpos_updates(
+            [{"arm": arm, "gripper": value} for value in values]
+        )
         executed = int(execution.get("executed_actions", 0))
         now = np.asarray(self.env.last_obs["state"]["joint_position"], dtype=np.float64)
         return {

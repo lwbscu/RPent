@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import uuid
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -28,11 +29,13 @@ import numpy as np
 from robots.yam.cameras import YamRgbdCameraRig
 from robots.yam.contracts import MODEL_SPEC, YAM_CAMERA_NAMES, validate_actions
 from robots.yam.geometry import (
+    ARM_JOINT_INDICES,
     YamGeometry,
     apply_previous_command_slew,
     enforce_hard_limits,
     joint_limits_from_config,
 )
+from robots.yam.hardware_ownership import HardwareLease
 from robots.yam.operator_control import read_receipt
 from rpent.utils.config import get_rlinf_repo_path
 
@@ -73,11 +76,22 @@ class YamAgentEnv:
         if self.max_joint_delta_per_step is not None:
             self.max_joint_delta_per_step = float(self.max_joint_delta_per_step)
         self.lower, self.upper = joint_limits_from_config(self.config)
+        self.max_tracking_error_rad = self.config.get("max_tracking_error_rad")
+        if self.max_tracking_error_rad is not None:
+            self.max_tracking_error_rad = float(self.max_tracking_error_rad)
+            if (
+                not np.isfinite(self.max_tracking_error_rad)
+                or self.max_tracking_error_rad <= 0
+            ):
+                raise ValueError("max_tracking_error_rad must be finite and positive")
         self.geometry = YamGeometry(self.config, kinematics=kinematics)
         self._runtime = runtime
+        self._owns_runtime = runtime is None
+        self._hardware_lease: HardwareLease | None = None
         self._cameras = cameras
         self._owns_cameras = cameras is None
         self._started = False
+        self._startup_failed = False
         self._closed = False
         self._lock = threading.RLock()
         self._stop_requested = threading.Event()
@@ -197,6 +211,7 @@ class YamAgentEnv:
                         self._runtime.hold()
                         self._last_stop_hold_s = time.time()
                         break
+                    self._check_measured_transition(accepted)
                     result = self._runtime.command(accepted)
                     last_result = result
                     if getattr(result, "rejection_reason", None):
@@ -244,12 +259,14 @@ class YamAgentEnv:
             or self._take_action_cnt >= self.step_lim
         )
         reward = 1.0 if terminated else 0.0
-        info.update({
-            "requested_actions": int(len(array)),
-            "executed_actions": int(executed),
-            "per_step": per_step,
-            "stop_requested": self._stop_requested.is_set(),
-        })
+        info.update(
+            {
+                "requested_actions": int(len(array)),
+                "executed_actions": int(executed),
+                "per_step": per_step,
+                "stop_requested": self._stop_requested.is_set(),
+            }
+        )
         if last_result is not None:
             info["accepted_action"] = np.asarray(last_result.accepted, dtype=np.float64)
             info["action_clipped"] = bool(getattr(last_result, "clipped", False))
@@ -261,15 +278,19 @@ class YamAgentEnv:
     def render_camera(self, camera_name: str, depth: bool = False) -> Any:
         with self._lock:
             self._ensure_started()
-            return self._cameras.render_camera(camera_name, depth=depth)
+            if self.last_obs is None:
+                self._observe_locked(require_valid_wrist_projection=True)
+            view = self.last_obs["views"][camera_name]
+            if depth:
+                return view["rgb"].copy(), view["depth"].copy()
+            return view["rgb"].copy()
 
     def get_camera_meta(self, camera_name: str) -> dict[str, Any]:
         with self._lock:
             self._ensure_started()
-            qpos = self._read_qpos()
-            return self.geometry.camera_meta_for_qpos(
-                camera_name, self._cameras.get_camera_meta(camera_name), qpos
-            )
+            if self.last_obs is None:
+                self._observe_locked(require_valid_wrist_projection=True)
+            return deepcopy(self.last_obs["views"][camera_name]["camera_meta"])
 
     def get_task_language(self) -> str:
         return self.task_language
@@ -332,16 +353,24 @@ class YamAgentEnv:
                 except Exception as error:
                     errors.append(error)
             self._started = False
-            self._closed = True
             if errors:
+                self._startup_failed = True
                 raise RuntimeError(
                     "failed to fully close YAM agent env: "
                     + "; ".join(str(error) for error in errors)
                 ) from errors[0]
+            if self._hardware_lease is not None:
+                self._hardware_lease.close()
+                self._hardware_lease = None
+            self._closed = True
 
     def _ensure_started(self) -> None:
         if self._closed:
             raise RuntimeError("cannot use a closed YamAgentEnv")
+        if self._startup_failed:
+            raise RuntimeError(
+                "YAM startup failed; operator intervention is required before restarting"
+            )
         if self._started:
             return
         if self._cameras is None:
@@ -349,6 +378,20 @@ class YamAgentEnv:
                 self.config, calibration=self.geometry.calibration
             )
         try:
+            if self._owns_runtime and self._hardware_lease is None:
+                lease = HardwareLease(
+                    [
+                        self._device_config("left_follower", "can_left").channel,
+                        self._device_config("right_follower", "can_right").channel,
+                    ]
+                )
+                try:
+                    lease.acquire()
+                    lease.check_subscriptions()
+                except BaseException:
+                    lease.close()
+                    raise
+                self._hardware_lease = lease
             self._cameras.open()
             if self._runtime is None:
                 self._runtime = self._build_runtime()
@@ -358,9 +401,12 @@ class YamAgentEnv:
             self._previous_command = qpos.copy()
             self._started = True
         except Exception:
+            self._startup_failed = True
+            runtime_closed = self._runtime is None
             if self._runtime is not None:
                 try:
                     self._runtime.close()
+                    runtime_closed = True
                 except Exception:
                     pass
             if self._cameras is not None and self._owns_cameras:
@@ -368,6 +414,9 @@ class YamAgentEnv:
                     self._cameras.close()
                 except Exception:
                     pass
+            if runtime_closed and self._hardware_lease is not None:
+                self._hardware_lease.close()
+                self._hardware_lease = None
             raise
 
     def _build_runtime(self) -> Any:
@@ -388,7 +437,7 @@ class YamAgentEnv:
             task_description=self.task_language,
             step_frequency=self.control_hz,
             max_joint_delta=max(float(self.max_joint_delta_per_step or 0.05), 1e-6),
-            enforce_runtime_joint_limits=False,
+            enforce_runtime_joint_limits=True,
             joint_limit_min=self.lower.tolist(),
             joint_limit_max=self.upper.tolist(),
             feedback_timeout_s=float(self.config.get("feedback_timeout_s", 0.25)),
@@ -440,6 +489,23 @@ class YamAgentEnv:
                 + str(table_guard.get("reason"))
             )
         return accepted, clipped
+
+    def _check_measured_transition(self, target: np.ndarray) -> None:
+        """Check the actual feedback-to-command segment immediately before sending."""
+        measured = enforce_hard_limits(self._read_qpos(), self.lower, self.upper)
+        if self.max_tracking_error_rad is not None:
+            error = np.max(
+                np.abs(target[ARM_JOINT_INDICES] - measured[ARM_JOINT_INDICES])
+            )
+            if error > self.max_tracking_error_rad:
+                raise RuntimeError(
+                    f"YAM tracking error {error:.4f} rad exceeds configured bound"
+                )
+        check = self.geometry.check_qpos_transition(measured, target)
+        if not check["ok"]:
+            raise RuntimeError(
+                f"YAM measured trajectory rejected: {check.get('reason')}"
+            )
 
     def _read_qpos(self) -> np.ndarray:
         state = self._runtime.read_state()
@@ -556,11 +622,13 @@ class YamAgentEnv:
                     "wrist cam2world uses current FK for a cached frame while joints moved "
                     f"{qpos_delta_linf:.6g} rad; require <= {qpos_static_tolerance:.6g}"
                 )
-            camera_meta.update({
-                "frame_age_s": frame_age_s,
-                "projection_valid": bool(projection_valid),
-                "projection_limitation": projection_limitation,
-            })
+            camera_meta.update(
+                {
+                    "frame_age_s": frame_age_s,
+                    "projection_valid": bool(projection_valid),
+                    "projection_limitation": projection_limitation,
+                }
+            )
             views[name] = {
                 "rgb": frame.rgb.copy(),
                 "depth": frame.depth.copy(),
@@ -576,6 +644,7 @@ class YamAgentEnv:
         info = {
             "episode_status": self._episode_status(),
             "robot_state": robot_state,
+            "commanded_qpos": self._previous_command.copy(),
         }
         self.last_obs = obs
         self.last_info = info
@@ -672,6 +741,10 @@ class YamAgentEnv:
         )
 
     def _require_ready_for_motion(self) -> None:
+        if self.config.get("require_table_guard", False) and (
+            self.geometry.table_z is None or not np.isfinite(self.geometry.table_z)
+        ):
+            raise RuntimeError("YAM motion requires a verified finite table_z in the site config")
         if self._operator_ready_receipt is None:
             self._runtime.hold()
             self._last_stop_hold_s = time.time()

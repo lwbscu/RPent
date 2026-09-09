@@ -19,6 +19,7 @@ from robots.yam.contracts import (
     MODEL_SPEC,
     env_runtime_contract,
 )
+from robots.yam.evaluation import finalize_run
 from robots.yam.prompt_bundle import system_prompt, user_prompt
 from rpent.dashboard.events import DashboardEventSink
 from rpent.memory import MemoryManager
@@ -35,6 +36,9 @@ if TYPE_CHECKING:
 def get_robot_spec() -> RobotSpec:
     return RobotSpec(
         name="yam",
+        supports_exploration=True,
+        default_memory_profile="local",
+        finalize_run=finalize_run,
         prompts=PromptBundle(system=system_prompt, user=user_prompt),
         add_cli_args=_add_cli_args,
         parse_config=_parse_config,
@@ -103,9 +107,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
     if not args.task_name:
         raise ValueError("--task-name is required")
     explore = bool(getattr(args, "explore", False))
-    memory_profile = getattr(args, "memory_profile", None) or (
-        "local" if explore else "hf"
-    )
+    memory_profile = getattr(args, "memory_profile", None) or "local"
     args.memory_profile = memory_profile
     memory_dir_arg = getattr(args, "memory_dir", None)
     memory_dir = (
@@ -133,7 +135,7 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
             "vla_enabled": bool(args.vla_endpoint and not args.without_vla),
             "memory_profile": memory_profile,
             "memory_dir": str(memory_dir),
-            "memory_inbox": str(memory_dir / "_inbox" / recipe_tag),
+            "memory_inbox": str(memory_dir / "_internal" / "inbox" / recipe_tag),
             "session_number": 1,
             "session_max": max(1, int(getattr(args, "explore_sessions", 1) or 1)),
         },

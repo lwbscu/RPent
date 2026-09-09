@@ -13,7 +13,7 @@ READ_ORDER = """Before the first robot mutation:
 1. Read robots/yam/guides/GUIDE_RPENT.md completely.
 2. Inspect view_env_state(step=0) and all three current RGB views.
 3. Read {{memory_dir}}/MEMORY.md and matching task/suite/global memory when present.
-   List {{memory_dir}}/task/ for prior recipe/audit pairs for this task; the index
+   List {{memory_dir}}/task_only/ for prior recipe/audit pairs for this task; the index
    covers suite/global leaves. Missing memory on a first run is normal: continue
    from current observations and create evidence through this run.
 
@@ -23,8 +23,12 @@ RUNTIME = """The registered YAM Toolkit is the only control surface. Do not use
 shell, Python, hidden robot APIs, raw network clients, or unregistered files to
 move the robot. Use the tools in this session and re-observe after every motion.
 The env server runs on the control machine and is responsible for CAN ownership,
-camera lifetime, sampled TCP table-clearance checks, and operator success marking.
-Full-link, self, object, and two-arm collision checking is not implemented."""
+camera lifetime, and operator success marking. When enabled in the site config,
+the server checks sampled model link geometry for self/two-arm collisions and
+the configured table plane. This excludes wrist cameras, cables, teaching arms,
+held objects, bags, bowls, and other scene obstacles; it is not a full collision
+planner or a guarantee about physical tracking. Visually check the whole arm
+and payload path, use short observed moves, and stop on uncertainty."""
 
 PERCEPTION = """Use top for global identity, distractors, destination, and task
 progress. Use the same-side wrist view for grasp geometry and near-contact
@@ -83,4 +87,7 @@ strategy/failure/infra, title, applies_when, confidence, and evidence.cells.
 Only your current inbox is writable. Never edit published corpus files.
 The runner creates the successful current-attempt recipe/audit pair; do not
 invent action logs or overwrite these generated files. Then call finish.
-Unsolved runs keep notes in the inbox; they do not publish verified task memory."""
+Unsolved runs do not publish success recipes. Working notes stay in wip;
+bounded failure lessons may be merged by the common MemoryManager, with explicit
+failed evidence and no claim of successful task completion. A new session does
+not reset the physical scene: follow the operator-readiness protocol before reset."""

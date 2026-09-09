@@ -39,11 +39,6 @@ logger = get_logger("libero_toolkit")
 class LiberoToolkit(Toolkit):
     """Toolkit for the LIBERO robot."""
 
-    _FRAME_ARTIFACTS = {
-        "camera": "agentview.png",
-        "wrist": "wrist.png",
-    }
-
     def __init__(
         self,
         *,
@@ -183,6 +178,11 @@ class LiberoToolkit(Toolkit):
         if result.get("interrupted"):
             out.update(result)
         return out
+
+    @property
+    def primitives(self) -> "libero_tools.LiberoPrimitives":
+        """Return the action primitives this toolkit drives."""
+        return self._primitives
 
     def init_primitives(
         self,

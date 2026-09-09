@@ -36,10 +36,18 @@ is no simultaneous dual-arm Cartesian primitive or coordinated collision planner
 All xyz targets use `left_base` as the shared world frame, in metres. Pose
 quaternions are **wxyz**. Each arm's native FK has its own base; the server
 converts right-arm poses through the calibrated base-to-base transform.
-The current YAM grasp convention reported from the physical rig is Y_site
-across the closing fingers, -Z_site the approach direction, and a grasp site
-98 mm along the gripper body's -Z. A strict vertical top-down grasp was reported
-unreachable in the validated setup; prefer the measured forward/down approach.
+The installed `yam + flexible_4310` MuJoCo model places `grasp_site` 100 mm
+along +Z of `tcp_site`, with the same orientation. In the source gripper XML
+this is `pos="0 0 -0.1", quat="0 1 0 0"`; the combined model also applies
+the gripper mounting transform. Do not interpret the source offset as a
+translation along an arm-base axis. Finger slides run along opposite Y_site
+directions. The modeled soft tips extend toward +Z_site from the mount;
+therefore +Z_site is the model's forward direction toward the tips, not
+-Z_site or -X_site. This is an offline geometry contract, not a verified
+physical approach or contact point. Confirm the installed fingers, TCP,
+calibration, and clear approach direction before contact. Choose an orientation
+supported by observed reachability; strict vertical top-down grasping is not
+guaranteed to be reachable.
 Do not invent a new TCP offset on the Agent side. The supplied quaternion is
 an exact request: the planner may fail instead of silently changing orientation.
 
@@ -49,6 +57,14 @@ objects, fixtures, or force/contact limits. Start with one arm in a cleared
 workspace and keep the other arm in its operator-confirmed staging area.
 When a view reports `world_xyz_limitation`, inspect it before attempting pixel
 localization. Invalid depth or an unaligned wrist frame is not a usable target.
+Calibration files must match the current camera mounts and TCP model. A saved
+matrix or a passing geometry test does not establish current physical accuracy.
+
+The first environment connection/observation can start hardware. With
+`gripper_limits` unset, the installed SDK drives each gripper in both directions
+to detect its stops before normal operation; this is not a motion-free hold.
+Hardware takeover requires the operator's confirmed workspace and startup
+authorization, including empty, unobstructed grippers for this calibration.
 
 For free-space manipulation, verify a hold before transport. For contact-rich
 grasping, re-grasp, insertion, tool use, or bimanual coordination, proceed only

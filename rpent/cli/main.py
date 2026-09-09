@@ -52,11 +52,12 @@ from rpent.dashboard.events import (
     NullDashboardEventSink,
     RunStartedEvent,
 )
+from rpent.evaluation import RunFinalizationContext
 from rpent.memory import MemoryManager
 from rpent.planner.base import REASONING_EFFORTS, build_planner
 from rpent.robots import enumerate_robots, get_robot_spec, get_toolkit
+from rpent.utils.config import get_memory_dir
 from rpent.utils.logging import get_logger, init_output_dir
-from rpent.utils.resources import ensure_resources
 
 logger = get_logger("agent")
 
@@ -126,8 +127,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--planner",
         default="api",
-        choices=["api", "claude_code", "codex"],
-        help="LLM backend: api | claude_code | codex.",
+        choices=["api", "claude_code", "codex", "task_card"],
+        help="Planner backend: api | claude_code | codex are LLMs in the "
+        "loop; task_card replays a recorded plan with no LLM, re-localizing "
+        "each waypoint's anchor.",
     )
     ap.add_argument(
         "--model",
@@ -198,7 +201,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--dashboard",
         action="store_true",
-        help="Start a local dashboard server for this single run.",
+        help="Start a long-lived local Dashboard Session. Session settings "
+        "are read from the CLI.",
     )
     ap.add_argument(
         "--dashboard-host",
@@ -248,8 +252,9 @@ def _handoff_message(output_dir, session_number: int, session_max: int) -> str:
         f"{attempts_dir}/ ({', '.join(prior) if prior else 'none yet'}), and their "
         "working notes are in the memory inbox under wip/.\n\n"
         "Read every archive and the working notes before acting. Do not repeat "
-        "failed approaches. A fresh toolkit has already restored a clean scene; "
-        "inspect it before acting."
+        "failed approaches. A new planner session does not prove that the scene "
+        "was reset. Inspect the current environment and follow the robot-specific "
+        "reset and operator-readiness requirements before acting."
     )
 
 
@@ -288,22 +293,14 @@ def _start_continuation_session(
             "session_max": session_max,
         },
     )
-    if args.robot_name == "yam":
-        previous_session = (
-            Path(output_dir) / "sessions" / f"session_{session_number - 1:03d}"
-        )
-        session_message = (
-            f"You are agent {session_number} of up to {session_max} on this cell. "
-            f"Read the recorded steps and artifacts in {previous_session}/ and "
-            f"working notes under {prompt_vars['memory_inbox']}/wip/. "
-            "The physical scene has NOT been reset. The previous session requested "
-            "stop; this toolkit only observes. Inspect the current state and previous "
-            "failures, ask the operator to prepare the next attempt and write a ready "
-            "receipt, then use the reset tool before motion. Do not repeat failed "
-            "approaches or claim that a new planner context restored the scene."
-        )
-    else:
-        session_message = _handoff_message(output_dir, session_number, session_max)
+    previous_session = (
+        Path(output_dir) / "sessions" / f"session_{session_number - 1:03d}"
+    )
+    session_message = _handoff_message(output_dir, session_number, session_max)
+    session_message += (
+        f"\nRead the previous session's recorded steps in {previous_session}/ "
+        f"and working notes under {prompt_vars.get('memory_inbox', 'the memory inbox')}/wip/."
+    )
     return planner, system_prompt, session_message
 
 
@@ -336,14 +333,14 @@ def main() -> int:
     args.robot_name = early.robot_name
     if args.dashboard and args.interactive:
         parser.error("--dashboard and --interactive cannot be used together")
-    if args.explore and args.robot_name not in ("libero", "yam"):
-        parser.error("--explore is currently supported only for LIBERO and YAM")
+    if args.explore and not robot_spec.supports_exploration:
+        parser.error(f"--explore is not supported by {robot_spec.name}")
     if args.explore and args.memory_profile == "hf":
         parser.error("--explore cannot be used with --memory-profile hf")
     if args.explore and getattr(args, "explore_sessions", 1) <= 0:
         parser.error("--explore-sessions must be greater than 0")
     args.memory_profile = args.memory_profile or (
-        "local" if args.explore or args.robot_name == "yam" else "hf"
+        "local" if args.explore else robot_spec.default_memory_profile
     )
     if args.memory_profile == "hf" and args.memory_dir is not None:
         parser.error("--memory-dir requires --memory-profile local or --explore")
@@ -364,12 +361,17 @@ def main() -> int:
     output_dir = init_output_dir(output_dir, verbose=args.verbose)
     logger.info("physical agent cmd: %s", shlex.join([sys.executable, *sys.argv]))
 
-    # Preserve the original HF-backed evaluation behavior by default.
     memory_profile = getattr(args, "memory_profile", "hf")
-    if not getattr(args, "explore", False) and memory_profile == "hf":
-        ensure_resources(robot_spec)
+    if (
+        not getattr(args, "explore", False)
+        and memory_profile == "hf"
+        and args.planner != "task_card"
+    ):
+        MemoryManager(get_memory_dir(robot_name)).sync(
+            remote_repo=robot_spec.memory_repo_id,
+        )
     else:
-        logger.info("resources: using local %s memory profile", memory_profile)
+        logger.info("memory: using local %s profile", memory_profile)
 
     dashboard_events = NullDashboardEventSink()
 
@@ -439,6 +441,7 @@ def main() -> int:
         sessions = 1
     recipe_path = ""
     solved = False
+    environment_success: bool | None = None
     memory_manager: MemoryManager | None = None
     try:
         if first_user_msg is not None:
@@ -463,7 +466,7 @@ def main() -> int:
                 state_output_dir = (
                     output_dir / "sessions" / f"session_{session_number:03d}"
                 )
-            if robot_name in ("libero", "yam"):
+            if robot_spec.supports_exploration:
                 toolkit = get_toolkit(
                     robot_name,
                     primitives_kwargs=primitives_kwargs,
@@ -495,34 +498,17 @@ def main() -> int:
                 messages += result.messages
                 stats = result.stats
                 agent_error = result.error
-                if robot_name in ("libero", "yam"):
+                if robot_spec.supports_exploration:
                     solved = toolkit.solved()
-                    if robot_name == "yam":
-                        # Planner finish arguments are requests; the recorded
-                        # tool result and current episode decide the outcome.
-                        recorded_finish = next(
-                            (
-                                record.result
-                                for record in reversed(toolkit.state.records())
-                                if (record.command or {}).get("action") == "finish"
-                            ),
-                            finish_result,
-                        )
-                        if recorded_finish is not None or solved:
-                            recorded_finish = recorded_finish or {}
-                            finish_result = {
-                                **recorded_finish,
-                                "requested_status": recorded_finish.get(
-                                    "requested_status", recorded_finish.get("status")
-                                ),
-                                "status": "success" if solved else "failure",
-                                "verified_success": bool(solved),
-                            }
-                        result.finish_result = finish_result
                     if solved:
                         recipe_path = toolkit.write_recipe(recipe_tag)
             finally:
-                toolkit.close()
+                try:
+                    if robot_spec.finalize_run is not None:
+                        environment_success = bool(toolkit.solved())
+                        solved = environment_success
+                finally:
+                    toolkit.close()
             if solved:
                 break
             if agent_error:
@@ -557,6 +543,7 @@ def main() -> int:
         "model": args.model,
         "elapsed_s": round(elapsed, 1),
         "finish": finish_result,
+        "environment_success": environment_success,
         "stats": stats,
         "messages": _serialize_messages(messages),
     }
@@ -572,13 +559,39 @@ def main() -> int:
     )
     logger.info("transcript: %s", transcript_path)
 
+    if robot_spec.finalize_run is not None:
+        try:
+            result_path = robot_spec.finalize_run(
+                RunFinalizationContext(
+                    output_dir=Path(output_dir),
+                    robot_name=robot_name,
+                    task_desc=dict(task_desc),
+                    environment_success=environment_success,
+                    agent_error=agent_error,
+                    elapsed_s=elapsed,
+                    planner=args.planner,
+                    model=args.model,
+                    reasoning_effort=args.reasoning_effort,
+                    max_turns=args.max_turns,
+                    planner_timeout_s=args.planner_timeout_s,
+                    finish_result=(
+                        dict(finish_result) if finish_result is not None else None
+                    ),
+                    stats=dict(stats),
+                )
+            )
+            if result_path:
+                logger.info("run result: %s", result_path)
+        except Exception as exc:
+            agent_error = f"result finalization failed: {type(exc).__name__}: {exc}"
+            logger.error("%s", agent_error)
+
     # Publish exploration artifacts into the corpus after the session loop.
     if (
         getattr(args, "explore", False)
         and getattr(args, "auto_merge_memory", False)
         and not agent_error
         and memory_manager is not None
-        and (robot_name != "yam" or solved)
     ):
         try:
             merge_result = memory_manager.merge_memory(

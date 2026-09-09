@@ -25,6 +25,7 @@ from robots.yam.contracts import (
 )
 from robots.yam.env_client import YamEnvClient
 from robots.yam.env_server import YamEnvFacade
+from robots.yam.hardware_ownership import HardwareLease
 from robots.yam.operator_control import write_receipt
 from robots.yam.primitives import YamPrimitives
 from robots.yam.rlinf_env import YamAgentEnv
@@ -689,11 +690,13 @@ def test_yam_env_client_constructor_observes_without_resetting() -> None:
         seed=12,
         max_episode_steps=40,
     )
-    rpc = FakeRpc({
-        "env.get_env_meta": expected_meta,
-        "env.observe": env.observe,
-        "env.reset": env.reset,
-    })
+    rpc = FakeRpc(
+        {
+            "env.get_env_meta": expected_meta,
+            "env.observe": env.observe,
+            "env.reset": env.reset,
+        }
+    )
 
     client = YamEnvClient(rpc, expected_meta=expected_meta)
 
@@ -705,10 +708,12 @@ def test_yam_env_client_constructor_observes_without_resetting() -> None:
 def test_common_env_client_default_still_resets_on_connect() -> None:
     env = FakeYamEnv()
     expected_meta = {"runtime": "generic"}
-    rpc = FakeRpc({
-        "env.get_env_meta": expected_meta,
-        "env.reset": env.reset,
-    })
+    rpc = FakeRpc(
+        {
+            "env.get_env_meta": expected_meta,
+            "env.reset": env.reset,
+        }
+    )
 
     client = BaseEnvClient(rpc, expected_meta=expected_meta)
 
@@ -1516,7 +1521,9 @@ def test_yam_toolkit_no_vla_primitives_recipe_and_memory_merge(tmp_path) -> None
         model=None,
     )
     recipe_tag = "yam_place_cube_s12"
-    technique_path = tmp_path / "memory" / "_inbox" / recipe_tag / "suite_technique.md"
+    technique_path = (
+        tmp_path / "memory" / "_internal" / "inbox" / recipe_tag / "suite_technique.md"
+    )
     technique = """---
 scope: suite
 suite: yam
@@ -1568,8 +1575,32 @@ Use the left gripper to stabilize the object before opening the right gripper.
     assert merge["task"] == 1
     assert (tmp_path / "memory" / "MEMORY.md").exists()
     assert (tmp_path / "memory" / "suite" / "suite_yam_real_tplace_cube.md").exists()
-    assert (tmp_path / "memory" / "task" / f"recipe_{recipe_tag}.jsonl").exists()
-    assert (tmp_path / "memory" / "task" / f"{recipe_tag}.json").exists()
+    assert (tmp_path / "memory" / "task_only" / f"{recipe_tag}_recipe.jsonl").exists()
+    assert (tmp_path / "memory" / "task_only" / f"{recipe_tag}.json").exists()
+
+    # A separate episode consumes the published corpus through normal tool bindings.
+    next_toolkit, _, _, next_memory = _make_yam_toolkit(tmp_path, model=None)
+    try:
+        recalled = next_toolkit.execute_tool(
+            "read_text_file",
+            {"path": str(next_memory.root / "suite" / "suite_yam_real_tplace_cube.md")},
+        )
+        recipe = next_toolkit.execute_tool(
+            "read_text_file",
+            {
+                "path": str(
+                    next_memory.root / "task_only" / f"{recipe_tag}_recipe.jsonl"
+                )
+            },
+        )
+        rejected = next_toolkit.execute_tool(
+            "write_text_file", {"path": str(technique_path), "content": "overwrite"}
+        )
+    finally:
+        next_toolkit.close()
+    assert "stabilize the object" in recalled.result["content"]
+    assert '"action": "release"' in recipe.result["content"]
+    assert "error" in rejected.result
 
 
 def test_yam_toolkit_recipe_uses_only_current_episode_after_external_reset(
@@ -1638,8 +1669,8 @@ def test_yam_toolkit_success_writes_recipe_and_memory_task_artifacts(tmp_path) -
     )
 
     assert merge["task"] == 1
-    assert (tmp_path / "memory" / "task" / f"recipe_{recipe_tag}.jsonl").exists()
-    assert (tmp_path / "memory" / "task" / f"{recipe_tag}.json").exists()
+    assert (tmp_path / "memory" / "task_only" / f"{recipe_tag}_recipe.jsonl").exists()
+    assert (tmp_path / "memory" / "task_only" / f"{recipe_tag}.json").exists()
 
 
 def test_yam_toolkit_failure_does_not_write_recipe_or_merge_task_artifacts(
@@ -1668,8 +1699,10 @@ def test_yam_toolkit_failure_does_not_write_recipe_or_merge_task_artifacts(
 
     assert env.take_action_cnt == MODEL_SPEC.use_length
     assert merge["task"] == 0
-    assert not (tmp_path / "memory" / "task" / f"recipe_{recipe_tag}.jsonl").exists()
-    assert not (tmp_path / "memory" / "task" / f"{recipe_tag}.json").exists()
+    assert not (
+        tmp_path / "memory" / "task_only" / f"{recipe_tag}_recipe.jsonl"
+    ).exists()
+    assert not (tmp_path / "memory" / "task_only" / f"{recipe_tag}.json").exists()
 
 
 def test_env_step_rpc_rejects_multiple_actions_before_command(tmp_path) -> None:
@@ -1687,3 +1720,163 @@ def test_env_step_rpc_rejects_multiple_actions_before_command(tmp_path) -> None:
         assert runtime.commands == []
     finally:
         facade.close()
+
+
+@pytest.mark.parametrize("arm,offset", [("left", 0), ("right", 7)])
+def test_single_arm_preserves_other_command_despite_measured_drift(arm, offset):
+    env = FakeToolkitEnv()
+    commanded = env.qpos.copy()
+    commanded[:6] = 0.1
+    commanded[7:13] = 0.2
+    commanded[[6, 13]] = [0.3, 0.8]
+    env.last_info["commanded_qpos"] = commanded.copy()
+    primitives = YamPrimitives(env=env, check_cancelled=lambda: None)
+    primitives.apply_qpos_updates([{"arm": arm, "arm_qpos": [0.4] * 6}])
+    sent = env.qpos
+    expected = commanded.copy()
+    expected[offset : offset + 6] = 0.4
+    np.testing.assert_array_equal(sent, expected)
+
+
+def test_camera_meta_and_render_remain_bound_to_observed_pose(tmp_path):
+    runtime = FakeRuntime()
+    env = YamAgentEnv(
+        _yam_agent_config(tmp_path=tmp_path),
+        runtime=runtime,
+        cameras=FreshSnapshotCameraRig(),
+        kinematics={side: FakeKinematics() for side in ("left", "right")},
+    )
+    try:
+        observation, info = env.observe()
+        runtime.qpos[0] += 0.2
+        runtime.qpos[7] += 0.3
+        for side in ("left", "right"):
+            meta = env.get_camera_meta(side)
+            np.testing.assert_array_equal(
+                meta["cam2world_cv"],
+                observation["views"][side]["camera_meta"]["cam2world_cv"],
+            )
+            np.testing.assert_array_equal(
+                env.render_camera(side), observation["views"][side]["rgb"]
+            )
+        _, next_info = env.observe()
+        np.testing.assert_array_equal(
+            next_info["commanded_qpos"], info["commanded_qpos"]
+        )
+    finally:
+        env.close()
+
+
+def test_can_lease_conflict_and_release(tmp_path):
+    first = HardwareLease(["can_left", "can_right"], lock_dir=tmp_path)
+    second = HardwareLease(["can_right"], lock_dir=tmp_path)
+    first.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="owned"):
+            second.acquire()
+    finally:
+        first.close()
+    second.acquire()
+    second.close()
+
+
+def test_existing_socketcan_subscriptions_are_rejected(tmp_path):
+    lease = HardwareLease(["can_left", "can_right"], lock_dir=tmp_path)
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    with pytest.raises(RuntimeError, match="unavailable"):
+        lease.check_subscriptions(proc_root=proc)
+    entries = proc / "rcvlist_all"
+    entries.write_text(
+        "receive list 'rx_all':\n  (any: no entry)\n  (can_left: no entry)\n"
+    )
+    lease.check_subscriptions(proc_root=proc)
+    entries.write_text(" device can_id can_mask\n can_left 000 00000000\n")
+    with pytest.raises(RuntimeError, match="Existing CAN"):
+        lease.check_subscriptions(proc_root=proc)
+
+
+def test_failed_ownership_cannot_be_bypassed_by_second_observe(tmp_path, monkeypatch):
+    rig = FreshSnapshotCameraRig()
+    env = YamAgentEnv(_yam_agent_config(tmp_path=tmp_path), cameras=rig)
+    monkeypatch.setattr(HardwareLease, "acquire", lambda self: None)
+    monkeypatch.setattr(HardwareLease, "close", lambda self: None)
+
+    def busy(self):
+        raise RuntimeError("Existing CAN subscription")
+
+    monkeypatch.setattr(HardwareLease, "check_subscriptions", busy)
+    with pytest.raises(RuntimeError, match="Existing CAN"):
+        env.observe()
+    with pytest.raises(RuntimeError, match="startup failed"):
+        env.observe()
+    assert rig.open_calls == 0
+    assert env._hardware_lease is None
+    env.close()
+
+
+def test_close_can_retry_after_runtime_cleanup_failure(tmp_path, monkeypatch):
+    runtime = FakeRuntime()
+    env = YamAgentEnv(_yam_agent_config(tmp_path=tmp_path), runtime=runtime)
+    calls = []
+
+    def close():
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("disconnect failure")
+
+    monkeypatch.setattr(runtime, "close", close)
+    with pytest.raises(RuntimeError, match="fully close"):
+        env.close()
+    assert not env._closed
+    env.close()
+    assert env._closed
+    assert len(calls) == 2
+
+
+def test_measured_transition_uses_feedback_and_rejects_tracking_lag(
+    tmp_path, monkeypatch
+):
+    runtime = FakeRuntime()
+    config = _yam_agent_config(tmp_path=tmp_path)
+    config["max_tracking_error_rad"] = 0.1
+    env = YamAgentEnv(config, runtime=runtime)
+    measured = runtime.qpos.copy()
+    measured[0] = 0.05
+    runtime.qpos = measured.copy()
+    target = measured.copy()
+    target[0] = 0.08
+    checked = []
+
+    def guard(start, finish):
+        checked.append((start.copy(), finish.copy()))
+        return {"ok": True}
+
+    monkeypatch.setattr(env.geometry, "check_qpos_transition", guard)
+    env._check_measured_transition(target)
+    np.testing.assert_array_equal(checked[0][0], measured)
+    np.testing.assert_array_equal(checked[0][1], target)
+    target[0] = 0.4
+    with pytest.raises(RuntimeError, match="tracking error"):
+        env._check_measured_transition(target)
+    assert runtime.commands == []
+    env.close()
+
+
+@pytest.mark.parametrize("table_z", [None, float("nan"), float("inf")])
+def test_site_requires_verified_table_before_any_motion(tmp_path, table_z):
+    config = _yam_agent_config(tmp_path=tmp_path)
+    config["require_table_guard"] = True
+    config["table_z"] = table_z
+    runtime = FakeRuntime()
+    if table_z is not None and not np.isfinite(table_z):
+        with pytest.raises(ValueError, match="table_z must be finite"):
+            YamAgentEnv(config, runtime=runtime)
+        assert runtime.commands == []
+        return
+    env = YamAgentEnv(config, runtime=runtime)
+    env._operator_ready_receipt = {"event": "ready"}
+    with pytest.raises(RuntimeError, match="verified finite table_z"):
+        env._require_ready_for_motion()
+    assert runtime.commands == []
+    env.close()

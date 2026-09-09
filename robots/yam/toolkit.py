@@ -203,14 +203,16 @@ class YamToolkit(Toolkit):
             # capture. Keep the planner termination signal at the top level.
             verified = status.get("eval_success") is True
             requested_status = str(result.get("status", "failure"))
-            captured.update({
-                **result,
-                "requested_status": requested_status,
-                "requested_success": requested_status.lower() == "success",
-                "verified_success": verified,
-                "episode_status": status,
-                "status": "success" if verified else "failure",
-            })
+            captured.update(
+                {
+                    **result,
+                    "requested_status": requested_status,
+                    "requested_success": requested_status.lower() == "success",
+                    "verified_success": verified,
+                    "episode_status": status,
+                    "status": "success" if verified else "failure",
+                }
+            )
         return captured
 
     def cancel_active_and_wait(self) -> None:
@@ -271,7 +273,7 @@ class YamToolkit(Toolkit):
                 continue
             recipe.append(command)
         self._run_output_dir.mkdir(parents=True, exist_ok=True)
-        name = f"recipe_{recipe_tag}.jsonl"
+        name = f"{recipe_tag}_recipe.jsonl"
         recipe_path = self._run_output_dir / name
         recipe_path.write_text(
             "".join(
@@ -297,6 +299,7 @@ class YamToolkit(Toolkit):
             else None,
             "recipe_actions": len(recipe),
             "session_state_dir": str(self._state_output_dir),
+            "coordinate_scope": "episode-local; re-localize before reuse",
         }
         audit_path.write_text(
             json.dumps(audit, ensure_ascii=False, indent=2, default=str),

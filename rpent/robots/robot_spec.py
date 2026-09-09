@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rpent.dashboard.events import DashboardEventSink
+from rpent.dashboard.spec import DashboardSpec
+from rpent.evaluation import RunFinalizer
 from rpent.robots.prompt_bundle import PromptBundle
 
 if TYPE_CHECKING:
@@ -61,5 +63,16 @@ class RobotSpec:
         [argparse.Namespace, Path, DashboardEventSink, set[str] | None],
         tuple[list["ProcessDaemon"], dict[str, Any]],
     ]
-    dashboard: dict[str, Any] | None = None
-    resources_repo_id: str = "RLinf/RPent-memory"
+    dashboard: DashboardSpec | None = None
+    memory_repo_id: str = "RLinf/RPent-memory"
+    finalize_run: RunFinalizer | None = None
+    #: Toolkit accepts exploration mode, attempt budget, and session state path.
+    supports_exploration: bool = False
+    #: Local robots can avoid implicit remote memory synchronization.
+    default_memory_profile: str = "hf"
+    #: Replay this robot's recorded plan for one cell, in place of a planner.
+    #: Takes the toolkit, the cell tag, and a note sink; returns at least
+    #: ``{"done": bool}``. Left unset by robots that record no cards.
+    replay_card: Callable[[Any, str, Callable[[str], None]], dict[str, Any]] | None = (
+        None
+    )
