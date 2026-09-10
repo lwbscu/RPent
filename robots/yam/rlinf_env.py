@@ -194,7 +194,9 @@ class YamAgentEnv:
             if self.control_diagnostics:
                 from robots.yam.diagnostics import read_control_diagnostics
 
-                info["control_diagnostics"] = read_control_diagnostics(self._runtime)
+                info["control_diagnostics"] = read_control_diagnostics(
+                    self._runtime, include_cached_motor_telemetry=True
+                )
             return {"state": {"joint_position": qpos.copy()}}, info
 
     def control_step(
@@ -746,7 +748,9 @@ class YamAgentEnv:
         if self.control_diagnostics:
             from robots.yam.diagnostics import read_control_diagnostics
 
-            info["control_diagnostics"] = read_control_diagnostics(self._runtime)
+            info["control_diagnostics"] = read_control_diagnostics(
+                self._runtime, include_cached_motor_telemetry=True
+            )
         self.last_obs = obs
         self.last_info = info
         return obs, info

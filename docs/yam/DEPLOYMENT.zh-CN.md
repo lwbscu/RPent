@@ -47,6 +47,8 @@ PI 使用服务端声明的 `compact_control` 接口时，只读取关节状态�
 有效增益、反馈与前馈快照；缺失能力明确为 unsupported，不启动额外硬件连接。
 保持之后 `commanded_qpos` 仍表示上一条轨迹目标，排查当前驱动目标应看诊断中的
 `active_command`。这些快照不是同一时刻原子采集，也不等于 CAN 执行确认。
+其中 `cached_motor_telemetry` 提供已有电机缓存的状态码和 MOS/转子温度；
+缓存读取时间不代表 CAN 接收时间，不能据此单独判定反馈新鲜或没有故障。
 
 `collision_guard.enabled=true`，模型间距设为 0.01 m；缺模型资产/基座外参时拒绝。
 `require_table_guard=true`：桌面几何必须在新鲜观察后核实并填写；当前未填写，所有原语运动均被拒绝，只允许观察。

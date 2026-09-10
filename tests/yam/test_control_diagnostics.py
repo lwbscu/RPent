@@ -177,3 +177,84 @@ def test_installed_sdk_public_observation_and_reversed_gripper_mapping():
     assert arm["active_command"]["target_qpos"][-1] == pytest.approx(0.25)
     assert arm["active_command"]["target_velocity"][-1] == pytest.approx(0.2)
     assert not robot.writes
+
+
+def test_actual_motor_chain_cached_telemetry_without_can():
+    driver = pytest.importorskip("i2rt.motor_drivers.dm_driver")
+    robot = Robot()
+    # Bind only the actual cached read; no constructor or CAN interface exists.
+    chain = SimpleNamespace(
+        state_lock=threading.Lock(),
+        motor_list=[[i, "DM4340"] for i in range(1, 8)],
+        motor_direction=np.ones(7),
+        absolute_positions=np.zeros(7),
+        _joint_position_real_to_sim_idx=lambda value, index: value,
+        state=[
+            SimpleNamespace(
+                id=i,
+                error_code="0x1",
+                velocity=0.0,
+                torque=0.0,
+                temperature_mos=31.0,
+                temperature_rotor=32.0,
+            )
+            for i in range(1, 8)
+        ],
+    )
+    chain.read_states = MethodType(driver.DMChainCanInterface.read_states, chain)
+    robot.motor_chain = chain
+    report = read_control_diagnostics(
+        runtime_with(robot), include_cached_motor_telemetry=True
+    )
+    section = report["arms"]["left"]["cached_motor_telemetry"]
+    assert section["status"] == "available"
+    assert section["motors"][2] == {
+        "motor_id": 3,
+        "error_code": 1,
+        "temp_mos_c": 31.0,
+        "temp_rotor_c": 32.0,
+    }
+    assert (
+        report["host_read_start_s"]
+        <= section["cache_read_timestamp_s"]
+        <= report["host_read_end_s"]
+    )
+    assert "not CAN reception" in section["limitation"]
+    assert not robot.writes
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("temp_mos", float("nan")),
+        ("timestamp", float("inf")),
+        ("error_code", "unknown"),
+        ("id", 1.5),
+    ],
+)
+def test_invalid_cached_motor_telemetry_is_unsupported(field, value):
+    robot = Robot()
+    states = [
+        SimpleNamespace(
+            id=i, error_code="0x1", temp_mos=30.0, temp_rotor=31.0, timestamp=1.0
+        )
+        for i in range(1, 8)
+    ]
+    setattr(states[0], field, value)
+    robot.motor_chain = SimpleNamespace(read_states=lambda: states)
+    report = read_control_diagnostics(
+        runtime_with(robot), include_cached_motor_telemetry=True
+    )
+    assert report["arms"]["left"]["cached_motor_telemetry"]["status"] == "unsupported"
+    json.dumps(report, allow_nan=False)
+
+
+def test_cached_motor_telemetry_is_opt_in_and_missing_capability_is_explicit():
+    robot = Robot()
+    report = read_control_diagnostics(runtime_with(robot))
+    assert "cached_motor_telemetry" not in report["arms"]["left"]
+    report = read_control_diagnostics(
+        runtime_with(robot), include_cached_motor_telemetry=True
+    )
+    assert report["arms"]["left"]["cached_motor_telemetry"]["status"] == "unsupported"

@@ -111,7 +111,48 @@ def _configured_control(robot: Any) -> dict[str, Any]:
     }
 
 
-def read_control_diagnostics(runtime: Any) -> dict[str, Any]:
+def _cached_motor_telemetry(robot: Any) -> dict[str, Any]:
+    # DMChainCanInterface.read_states copies its existing state under
+    # state_lock; it does not send CAN frames. Its timestamp is generated at
+    # this read, not when each motor feedback frame arrived.
+    states = robot.motor_chain.read_states()
+    if len(states) != 7:
+        raise ValueError("expected seven cached motor states")
+    motors = []
+    for state in states:
+        # Actual SDK stores hex strings despite MotorInfo's int annotation.
+        code = state.error_code
+        if isinstance(code, str):
+            code = int(code, 16)
+        values = _vector([state.id, code, state.temp_mos, state.temp_rotor], 4)
+        motor_id, error_code, temp_mos, temp_rotor = values
+        if motor_id != int(motor_id) or not 1 <= motor_id <= 127:
+            raise ValueError("invalid cached motor ID")
+        if error_code != int(error_code) or not 0 <= error_code <= 15:
+            raise ValueError("invalid cached motor error code")
+        motors.append(
+            {
+                "motor_id": int(motor_id),
+                "error_code": int(error_code),
+                "temp_mos_c": temp_mos,
+                "temp_rotor_c": temp_rotor,
+            }
+        )
+    if len({motor["motor_id"] for motor in motors}) != 7:
+        raise ValueError("duplicate cached motor IDs")
+    stamps = _vector([state.timestamp for state in states], 7)
+    return {
+        "motors": motors,
+        "cache_read_timestamp_s": stamps[0],
+        "source": "i2rt.motor_chain.read_states; cached copy under state_lock",
+        "error_code_convention": "raw MIT feedback status nibble as integer; SDK treats 1 as enabled, not 0",
+        "limitation": "timestamp marks cache read, not CAN reception; freshness and present fault-free state are not established",
+    }
+
+
+def read_control_diagnostics(
+    runtime: Any, *, include_cached_motor_telemetry: bool = False
+) -> dict[str, Any]:
     """Return explicit available/unsupported sections without opening devices.
 
     Call from the environment's existing serialized observation path. Each SDK
@@ -147,6 +188,10 @@ def read_control_diagnostics(runtime: Any) -> dict[str, Any]:
                 }
             ),
         }
+        if include_cached_motor_telemetry:
+            sections["cached_motor_telemetry"] = _section(
+                lambda: _cached_motor_telemetry(robot)
+            )
         arms[side] = {
             "status": "available"
             if all(s["status"] == "available" for s in sections.values())

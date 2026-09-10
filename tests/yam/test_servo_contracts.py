@@ -99,7 +99,8 @@ def test_diagnostics_switch_controls_observation_info_only(
     calls = []
     payload = {"status": "available", "arms": {"left": {"status": "available"}}}
 
-    def read(runtime):
+    def read(runtime, *, include_cached_motor_telemetry=False):
+        assert include_cached_motor_telemetry is True
         calls.append(runtime)
         return deepcopy(payload)
 
