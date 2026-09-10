@@ -10,11 +10,14 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
 
 from robots.yam.contracts import YAM_CAMERA_NAMES, YAM_STATUS_KEYS, validate_actions
+from robots.yam.geometry import joint_limits_from_config
+from robots.yam.servo import JointServoConfig
 from rpent.robots.components.env_client_base import BaseEnvClient
 from rpent.utils.rpc import RpcClient
 
@@ -34,12 +37,41 @@ class YamEnvClient(BaseEnvClient):
         *,
         expected_meta: dict[str, Any],
     ) -> None:
+        server_meta = client.call(
+            "env.get_env_meta", timeout_s=self._TIMEOUT_S["default"]
+        )
+        if not isinstance(server_meta, dict):
+            raise ValueError("YAM server metadata must be a mapping")
+        fixed = deepcopy(server_meta)
+        execution = fixed.get("execution")
+        if not isinstance(execution, dict):
+            raise ValueError("YAM server execution capabilities must be a mapping")
+        if "joint_servo" in execution:
+            JointServoConfig.from_config(execution.pop("joint_servo"))
+        if "compact_control" in execution:
+            if type(execution.pop("compact_control")) is not bool:
+                raise ValueError("YAM compact_control capability must be boolean")
+        bound_keys = {"joint_limit_min", "joint_limit_max"}
+        provided_bounds = bound_keys.intersection(execution)
+        if provided_bounds:
+            if provided_bounds != bound_keys:
+                raise ValueError("YAM server must advertise both joint limit bounds")
+            joint_limits_from_config({key: execution.pop(key) for key in bound_keys})
+        expected_fixed = deepcopy(expected_meta)
+        for key in ("joint_servo", "compact_control", *bound_keys):
+            expected_fixed.get("execution", {}).pop(key, None)
+        if fixed != expected_fixed:
+            raise ValueError(
+                f"env_meta mismatch: expected={expected_fixed!r} actual={fixed!r}"
+            )
+        # The common handshake verifies this complete snapshot is still current.
+        # Observe happens only after both fixed and optional contracts pass.
         super().__init__(
             client,
-            expected_meta=expected_meta,
+            expected_meta=server_meta,
             reset_on_connect=False,
         )
-        self.server_meta = dict(expected_meta)
+        self.server_meta = deepcopy(server_meta)
         execution = self.server_meta.get("execution", {})
         self.execution_capabilities = (
             dict(execution) if isinstance(execution, dict) else {}
@@ -93,6 +125,51 @@ class YamEnvClient(BaseEnvClient):
         self.last_info = info
         self._require_episode_status(info)
         return self.last_obs, info
+
+    def _cache_control_state(self, observation: Any, info: Any) -> None:
+        if not isinstance(observation, dict) or not isinstance(
+            observation.get("state"), dict
+        ):
+            raise ValueError("YAM compact feedback requires a state mapping")
+        qpos = np.asarray(observation["state"].get("joint_position"), dtype=np.float64)
+        if qpos.shape != (14,) or not np.isfinite(qpos).all():
+            raise ValueError("YAM compact feedback requires finite qpos14")
+        self._require_episode_status(info)
+        if not isinstance(info.get("robot_state"), dict):
+            raise ValueError("YAM compact feedback requires robot_state")
+        commanded = np.asarray(info.get("commanded_qpos"), dtype=np.float64)
+        if commanded.shape != (14,) or not np.isfinite(commanded).all():
+            raise ValueError("YAM compact feedback requires finite commanded_qpos")
+        self.last_control_obs = observation
+        self.last_control_info = info
+
+    def read_control_state(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        if self.execution_capabilities.get("compact_control") is not True:
+            raise RuntimeError("YAM server does not advertise compact_control")
+        result = self._client.call(
+            "env.read_control_state", timeout_s=self._TIMEOUT_S["default"]
+        )
+        observation, info = self._require_result_tuple(
+            result, 2, "env.read_control_state"
+        )
+        self._cache_control_state(observation, info)
+        return observation, info
+
+    def control_step(self, action: Any, *, expected_episode_id: str) -> tuple:
+        if self.execution_capabilities.get("compact_control") is not True:
+            raise RuntimeError("YAM server does not advertise compact_control")
+        flat = validate_actions(action)
+        if flat.shape[0] != 1:
+            raise ValueError("YAM control_step requires one qpos14 action")
+        result = self._client.call(
+            "env.control_step",
+            args=(flat[0],),
+            kwargs={"expected_episode_id": expected_episode_id},
+            timeout_s=self._TIMEOUT_S["env.step"],
+        )
+        result = self._require_result_tuple(result, 5, "env.control_step")
+        self._cache_control_state(result[0], result[4])
+        return result
 
     def reset(self) -> tuple[dict[str, Any], dict[str, Any]]:
         result = self._client.call(
@@ -196,7 +273,16 @@ class YamEnvClient(BaseEnvClient):
         )
 
     def request_stop(self) -> dict[str, Any]:
-        return self._client.call(
+        receipt = self._client.call(
             "env.request_stop",
             timeout_s=5.0,
         )
+        if isinstance(receipt, dict) and receipt.get("stop_requested") is True:
+            for name in ("last_info", "last_control_info"):
+                info = getattr(self, name, None)
+                if isinstance(info, dict) and isinstance(
+                    info.get("episode_status"), dict
+                ):
+                    # This acknowledges the flag, not a completed hold or new joints.
+                    info["episode_status"]["stop_requested"] = True
+        return receipt

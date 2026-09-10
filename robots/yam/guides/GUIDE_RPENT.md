@@ -17,6 +17,11 @@ Without a VLA endpoint, both evaluation and Explore use primitives only;
 `move_to` delegates reachability,
 IK, table protection, and waypoint generation to the env server, then executes
 the full returned waypoint list.
+The site may enable bounded outer joint PI after that path. Its `servo` result
+reports actual convergence, correction bias, timeout or no-progress stopping.
+Do not retry a failed servo by enlarging targets or altering site limits.
+Reaching the target during PI does not prove it remains there after a stop:
+the stop handler switches to measured-pose hold and discards that correction.
 
 The dual-arm names follow RoboTwin: `move_to(arm="left"|"right", xyz=...,
 quat=...)`, `rotate_wrist(arm=..., delta_yaw_deg=...)`,
@@ -26,8 +31,8 @@ Open with `val=1` (or `release`); close with `val=0`. There are no separate
 gripper values. `gripper_val` reports measured position; primitive execution
 success does not prove a secure grasp.
 
-Each geometric action selects one arm and holds the other arm at the measured
-qpos captured at the start of the chunk. The control machine executes all
+Each geometric action selects one arm and preserves the other arm's previous
+accepted target and gripper. The control machine executes all
 waypoints at 30 Hz with per-step feedback and stop handling. This differs from
 RoboTwin's per-waypoint Agent RPC, and deliberately does not expose its path
 subsampling option. Two arms can work in observed alternating phases, but there

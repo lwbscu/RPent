@@ -17,6 +17,7 @@ import numpy as np
 
 from robots.yam.contracts import MODEL_SPEC, validate_actions
 from robots.yam.env_client import YamEnvClient
+from robots.yam.servo import JointServoConfig, run_joint_servo
 from rpent.robots.components.vla_client_base import BaseVLAClient
 
 
@@ -205,15 +206,25 @@ class YamPrimitives:
         return normalized
 
     def apply_qpos_updates(
-        self, updates: list[dict[str, Any]], *, expected_episode_id: str | None = None
+        self,
+        updates: list[dict[str, Any]],
+        *,
+        expected_episode_id: str | None = None,
+        compact_control: bool = False,
     ) -> dict[str, Any]:
         updates = self._validate_qpos_updates_request(updates)
         self._check_cancelled()
-        state = np.asarray(
-            self.env.last_obs["state"]["joint_position"], dtype=np.float64
+        if compact_control and len(updates) != 1:
+            raise ValueError("compact control requires exactly one update")
+        observation = (
+            self.env.last_control_obs if compact_control else self.env.last_obs
         )
+        current_info = (
+            self.env.last_control_info if compact_control else self.env.last_info
+        )
+        state = np.asarray(observation["state"]["joint_position"], dtype=np.float64)
         action = np.asarray(
-            self.env.last_info.get("commanded_qpos", state), dtype=np.float64
+            current_info.get("commanded_qpos", state), dtype=np.float64
         ).copy()
         actions = []
         for update in updates:
@@ -224,17 +235,24 @@ class YamPrimitives:
                 action[offset + 6] = update["gripper"]
             actions.append(action.copy())
         actions_array = validate_actions(actions)
-        payload, _, _, _, info = self.env.chunk_step(
-            actions_array,
-            action_type="qpos",
-            expected_episode_id=expected_episode_id
-            or self.env.last_info["episode_status"]["episode_id"],
-            return_all_frames=self.env.execution_capabilities.get(
-                "chunk_step_all_frames"
+        if compact_control:
+            _, _, _, _, info = self.env.control_step(
+                actions_array[0],
+                expected_episode_id=expected_episode_id
+                or current_info["episode_status"]["episode_id"],
             )
-            is True,
-        )
-        self._record_chunk_payload(payload)
+        else:
+            payload, _, _, _, info = self.env.chunk_step(
+                actions_array,
+                action_type="qpos",
+                expected_episode_id=expected_episode_id
+                or current_info["episode_status"]["episode_id"],
+                return_all_frames=self.env.execution_capabilities.get(
+                    "chunk_step_all_frames"
+                )
+                is True,
+            )
+            self._record_chunk_payload(payload)
         episode_status = info["episode_status"]
         executed = int(info.get("executed_actions", 0))
         return {
@@ -254,6 +272,9 @@ class YamPrimitives:
     ) -> dict[str, Any]:
         if arm not in ("left", "right"):
             raise ValueError("arm must be 'left' or 'right'")
+        servo_config = JointServoConfig.from_config(
+            self.env.execution_capabilities.get("joint_servo")
+        )
         robot_state = self.env.last_info["robot_state"]
         if quat is None:
             key = "left_eef_pose" if arm == "left" else "right_eef_pose"
@@ -281,9 +302,61 @@ class YamPrimitives:
         updates = [
             {"arm": arm, "arm_qpos": waypoint, "gripper": gripper} for waypoint in path
         ]
-        execution = self.apply_qpos_updates(updates, expected_episode_id=episode_id)
+        try:
+            execution = self.apply_qpos_updates(updates, expected_episode_id=episode_id)
+        except Exception:
+            if servo_config.enabled:
+                self.env.request_stop()
+            raise
         executed = int(execution.get("executed_actions", 0))
         status = execution["episode_status"]
+        if servo_config.enabled:
+            if executed == len(updates):
+                servo = run_joint_servo(
+                    env=self.env,
+                    apply_updates=self.apply_qpos_updates,
+                    check_cancelled=self._check_cancelled,
+                    arm=arm,
+                    nominal=path[-1],
+                    target_pose=target,
+                    episode_id=episode_id,
+                    config=servo_config,
+                )
+            else:
+                self.env.request_stop()
+                servo = {
+                    "enabled": True,
+                    "success": False,
+                    "stop_reason": "path_incomplete",
+                    "executed_steps": 0,
+                    "trace": [],
+                }
+            servo_steps = int(servo["executed_steps"])
+            servo_requested = int(servo.get("requested_steps", servo_steps))
+            return {
+                **execution,
+                "completed": servo["success"],
+                "success": servo["success"],
+                "requested_steps": len(updates) + servo_requested,
+                "requested_actions": len(updates) + servo_requested,
+                "executed_steps": executed + servo_steps,
+                "executed_actions": executed + servo_steps,
+                "path_executed_steps": executed,
+                "servo_executed_steps": servo_steps,
+                "stop_reason": servo["stop_reason"],
+                "servo": servo,
+                "plan_status": planned["status"],
+                "waypoints": len(path),
+                "target_pose": target.tolist(),
+                "measured_pose": servo.get("measured_pose"),
+                "position_error_m": servo.get("position_error_m"),
+                "rotation_error_rad": servo.get("rotation_error_rad"),
+                "position_tolerance_m": servo_config.position_tolerance_m,
+                "rotation_tolerance_rad": servo_config.rotation_tolerance_rad,
+                "episode_status": servo.get(
+                    "episode_status", self.env.last_info["episode_status"]
+                ),
+            }
         key = "left_eef_pose" if arm == "left" else "right_eef_pose"
         measured_pose = np.asarray(
             self.env.last_info["robot_state"][key], dtype=np.float64

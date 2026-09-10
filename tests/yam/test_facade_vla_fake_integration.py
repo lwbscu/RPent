@@ -702,7 +702,11 @@ def test_yam_env_client_constructor_observes_without_resetting() -> None:
 
     assert client.last_obs["state"]["joint_position"].shape == (14,)
     assert env.reset_calls == 0
-    assert [call[0] for call in rpc.calls] == ["env.get_env_meta", "env.observe"]
+    assert [call[0] for call in rpc.calls] == [
+        "env.get_env_meta",
+        "env.get_env_meta",
+        "env.observe",
+    ]
 
 
 def test_common_env_client_default_still_resets_on_connect() -> None:

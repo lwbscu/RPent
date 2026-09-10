@@ -36,16 +36,22 @@ class YamEnvFacade(BaseEnvFacade):
 
     def _register_rpc(self):
         super()._register_rpc()
-        self._rpc.update({
-            "env.observe": self.observe,
-            "env.plan_arm_path": self.plan_arm_path,
-            "env.request_stop": self.request_stop,
-        })
+        self._rpc.update(
+            {
+                "env.observe": self.observe,
+                "env.plan_arm_path": self.plan_arm_path,
+                "env.request_stop": self.request_stop,
+                "env.read_control_state": self.read_control_state,
+                "env.control_step": self.control_step,
+            }
+        )
         # Camera snapshots and FK share state; serialize them with execution.
-        self._readonly_methods.difference_update({
-            "env.render_camera",
-            "env.get_camera_meta",
-        })
+        self._readonly_methods.difference_update(
+            {
+                "env.render_camera",
+                "env.get_camera_meta",
+            }
+        )
 
     def _dispatch(self, method, args, kwargs):
         # Never wait behind a motion chunk just to signal cancellation. This
@@ -59,6 +65,12 @@ class YamEnvFacade(BaseEnvFacade):
 
     def observe(self):
         return self._env.observe()
+
+    def read_control_state(self):
+        return self._env.read_control_state()
+
+    def control_step(self, action, *, expected_episode_id=None):
+        return self._env.control_step(action, expected_episode_id=expected_episode_id)
 
     def reset(self, *, seed=None, options=None):
         return self._env.reset(seed=seed, options=options)
@@ -120,13 +132,18 @@ def main():
     with open(args.config) as stream:
         config = json.load(stream)
     env = YamAgentEnv(config)
+    metadata = env_runtime_contract(
+        task_name=config["task_name"],
+        seed=config.get("seed", 0),
+        max_episode_steps=config.get("max_episode_steps", 1000),
+        joint_servo=config.get("joint_servo"),
+    )
+    metadata["execution"]["joint_limit_min"] = env.lower.tolist()
+    metadata["execution"]["compact_control"] = True
+    metadata["execution"]["joint_limit_max"] = env.upper.tolist()
     facade = YamEnvFacade(
         env,
-        metadata=env_runtime_contract(
-            task_name=config["task_name"],
-            seed=config.get("seed", 0),
-            max_episode_steps=config.get("max_episode_steps", 1000),
-        ),
+        metadata=metadata,
     )
     try:
         facade.serve(

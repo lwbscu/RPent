@@ -37,9 +37,13 @@ MODEL_SPEC = YamModelSpec()
 
 
 def env_runtime_contract(
-    *, task_name: str, seed: int = 0, max_episode_steps: int = 1000
+    *,
+    task_name: str,
+    seed: int = 0,
+    max_episode_steps: int = 1000,
+    joint_servo: dict | None = None,
 ) -> dict:
-    return {
+    contract = {
         "runtime": "yam_real_env",
         "task_name": task_name,
         "seed": int(seed),
@@ -66,6 +70,13 @@ def env_runtime_contract(
             "request_stop": True,
         },
     }
+    if joint_servo is not None:
+        from robots.yam.servo import JointServoConfig
+
+        contract["execution"]["joint_servo"] = JointServoConfig.from_config(
+            joint_servo
+        ).as_dict()
+    return contract
 
 
 def validate_actions(actions, *, action_type="qpos") -> np.ndarray:

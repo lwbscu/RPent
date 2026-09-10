@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 import time
@@ -85,6 +86,9 @@ class YamAgentEnv:
             ):
                 raise ValueError("max_tracking_error_rad must be finite and positive")
         self.geometry = YamGeometry(self.config, kinematics=kinematics)
+        self.control_diagnostics = self.config.get("control_diagnostics", False)
+        if not isinstance(self.control_diagnostics, bool):
+            raise ValueError("control_diagnostics must be a boolean")
         self._runtime = runtime
         self._owns_runtime = runtime is None
         self._hardware_lease: HardwareLease | None = None
@@ -95,6 +99,10 @@ class YamAgentEnv:
         self._closed = False
         self._lock = threading.RLock()
         self._stop_requested = threading.Event()
+        self._stop_hold_episode_id: str | None = None
+        self._stop_worker_lock = threading.Lock()
+        self._stop_worker: threading.Thread | None = None
+        self._pending_stop_episode: str | None = None
         self._next_tick_s: float | None = None
         self._previous_command: np.ndarray | None = None
         self._take_action_cnt = 0
@@ -172,6 +180,33 @@ class YamAgentEnv:
             expected_episode_id=expected_episode_id,
         )
 
+    def read_control_state(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Read fresh joints and control status without taking a camera snapshot."""
+        with self._lock:
+            self._ensure_started()
+            self._poll_operator_receipt_locked()
+            qpos = self._read_qpos()
+            info = {
+                "robot_state": self.geometry.robot_state(qpos),
+                "episode_status": self._episode_status(),
+                "commanded_qpos": self._previous_command.copy(),
+            }
+            if self.control_diagnostics:
+                from robots.yam.diagnostics import read_control_diagnostics
+
+                info["control_diagnostics"] = read_control_diagnostics(self._runtime)
+            return {"state": {"joint_position": qpos.copy()}}, info
+
+    def control_step(
+        self, action: Any, *, expected_episode_id: str | None = None
+    ) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
+        """Execute the existing guarded step and omit image buffers on the wire."""
+        if np.asarray(action).shape not in {(14,), (1, 14)}:
+            raise ValueError("control_step requires a single qpos14 action")
+        return self._execute_chunk(
+            action, expected_episode_id=expected_episode_id, compact_control=True
+        )
+
     def chunk_step(
         self,
         actions: Any,
@@ -179,6 +214,25 @@ class YamAgentEnv:
         return_all_frames: bool = False,
         expected_episode_id: str | None = None,
     ) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
+        return self._execute_chunk(
+            actions,
+            action_type=action_type,
+            return_all_frames=return_all_frames,
+            expected_episode_id=expected_episode_id,
+        )
+
+    def _execute_chunk(
+        self,
+        actions: Any,
+        action_type: Literal["qpos"] = "qpos",
+        return_all_frames: bool = False,
+        expected_episode_id: str | None = None,
+        *,
+        compact_control: bool = False,
+    ) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
+        read_feedback = (
+            self.read_control_state if compact_control else self._observe_locked
+        )
         array = validate_actions(actions, action_type=action_type)
         per_step: list[dict[str, Any]] = []
         frames: list[dict[str, Any]] = []
@@ -196,8 +250,7 @@ class YamAgentEnv:
                         self._last_stop_hold_s = time.time()
                         break
                     if self._stop_requested.is_set():
-                        self._runtime.hold()
-                        self._last_stop_hold_s = time.time()
+                        self._hold_stop_once_locked(self._episode_id)
                         break
                     self._require_ready_for_motion()
                     if self._take_action_cnt >= self.step_lim:
@@ -208,8 +261,7 @@ class YamAgentEnv:
                     self._pace()
                     self._require_expected_episode_locked(expected_episode_id)
                     if self._stop_requested.is_set():
-                        self._runtime.hold()
-                        self._last_stop_hold_s = time.time()
+                        self._hold_stop_once_locked(self._episode_id)
                         break
                     self._check_measured_transition(accepted)
                     result = self._runtime.command(accepted)
@@ -225,7 +277,9 @@ class YamAgentEnv:
                     self._previous_command = accepted_qpos.copy()
                     self._take_action_cnt += 1
                     executed += 1
-                    obs, info = self._observe_locked()
+                    if self._stop_requested.is_set():
+                        self._hold_stop_once_locked(self._episode_id)
+                    obs, info = read_feedback()
                     step_info = {
                         "requested_action": np.asarray(requested, dtype=np.float64),
                         "accepted_action": accepted_qpos,
@@ -247,7 +301,7 @@ class YamAgentEnv:
                         self._runtime.hold()
                         self._last_stop_hold_s = time.time()
                         break
-                obs, info = self._observe_locked()
+                obs, info = read_feedback()
             except Exception:
                 self._stop_requested.set()
                 self._hold_after_failure()
@@ -306,21 +360,60 @@ class YamAgentEnv:
     def request_stop(self) -> None:
         """Request stop without waiting for the dispatch lock.
 
-        If the env is idle and the lock is available, issue a hold immediately
-        through the same serialized runtime path. If a chunk is active, this call
-        only sets the event; the active writer observes it at the next boundary
-        and holds.
+        The first successful stop holds measured joints. Repeated requests in
+        the same episode preserve that target instead of recapturing sag. If
+        the lock is busy, one deferred worker uses the same lock and runtime;
+        it also covers a request arriving at the final chunk boundary.
         """
+        episode_id = self._episode_id
         self._stop_requested.set()
         acquired = self._lock.acquire(blocking=False)
         if not acquired:
+            with self._stop_worker_lock:
+                self._pending_stop_episode = episode_id
+                if self._stop_worker is None:
+                    self._stop_worker = threading.Thread(
+                        target=self._drain_stop_requests,
+                        name="yam-deferred-stop",
+                        daemon=True,
+                    )
+                    self._stop_worker.start()
             return
         try:
-            if self._started and self._runtime is not None:
-                self._runtime.hold()
-                self._last_stop_hold_s = time.time()
+            self._hold_stop_once_locked(episode_id)
         finally:
             self._lock.release()
+
+    def _hold_stop_once_locked(self, episode_id: str) -> None:
+        if (
+            self._closed
+            or not self._started
+            or self._runtime is None
+            or episode_id != self._episode_id
+        ):
+            return
+        self._stop_requested.set()
+        if self._stop_hold_episode_id == episode_id:
+            return
+        self._runtime.hold()
+        # Do not mark a failed/partial hold successful: a later stop may retry.
+        self._stop_hold_episode_id = episode_id
+        self._last_stop_hold_s = time.time()
+
+    def _drain_stop_requests(self) -> None:
+        while True:
+            with self._stop_worker_lock:
+                episode_id = self._pending_stop_episode
+                self._pending_stop_episode = None
+            try:
+                with self._lock:
+                    self._hold_stop_once_locked(episode_id)
+            except Exception:
+                logging.getLogger(__name__).exception("Deferred YAM stop hold failed")
+            with self._stop_worker_lock:
+                if self._pending_stop_episode is None:
+                    self._stop_worker = None
+                    return
 
     def _begin_episode(
         self,
@@ -331,6 +424,7 @@ class YamAgentEnv:
         self._next_tick_s = None
         self._actual_seed = self._actual_seed if seed is None else int(seed)
         self._episode_id = uuid.uuid4().hex
+        self._stop_hold_episode_id = None
         self._operator_success = None
         self._operator_success_source = None
         self._operator_success_receipt = None
@@ -649,6 +743,10 @@ class YamAgentEnv:
             "robot_state": robot_state,
             "commanded_qpos": self._previous_command.copy(),
         }
+        if self.control_diagnostics:
+            from robots.yam.diagnostics import read_control_diagnostics
+
+            info["control_diagnostics"] = read_control_diagnostics(self._runtime)
         self.last_obs = obs
         self.last_info = info
         return obs, info
@@ -688,8 +786,11 @@ class YamAgentEnv:
         if self._runtime is None:
             return
         try:
-            self._runtime.hold()
-            self._last_stop_hold_s = time.time()
+            if self._stop_requested.is_set():
+                self._hold_stop_once_locked(self._episode_id)
+            else:
+                self._runtime.hold()
+                self._last_stop_hold_s = time.time()
         except Exception:
             try:
                 self._runtime.emergency_hold()
