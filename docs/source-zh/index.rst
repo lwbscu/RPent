@@ -78,6 +78,7 @@
    动作原语 <rst_source/usage/configure_primitives>
    LIBERO <rst_source/usage/libero>
    BEHAVIOR <rst_source/usage/behavior>
+   LIBERO 数据飞轮 <rst_source/usage/flywheel>
    RoboCasa <rst_source/usage/robocasa>
    RoboTwin <rst_source/usage/robotwin>
    Franka <rst_source/usage/franka>

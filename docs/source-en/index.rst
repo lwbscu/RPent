@@ -86,6 +86,7 @@ Welcome to RPent
    Action Primitives <rst_source/usage/configure_primitives>
    LIBERO <rst_source/usage/libero>
    BEHAVIOR <rst_source/usage/behavior>
+   LIBERO Data Flywheel <rst_source/usage/flywheel>
    RoboCasa <rst_source/usage/robocasa>
    RoboTwin <rst_source/usage/robotwin>
    Franka <rst_source/usage/franka>

@@ -1,5 +1,17 @@
 # YAM 本地接入验收
 
+## 2026-09-10 后续核对
+
+用户确认 run1 标定后相机和底座未移动，实际双底座高差未知。
+已有静止三视角裸布重叠点云的最近表面距离中位数约 7.4/7.2 mm，P95 约 18.5/14.7 mm，
+没有发现约 40 mm 的整体错层证据；该检查不能排除平面内或公共系统性误差，不等于接触精度通过。
+当天单独读取了顶相机新画面，未连接电机；原环境服务已停止。
+
+再次 fetch 并合并 upstream/main `3fcf4b3645d2210c629974232c6182b5b7f98cc5`。
+YAM、公共 CLI/registry/memory、RPC/序列化及相关测试共 235 项通过；新增 Flywheel 两项导出测试
+因未安装可选 `lerobot.datasets` 依赖失败。YAM 本轮不启用该 LIBERO 训练导出功能。
+`RPENT_RLINF_ROOT` 仍须明确设为本机大写目录 `/home/yambox/cynws/RLinf`。
+
 ## 2026-09-09 yambox 接手状态
 
 已部署 fork/yam 并合并 upstream/main `24541d6`，现场配置在未跟踪日志目录。
