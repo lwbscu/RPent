@@ -44,7 +44,7 @@ class JointServoConfig:
             "kp": (0, 0.5),
             "ki": (0, 2),
             "period_s": (0.05, 0.2),
-            "timeout_s": (0.3, 3),
+            "timeout_s": (0.3, 8),
             "max_bias_rad": (0, 0.025),
             "max_bias_step_rad": (0, 0.002),
             "joint_tolerance_rad": (0, 0.008),

@@ -120,7 +120,7 @@ def run(plant, **kwargs):
         {"max_bias_step_rad": 0.003},
         {"stable_samples": True},
         {"stable_samples": 2},
-        {"timeout_s": 4},
+        {"timeout_s": 9},
     ],
 )
 def test_config_rejects_unbounded_or_ambiguous_settings(value):
@@ -131,6 +131,15 @@ def test_config_rejects_unbounded_or_ambiguous_settings(value):
 def test_empty_configuration_disabled():
     assert not JointServoConfig.from_config(None).enabled
     assert not JointServoConfig.from_config({}).enabled
+
+
+def test_longer_settling_window_preserves_correction_bounds():
+    default = JointServoConfig.from_config({})
+    longer = JointServoConfig.from_config({"timeout_s": 8})
+    assert default.timeout_s == 3
+    assert longer.max_bias_rad == default.max_bias_rad == 0.025
+    assert longer.max_bias_step_rad == default.max_bias_step_rad == 0.002
+    assert longer.progress_timeout_s == default.progress_timeout_s == 1
 
 
 def test_pi_step_total_clips_and_antiwindup():
