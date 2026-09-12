@@ -602,7 +602,9 @@ def main() -> int:
     if (
         getattr(args, "explore", False)
         and getattr(args, "auto_merge_memory", False)
-        and not agent_error
+        # An unsolved hardware failure still has useful inbox lessons. Keep
+        # the error exit status and never publish a solved recipe on this path.
+        and (not agent_error or not solved)
         and memory_manager is not None
     ):
         try:
