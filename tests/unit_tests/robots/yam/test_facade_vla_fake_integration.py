@@ -1714,6 +1714,20 @@ def test_yam_primitives_set_gripper_reports_actual_value_and_preserves_other_arm
     assert qpos[other_index] == pytest.approx(before_other)
 
 
+@pytest.mark.parametrize("arm,index", [("left", 6), ("right", 13)])
+@pytest.mark.parametrize("target", [0.0, 1.0])
+def test_gripper_interpolation_preserves_exact_normalized_endpoints(arm, index, target):
+    env = FakeToolkitEnv()
+    env.qpos[index] = 0.4509355509355506
+    env.observe()
+    before = env.qpos.copy()
+    primitive = YamPrimitives(env=env, model=None, check_cancelled=lambda: None)
+    result = primitive.set_gripper(arm=arm, val=target, steps=10)
+    assert result["success"]
+    assert env.qpos[index] == target
+    np.testing.assert_array_equal(np.delete(env.qpos, index), np.delete(before, index))
+
+
 def test_yam_toolkit_pi05_act_rejects_model_side_episode_reset(tmp_path) -> None:
     env = FakeToolkitEnv(require_expected_episode_id=True)
     model = FakeToolkitModel(on_predict=env.force_new_episode_id)

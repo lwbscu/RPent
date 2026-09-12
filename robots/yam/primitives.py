@@ -451,10 +451,7 @@ class YamPrimitives:
         target = float(val)
         if not np.isfinite(target) or not 0.0 <= target <= 1.0:
             raise ValueError("val must be finite and within [0,1]")
-        values = [
-            current + (target - current) * i / int(steps)
-            for i in range(1, int(steps) + 1)
-        ]
+        values = np.linspace(current, target, int(steps) + 1)[1:].tolist()
         execution = self.apply_qpos_updates(
             [{"arm": arm, "gripper": value} for value in values]
         )
