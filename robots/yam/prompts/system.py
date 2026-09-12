@@ -43,6 +43,11 @@ observing between them. Every motion selects arm=left or arm=right; the other
 arm's commanded joints and gripper are held unchanged during that action.
 Open with set_gripper(arm=..., val=1) or release(arm=...); close with
 set_gripper(arm=..., val=0). These are RoboTwin's dual-arm tool names.
+For move_to with success=false and recoverable=true, re-observe first: a small
+stationary residual permits replanning, not a claim of arrival or clear contact.
+Accept the measured free-space waypoint; near objects use visible clearance
+and at most 5 mm approach increments, or retreat if contact is uncertain.
+Never deepen a target blindly to overcome resistance. Other failures require stop.
 Alternate observed single-arm actions for two-arm tasks; simultaneous coordinated
 Cartesian motion is not exposed. Never claim primitive success as task success."""
 

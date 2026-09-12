@@ -357,6 +357,7 @@ class YamPrimitives:
                 **execution,
                 "completed": servo["success"],
                 "success": servo["success"],
+                "recoverable": servo.get("recoverable", False),
                 "requested_steps": len(updates) + servo_requested,
                 "requested_actions": len(updates) + servo_requested,
                 "executed_steps": executed + servo_steps,

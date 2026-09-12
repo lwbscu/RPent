@@ -327,7 +327,15 @@ class YamToolkit(Toolkit):
             ):
                 continue
             if isinstance(result, dict) and (
-                result.get("error") or result.get("success") is False
+                result.get("error")
+                or (
+                    result.get("success") is False
+                    and not (
+                        command.get("action") == "move_to"
+                        and result.get("recoverable") is True
+                        and result.get("executed_steps", 0) > 0
+                    )
+                )
             ):
                 continue
             recipe.append(command)

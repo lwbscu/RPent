@@ -364,13 +364,34 @@ def run_joint_servo(
             time.sleep(max(0.0, config.period_s - (time.monotonic() - now)))
     except Exception as error:
         trace.append({"failure": f"{type(error).__name__}: {error}", "stage": reason})
-    try:
-        stop_receipt = env.request_stop()
-    except Exception as error:
-        stop_error = f"{type(error).__name__}: {error}"
+    # A bounded stationary residual is not convergence or evidence of free
+    # space. Preserve the accepted command so the planner can observe before
+    # choosing a new approach; all faults still latch the normal stop.
+    recoverable = (
+        reason == "no_progress"
+        and position_error is not None
+        and position_error <= 0.015
+        and rotation_error <= config.rotation_tolerance_rad
+        and joint_error <= config.max_bias_rad
+        and len(trace) >= config.stable_samples
+        and all("joint_error_rad" in row for row in trace[-config.stable_samples :])
+        and np.max(
+            np.ptp(
+                [row["joint_error_rad"] for row in trace[-config.stable_samples :]],
+                axis=0,
+            )
+        )
+        <= 0.001
+    )
+    if not recoverable:
+        try:
+            stop_receipt = env.request_stop()
+        except Exception as error:
+            stop_error = f"{type(error).__name__}: {error}"
     return {
         "enabled": True,
         "success": False,
+        "recoverable": bool(recoverable),
         "stop_reason": reason,
         "executed_steps": executed,
         "requested_steps": requested,

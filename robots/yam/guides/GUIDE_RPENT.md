@@ -21,7 +21,15 @@ IK, table protection, and waypoint generation to the env server, then executes
 the full returned waypoint list.
 The site may enable bounded outer joint PI after that path. Its `servo` result
 reports actual convergence, correction bias, timeout or no-progress stopping.
-Do not retry a failed servo by enlarging targets or altering site limits.
+`success=false, recoverable=true` means a stationary residual within 15 mm,
+with bounded joint and rotation errors and live feedback; correction stopped
+without latching an episode stop. It does not prove free space or absence of
+contact. Observe again before any action. For a clear free-space waypoint,
+use the measured pose to plan the next segment without requiring exact arrival.
+Near objects, inspect both fingers and the object, and change the approach in
+at most 5 mm increments only when the path is visibly clear. If contact is
+uncertain, retreat instead of commanding deeper. Never enlarge a target to
+force through an obstacle or change site limits. Other servo failures still stop.
 Reaching the target during PI does not prove it remains there after a stop:
 the stop handler switches to measured-pose hold and discards that correction.
 

@@ -189,6 +189,39 @@ def test_stationary_plant_stops_without_unbounded_windup(clock, timeout, reason)
     )
 
 
+def test_small_stationary_residual_allows_observation_and_next_motion(clock):
+    plant = Plant(clock, servo={"enabled": True}, frozen=True)
+    plant.measured[:6] = 0.394
+    untouched = plant.command[6:].copy()
+    primitive = YamPrimitives(env=plant, check_cancelled=lambda: None)
+    result = primitive.move_to(arm="left", xyz=[0.4, 0.4, 0.4])
+    assert not result["success"]
+    assert result["recoverable"]
+    assert result["stop_reason"] == "no_progress"
+    assert 0.005 < result["position_error_m"] <= 0.015
+    assert plant.stops == 0
+    assert not plant.status["stop_requested"]
+    primitive.set_gripper(arm="left", val=1, steps=2)
+    for command in plant.commands:
+        np.testing.assert_array_equal(command[7:], untouched[1:])
+
+
+def test_small_residual_with_unsettled_joints_still_stops(clock):
+    plant = Plant(clock, frozen=True)
+    plant.measured[:6] = 0.394
+    observe = plant.observe
+
+    def oscillating():
+        plant.measured[3] = 0.389 if plant.measured[3] > 0.39 else 0.393
+        return observe()
+
+    plant.observe = oscillating
+    result = run(plant)
+    assert not result["success"]
+    assert not result["recoverable"]
+    assert plant.stops == 1
+
+
 @pytest.mark.parametrize(
     "fault,reason",
     [
@@ -367,7 +400,10 @@ def test_compact_pi_uses_separate_cache_and_traces_existing_motor_diagnostics(cl
         result["requested_actions"] == result["executed_actions"] == len(plant.commands)
     )
     assert result["episode_status"]["take_action_cnt"] == len(plant.commands)
-    assert plant.last_info["episode_status"]["take_action_cnt"] == result["path_executed_steps"]
+    assert (
+        plant.last_info["episode_status"]["take_action_cnt"]
+        == result["path_executed_steps"]
+    )
     assert result["servo"]["compact_control"]
     for entry in result["servo"]["trace"]:
         assert len(entry["driver"]["target_qpos"]) == 6

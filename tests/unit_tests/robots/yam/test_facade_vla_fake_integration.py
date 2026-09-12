@@ -1863,6 +1863,36 @@ def test_yam_toolkit_recipe_uses_only_current_episode_after_external_reset(
     assert audit["recipe_actions"] == 1
 
 
+@pytest.mark.parametrize(
+    "recoverable,steps,included", [(True, 2, True), (False, 2, False), (True, 0, False)]
+)
+def test_recipe_retains_executed_recoverable_waypoints(
+    tmp_path, monkeypatch, recoverable, steps, included
+):
+    toolkit, env, _, _ = _make_yam_toolkit(
+        tmp_path, success_after_chunk=False, mode="exploration", model=None
+    )
+    monkeypatch.setattr(
+        YamPrimitives,
+        "move_to",
+        lambda self, **kwargs: {
+            "success": False,
+            "recoverable": recoverable,
+            "executed_steps": steps,
+        },
+    )
+    try:
+        toolkit.execute_tool("move_to", {"arm": "right", "xyz": [0, 0, 0]})
+        assert toolkit.write_recipe("unsolved") == ""
+        env.success_after_chunk = True
+        toolkit.execute_tool("release", {"arm": "right", "steps": 1})
+        text = Path(toolkit.write_recipe("solved")).read_text()
+        assert ('"action": "move_to"' in text) == included
+        assert '"action": "release"' in text
+    finally:
+        toolkit.close()
+
+
 def test_yam_toolkit_success_writes_recipe_and_memory_task_artifacts(tmp_path) -> None:
     toolkit, env, model, memory = _make_yam_toolkit(
         tmp_path,
