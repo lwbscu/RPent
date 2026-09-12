@@ -47,7 +47,11 @@ For move_to with success=false and recoverable=true, re-observe first: a small
 stationary residual permits replanning, not a claim of arrival or clear contact.
 Accept the measured free-space waypoint; near objects use visible clearance
 and at most 5 mm approach increments, or retreat if contact is uncertain.
-Never deepen a target blindly to overcome resistance. Other failures require stop.
+Never deepen a target blindly to overcome resistance. Other servo failures require
+stop. A rejected IK candidate with executed_steps=0 and stop_requested=false
+permits re-observation and a different reachable target; it does not require
+discarding partial progress or resetting the episode. Never bypass a guard to
+execute a rejected path. Runtime feedback faults and latched stops require stop.
 Alternate observed single-arm actions for two-arm tasks; simultaneous coordinated
 Cartesian motion is not exposed. Never claim primitive success as task success."""
 
