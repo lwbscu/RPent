@@ -1417,16 +1417,7 @@ def test_yam_vla_facade_rejects_bad_observations_before_model_call(
     [
         np.zeros((1, MODEL_SPEC.use_length, 13), dtype=np.float32),
         np.full((1, MODEL_SPEC.use_length, 14), np.nan, dtype=np.float32),
-        np.repeat(
-            np.array([[[0, 0, 0, 0, 0, 0, -0.1, 0, 0, 0, 0, 0, 0, 0.5]]]),
-            MODEL_SPEC.use_length,
-            axis=1,
-        ),
-        np.repeat(
-            np.array([[[0, 0, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, 0, 1.1]]]),
-            MODEL_SPEC.use_length,
-            axis=1,
-        ),
+        np.full((1, MODEL_SPEC.use_length, 14), np.inf, dtype=np.float32),
     ],
 )
 def test_yam_vla_facade_rejects_bad_policy_outputs(bad_actions: np.ndarray) -> None:
@@ -1435,6 +1426,23 @@ def test_yam_vla_facade_rejects_bad_policy_outputs(bad_actions: np.ndarray) -> N
 
     with pytest.raises(ValueError):
         facade.predict(_valid_vla_observation())
+
+
+def test_yam_vla_saturates_grippers_like_rlinf_without_changing_joints():
+    actions = np.linspace(-0.2, 1.2, 30 * 14, dtype=np.float32).reshape(1, 30, 14)
+    model = FakeYamModel(actions=actions.copy())
+    facade = YamVLAFacade(model=model)
+
+    result = facade.predict(_valid_vla_observation())
+
+    joints = [i for i in range(14) if i not in (6, 13)]
+    np.testing.assert_array_equal(result[..., joints], actions[..., joints])
+    np.testing.assert_array_equal(
+        result[..., [6, 13]], np.clip(actions[..., [6, 13]], 0.0, 1.0)
+    )
+    np.testing.assert_array_equal(model.actions, actions)
+    with pytest.raises(ValueError, match="grippers"):
+        validate_actions(actions[0])
 
 
 def test_yam_vla_rpc_returns_errors_for_bad_observation() -> None:

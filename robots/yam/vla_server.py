@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import logging
 import sys
 
 import numpy as np
@@ -120,6 +121,18 @@ class YamVLAFacade(BaseVLAFacade):
         expected_shape = (1, MODEL_SPEC.action_horizon, 14)
         if actions.shape != expected_shape:
             raise ValueError(f"policy output must be {expected_shape}; got {actions.shape}")
+        if not np.isfinite(actions).all():
+            raise ValueError("YAM policy output must be finite")
+        # Match RLinf YamControlRuntime.command's normalized gripper saturation.
+        # Keep joint predictions unchanged and the public action contract strict.
+        grippers = actions[..., [6, 13]]
+        if np.any((grippers < 0) | (grippers > 1)):
+            logging.getLogger(__name__).info(
+                "Saturating policy grippers to [0,1] as RLinf: min=%.6f max=%.6f",
+                float(grippers.min()), float(grippers.max()),
+            )
+            actions = actions.copy()
+            actions[..., [6, 13]] = np.clip(grippers, 0.0, 1.0)
         result = validate_actions(actions[0])
         return result[None].astype(np.float32)
 
