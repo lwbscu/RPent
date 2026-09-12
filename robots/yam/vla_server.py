@@ -17,7 +17,7 @@ import sys
 
 import numpy as np
 
-from robots.yam.contracts import MODEL_SPEC, validate_actions
+from robots.yam.contracts import MODEL_SPEC, validate_actions, vla_runtime_contract
 from rpent.robots.components.vla_facade_base import BaseVLAFacade
 from rpent.utils.config import get_rlinf_repo_path
 
@@ -68,6 +68,11 @@ class YamVLAFacade(BaseVLAFacade):
         self._model = model
         super().__init__()
 
+    def _builtin_dispatch(self, method: str, args: tuple, kwargs: dict):
+        if method == "healthz":
+            return vla_runtime_contract()
+        return super()._builtin_dispatch(method, args, kwargs)
+
     def predict(self, observation, options=None):
         options = options or {}
         if not isinstance(options, dict) or set(options) - {"mode"}:
@@ -112,14 +117,10 @@ class YamVLAFacade(BaseVLAFacade):
         if hasattr(actions, "detach"):
             actions = actions.detach().cpu().numpy()
         actions = np.asarray(actions)
-        if actions.ndim != 3 or actions.shape[0] != 1:
-            raise ValueError(f"policy output must be [1,T,14]; got {actions.shape}")
-        if actions.shape[1] < MODEL_SPEC.use_length:
-            raise ValueError(
-                f"policy output has {actions.shape[1]} actions; "
-                f"use_length={MODEL_SPEC.use_length}"
-            )
-        result = validate_actions(actions[0, : MODEL_SPEC.use_length])
+        expected_shape = (1, MODEL_SPEC.action_horizon, 14)
+        if actions.shape != expected_shape:
+            raise ValueError(f"policy output must be {expected_shape}; got {actions.shape}")
+        result = validate_actions(actions[0])
         return result[None].astype(np.float32)
 
 

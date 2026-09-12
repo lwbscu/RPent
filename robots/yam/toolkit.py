@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-import json
+import time
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from robots.yam import tools
-from robots.yam.contracts import YAM_CAMERA_NAMES
+from robots.yam.contracts import MODEL_SPEC, YAM_CAMERA_NAMES
 from robots.yam.primitives import YamPrimitives
 from robots.yam.projection import world_from_depth as _world_from_depth_cv
 from rpent.dashboard.events import DashboardEventSink
@@ -40,6 +40,7 @@ _RECIPE_ACTIONS = {
 
 
 class YamToolkit(Toolkit):
+    _OPERATOR_WAIT_S = 20.0
     _SPECS = {spec["name"]: spec for spec in tools.TOOLS_SPEC}
     _FRAME_ARTIFACTS = {
         "top": "top_rgb.png",
@@ -66,7 +67,7 @@ class YamToolkit(Toolkit):
         self._mode = mode
         self._attempt = 1
         self._attempts_per_session = max(0, int(attempts_per_session))
-        self._session_attempt = 1
+        self._session_attempt = 0
         self._run_output_dir = Path(
             run_output_dir or state_output_dir or get_output_dir()
         )
@@ -89,6 +90,7 @@ class YamToolkit(Toolkit):
             self._latest_status = initial_state.get(
                 "episode_status", self._latest_status
             )
+        self._session_attempt = int(bool(self._latest_status.get("ready_for_motion")))
 
     def _register_yam_tools(self) -> None:
         self._tools.pop("finish", None)
@@ -123,8 +125,48 @@ class YamToolkit(Toolkit):
             self.add_tool("reset", self._SPECS["reset"], self._reset_episode)
         self.add_tool("finish", self._SPECS["finish"], self._finish)
 
+    def _poll_operator_status(self) -> dict[str, Any]:
+        _, info = self._primitives.env.read_control_state()
+        self._latest_status = info["episode_status"]
+        return self._latest_status
+
+    def _wait_for_operator(self, event: str) -> dict[str, Any]:
+        deadline = time.monotonic() + self._OPERATOR_WAIT_S
+        while True:
+            self.raise_if_cancelled()
+            status = self._poll_operator_status()
+            if status.get("terminal_event") == "abort":
+                return status
+            if event == "ready" and status.get("ready_to_reset"):
+                return status
+            if event == "verdict" and (
+                status.get("eval_success") is True
+                or status.get("terminal_event") == "failure"
+            ):
+                return status
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return status
+            time.sleep(min(0.2, remaining))
+
     def _finish(self, *, status: str, summary: str) -> dict[str, Any]:
-        return {"_finish": True, "status": status, "summary": summary}
+        if status != "success":
+            return {"_finish": True, "status": status, "summary": summary}
+        if self._poll_operator_status().get("eval_success") is True:
+            return {"_finish": True, "status": "success", "summary": summary}
+        self._primitives.env.request_stop()
+        verdict = self._wait_for_operator("verdict")
+        if verdict.get("eval_success") is True:
+            if self._mode != "exploration":
+                return {"_finish": True, "status": "success", "summary": summary}
+            return {"error": "finish refused: review newly confirmed success", "status": "retry", "notice": "Operator confirmed success. Read the current evidence, distil the technique to memory inbox, then call finish again."}
+        if verdict.get("terminal_event") == "abort":
+            return {"_finish": True, "status": "failure", "summary": "Operator aborted."}
+        if verdict.get("terminal_event") == "failure":
+            if self._attempts_per_session and self._session_attempt >= self._attempts_per_session:
+                return {"_finish": True, "status": "failure", "summary": summary}
+            return {"error": "finish refused: operator marked failure", "status": "retry", "notice": "Record the lesson, then reset after the scene is ready."}
+        return {"error": "finish refused: pending operator verdict", "status": "pending", "notice": "Call finish again; this has not ended the session."}
 
     def _reset_episode(self) -> dict[str, Any]:
         budget = self._attempts_per_session
@@ -133,8 +175,16 @@ class YamToolkit(Toolkit):
                 "error": "reset refused",
                 "reason": f"This session's attempt budget is spent ({budget} attempts).",
             }
+        ready = self._wait_for_operator("ready")
+        if ready.get("terminal_event") == "abort":
+            return {"error": "Operator aborted; call finish(status='failure') now.", "status": "failure"}
+        if not ready.get("ready_to_reset"):
+            return {"status": "pending", "notice": "Waiting for operator ready. Call reset again; the attempt count is unchanged."}
+        self._save_episode_video()
         result = self._primitives.reset()
-        self._attempt += 1
+        # The initial ready/reset opens attempt 1, rather than spending it.
+        if self._session_attempt:
+            self._attempt += 1
         self._session_attempt += 1
         self._latest_status = result.get("episode_status", {})
         result["attempt"] = self._attempt
@@ -145,6 +195,7 @@ class YamToolkit(Toolkit):
 
     def _capture_full_observation(self) -> tuple[dict[str, Any], dict[str, Any]]:
         env = self._primitives.env
+        self._poll_operator_status()
         obs, info = env.observe()
         views: dict[str, dict[str, Any]] = {}
         for camera_name in YAM_CAMERA_NAMES:
@@ -198,6 +249,8 @@ class YamToolkit(Toolkit):
             log={"command": command, "result": result, "elapsed_s": elapsed_s},
         )
         captured = tools.view_env_state(record.step_idx, state=self._state)
+        if result.get("error") or result.get("status") in {"pending", "retry"}:
+            captured.update(result)
         if result.get("_finish"):
             # Toolkit.execute_tool replaces stateful handler output with this
             # capture. Keep the planner termination signal at the top level.
@@ -236,16 +289,22 @@ class YamToolkit(Toolkit):
             self._primitives.env.request_stop()
         except Exception as error:
             stop_error = error
-        frames = self._primitives.stop_recording()
-        if frames:
-            self._state.save("episode.mp4", frames, step=None, fps=20)
+        self._save_episode_video()
         if stop_error:
             raise RuntimeError(
                 "Could not deliver YAM stop request during toolkit close"
             ) from stop_error
 
+    def _save_episode_video(self) -> None:
+        frames = self._primitives.stop_recording()
+        if frames:
+            self._state.save(
+                f"episode_{self._attempt:03d}.mp4", frames, step=None,
+                fps=MODEL_SPEC.control_hz,
+            )
+
     def solved(self) -> bool:
-        return self._latest_status.get("eval_success") is True
+        return self._poll_operator_status().get("eval_success") is True
 
     def write_recipe(self, recipe_tag: str) -> str:
         if not self.solved():
@@ -272,16 +331,10 @@ class YamToolkit(Toolkit):
             ):
                 continue
             recipe.append(command)
-        self._run_output_dir.mkdir(parents=True, exist_ok=True)
+        artifacts = EnvState(self._run_output_dir)
         name = f"{recipe_tag}_recipe.jsonl"
-        recipe_path = self._run_output_dir / name
-        recipe_path.write_text(
-            "".join(
-                json.dumps(command, ensure_ascii=False) + "\n" for command in recipe
-            ),
-            encoding="utf-8",
-        )
-        audit_path = self._run_output_dir / f"{recipe_tag}.json"
+        if artifacts.save(name, recipe, step=None) is None:
+            raise RuntimeError("failed to save YAM recipe")
         audit = {
             "robot": "yam",
             "recipe_tag": recipe_tag,
@@ -301,8 +354,6 @@ class YamToolkit(Toolkit):
             "session_state_dir": str(self._state_output_dir),
             "coordinate_scope": "episode-local; re-localize before reuse",
         }
-        audit_path.write_text(
-            json.dumps(audit, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
-        )
-        return str(recipe_path)
+        if artifacts.save(f"{recipe_tag}.json", audit, step=None) is None:
+            raise RuntimeError("failed to save YAM audit")
+        return str(artifacts.artifact_path(name, step=None))

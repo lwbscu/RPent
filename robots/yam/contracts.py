@@ -10,6 +10,7 @@
 """Hardware-independent YAM wire and policy contracts."""
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -27,9 +28,10 @@ YAM_STATUS_KEYS = (
 class YamModelSpec:
     policy_name: str = "pi05_yam_joint"
     camera_order: tuple[str, ...] = YAM_CAMERA_NAMES
+    state_layout: str = "qpos14"
     action_layout: str = "qpos14"
     action_horizon: int = 30
-    use_length: int = 5
+    use_length: int = 30
     control_hz: int = 30
 
 
@@ -77,6 +79,31 @@ def env_runtime_contract(
             joint_servo
         ).as_dict()
     return contract
+
+
+def vla_runtime_contract() -> dict:
+    """Return the identity required from a YAM Pi0.5 VLA server."""
+    return {
+        "runtime": "yam_vla",
+        "policy_name": MODEL_SPEC.policy_name,
+        "camera_order": list(MODEL_SPEC.camera_order),
+        "state_layout": MODEL_SPEC.state_layout,
+        "action_layout": MODEL_SPEC.action_layout,
+        "action_dim": 14,
+        "action_horizon": MODEL_SPEC.action_horizon,
+        "use_length": MODEL_SPEC.use_length,
+    }
+
+
+def validate_contract(vla_rpc: Any, expected_meta: dict[str, Any]) -> None:
+    """Connect and require the expected YAM VLA runtime identity."""
+    actual_meta = vla_rpc.call("healthz", timeout_s=30.0)
+    if actual_meta != expected_meta:
+        raise RuntimeError(
+            "YAM VLA metadata mismatch: "
+            f"expected={expected_meta!r} actual={actual_meta!r}. "
+            "Connect to the Pi0.5 YAM qpos14 VLA server."
+        )
 
 
 def validate_actions(actions, *, action_type="qpos") -> np.ndarray:

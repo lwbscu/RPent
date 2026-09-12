@@ -76,7 +76,8 @@ def test_servo_stop_then_toolkit_close_does_not_recapture_sag(env):
     env._runtime.measured[3] -= 0.025
     # Exactly the real toolkit cleanup method, with fake primitive dependencies.
     toolkit = SimpleNamespace(
-        _primitives=SimpleNamespace(env=env, stop_recording=lambda: [])
+        _primitives=SimpleNamespace(env=env, stop_recording=lambda: []),
+        _save_episode_video=lambda: None,
     )
     YamToolkit.close(toolkit)
     env.request_stop()

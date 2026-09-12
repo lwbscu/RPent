@@ -61,7 +61,7 @@ class YamPrimitives:
         self._frames.append(np.ascontiguousarray(np.asarray(rgb)))
 
     def stop_recording(self) -> list[np.ndarray]:
-        frames = list(self._frames)
+        frames = self._frames
         self._frames = []
         return frames
 
@@ -136,10 +136,13 @@ class YamPrimitives:
             )
         if int(chunks) < 1:
             raise ValueError("chunks must be at least 1")
-        if int(use_length) != MODEL_SPEC.use_length:
-            raise ValueError(f"YAM Pi0.5 requires use_length={MODEL_SPEC.use_length}")
+        if isinstance(use_length, bool) or int(use_length) != use_length or not (
+            1 <= int(use_length) <= MODEL_SPEC.action_horizon
+        ):
+            raise ValueError(f"use_length must be an integer in [1,{MODEL_SPEC.action_horizon}]")
+        use_length = int(use_length)
         executed = 0
-        requested = int(chunks) * MODEL_SPEC.use_length
+        requested = int(chunks) * use_length
         native_prompt = None
         for _ in range(int(chunks)):
             self._check_cancelled()
@@ -155,9 +158,10 @@ class YamPrimitives:
             )
             observation = self._build_policy_observation(prompt=prompt)
             episode_id = self.env.last_info["episode_status"]["episode_id"]
-            actions = validate_actions(np.asarray(self.model.predict(observation))[0])[
-                : MODEL_SPEC.use_length
-            ]
+            actions = validate_actions(np.asarray(self.model.predict(observation))[0])
+            if len(actions) < use_length:
+                raise ValueError(f"VLA returned {len(actions)} actions; requested {use_length}")
+            actions = actions[:use_length]
             payload, _, _, _, info = self.env.chunk_step(
                 actions,
                 action_type="qpos",
@@ -269,7 +273,10 @@ class YamPrimitives:
         xyz: list[float],
         quat: list[float] | None = None,
         gripper: float | None = None,
+        substeps: int = 25,
     ) -> dict[str, Any]:
+        if isinstance(substeps, bool) or int(substeps) != substeps or substeps < 0:
+            raise ValueError("substeps must be a non-negative integer")
         if arm not in ("left", "right"):
             raise ValueError("arm must be 'left' or 'right'")
         servo_config = JointServoConfig.from_config(
@@ -298,6 +305,19 @@ class YamPrimitives:
         if path.ndim != 2 or path.shape[1] != 6:
             raise ValueError(
                 f"YAM plan_arm_path returned invalid path shape {path.shape}"
+            )
+        # Keep all safety waypoints; only insert samples along planned segments.
+        if len(path) > 1 and substeps > len(path):
+            counts = np.ones(len(path) - 1, dtype=int)
+            extra = int(substeps) - len(path)
+            counts += extra // len(counts)
+            counts[: extra % len(counts)] += 1
+            path = np.concatenate(
+                [path[:1]]
+                + [
+                    np.linspace(start, end, count + 1)[1:]
+                    for start, end, count in zip(path[:-1], path[1:], counts)
+                ]
             )
         updates = [
             {"arm": arm, "arm_qpos": waypoint, "gripper": gripper} for waypoint in path
@@ -395,6 +415,7 @@ class YamPrimitives:
         arm: str,
         delta_yaw_deg: float,
         gripper: float | None = None,
+        substeps: int = 25,
     ) -> dict[str, Any]:
         state = self.env.last_info["robot_state"]
         key = "left_eef_pose" if arm == "left" else "right_eef_pose"
@@ -406,6 +427,7 @@ class YamPrimitives:
             xyz=pose[:3].tolist(),
             quat=_qmult(world_z, pose[3:]).tolist(),
             gripper=gripper,
+            substeps=substeps,
         )
         result["requested_delta_yaw_deg"] = float(delta_yaw_deg)
         return result

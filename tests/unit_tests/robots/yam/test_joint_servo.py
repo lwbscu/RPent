@@ -231,10 +231,15 @@ def test_move_to_servo_has_strict_pose_criterion_and_combined_counts(clock):
     result = primitive.move_to(arm="left", xyz=[0.4, 0.4, 0.4], quat=[1, 0, 0, 0])
     assert result["success"], result
     assert result["position_tolerance_m"] == 0.005
-    assert result["path_executed_steps"] == 2
+    assert result["path_executed_steps"] == 25
     assert result["servo_executed_steps"] > 0
     assert result["executed_steps"] == len(plant.commands)
-    assert result["executed_steps"] == 2 + result["servo_executed_steps"]
+    assert result["executed_steps"] == 25 + result["servo_executed_steps"]
+    np.testing.assert_allclose(plant.commands[0][:6], np.full(6, 0.39))
+    np.testing.assert_allclose(
+        plant.commands[result["path_executed_steps"] - 1][:6],
+        np.full(6, 0.4),
+    )
 
 
 def test_disabled_retains_legacy_completion(clock):
@@ -245,7 +250,9 @@ def test_disabled_retains_legacy_completion(clock):
     assert result["success"]
     assert result["position_tolerance_m"] == 0.025
     assert "servo" not in result
-    assert len(plant.commands) == 2
+    assert len(plant.commands) == 25
+    np.testing.assert_allclose(plant.commands[0][:6], np.full(6, 0.39))
+    np.testing.assert_allclose(plant.commands[-1][:6], np.full(6, 0.4))
 
 
 def test_servo_does_not_accept_legacy_17mm_pose_error(clock):
@@ -360,7 +367,7 @@ def test_compact_pi_uses_separate_cache_and_traces_existing_motor_diagnostics(cl
         result["requested_actions"] == result["executed_actions"] == len(plant.commands)
     )
     assert result["episode_status"]["take_action_cnt"] == len(plant.commands)
-    assert plant.last_info["episode_status"]["take_action_cnt"] == 2
+    assert plant.last_info["episode_status"]["take_action_cnt"] == result["path_executed_steps"]
     assert result["servo"]["compact_control"]
     for entry in result["servo"]["trace"]:
         assert len(entry["driver"]["target_qpos"]) == 6

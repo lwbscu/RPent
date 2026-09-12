@@ -13,7 +13,9 @@ left-base frame.
 
 Without a VLA endpoint, both evaluation and Explore use primitives only;
 `pi05_act` is absent from the available tools. Once a trained endpoint is supplied,
-`pi05_act` runs that policy; keep chunks short on the real robot.
+`pi05_act(chunks=1, use_length=30, prompt=None)` runs that policy. The server
+returns 30 absolute joint targets; execution alone chooses 1–30 steps. Omitting
+`prompt` uses the full task language. Arbitrary subtask prompts are unvalidated.
 `move_to` delegates reachability,
 IK, table protection, and waypoint generation to the env server, then executes
 the full returned waypoint list.
@@ -24,7 +26,8 @@ Reaching the target during PI does not prove it remains there after a stop:
 the stop handler switches to measured-pose hold and discards that correction.
 
 The dual-arm names follow RoboTwin: `move_to(arm="left"|"right", xyz=...,
-quat=...)`, `rotate_wrist(arm=..., delta_yaw_deg=...)`,
+quat=..., gripper=None, substeps=25)`,
+`rotate_wrist(arm=..., delta_yaw_deg=..., substeps=25)`,
 `set_gripper(arm=..., val=..., steps=10)`, and `release(arm=..., steps=10)`.
 Open with `val=1` (or `release`); close with `val=0`. There are no separate
 `open`/`close` aliases. LIBERO's signed controller gripper actions are not YAM
@@ -34,8 +37,9 @@ success does not prove a secure grasp.
 Each geometric action selects one arm and preserves the other arm's previous
 accepted target and gripper. The control machine executes all
 waypoints at 30 Hz with per-step feedback and stop handling. This differs from
-RoboTwin's per-waypoint Agent RPC, and deliberately does not expose its path
-subsampling option. Two arms can work in observed alternating phases, but there
+RoboTwin's per-waypoint Agent RPC. `substeps` can add samples but never removes
+server-planned safety waypoints; use the returned executed step count. Two arms
+can work in observed alternating phases, but there
 is no simultaneous dual-arm Cartesian primitive or coordinated collision planner.
 
 All xyz targets use `left_base` as the shared world frame, in metres. Pose
@@ -56,9 +60,9 @@ guaranteed to be reachable.
 Do not invent a new TCP offset on the Agent side. The supplied quaternion is
 an exact request: the planner may fail instead of silently changing orientation.
 
-The current geometric guard checks sampled TCP clearance above the configured
-table. It does not cover arm links, self-collision, two-arm collisions, held
-objects, fixtures, or force/contact limits. Start with one arm in a cleared
+When enabled in the site configuration, the model guard checks sampled arm link
+self/two-arm collisions and the configured finite table. Held objects, wrist
+cameras, cables, fixtures, and contact forces remain outside that model. Start with one arm in a cleared
 workspace and keep the other arm in its operator-confirmed staging area.
 When a view reports `world_xyz_limitation`, inspect it before attempting pixel
 localization. Invalid depth or an unaligned wrist frame is not a usable target.
@@ -90,3 +94,21 @@ for the Agent's retry reset. Reset does not home, fold,
 clear motor faults, or turn torque off. Never write the operator receipt file,
 call a hidden API, or substitute an Agent judgement for an operator verdict.
 Archive failed attempts; export only the current successful attempt's recipe.
+
+During exploration, use `reset` to consume ready for both the initial attempt and
+retries. Waiting for ready or a verdict lasts at most 20 seconds per tool call;
+`pending` leaves the session and attempt count unchanged. An operator failure
+allows another prepared attempt within budget; abort means finish failure now.
+The operator's separate `reset_pose` command moves to the recorded start pose.
+It is a motion, not a scene reset or an Agent tool.
+
+Planner session close requests hold only. The environment service's `shutdown`
+or Ctrl+C moves to configured `park_on_close` home, verifies convergence, then
+closes motor output. A failed home keeps the service/runtime alive for an operator
+retry. Abrupt process termination or power loss cannot run this sequence.
+
+Use one official MemoryManager corpus. A/B bag rules belong to their distinct
+task IDs; shared perception and motion lessons must not imply a universal bag
+mapping. A successful run contributes one independent piece of evidence. The
+runner filters recipes to that successful episode, merges the inbox with the
+official conflict archive rules, and rebuilds the index for the next run.

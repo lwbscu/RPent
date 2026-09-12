@@ -191,6 +191,7 @@ class YamAgentEnv:
                 "episode_status": self._episode_status(),
                 "commanded_qpos": self._previous_command.copy(),
             }
+            info["episode_status"]["ready_to_reset"] = self._pending_ready_receipt() is not None
             if self.control_diagnostics:
                 from robots.yam.diagnostics import read_control_diagnostics
 
@@ -437,6 +438,12 @@ class YamAgentEnv:
         with self._lock:
             if self._closed:
                 return
+            if self._started and self.config.get("park_on_close", {}).get("enabled"):
+                logging.getLogger(__name__).info("[结束泊车] 返回已确认的 home。")
+                self._move_to_configured_qpos("park_on_close")
+                logging.getLogger(__name__).info("[home 已到位] 现在关闭机械臂输出。")
+            # On a partial release retry, do not move disconnected arms again.
+            self._started = False
             errors: list[Exception] = []
             if self._runtime is not None:
                 try:
@@ -448,7 +455,6 @@ class YamAgentEnv:
                     self._cameras.close()
                 except Exception as error:
                     errors.append(error)
-            self._started = False
             if errors:
                 self._startup_failed = True
                 raise RuntimeError(
@@ -459,6 +465,30 @@ class YamAgentEnv:
                 self._hardware_lease.close()
                 self._hardware_lease = None
             self._closed = True
+
+    def _move_to_configured_qpos(self, name: str) -> None:
+        pose = self.config.get(name, {})
+        if not pose.get("enabled"):
+            raise ValueError(f"site config has no enabled {name} pose")
+        target = validate_actions([*pose["left_qpos"], *pose["right_qpos"]])[0]
+        joints = target.reshape(2, 7)[:, :6]
+        if np.any(joints < self.lower) or np.any(joints > self.upper):
+            raise ValueError(f"{name} pose exceeds joint limits")
+        self._runtime.move_to(
+            target,
+            duration_s=float(pose["duration_s"]),
+            max_joint_delta=float(pose["max_joint_delta"]),
+            tolerance=float(pose["tolerance"]),
+            timeout_s=float(pose["timeout_s"]),
+        )
+        self._previous_command = self._read_qpos().copy()
+
+    def reset_to_configured_qpos(self) -> dict[str, Any]:
+        """Explicit operator motion, separate from episode bookkeeping reset."""
+        with self._lock:
+            self._ensure_started()
+            self._move_to_configured_qpos("reset")
+            return {"reset_pose_reached": True}
 
     def _ensure_started(self) -> None:
         if self._closed:
@@ -889,7 +919,7 @@ class YamAgentEnv:
         self._consumed_receipt_ids.add(receipt_key)
         return normalized
 
-    def _consume_ready_receipt_locked(self) -> dict[str, Any] | None:
+    def _pending_ready_receipt(self) -> dict[str, Any] | None:
         receipt = read_receipt(self.operator_receipt_path)
         if receipt is None or receipt.get("episode_id") != self._episode_id:
             return None
@@ -897,6 +927,12 @@ class YamAgentEnv:
             return None
         key = f"ready:{receipt['request_id']}"
         if key in self._consumed_receipt_ids:
+            return None
+        return receipt
+
+    def _consume_ready_receipt_locked(self) -> dict[str, Any] | None:
+        receipt = self._pending_ready_receipt()
+        if receipt is None:
             return None
         ready = self._validate_operator_receipt(receipt, event="ready")
         self._operator_ready_receipt = ready

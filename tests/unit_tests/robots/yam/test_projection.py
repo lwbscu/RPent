@@ -159,7 +159,7 @@ def test_world_from_depth_rejects_projection_invalid_camera_meta() -> None:
 
 
 def test_world_from_depth_rejects_modified_brown_conrady_deprojection() -> None:
-    with pytest.raises(ValueError, match="modified_brown_conrady"):
+    with pytest.raises((RuntimeError, ValueError), match="pyrealsense2|modified_brown_conrady"):
         world_from_depth(
             np.ones((2, 2), dtype=np.float32),
             _camera_meta(

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import threading
 
 from robots.yam.contracts import env_runtime_contract
 from rpent.robots.components.env_facade_base import BaseEnvFacade
@@ -43,6 +45,7 @@ class YamEnvFacade(BaseEnvFacade):
                 "env.request_stop": self.request_stop,
                 "env.read_control_state": self.read_control_state,
                 "env.control_step": self.control_step,
+                "env.reset_to_configured_qpos": self.reset_to_configured_qpos,
             }
         )
         # Camera snapshots and FK share state; serialize them with execution.
@@ -58,6 +61,13 @@ class YamEnvFacade(BaseEnvFacade):
         # path sets an Event; all CAN writes, including hold(), stay on writer.
         if method == "env.request_stop":
             return self.request_stop()
+        if method == "shutdown":
+            # Home must succeed while the RPC server is still alive, so an
+            # operator can retry a failed shutdown without losing motor output.
+            with self._dispatch_lock.write():
+                self.close()
+                self._shutdown_event.set()
+            return {"ok": True}
         return super()._dispatch(method, args, kwargs)
 
     def get_env_meta(self):
@@ -113,6 +123,9 @@ class YamEnvFacade(BaseEnvFacade):
         self._env.request_stop()
         return {"stop_requested": True, "hold_confirmed": False}
 
+    def reset_to_configured_qpos(self):
+        return self._env.reset_to_configured_qpos()
+
     def close(self):
         self._env.close()
 
@@ -131,6 +144,8 @@ def main():
 
     with open(args.config) as stream:
         config = json.load(stream)
+    if not config.get("park_on_close", {}).get("enabled"):
+        parser.error("site config must enable park_on_close with the confirmed home pose")
     env = YamAgentEnv(config)
     metadata = env_runtime_contract(
         task_name=config["task_name"],
@@ -152,8 +167,20 @@ def main():
             transport=args.transport,
             parent_watch=args.parent_watch,
         )
+    except KeyboardInterrupt:
+        pass
     finally:
-        facade.close()
+        while True:
+            try:
+                facade.close()
+                break
+            except Exception:
+                logging.exception("YAM shutdown incomplete; keeping runtime alive")
+                try:
+                    input("home 回位未完成；检查路径后按回车重试。请勿直接关闭终端：")
+                except EOFError:
+                    logging.error("No input; support the arms before manually stopping this process.")
+                    threading.Event().wait()
 
 
 if __name__ == "__main__":

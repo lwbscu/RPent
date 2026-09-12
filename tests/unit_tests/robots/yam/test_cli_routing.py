@@ -8,10 +8,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from robots.yam.evaluation import finalize_run
+from rpent.memory import MemoryManager
 from rpent.robots.robot_spec import RobotSpec, RunConfig
 
 
@@ -62,10 +64,13 @@ class FakeToolkit:
         *,
         solved: bool = False,
         finish_record: dict | None = None,
+        memory: Any | None = None,
+        output_dir: Path | None = None,
     ) -> None:
-        self.memory = FakeMemory()
+        self.memory = memory or FakeMemory()
         self.closed = False
         self._solved = solved
+        self._output_dir = output_dir
         self.recipe_tags: list[str] = []
         self.state = FakeState(
             [SimpleNamespace(command={"action": "finish"}, result=finish_record)]
@@ -78,6 +83,25 @@ class FakeToolkit:
 
     def write_recipe(self, recipe_tag: str) -> str:
         self.recipe_tags.append(recipe_tag)
+        if self._output_dir is not None:
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+            recipe_path = self._output_dir / f"{recipe_tag}_recipe.jsonl"
+            recipe_path.write_text(
+                json.dumps({"action": "release", "arm": "right"}) + "\n",
+                encoding="utf-8",
+            )
+            (self._output_dir / f"{recipe_tag}.json").write_text(
+                json.dumps(
+                    {
+                        "robot": "yam",
+                        "recipe_tag": recipe_tag,
+                        "solved": True,
+                        "source": "test_cli_fake",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return str(recipe_path)
         return f"{recipe_tag}.json"
 
     def close(self) -> None:
@@ -236,6 +260,31 @@ def test_cli_merges_yam_explore_memory_after_solved(monkeypatch, tmp_path) -> No
 
     spec = _fake_robot_spec("yam", tmp_path)
     toolkits: list[FakeToolkit] = []
+    memory_root = tmp_path / "memory"
+    recipe_tag = "yam_place_cube_s7"
+
+    class MemoryWritingPlanner(FakePlanner):
+        def solve(self, **kwargs):
+            toolkit = kwargs["toolkit"]
+            inbox = toolkit.memory.root / "_internal" / "inbox" / recipe_tag
+            inbox.mkdir(parents=True, exist_ok=True)
+            (inbox / "suite_technique.md").write_text(
+                """---
+scope: suite
+suite: yam
+regime: real
+task_id: place_cube
+task_language: place the cube
+confidence: single-shot
+evidence:
+  cells:
+    - yam_place_cube_s7
+---
+Open the right gripper only after the left arm has stabilized the cube.
+""",
+                encoding="utf-8",
+            )
+            return super().solve(**kwargs)
 
     monkeypatch.setattr(cli_main, "enumerate_robots", lambda: ("libero", "yam"))
     monkeypatch.setattr(cli_main, "get_robot_spec", lambda name: spec)
@@ -246,12 +295,21 @@ def test_cli_merges_yam_explore_memory_after_solved(monkeypatch, tmp_path) -> No
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("remote sync")),
     )
     monkeypatch.setattr(
-        cli_main, "build_planner", lambda *args, **kwargs: FakePlanner()
+        cli_main, "build_planner", lambda *args, **kwargs: MemoryWritingPlanner()
     )
 
     def get_toolkit(name, **kwargs):
-        del name, kwargs
-        toolkit = FakeToolkit(solved=True)
+        del name
+        config = kwargs["config"]
+        toolkit = FakeToolkit(
+            solved=True,
+            memory=MemoryManager(
+                memory_root,
+                memory_access="inbox_write",
+                inbox_cell_tag=config.recipe_tag,
+            ),
+            output_dir=config.output_dir,
+        )
         toolkits.append(toolkit)
         return toolkit
 
@@ -272,6 +330,8 @@ def test_cli_merges_yam_explore_memory_after_solved(monkeypatch, tmp_path) -> No
             "--explore",
             "--explore-sessions",
             "2",
+            "--memory-dir",
+            str(memory_root),
             "--output-dir",
             str(tmp_path / "yam-out"),
             "--max-turns",
@@ -282,14 +342,20 @@ def test_cli_merges_yam_explore_memory_after_solved(monkeypatch, tmp_path) -> No
     assert cli_main.main() == 0
 
     assert len(toolkits) == 1
-    assert toolkits[0].recipe_tags == ["yam_place_cube_s7"]
-    assert toolkits[0].memory.merge_calls == [
-        {
-            "cell_tag": "yam_place_cube_s7",
-            "run_state_dir": tmp_path / "yam-out",
-            "solved": True,
-        }
-    ]
+    assert toolkits[0].recipe_tags == [recipe_tag]
+    suite_note = memory_root / "suite" / "suite_yam_real_tplace_cube.md"
+    recipe = memory_root / "task_only" / f"{recipe_tag}_recipe.jsonl"
+    audit = memory_root / "task_only" / f"{recipe_tag}.json"
+    assert suite_note.exists()
+    assert recipe.exists()
+    assert audit.exists()
+    read_text_spec, read_text = MemoryManager(
+        memory_root, memory_access="read_only"
+    ).get_common_tool_bindings()["read_text_file"]
+    del read_text_spec
+    recalled = read_text(path=str(suite_note))
+    assert "stabilized the cube" in recalled["content"]
+    assert json.loads(audit.read_text(encoding="utf-8"))["recipe_tag"] == recipe_tag
 
 
 def test_cli_yam_finalization_uses_environment_over_planner_success(
@@ -502,12 +568,55 @@ def test_yam_spec_primitives_only_runtime_does_not_connect_vla(
     assert config.prompt_vars["vla_enabled"] is False
     assert config.prompt_vars["memory_profile"] == "local"
     assert Path(config.prompt_vars["memory_inbox"]) == (
-        tmp_path / "memory" / "_internal" / "inbox" / "yam_place_cube_s7"
+        tmp_path / "memory" / "_internal" / "inbox" / config.recipe_tag
     )
+    assert config.recipe_tag.startswith("yam_place_cube_s7_")
+    assert len(config.recipe_tag.rsplit("_", 1)[-1]) == 12
     assert endpoints == ["http://env"]
     assert waited == ["env"]
     assert daemons == []
     assert runtime_kwargs == {"env": "rpc:http://env"}
+
+
+def test_yam_spec_repeated_runs_get_unique_recipe_tag_suffixes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import robots.yam.robot_spec as yam_robot_spec
+
+    ids = iter(
+        [
+            SimpleNamespace(hex="aaaaaaaaaaaa00000000000000000000"),
+            SimpleNamespace(hex="bbbbbbbbbbbb00000000000000000000"),
+        ]
+    )
+    monkeypatch.setattr(yam_robot_spec, "uuid4", lambda: next(ids))
+    spec = yam_robot_spec.get_robot_spec()
+
+    def args() -> SimpleNamespace:
+        return SimpleNamespace(
+            task_name="place_cube",
+            task_language=None,
+            seed=7,
+            max_episode_steps=1000,
+            explore=True,
+            explore_sessions=1,
+            memory_profile=None,
+            memory_dir=str(tmp_path / "memory"),
+            output_dir=tmp_path / "run",
+            env_endpoint="http://env",
+            vla_endpoint=None,
+            without_vla=True,
+        )
+
+    first = spec.parse_config(args())
+    second = spec.parse_config(args())
+
+    assert first.recipe_tag == "yam_place_cube_s7_aaaaaaaaaaaa"
+    assert second.recipe_tag == "yam_place_cube_s7_bbbbbbbbbbbb"
+    assert first.recipe_tag != second.recipe_tag
+    assert first.prompt_vars["recipe_tag"] == first.recipe_tag
+    assert second.prompt_vars["memory_inbox"].endswith(second.recipe_tag)
 
 
 @pytest.mark.parametrize(

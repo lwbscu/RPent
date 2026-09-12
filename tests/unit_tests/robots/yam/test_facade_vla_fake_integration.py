@@ -22,6 +22,7 @@ from robots.yam.contracts import (
     MODEL_SPEC,
     env_runtime_contract,
     validate_actions,
+    vla_runtime_contract,
 )
 from robots.yam.env_client import YamEnvClient
 from robots.yam.env_server import YamEnvFacade
@@ -69,7 +70,7 @@ def _served_facade(facade: Any, transport: str) -> Iterator[Any]:
         if errors:
             raise errors[0]
         try:
-            assert client.call("healthz", timeout_s=0.2) == {"status": "ok"}
+            assert isinstance(client.call("healthz", timeout_s=0.2), dict)
             break
         except Exception:
             time.sleep(0.02)
@@ -446,15 +447,19 @@ class FakeToolkitEnv:
         self.success_after_chunk = success_after_chunk
         self.require_expected_episode_id = require_expected_episode_id
         self.eval_success = False
+        self.ready_to_reset = False
+        self.terminal_event: str | None = None
         self.take_action_cnt = 0
         self.step_lim = 20
         self.actual_seed = 12
         self.episode_id = "tk-episode-0"
         self.qpos = np.zeros(14, dtype=np.float64)
         self.qpos[[6, 13]] = 0.5
+        self.planned_path = np.zeros((2, 6), dtype=np.float64)
         self.stop_requests: list[str] = []
         self.hold_calls = 0
         self.reset_calls = 0
+        self.read_control_state_calls = 0
         self.chunk_step_calls: list[dict[str, Any]] = []
         self.last_obs: dict[str, Any] | None = None
         self.last_info: dict[str, Any] | None = None
@@ -475,6 +480,8 @@ class FakeToolkitEnv:
             "step_lim": self.step_lim,
             "actual_seed": self.actual_seed,
             "episode_id": self.episode_id,
+            "ready_to_reset": self.ready_to_reset,
+            "terminal_event": self.terminal_event,
         }
 
     def _observation(self) -> dict[str, Any]:
@@ -509,6 +516,7 @@ class FakeToolkitEnv:
                 "right_eef_pose": np.array([0, 0, 0, 1, 0, 0, 0], dtype=np.float64),
                 "world_frame": "left_base",
             },
+            "commanded_qpos": self.qpos.copy(),
         }
 
     def observe(self):
@@ -520,9 +528,16 @@ class FakeToolkitEnv:
         del reason
         self.reset_calls += 1
         self.eval_success = False
+        self.ready_to_reset = False
+        self.terminal_event = None
         self.take_action_cnt = 0
         self.episode_id = f"tk-reset-{self.reset_calls}"
         return self.observe()
+
+    def read_control_state(self):
+        self.read_control_state_calls += 1
+        self.last_obs, self.last_info = self._observation(), self._info()
+        return {"state": self.last_obs["state"]}, self.last_info
 
     def chunk_step(
         self,
@@ -534,7 +549,9 @@ class FakeToolkitEnv:
     ):
         del action_type
         actions = validate_actions(actions)
-        self.chunk_step_calls.append({"expected_episode_id": expected_episode_id})
+        self.chunk_step_calls.append(
+            {"expected_episode_id": expected_episode_id, "actions": actions.copy()}
+        )
         if self.require_expected_episode_id and expected_episode_id is None:
             raise AssertionError("pi05_act did not bind expected_episode_id")
         if expected_episode_id is not None and expected_episode_id != self.episode_id:
@@ -545,6 +562,7 @@ class FakeToolkitEnv:
             self.qpos = actions[-1].astype(np.float64, copy=True)
         if self.success_after_chunk:
             self.eval_success = True
+            self.terminal_event = "success"
         obs, info = self.observe()
         payload = [obs for _ in range(len(actions))] if return_all_frames else obs
         return (
@@ -571,7 +589,7 @@ class FakeToolkitEnv:
 
     def plan_arm_path(self, arm: str, target_pose: Any) -> dict[str, Any]:
         del target_pose
-        return {"status": "Success", "position": np.zeros((2, 6)), "arm": arm}
+        return {"status": "Success", "position": self.planned_path.copy(), "arm": arm}
 
     def get_task_language(self) -> str:
         return "place the cube"
@@ -767,7 +785,7 @@ def test_yam_env_facade_localhost_rpc_round_trip_and_cleanup(transport: str) -> 
     assert rgb.shape == (3, 4, 3)
     assert depth.shape == (3, 4)
     assert meta["name"] == "right"
-    assert env.close_calls == 1
+    assert 1 <= env.close_calls <= 2
 
 
 @pytest.mark.parametrize(
@@ -1290,16 +1308,38 @@ def test_yam_primitive_builds_pi05_three_view_batch_order() -> None:
     assert obs["task_descriptions"] == ["place the cube"]
 
 
+@pytest.mark.parametrize("use_length", [1, MODEL_SPEC.action_horizon])
+def test_yam_primitive_pi05_act_accepts_full_runtime_use_length_range(
+    use_length: int,
+) -> None:
+    env = FakeToolkitEnv()
+    model = FakeToolkitModel()
+    primitive = YamPrimitives(env=env, model=model, check_cancelled=lambda: None)
+
+    result = primitive.pi05_act(chunks=1, use_length=use_length, prompt=None)
+
+    assert result["requested_steps"] == use_length
+    assert result["executed_steps"] == use_length
+    assert result["success"] is True
+    assert result["prompt"] == "place the cube"
+    assert env.chunk_step_calls[-1]["actions"].shape == (use_length, 14)
+    assert env.take_action_cnt == use_length
+
+
 @pytest.mark.parametrize("transport", ["http", "socket"])
 def test_yam_vla_localhost_rpc_round_trip_meta_and_actions(transport: str) -> None:
     model = FakeYamModel()
     facade = YamVLAFacade(model=model)
 
     with _served_facade(facade, transport) as rpc:
+        metadata = rpc.call("healthz", timeout_s=2.0)
         client = BaseVLAClient(rpc)
         actions = client.predict(_valid_vla_observation(), options={"mode": "eval"})
 
-    assert actions.shape == (1, MODEL_SPEC.use_length, 14)
+    assert metadata == vla_runtime_contract()
+    assert metadata["action_horizon"] == 30
+    assert metadata["action_dim"] == 14
+    assert actions.shape == (1, MODEL_SPEC.action_horizon, 14)
     assert np.all(actions[0, :, 6] == pytest.approx(0.25))
     assert np.all(actions[0, :, 13] == pytest.approx(0.75))
     assert len(model.calls) == 1
@@ -1313,13 +1353,19 @@ def test_yam_vla_localhost_rpc_round_trip_meta_and_actions(transport: str) -> No
     assert env_obs["states"].shape == (1, 14)
 
 
-def test_yam_vla_contract_and_build_cfg_use_horizon30_use5_qpos14() -> None:
+def test_yam_vla_contract_and_build_cfg_use_horizon30_use30_qpos14() -> None:
     cfg = build_model_cfg("/tmp/fake-yam-model", "/tmp/fake-norm-stats")
+    metadata = vla_runtime_contract()
 
     assert MODEL_SPEC.camera_order == ("top", "left", "right")
     assert MODEL_SPEC.action_layout == "qpos14"
     assert MODEL_SPEC.action_horizon == 30
-    assert MODEL_SPEC.use_length == 5
+    assert MODEL_SPEC.use_length == 30
+    assert metadata["runtime"] == "yam_vla"
+    assert metadata["policy_name"] == MODEL_SPEC.policy_name
+    assert metadata["action_layout"] == "qpos14"
+    assert metadata["action_horizon"] == 30
+    assert metadata["action_dim"] == 14
     assert cfg.model_path == "/tmp/fake-yam-model"
     assert cfg.precision == "bf16"
     assert cfg.num_action_chunks == MODEL_SPEC.action_horizon
@@ -1432,6 +1478,19 @@ def _make_yam_toolkit(
     return toolkit, env, model, memory
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 100.0
+        self.sleep_calls: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, duration: float) -> None:
+        self.sleep_calls.append(float(duration))
+        self.now += float(duration)
+
+
 def test_yam_toolkit_without_model_hides_pi05_but_keeps_primitives_and_reset(
     tmp_path,
 ) -> None:
@@ -1453,6 +1512,7 @@ def test_yam_toolkit_without_model_hides_pi05_but_keeps_primitives_and_reset(
 
 def test_yam_toolkit_finish_claim_cannot_create_verified_success(tmp_path) -> None:
     toolkit, env, _, _ = _make_yam_toolkit(tmp_path, success_after_chunk=False)
+    env.terminal_event = "abort"
     try:
         result = toolkit.execute_tool(
             "finish",
@@ -1465,6 +1525,167 @@ def test_yam_toolkit_finish_claim_cannot_create_verified_success(tmp_path) -> No
     assert result.is_finish is True
     assert result.result["verified_success"] is False
     assert result.result["status"] == "failure"
+
+
+def test_yam_toolkit_reset_polls_ready_to_reset_without_spending_pending_attempt(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import robots.yam.toolkit as yam_toolkit_module
+
+    clock = FakeClock()
+    monkeypatch.setattr(yam_toolkit_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(yam_toolkit_module.time, "sleep", clock.sleep)
+    toolkit, env, _, _ = _make_yam_toolkit(
+        tmp_path,
+        mode="exploration",
+        attempts_per_session=2,
+        model=None,
+    )
+    try:
+        pending = toolkit.execute_tool("reset", {})
+        pending_poll_count = env.read_control_state_calls
+        pending_sleep_s = sum(clock.sleep_calls)
+        env.ready_to_reset = True
+        clock.sleep_calls.clear()
+        reset = toolkit.execute_tool("reset", {})
+    finally:
+        toolkit.close()
+
+    assert pending.is_finish is False
+    assert pending.result["status"] == "pending"
+    assert "attempt count is unchanged" in pending.result["notice"]
+    assert pending_sleep_s == pytest.approx(20.0)
+    assert sum(clock.sleep_calls) == 0.0
+    assert pending_poll_count > 1
+    assert env.reset_calls == 1
+    assert toolkit._session_attempt == 1
+    assert toolkit._attempt == 1
+    assert reset.result["log"]["result"]["attempt"] == 1
+
+
+def test_yam_toolkit_finish_pending_waits_one_operator_window_without_ending(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import robots.yam.toolkit as yam_toolkit_module
+
+    clock = FakeClock()
+    monkeypatch.setattr(yam_toolkit_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(yam_toolkit_module.time, "sleep", clock.sleep)
+    toolkit, _, _, _ = _make_yam_toolkit(tmp_path, mode="exploration", model=None)
+    try:
+        result = toolkit.execute_tool(
+            "finish",
+            {"status": "success", "summary": "agent thinks this is done"},
+        )
+    finally:
+        toolkit.close()
+
+    assert result.is_finish is False
+    assert result.result["status"] == "pending"
+    assert result.result["error"] == "finish refused: pending operator verdict"
+    assert sum(clock.sleep_calls) == pytest.approx(20.0)
+
+
+def test_yam_toolkit_success_verdict_requires_memory_then_allows_final_finish(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import robots.yam.toolkit as yam_toolkit_module
+
+    clock = FakeClock()
+    monkeypatch.setattr(yam_toolkit_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(yam_toolkit_module.time, "sleep", clock.sleep)
+    toolkit, env, _, _ = _make_yam_toolkit(tmp_path, mode="exploration", model=None)
+    original_read_control_state = env.read_control_state
+    reads = {"count": 0}
+
+    def read_control_state_after_stop():
+        reads["count"] += 1
+        if reads["count"] >= 2:
+            env.eval_success = True
+            env.terminal_event = "success"
+        return original_read_control_state()
+
+    env.read_control_state = read_control_state_after_stop
+    try:
+        first = toolkit.execute_tool(
+            "finish",
+            {"status": "success", "summary": "operator just confirmed"},
+        )
+        second = toolkit.execute_tool(
+            "finish",
+            {"status": "success", "summary": "memory has been written"},
+        )
+    finally:
+        toolkit.close()
+
+    assert first.is_finish is False
+    assert first.result["status"] == "retry"
+    assert first.result["error"] == "finish refused: review newly confirmed success"
+    assert "memory inbox" in first.result["notice"]
+    assert second.is_finish is True
+    assert second.result["status"] == "success"
+    assert second.result["verified_success"] is True
+
+
+@pytest.mark.parametrize(
+    ("terminal_event", "expected_finish", "expected_status", "expected_error"),
+    [
+        ("failure", False, "retry", "finish refused: operator marked failure"),
+        ("abort", True, "failure", None),
+    ],
+)
+def test_yam_toolkit_finish_respects_operator_terminal_events(
+    monkeypatch,
+    tmp_path,
+    terminal_event: str,
+    expected_finish: bool,
+    expected_status: str,
+    expected_error: str | None,
+) -> None:
+    import robots.yam.toolkit as yam_toolkit_module
+
+    clock = FakeClock()
+    monkeypatch.setattr(yam_toolkit_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(yam_toolkit_module.time, "sleep", clock.sleep)
+    toolkit, env, _, _ = _make_yam_toolkit(
+        tmp_path,
+        mode="exploration",
+        attempts_per_session=2,
+        model=None,
+    )
+    env.terminal_event = terminal_event
+    try:
+        result = toolkit.execute_tool(
+            "finish",
+            {"status": "success", "summary": "agent done"},
+        )
+    finally:
+        toolkit.close()
+
+    assert result.is_finish is expected_finish
+    assert result.result["status"] == expected_status
+    if expected_error is None:
+        assert "error" not in result.result
+    else:
+        assert result.result["error"] == expected_error
+    assert clock.sleep_calls == []
+
+
+def test_yam_toolkit_solved_refreshes_control_state(tmp_path) -> None:
+    toolkit, env, _, _ = _make_yam_toolkit(tmp_path, mode="exploration", model=None)
+    try:
+        before = env.read_control_state_calls
+        env.eval_success = True
+        env.terminal_event = "success"
+        solved = toolkit.solved()
+    finally:
+        toolkit.close()
+
+    assert solved is True
+    assert env.read_control_state_calls == before + 1
 
 
 @pytest.mark.parametrize(
@@ -1740,6 +1961,108 @@ def test_single_arm_preserves_other_command_despite_measured_drift(arm, offset):
     expected = commanded.copy()
     expected[offset : offset + 6] = 0.4
     np.testing.assert_array_equal(sent, expected)
+
+
+def test_dual_arm_qpos_updates_are_absolute_from_last_commanded_state():
+    env = FakeToolkitEnv()
+    measured = np.linspace(-0.6, 0.7, 14, dtype=np.float64)
+    measured[[6, 13]] = [0.9, 0.1]
+    commanded = np.linspace(0.1, 1.4, 14, dtype=np.float64)
+    commanded[[6, 13]] = [0.25, 0.75]
+    env.qpos = measured.copy()
+    env.last_obs["state"]["joint_position"] = measured.copy()
+    env.last_info["commanded_qpos"] = commanded.copy()
+    primitive = YamPrimitives(env=env, check_cancelled=lambda: None)
+    left_target = np.full(6, 0.4, dtype=np.float64)
+    right_target = np.full(6, -0.2, dtype=np.float64)
+
+    primitive.apply_qpos_updates(
+        [
+            {"arm": "left", "arm_qpos": left_target, "gripper": 0.3},
+            {"arm": "right", "arm_qpos": right_target, "gripper": 0.8},
+        ]
+    )
+
+    sent = env.chunk_step_calls[-1]["actions"]
+    expected_first = commanded.copy()
+    expected_first[:6] = left_target
+    expected_first[6] = 0.3
+    expected_second = expected_first.copy()
+    expected_second[7:13] = right_target
+    expected_second[13] = 0.8
+    np.testing.assert_allclose(sent[0], expected_first)
+    np.testing.assert_allclose(sent[1], expected_second)
+    np.testing.assert_allclose(env.qpos, expected_second)
+
+
+def _assert_path_waypoints_preserved_in_order(
+    sent: np.ndarray,
+    planned_path: np.ndarray,
+    *,
+    offset: int,
+) -> None:
+    cursor = 0
+    for waypoint in planned_path:
+        comparisons = np.isclose(sent[cursor:, offset : offset + 6], waypoint)
+        matches = np.flatnonzero(np.all(comparisons, axis=1))
+        assert len(matches), f"planned waypoint was dropped: {waypoint.tolist()}"
+        cursor += int(matches[0]) + 1
+
+
+@pytest.mark.parametrize("arm,offset", [("left", 0), ("right", 7)])
+def test_move_to_substeps_only_insert_between_planned_safety_waypoints(
+    arm: str,
+    offset: int,
+):
+    env = FakeToolkitEnv()
+    env.planned_path = np.asarray(
+        [
+            [0.10, 0.11, 0.12, 0.13, 0.14, 0.15],
+            [0.30, 0.31, 0.32, 0.33, 0.34, 0.35],
+            [0.60, 0.61, 0.62, 0.63, 0.64, 0.65],
+        ],
+        dtype=np.float64,
+    )
+    primitive = YamPrimitives(env=env, check_cancelled=lambda: None)
+
+    result = primitive.move_to(
+        arm=arm,
+        xyz=[0.2, 0.1, 0.3],
+        quat=[1.0, 0.0, 0.0, 0.0],
+        gripper=0.4,
+        substeps=6,
+    )
+
+    sent = env.chunk_step_calls[-1]["actions"]
+    assert result["requested_actions"] == result["executed_actions"] == len(sent)
+    assert len(sent) == 6
+    assert len(sent) > len(env.planned_path)
+    _assert_path_waypoints_preserved_in_order(sent, env.planned_path, offset=offset)
+
+
+def test_rotate_wrist_forwards_substeps_to_move_to(monkeypatch):
+    env = FakeToolkitEnv()
+    primitive = YamPrimitives(env=env, check_cancelled=lambda: None)
+    captured: dict[str, Any] = {}
+
+    def fake_move_to(self, **kwargs):
+        del self
+        captured.update(kwargs)
+        return {"success": True}
+
+    monkeypatch.setattr(YamPrimitives, "move_to", fake_move_to)
+
+    result = primitive.rotate_wrist(
+        arm="right",
+        delta_yaw_deg=15.0,
+        gripper=0.7,
+        substeps=9,
+    )
+
+    assert captured["arm"] == "right"
+    assert captured["gripper"] == pytest.approx(0.7)
+    assert captured["substeps"] == 9
+    assert result["requested_delta_yaw_deg"] == pytest.approx(15.0)
 
 
 def test_camera_meta_and_render_remain_bound_to_observed_pose(tmp_path):

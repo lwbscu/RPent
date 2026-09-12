@@ -82,7 +82,7 @@ def main():
     parser.add_argument(
         "--event",
         default="status",
-        choices=("status", "ready", "start", "success", "failure", "abort"),
+        choices=("status", "ready", "start", "success", "failure", "abort", "reset_pose", "shutdown"),
     )
     parser.add_argument("--note", default="")
     args = parser.parse_args()
@@ -90,8 +90,12 @@ def main():
 
     client = make_rpc_client(args.endpoint)
     if args.event == "status":
-        _, info = client.call("env.observe", timeout_s=120)
+        _, info = client.call("env.read_control_state", timeout_s=120)
         print(json.dumps(info["episode_status"], default=str, ensure_ascii=False))
+        return
+    if args.event in {"reset_pose", "shutdown"}:
+        method = "env.reset_to_configured_qpos" if args.event == "reset_pose" else "shutdown"
+        print(json.dumps(client.call(method, timeout_s=180), ensure_ascii=False))
         return
     if not args.episode_id or not args.note.strip():
         parser.error("--episode-id and --note are required for operator events")

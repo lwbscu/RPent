@@ -176,7 +176,11 @@ def test_server_entrypoint_publishes_configured_servo_and_actual_joint_bounds(
 
     from robots.yam import env_server, rlinf_env
 
-    config = {"task_name": "place_cube", "joint_servo": {"enabled": True}}
+    config = {
+        "task_name": "place_cube",
+        "joint_servo": {"enabled": True},
+        "park_on_close": {"enabled": True},
+    }
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
     fake_env = FakeYamEnv()

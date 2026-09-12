@@ -14,10 +14,13 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from robots.yam.contracts import (
     MODEL_SPEC,
     env_runtime_contract,
+    validate_contract,
+    vla_runtime_contract,
 )
 from robots.yam.evaluation import finalize_run
 from robots.yam.prompt_bundle import system_prompt, user_prompt
@@ -117,11 +120,11 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
     )
     output_dir = getattr(args, "output_dir", None)
     if output_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S")
+        timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S.%f")
         output_dir = (
             get_repo_root() / "logs" / f"{timestamp}_yam_{args.task_name}_s{args.seed}"
         )
-    recipe_tag = f"yam_{args.task_name}_s{args.seed}"
+    recipe_tag = f"yam_{args.task_name}_s{args.seed}_{uuid4().hex[:12]}"
     instruction = args.task_language or args.task_name.replace("_", " ")
     return RunConfig(
         recipe_tag=recipe_tag,
@@ -225,4 +228,5 @@ def _build_env_runtime_kwargs(args: argparse.Namespace, env_rpc: Any) -> dict[st
 def _build_vla_runtime_kwargs(vla_rpc: Any) -> dict[str, Any]:
     from rpent.robots.components.vla_client_base import BaseVLAClient
 
+    validate_contract(vla_rpc, vla_runtime_contract())
     return {"model": BaseVLAClient(vla_rpc)}

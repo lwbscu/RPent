@@ -47,8 +47,9 @@ Alternate observed single-arm actions for two-arm tasks; simultaneous coordinate
 Cartesian motion is not exposed. Never claim primitive success as task success."""
 
 VLA = """A trained YAM qpos14 VLA is connected and pi05_act is available.
-Use short chunks with a trained task-relevant subgoal via prompt; the full task
-language remains the episode goal. pi05_act can command both arms together."""
+Default to the full trained task instruction (omit prompt), with one 30-step
+chunk per call and a fresh observation afterwards. use_length may be 1..30 to
+shorten an intervention; arbitrary subgoal prompts have not been validated. pi05_act can command both arms together."""
 
 PRIMITIVES_ONLY = """This session has no VLA. Solve and explore using the geometric
 primitives and current observations; pi05_act is not available. If the task needs
@@ -57,13 +58,17 @@ instead of requesting an untrained policy."""
 
 SUCCESS = """Only fresh env eval_success=true confirms success. On the real YAM
 rig this may be an operator-confirmed flag until a perception success checker is
-installed. Every exit must call finish exactly once; if eval_success is still
-false, report failure honestly even when the agent believes the task is done."""
+installed. finish(success) waits for an operator verdict when needed. A pending or
+finish-refused response does not end the session. In exploration, re-observe and
+write the technique after confirmed success before finishing. Evaluation memory
+is read-only. Never invent an operator verdict."""
 
 EXPLORE = """Exploration is operator-supervised real-robot work. Prefer in-place
 recovery when it is safe, reset only after the failed attempt is archived and the
 next plan changes a named lever. Keep attempts concise, preserve useful partial
 progress, and write observations as bounded evidence rather than global claims.
+At startup, if ready_for_motion is false, call reset and wait for operator ready
+before any action. An operator abort requires finish(status="failure") immediately.
 
 Your cell is {{recipe_tag}}, session {{session_number}} of {{session_max}}.
 Use the common file tools to save working notes under {{memory_inbox}}/wip/.
@@ -71,9 +76,10 @@ Before a retry or session handoff, write an attempt note there: episode ID,
 selected objects and arm roles, observed outcome, failed hypothesis, and the one
 parameter or approach to change next. Existing step records keep raw evidence;
 do not invent a second action log. Re-localize targets on every restored scene.
-Do not repeatedly call reset while waiting for an operator: archive the failed
-attempt, explain the requested scene restoration, and hand off if no ready
-receipt is available. A reset error is not a new attempt or proof of failure.
+Archive the failed attempt and explain the requested scene restoration. reset
+waits up to 20 seconds for operator ready; a pending response means wait and retry
+reset, not a new attempt or proof of failure. Use the remaining attempt budget
+for a changed approach; stop immediately if the operator aborts.
 
 After actual env success, distil a task technique to {{memory_inbox}}/technique.md.
 Use YAML frontmatter: scope: suite, suite: yam, regime: real,
