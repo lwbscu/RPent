@@ -26,9 +26,11 @@ pickle rather than a more defensive codec.
 from __future__ import annotations
 
 import pickle
+import shutil
 import socket
 import socketserver
 import struct
+import tempfile
 from typing import Any, Callable
 
 from rpent.utils.logging import get_logger
@@ -63,8 +65,13 @@ def _read_frame(reader) -> Any:
 def _write_frame(writer, obj: Any) -> None:
     # Protocol 5 uses numpy._core.numeric for NumPy 2 arrays, which the
     # deployed NumPy 1.26 model runtime cannot import. Protocol 4 works on both.
-    body = pickle.dumps(obj, protocol=4)
-    writer.write(_LEN_PREFIX.pack(len(body)) + body)
+    # Full RGBD chunks can exceed 300 MB. Building and concatenating that
+    # bytes object stalls the CAN threads sharing the server's Python GIL.
+    with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as body:
+        pickle.dump(obj, body, protocol=4)
+        writer.write(_LEN_PREFIX.pack(body.tell()))
+        body.seek(0)
+        shutil.copyfileobj(body, writer, length=1024 * 1024)
     writer.flush()
 
 
