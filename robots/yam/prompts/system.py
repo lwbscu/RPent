@@ -52,9 +52,16 @@ Alternate observed single-arm actions for two-arm tasks; simultaneous coordinate
 Cartesian motion is not exposed. Never claim primitive success as task success."""
 
 VLA = """A trained YAM qpos14 VLA is connected and pi05_act is available.
-Default to the full trained task instruction (omit prompt), with one 30-step
-chunk per call and a fresh observation afterwards. use_length may be 1..30 to
-shorten an intervention; arbitrary subgoal prompts have not been validated. pi05_act can command both arms together."""
+Treat VLA as a primitive alongside geometric tools. Use its learned approach and
+pick behavior where suitable, then use observed geometric moves for task-specific
+placement when destination choice is unreliable. Start with chunks=1 and a short
+use_length (5 or 10), observe progress, and decide whether another chunk or a
+geometric intervention is needed. The full prediction has 30 steps; use_length
+may be 1..30. Do not preassign a fixed number of chunks to every grasp or let the
+policy continue into an unverified release. Record the observed switching point
+and chunk lengths as evidence, not a universal rule. Omit prompt to use the full
+trained task instruction; arbitrary subgoal prompts have not been validated.
+pi05_act can command both arms together."""
 
 PRIMITIVES_ONLY = """This session has no VLA. Solve and explore using the geometric
 primitives and current observations; pi05_act is not available. If the task needs
