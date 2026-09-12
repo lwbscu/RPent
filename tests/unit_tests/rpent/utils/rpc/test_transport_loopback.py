@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import io
 import os
+import pickle
 import socket
 import threading
 import time
@@ -37,6 +39,7 @@ from rpent.utils.rpc import (
     wait_for_ready,
 )
 from rpent.utils.rpc.http_rpc import HttpRpcClient, _is_direct_url
+from rpent.utils.rpc.socket_rpc import _write_frame
 
 Transport = Literal["http", "socket"]
 PROXY_ENVIRONMENT_VARIABLES = (
@@ -49,6 +52,22 @@ PROXY_ENVIRONMENT_VARIABLES = (
     "all_proxy",
     "no_proxy",
 )
+
+
+def test_numpy_array_frame_loads_without_numpy2_numeric_module() -> None:
+    # NumPy 1.26.4 on the model host lacks numpy._core.numeric. A NumPy 2
+    # protocol-5 array request therefore closes the socket before dispatch.
+    class ModelHostUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module == "numpy._core.numeric":
+                raise ModuleNotFoundError("No module named 'numpy._core.numeric'")
+            return super().find_class(module, name)
+
+    frames = io.BytesIO()
+    values = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)
+    _write_frame(frames, {"image": values})
+    decoded = ModelHostUnpickler(io.BytesIO(frames.getvalue()[4:])).load()
+    np.testing.assert_array_equal(decoded["image"], values)
 
 
 @pytest.fixture(autouse=True)

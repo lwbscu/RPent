@@ -61,7 +61,9 @@ def _read_frame(reader) -> Any:
 
 
 def _write_frame(writer, obj: Any) -> None:
-    body = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    # Protocol 5 uses numpy._core.numeric for NumPy 2 arrays, which the
+    # deployed NumPy 1.26 model runtime cannot import. Protocol 4 works on both.
+    body = pickle.dumps(obj, protocol=4)
     writer.write(_LEN_PREFIX.pack(len(body)) + body)
     writer.flush()
 
